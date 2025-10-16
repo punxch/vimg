@@ -69,9 +69,29 @@ impl Vcs {
         ensure!(
             self.output
                 .as_ref()
-                .is_none_or(|p| p.extension().and_then(|e| e.to_str()) == Some("avif")),
-            "output must be avif"
+                .map(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|ext| {
+                            ext.eq_ignore_ascii_case("avif") || ext.eq_ignore_ascii_case("jpg")
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true),
+            "output must be .avif or .jpg"
         );
+
+        let is_jpg = self
+            .output
+            .as_ref()
+            .is_some_and(|p| p.extension().and_then(|e| e.to_str()) == Some("jpg"));
+        ensure!(
+            !is_jpg || (self.args.capture_frames.unwrap_or(1) == 1),
+            "jpg output only supported for single-frame captures"
+        );
+        if is_jpg {
+            self.args.capture_frames = Some(1);
+        }
 
         let parent_dir = self
             .args
@@ -153,20 +173,44 @@ impl Vcs {
             })?;
 
         // write to temp location until successful
+        let suffix = if is_jpg { "jpg" } else { "avif" };
         let temp_out_file = {
             let mut o = temp_dir.clone();
-            o.push(format!("{file_prefix}.avif"));
+            o.push(format!("{file_prefix}.{suffix}"));
             o
         };
         // output file if successful
         let out_file = self.output.unwrap_or_else(|| {
             let mut o = parent_dir;
-            o.push(format!("{file_prefix}.avif"));
+            o.push(format!("{file_prefix}.{suffix}"));
             o
         });
 
         spinner.set_message(format!("Encoding {}", sh_escape_filename(&out_file)));
-        let out = Command::new("ffmpeg")
+        if is_jpg {
+            let out = Command::new("ffmpeg")
+            .arg2("-r", self.avif_fps)
+            .arg2("-i", {
+                let mut o = temp_dir;
+                o.push(format!("{file_prefix}-%0{frame_w}d.bmp"));
+                o
+            })
+            .arg2("-v", "quiet")
+            .arg2("-threads", "1")
+            .arg2("-skip_frame", "nokey")
+            .arg("-an")
+            .arg("-sn")
+            .arg("-dn")
+            .arg("-y")
+            .arg(&temp_out_file)
+            .output()?;
+            ensure!(
+                out.status.success(),
+                "ffmpeg convert-to-jpg failed\n---stderr---\n{}\n------",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+        } else {
+            let out = Command::new("ffmpeg")
             .arg2("-r", self.avif_fps)
             .arg2("-i", {
                 let mut o = temp_dir;
@@ -190,11 +234,12 @@ impl Vcs {
             .arg("-y")
             .arg(&temp_out_file)
             .output()?;
-        ensure!(
-            out.status.success(),
-            "ffmpeg convert-to-avif failed\n---stderr---\n{}\n------",
-            String::from_utf8_lossy(&out.stderr).trim(),
-        );
+            ensure!(
+                out.status.success(),
+                "ffmpeg convert-to-avif failed\n---stderr---\n{}\n------",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
+        }
 
         fs::rename(&temp_out_file, &out_file)
             .or_else(|_| fs::copy(&temp_out_file, &out_file).map(|_| ()))?;

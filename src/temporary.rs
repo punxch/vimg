@@ -26,7 +26,7 @@ pub fn process_dir(conf_parent: Option<PathBuf>, delete_on_exit: bool) -> PathBu
     });
 
     let mut temp_dir =
-        conf_parent.unwrap_or_else(|| env::current_dir().expect("current working directory"));
+        conf_parent.unwrap_or_else(|| env::temp_dir());
     temp_dir.push(&*SUBDIR);
 
     if !temp_dir.exists() && delete_on_exit {

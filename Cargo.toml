@@ -31,3 +31,7 @@ strip = true
 
 [lints.rust]
 unused_crate_dependencies = "deny"
+
+[profile.dev]
+debug = false
+
