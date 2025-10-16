@@ -75,6 +75,7 @@ impl Vcs {
                     .map(|ext| ext == "jpg" || ext.is_empty())
                     .unwrap_or(false)
             });
+        let is_webp = true;
         ensure!(
             !is_jpg || (self.args.capture_frames.unwrap_or(1) == 1),
             "jpg output only supported for single-frame captures"
@@ -163,7 +164,7 @@ impl Vcs {
             })?;
 
         // write to temp location until successful
-        let suffix = if is_jpg { "jpg" } else { "avif" };
+        let suffix = if is_jpg { "jpg" } else if is_webp {"webp"} else { "avif" };
         let temp_out_file = {
             let mut o = temp_dir.clone();
             o.push(format!("{file_prefix}.{suffix}"));
@@ -199,6 +200,42 @@ impl Vcs {
                 "ffmpeg convert-to-jpg failed\n---stderr---\n{}\n------",
                 String::from_utf8_lossy(&out.stderr).trim(),
             );
+        } else if is_webp {
+            let out = Command::new("ffmpeg")
+            .arg2("-r", self.avif_fps)
+            .arg2("-i", {
+                let mut o = temp_dir;
+                o.push(format!("{file_prefix}-%0{frame_w}d.bmp"));
+                o
+            })
+            .arg2("-lossless", "0")
+            .arg2("-loop", "0")
+            .arg2("-c:v", "libwebp")
+            // .arg2("-c:v", &self.avif_codec)
+            // .arg2(
+            //     match self.avif_codec.as_str() {
+            //         "libaom-av1" => "-cpu-used",
+            //         _ => "-preset",
+            //     },
+            //     self.avif_preset
+            //         .unwrap_or(match self.args.capture_frames() {
+            //             1 => 1,
+            //             _ => 6,
+            //         }),
+            // )
+            .arg2("-preset", "photo")
+            .arg2("-quality","10")
+            .arg2("-compression_level", "3")
+            .arg2("-crf", self.avif_crf)
+            .arg2("-pix_fmt", "yuv420p10le")
+            .arg("-y")
+            .arg(&temp_out_file)
+            .output()?;
+            ensure!(
+                out.status.success(),
+                "ffmpeg convert-to-webp failed\n---stderr---\n{}\n------",
+                String::from_utf8_lossy(&out.stderr).trim(),
+            );
         } else {
             let out = Command::new("ffmpeg")
             .arg2("-r", self.avif_fps)
@@ -219,7 +256,6 @@ impl Vcs {
                         _ => 6,
                     }),
             )
-            .arg2("-crf", self.avif_crf)
             .arg2("-pix_fmt", "yuv420p10le")
             .arg("-y")
             .arg(&temp_out_file)
