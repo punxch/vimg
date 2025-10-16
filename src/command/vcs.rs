@@ -66,25 +66,15 @@ pub struct Vcs {
 
 impl Vcs {
     pub fn run(mut self) -> anyhow::Result<()> {
-        ensure!(
-            self.output
-                .as_ref()
-                .map(|p| {
-                    p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|ext| {
-                            ext.eq_ignore_ascii_case("avif") || ext.eq_ignore_ascii_case("jpg")
-                        })
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true),
-            "output must be .avif or .jpg"
-        );
-
         let is_jpg = self
             .output
             .as_ref()
-            .is_some_and(|p| p.extension().and_then(|e| e.to_str()) == Some("jpg"));
+            .is_some_and(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|ext| ext == "jpg" || ext.is_empty())
+                    .unwrap_or(false)
+            });
         ensure!(
             !is_jpg || (self.args.capture_frames.unwrap_or(1) == 1),
             "jpg output only supported for single-frame captures"
