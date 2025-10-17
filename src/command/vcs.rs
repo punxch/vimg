@@ -211,21 +211,10 @@ impl Vcs {
             .arg2("-lossless", "0")
             .arg2("-loop", "0")
             .arg2("-c:v", "libwebp")
-            // .arg2("-c:v", &self.avif_codec)
-            // .arg2(
-            //     match self.avif_codec.as_str() {
-            //         "libaom-av1" => "-cpu-used",
-            //         _ => "-preset",
-            //     },
-            //     self.avif_preset
-            //         .unwrap_or(match self.args.capture_frames() {
-            //             1 => 1,
-            //             _ => 6,
-            //         }),
-            // )
-            .arg2("-preset", "photo")
-            .arg2("-quality","10")
-            .arg2("-compression_level", "3")
+            .arg2("-vf","cropdetect=24:16:0, crop=iw-2*24:ih-2*16") // remove border artifacts
+            // .arg2("-preset", "photo") // **useless if using compression_level or something else?
+            .arg2("-quality","60")
+            .arg2("-compression_level", "2")
             .arg2("-crf", self.avif_crf)
             .arg2("-pix_fmt", "yuv420p10le")
             .arg("-y")
