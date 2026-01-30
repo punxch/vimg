@@ -62,6 +62,10 @@ pub struct Vcs {
     /// Keep temporary files.
     #[arg(long, default_value_t = false)]
     pub keep: bool,
+
+    /// Output as webp instead of avif.
+    #[arg(long, default_value_t = 0)]
+    pub webp: u8,
 }
 
 impl Vcs {
@@ -75,7 +79,7 @@ impl Vcs {
                     .map(|ext| ext == "jpg" || ext.is_empty())
                     .unwrap_or(false)
             });
-        let is_webp = true;
+        let is_webp = self.webp != 0;
         ensure!(
             !is_jpg || (self.args.capture_frames.unwrap_or(1) == 1),
             "jpg output only supported for single-frame captures"
