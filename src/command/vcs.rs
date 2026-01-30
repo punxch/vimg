@@ -249,6 +249,7 @@ impl Vcs {
                         _ => 6,
                     }),
             )
+            .arg2("-crf", self.avif_crf)
             .arg2("-pix_fmt", "yuv420p10le")
             .arg("-y")
             .arg(&temp_out_file)
