@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(rm -rf .vimg-* output.avif)",
+      "Bash(time ./target/release/vimg.exe vcs -c3 -H160 -n9 sample/input.mkv --output output.avif)",
+      "Bash(ffmpeg -hide_banner -decoders)",
+      "Bash(./target/release/vimg.exe extract:*)",
+      "Bash(tasklist)",
+      "Bash(cd:*)",
+      "Read(//d/Repo/Rust/vimg/$USERPROFILE/.cargo/registry/**)",
+      "Bash(grep:*)",
+      "Bash(time ./target/release/vimg.exe vcs -c3 -H160 -n9 .sampleinput.mkv --output output.avif)",
+      "Bash(./target/release/vimg.exe vcs:*)",
+      "Bash(ffprobe -v quiet -print_format json -show_format -show_streams \".\\\\sample\\\\input.mkv\")",
+      "Bash(done)",
+      "Bash(ffmpeg -hwaccel cuda -ss 10 -t 1.5 -i \"D:/Repo/Rust/vimg/sample/input.mkv\" -r 20 -vframes 30 -f rawvideo -pix_fmt rgb24 -s 284x160 -y pipe:1)",
+      "Bash(ffmpeg -hwaccel cuda -ss 10 -t 1.5 -i D:/Repo/Rust/vimg/sample/input.mkv -r 20 -vframes 30 -f rawvideo -pix_fmt rgb24 -s 284x160 -y pipe:1)",
+      "Bash(rm -rf .vimg-* output.avif 2)",
+      "Bash(/dev/null echo:*)",
+      "Bash(/dev/null ./target/release/vimg.exe vcs -c3 -H160 -n9 --avif-codec hevc_nvenc .sampleinput.mkv --output output.hevc_nvenc.mp4)",
+      "Bash(rm -rf .vimg-* 2)",
+      "Bash(/dev/null ./target/release/vimg.exe vcs -c3 -H160 -n9 --avif-codec h264_nvenc .sampleinput.mkv --output output.h264_nvenc.mp4)",
+      "Bash(nvidia-smi:*)",
+      "Bash(ffmpeg -hide_banner -h encoder=av1_nvenc)",
+      "Bash(ffmpeg -f lavfi -i testsrc=duration=1:size=320x240:rate=30 -c:v av1_nvenc -preset p4 -y output_nvenc_test.mp4)",
+      "Bash(ffmpeg -f lavfi -i testsrc=duration=1:size=320x240:rate=30 -c:v h264_nvenc -preset p4 -y output_nvenc_test.mp4)",
+      "Bash(for i:*)",
+      "Bash(do rm:*)"
+    ],
+    "defaultMode": "auto"
+  }
+}

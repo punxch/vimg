@@ -97,19 +97,21 @@ pub fn draw(
         let min_x = b.min.x as u32;
         let max_y = (b.max.y.ceil() as u32).min(rgba.height() - 1);
         let min_y = b.min.y as u32;
+        let width = rgba.width();
+        let buf = rgba.as_mut();
+        let alpha = (conf.background_opacity * 255.0) as u32;
+        let inv_alpha = 255 - alpha;
 
-        for x in min_x..=max_x {
-            for y in min_y..=max_y {
+        for y in min_y..=max_y {
+            let row_offset = (y * width * 4) as usize;
+            for x in min_x..=max_x {
                 if (x == max_x || x == min_x) && (y == max_y || y == min_y) {
-                    // skip corners
                     continue;
                 }
-                rgba.get_pixel_mut(x, y).blend(&image::Rgba([
-                    0,
-                    0,
-                    0,
-                    (conf.background_opacity * 255.0) as u8,
-                ]));
+                let idx = row_offset + (x * 4) as usize;
+                buf[idx] = ((buf[idx] as u32 * inv_alpha) / 255) as u8;
+                buf[idx + 1] = ((buf[idx + 1] as u32 * inv_alpha) / 255) as u8;
+                buf[idx + 2] = ((buf[idx + 2] as u32 * inv_alpha) / 255) as u8;
             }
         }
     }

@@ -94,3 +94,58 @@ impl Join {
         Ok(img)
     }
 }
+
+/// Join same-sized images from memory into a single grid image.
+pub fn join_from_memory(
+    images: &[image::RgbImage],
+    columns: u32,
+    labels: &[String],
+) -> anyhow::Result<image::RgbImage> {
+    let n_captures = images.len() as u32;
+    let (cap_w, cap_h) = (images[0].width(), images[0].height());
+    let (rows, cols) = if columns == 0 || n_captures <= columns {
+        (1, n_captures)
+    } else {
+        let mut rows = n_captures / columns;
+        if !n_captures.is_multiple_of(columns) {
+            rows += 1;
+        }
+        (rows, columns)
+    };
+
+    let mut all = image::RgbaImage::new(cap_w * cols, cap_h * rows);
+    let all_w = cap_w * cols;
+
+    for (idx, img) in images.iter().enumerate() {
+        let label = labels.get(idx).map(|s| s.as_str()).unwrap_or("");
+        let col = (idx as u32) % cols;
+        let row = (idx as u32) / cols;
+        let x0 = col * cap_w;
+        let y0 = row * cap_h;
+
+        if label.is_empty() {
+            // Fast path: no label, direct RGB-to-RGBA copy
+            let src = img.as_raw();
+            let all_buf = all.as_mut();
+            for y in 0..cap_h {
+                let src_row = (y * cap_w * 3) as usize;
+                let dst_row = ((y0 + y) * all_w * 4 + x0 * 4) as usize;
+                for x in 0..cap_w {
+                    let si = src_row + (x * 3) as usize;
+                    let di = dst_row + (x * 4) as usize;
+                    all_buf[di] = src[si];
+                    all_buf[di + 1] = src[si + 1];
+                    all_buf[di + 2] = src[si + 2];
+                    all_buf[di + 3] = 255;
+                }
+            }
+        } else {
+            // Label path: draw label then copy
+            let img = image::DynamicImage::ImageRgb8(img.clone());
+            let img = label::draw(img, label, &label::Config::default())?;
+            all.copy_from(&img, x0 as _, y0 as _)?;
+        }
+    }
+
+    Ok(image::DynamicImage::from(all).into_rgb8())
+}
