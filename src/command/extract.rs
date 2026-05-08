@@ -413,7 +413,7 @@ impl fmt::Display for OutTemplate {
 
 // --- In-memory pipe-based extraction ---
 
-static CUDA_AVAILABLE: AtomicBool = AtomicBool::new(true);
+static CUDA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 
 pub struct CaptureFrames {
     pub seconds: u32,
