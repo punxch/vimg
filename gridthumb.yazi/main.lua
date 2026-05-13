@@ -1,7 +1,7 @@
 local M = {}
 
 function M:setup()
-	-- no-op, reserved for future use
+	-- no-op
 end
 
 function M:peek(job)
@@ -19,16 +19,23 @@ function M:peek(job)
 		return ya.preview_widget(job, err)
 	end
 
-	-- Fallback to regular cache
-	local ok, err = self:preload(job)
-	if not ok or err then
-		return ya.preview_widget(job, err)
-	end
+	-- No avif yet. Ensure static ffmpeg cache exists and show it.
+	self:ensure_static(job)
 
+	-- Show static image immediately
 	ya.sleep(math.max(0, rt.preview.image_delay / 1000 + start - os.clock()))
-
 	local _, err = ya.image_show(cache, job.area)
 	ya.preview_widget(job, err)
+
+	-- Generate avif synchronously (blocks, but static image is already shown)
+	self:generate_avif(job, cache)
+
+	-- Show avif (now that it's generated)
+	local cha_avif2 = fs.cha(cache_avif)
+	if cha_avif2 and cha_avif2.len > 0 then
+		local _, err2 = ya.image_show(cache_avif, job.area)
+		ya.preview_widget(job, err2)
+	end
 end
 
 function M:seek(job)
