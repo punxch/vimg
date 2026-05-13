@@ -206,3 +206,4 @@ fn run_vcs(video: &PathBuf, output: &PathBuf) -> anyhow::Result<()> {
 
     vcs.run()
 }
+

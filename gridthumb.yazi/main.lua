@@ -19,20 +19,23 @@ function M:peek(job)
 		return ya.preview_widget(job, err)
 	end
 
-	-- No avif yet. Ensure static ffmpeg cache exists and show it.
-	self:ensure_static(job)
+	-- Fallback: run preload (ffmpeg + vimg)
+	local ok, err = self:preload(job)
+	if not ok or err then
+		return ya.preview_widget(job, err)
+	end
 
-	-- Show static image immediately
+	-- Show static image
 	ya.sleep(math.max(0, rt.preview.image_delay / 1000 + start - os.clock()))
 	local _, err = ya.image_show(cache, job.area)
 	ya.preview_widget(job, err)
 
-	-- Generate avif synchronously (blocks, but static image is already shown)
+	-- Generate avif synchronously (blocks ~2.5s, static already shown)
 	self:generate_avif(job, cache)
 
-	-- Show avif (now that it's generated)
-	local cha_avif2 = fs.cha(cache_avif)
-	if cha_avif2 and cha_avif2.len > 0 then
+	-- Refresh with avif if generated
+	local cha2 = fs.cha(cache_avif)
+	if cha2 and cha2.len > 0 then
 		local _, err2 = ya.image_show(cache_avif, job.area)
 		ya.preview_widget(job, err2)
 	end
@@ -48,68 +51,76 @@ function M:seek(job)
 	end
 end
 
---- Generate ffmpeg single-frame cache if missing (synchronous, fast).
-function M:ensure_static(job)
+function M:preload(job)
+	ya.dbg("[gridthumb] preload:", tostring(job.file.url))
 	local cache = ya.file_cache(job)
 	if not cache then
-		return
+		return true
 	end
 
-	local cha = fs.cha(cache)
-	if cha and cha.len > 0 then
-		return -- already exists
+	local cache_avif = Url(tostring(cache) .. ".avif")
+	local cha_avif = fs.cha(cache_avif)
+	if cha_avif and cha_avif.len > 0 then
+		return true
 	end
 
 	local meta, err = self.list_meta(job.file.url, "format=duration:stream_disposition=attached_pic")
 	if not meta then
-		return
+		return true, err
 	elseif not meta.format.duration then
-		return
+		return true, Err("Failed to get video duration")
 	end
 
 	local pic = M.has_pic(meta)
 	local percent = (pic and 0 or 5) + job.skip
 	if percent > 95 then
-		return
+		ya.emit("peek", { pic and 95 or 90, only_if = job.file.url, upper_bound = true })
+		return false
 	end
 
-	-- stylua: ignore
-	local cmd = Command("ffmpeg"):arg({
-		"-v", "quiet", "-threads", 1, "-hwaccel", "auto",
-		"-skip_frame", "nokey",
-		"-an", "-sn", "-dn",
-	})
+	-- method 1: ffmpeg single-frame cache (skip if exists)
+	local cha = fs.cha(cache)
+	if not (cha and cha.len > 0) then
+		-- stylua: ignore
+		local cmd = Command("ffmpeg"):arg({
+			"-v", "quiet", "-threads", 1, "-hwaccel", "auto",
+			"-skip_frame", "nokey",
+			"-an", "-sn", "-dn",
+		})
 
-	if percent ~= 0 then
-		cmd:arg { "-ss", math.floor(meta.format.duration * percent / 100) }
-	end
-	cmd:arg { "-i", tostring(job.file.url) }
-	if percent == 0 then
-		cmd:arg { "-map", "disp:attached_pic" }
+		if percent ~= 0 then
+			cmd:arg { "-ss", math.floor(meta.format.duration * percent / 100) }
+		end
+		cmd:arg { "-i", tostring(job.file.url) }
+		if percent == 0 then
+			cmd:arg { "-map", "disp:attached_pic" }
+		end
+
+		-- stylua: ignore
+		local status, err = cmd:arg({
+			"-vframes", 1,
+			"-q:v", 31 - math.floor(rt.preview.image_quality * 0.3),
+			"-vf", string.format("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:flags=fast_bilinear", rt.preview.max_width, rt.preview.max_height),
+			"-f", "image2",
+			"-y", tostring(cache),
+		}):status()
+
+		if not status then
+			return true, Err("Failed to start `ffmpeg`, error: %s", err)
+		elseif not status.success then
+			return false, Err("`ffmpeg` exited with error code: %s", status.code)
+		end
 	end
 
-	-- stylua: ignore
-	local status, err = cmd:arg({
-		"-vframes", 1,
-		"-q:v", 31 - math.floor(rt.preview.image_quality * 0.3),
-		"-vf", string.format("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:flags=fast_bilinear", rt.preview.max_width, rt.preview.max_height),
-		"-f", "image2",
-		"-y", tostring(cache),
-	}):status()
-
-	if status then
-		ya.dbg("[gridthumb] ffmpeg done:", tostring(cache))
-	else
-		ya.dbg("[gridthumb] ffmpeg failed:", tostring(err))
-	end
+	return true
 end
 
---- Generate avif via vimg serve (synchronous, blocks this async task).
+--- Generate avif via vimg serve (synchronous, blocks ~2.5s).
 function M:generate_avif(job, cache)
 	local cache_avif = tostring(cache) .. ".avif"
 	local cha_avif = fs.cha(Url(cache_avif))
 	if cha_avif and cha_avif.len > 0 then
-		return -- avif already exists
+		return
 	end
 
 	local file_url = tostring(job.file.url)
