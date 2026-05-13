@@ -3,24 +3,11 @@ local M = {}
 -- Track pending vimg requests: cache_path -> file_url
 local pending = {}
 
--- Cached ps module reference for publishing from peek context
-local ps_pub = nil
+local JOB_DIR = os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
+JOB_DIR = JOB_DIR .. "/vimg-serve"
 
 function M:setup()
-	ya.dbg("[gridthumb] setup called")
-	ps_pub = ps.pub_to
-	ps.sub_remote("vimg-ready", function(cache_path)
-		ya.dbg("[gridthumb] vimg-ready received:", cache_path)
-		local file_url = pending[cache_path]
-		if not file_url then
-			ya.dbg("[gridthumb] vimg-ready: no pending entry for", cache_path)
-			return
-		end
-		pending[cache_path] = nil
-		ya.dbg("[gridthumb] vimg-ready: re-peek", file_url)
-		ya.emit("peek", { 0, only_if = file_url, upper_bound = true })
-	end)
-	ya.dbg("[gridthumb] setup done, subscribed to vimg-ready")
+	ya.dbg("[gridthumb] setup called, job_dir=" .. JOB_DIR)
 end
 
 function M:peek(job)
@@ -118,28 +105,23 @@ function M:preload(job)
 		return false, Err("`ffmpeg` exited with error code: %s", status.code)
 	end
 
-	-- method 2: request vimg avif generation via DDS
+	-- method 2: request vimg avif generation via job file
 	local cache_avif = tostring(cache) .. ".avif"
 	pending[cache_avif] = tostring(job.file.url)
-	local yazi_id = os.getenv("YAZI_ID") or ""
 	local file_escaped = tostring(job.file.url):gsub('\\', '\\\\')
 	local cache_escaped = cache_avif:gsub('\\', '\\\\')
-	local json = string.format('{"file":"%s","cache":"%s","id":"%s"}',
-		file_escaped, cache_escaped, yazi_id)
-	ya.dbg("[gridthumb] SEND vimg-gen:", json)
-	local st, err = Command("ya"):arg({
-		"pub", "vimg-gen", "--json", json,
-	}):output()
-	if st then
-		ya.dbg("[gridthumb] ya pub exit: ok")
-		if st.stdout and #st.stdout > 0 then
-			ya.dbg("[gridthumb] ya pub stdout:", st.stdout)
-		end
-		if st.stderr and #st.stderr > 0 then
-			ya.dbg("[gridthumb] ya pub stderr:", st.stderr)
-		end
+	local json = string.format('{"file":"%s","cache":"%s"}',
+		file_escaped, cache_escaped)
+	local job_id = string.format("%08x", math.random(0, 0xFFFFFFFF))
+	local job_path = JOB_DIR .. "/" .. job_id .. ".json"
+	Command("mkdir"):arg({"-p", JOB_DIR}):status()
+	local f = io.open(job_path, "w")
+	if f then
+		f:write(json)
+		f:close()
+		ya.dbg("[gridthumb] Wrote job:", job_path)
 	else
-		ya.err("[gridthumb] ya pub FAILED:", err)
+		ya.err("[gridthumb] Failed to write job:", job_path)
 	end
 
 	return true

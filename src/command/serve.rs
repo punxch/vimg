@@ -1,9 +1,8 @@
 use crate::command;
 use anyhow::ensure;
 use std::{
-    io::{BufRead, BufReader},
+    fs,
     path::PathBuf,
-    process::{Command, Stdio},
     sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}, mpsc},
     thread,
     time::{Duration, Instant},
@@ -11,12 +10,16 @@ use std::{
 
 const MAX_WORKERS: usize = 10;
 
-/// Run as a background service, listening for yazi DDS messages.
+/// Run as a background service, watching for vimg job files.
 #[derive(clap::Parser, Debug)]
 pub struct Serve {}
 
 impl Serve {
     pub fn run(self) -> anyhow::Result<()> {
+        let job_dir = job_dir();
+        fs::create_dir_all(&job_dir)?;
+        println!("[serve] Watching: {}", job_dir.display());
+
         let (tx, rx) = mpsc::sync_channel::<Job>(MAX_WORKERS * 10);
         let rx = Arc::new(Mutex::new(rx));
         let pending_count = Arc::new(AtomicUsize::new(0));
@@ -39,154 +42,78 @@ impl Serve {
             });
         }
 
-        // Main loop: spawn ya sub, reconnect on failure
-        println!("[serve] Starting vimg-generate listener...");
+        // Poll for job files
         loop {
-            match listen_ya_sub(&tx, &pending_count) {
-                Ok(()) => {
-                    println!("[serve] ya sub exited, restarting...");
+            match fs::read_dir(&job_dir) {
+                Ok(entries) => {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                            continue;
+                        };
+                        if !name.ends_with(".json") {
+                            continue;
+                        }
+                        let Some(job) = Job::from_file(&path) else {
+                            eprintln!("[serve] Bad job file: {}", path.display());
+                            let _ = fs::remove_file(&path);
+                            continue;
+                        };
+
+                        let _ = fs::remove_file(&path);
+
+                        let pending = pending_count.load(Ordering::Relaxed);
+                        println!(
+                            "[serve] Queued: {} ({} pending)",
+                            job.file_name(),
+                            pending
+                        );
+
+                        if tx.try_send(job).is_err() {
+                            eprintln!("[serve] Queue full, dropping");
+                        } else {
+                            pending_count.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                 }
                 Err(e) => {
-                    eprintln!("[serve] {e}");
+                    eprintln!("[serve] read_dir error: {e}");
                 }
             }
-            thread::sleep(Duration::from_secs(2));
+            thread::sleep(Duration::from_millis(200));
         }
     }
 }
 
-fn listen_ya_sub(
-    tx: &mpsc::SyncSender<Job>,
-    pending_count: &AtomicUsize,
-) -> anyhow::Result<()> {
-    let mut child = Command::new("ya")
-        .args(["sub", "vimg-gen"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-
-    println!("[serve] ya sub vimg-gen started, pid={}", child.id());
-
-    // Read stderr in a separate thread
-    let stderr = child.stderr.take().expect("piped stderr");
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            eprintln!("[serve] ya sub stderr: {line}");
-        }
-    });
-
-    let stdout = child.stdout.take().expect("piped stdout");
-    let reader = BufReader::new(stdout);
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-
-        let Some(msg) = parse_dds_message(&line) else {
-            eprintln!("[serve] Failed to parse: {line}");
-            continue;
-        };
-
-        let Some(job) = parse_job(&msg.body) else {
-            eprintln!("[serve] Failed to parse body: {}", msg.body);
-            continue;
-        };
-
-        let pending = pending_count.load(Ordering::Relaxed);
-        println!(
-            "[serve] Queued: {} ({} pending)",
-            job.file_name(),
-            pending
-        );
-
-        if tx.try_send(job).is_err() {
-            eprintln!("[serve] Queue full, dropping request");
-        } else {
-            pending_count.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    let status = child.wait()?;
-    eprintln!("[serve] ya sub exited with: {status}");
-    Ok(())
-}
-
-struct DdsMessage {
-    _kind: String,
-    _receiver: String,
-    _sender: String,
-    body: String,
+fn job_dir() -> PathBuf {
+    let mut dir = std::env::temp_dir();
+    dir.push("vimg-serve");
+    dir
 }
 
 struct Job {
     file: PathBuf,
     cache: PathBuf,
-    /// Yazi instance ID to send the result back to.
-    id: String,
 }
 
 impl Job {
+    fn from_file(path: &PathBuf) -> Option<Job> {
+        let content = fs::read_to_string(path).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+        let file = v.get("file")?.as_str()?;
+        let cache = v.get("cache")?.as_str()?;
+        Some(Job {
+            file: PathBuf::from(file),
+            cache: PathBuf::from(cache),
+        })
+    }
+
     fn file_name(&self) -> &str {
         self.file
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?")
     }
-}
-
-fn parse_dds_message(line: &str) -> Option<DdsMessage> {
-    // Wire format: kind,receiver,sender,{json}
-    // Split on first 3 commas; the rest is the JSON body.
-    let mut parts = Vec::new();
-    let mut rest = line;
-    for _ in 0..3 {
-        let pos = rest.find(',')?;
-        parts.push(rest[..pos].to_string());
-        rest = &rest[pos + 1..];
-    }
-    Some(DdsMessage {
-        _kind: parts.remove(0),
-        _receiver: parts.remove(0),
-        _sender: parts.remove(0),
-        body: rest.to_string(),
-    })
-}
-
-fn parse_job(body: &str) -> Option<Job> {
-    // Body is a JSON value. For --json it's an object, for --str it's a string.
-    // We expect: {"file": "...", "cache": "...", "id": "..."}
-    // Also handle --list format: ["file","cache","id"]
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-
-    if let Some(obj) = v.as_object() {
-        let file = obj.get("file")?.as_str()?;
-        let cache = obj.get("cache")?.as_str()?;
-        let id = obj.get("id")?.as_str()?;
-        return Some(Job {
-            file: PathBuf::from(file),
-            cache: PathBuf::from(cache),
-            id: id.to_string(),
-        });
-    }
-
-    if let Some(arr) = v.as_array() {
-        if arr.len() >= 3 {
-            let file = arr[0].as_str()?;
-            let cache = arr[1].as_str()?;
-            let id = arr[2].as_str()?;
-            return Some(Job {
-                file: PathBuf::from(file),
-                cache: PathBuf::from(cache),
-                id: id.to_string(),
-            });
-        }
-    }
-
-    None
 }
 
 fn process_job(worker_id: usize, job: &Job) {
@@ -207,7 +134,6 @@ fn process_job(worker_id: usize, job: &Job) {
                 job.file_name(),
                 elapsed.as_secs_f32()
             );
-            notify_ready(&job.id, &job.cache);
         }
         Err(e) => {
             eprintln!("[serve] #{worker_id} Error: {}: {e}", job.file_name());
@@ -232,7 +158,7 @@ fn run_vcs(video: &PathBuf, output: &PathBuf) -> anyhow::Result<()> {
             ignore_start: Default::default(),
             ignore_end: Default::default(),
             capture_frames: None,
-            capture_time: Default::default(),
+            capture_time: command::HumanDuration { seconds: 1.5 },
             vfilter: None,
             threads: 8,
             output_dir: None,
@@ -243,21 +169,4 @@ fn run_vcs(video: &PathBuf, output: &PathBuf) -> anyhow::Result<()> {
     };
 
     vcs.run()
-}
-
-fn notify_ready(yazi_id: &str, cache: &PathBuf) {
-    let cache_str = cache.to_string_lossy().to_string();
-    let status = Command::new("ya")
-        .args(["pub-to", yazi_id, "vimg-ready", "--str", &cache_str])
-        .status();
-
-    match status {
-        Ok(s) if !s.success() => {
-            eprintln!("[serve] ya pub-to failed for {yazi_id}");
-        }
-        Err(e) => {
-            eprintln!("[serve] Failed to run ya pub-to: {e}");
-        }
-        _ => {}
-    }
 }

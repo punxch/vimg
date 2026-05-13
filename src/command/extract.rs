@@ -288,7 +288,7 @@ impl Extract {
             if use_cuda {
                 cmd.arg2("-hwaccel", "cuda");
             }
-            cmd.arg2("-v", "quiet")
+            cmd.arg2("-v", "error")
                 .arg2("-ss", start_s)
                 .arg2("-t", capture_time.seconds)
                 .arg2("-i", video)
@@ -303,9 +303,14 @@ impl Extract {
 
             let output = cmd.output()?;
             if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stderr = stderr.trim();
                 anyhow::bail!(
-                    "ffmpeg capture failed\n---stderr---\n{}\n------",
-                    String::from_utf8_lossy(&output.stderr).trim()
+                    "ffmpeg capture failed (exit {:?}, cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {stderr}\nstdout: {} bytes",
+                    output.status.code(),
+                    capture_time.seconds,
+                    video.display(),
+                    output.stdout.len(),
                 );
             }
             Ok(output.stdout)
