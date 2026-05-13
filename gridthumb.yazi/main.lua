@@ -3,8 +3,12 @@ local M = {}
 -- Track pending vimg requests: cache_path -> file_url
 local pending = {}
 
+-- Cached ps module reference for publishing from peek context
+local ps_pub = nil
+
 function M:setup()
 	ya.dbg("[gridthumb] setup called")
+	ps_pub = ps.pub_to
 	ps.sub_remote("vimg-ready", function(cache_path)
 		ya.dbg("[gridthumb] vimg-ready received:", cache_path)
 		local file_url = pending[cache_path]
@@ -117,7 +121,7 @@ function M:preload(job)
 	-- method 2: request vimg avif generation via DDS
 	local cache_avif = tostring(cache) .. ".avif"
 	pending[cache_avif] = tostring(job.file.url)
-	local yazi_id = tostring(rt.yazi_id)
+	local yazi_id = os.getenv("YAZI_ID") or ""
 	local file_escaped = tostring(job.file.url):gsub('\\', '\\\\')
 	local cache_escaped = cache_avif:gsub('\\', '\\\\')
 	local json = string.format('{"file":"%s","cache":"%s","id":"%s"}',

@@ -1,16 +1,14 @@
 use crate::command;
 use anyhow::ensure;
 use std::{
-    io::{BufRead, BufReader, Write},
-    net::TcpStream,
+    io::{BufRead, BufReader},
     path::PathBuf,
-    process::Command,
+    process::{Command, Stdio},
     sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
-const DDS_ADDR: &str = "127.0.0.1:33581";
 const MAX_WORKERS: usize = 10;
 
 /// Run as a background service, listening for yazi DDS messages.
@@ -41,12 +39,12 @@ impl Serve {
             });
         }
 
-        // Main loop: connect to DDS, reconnect on failure
-        println!("[serve] Waiting for yazi DDS at {DDS_ADDR}...");
+        // Main loop: spawn ya sub, reconnect on failure
+        println!("[serve] Starting vimg-generate listener...");
         loop {
-            match connect_and_listen(&tx, &pending_count) {
+            match listen_ya_sub(&tx, &pending_count) {
                 Ok(()) => {
-                    println!("[serve] Connection lost, reconnecting...");
+                    println!("[serve] ya sub exited, restarting...");
                 }
                 Err(e) => {
                     eprintln!("[serve] {e}");
@@ -57,19 +55,29 @@ impl Serve {
     }
 }
 
-fn connect_and_listen(
+fn listen_ya_sub(
     tx: &mpsc::SyncSender<Job>,
     pending_count: &AtomicUsize,
 ) -> anyhow::Result<()> {
-    let stream = TcpStream::connect(DDS_ADDR)?;
-    stream.set_read_timeout(None)?;
-    let mut writer = stream.try_clone()?;
-    let reader = BufReader::new(stream);
+    let mut child = Command::new("ya")
+        .args(["sub", "vimg-gen"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
 
-    // Subscribe to vimg-gen events
-    writer.write_all(b"vimg-gen\n")?;
-    writer.flush()?;
-    println!("[serve] Connected, listening for vimg-gen events...");
+    println!("[serve] ya sub vimg-gen started, pid={}", child.id());
+
+    // Read stderr in a separate thread
+    let stderr = child.stderr.take().expect("piped stderr");
+    thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("[serve] ya sub stderr: {line}");
+        }
+    });
+
+    let stdout = child.stdout.take().expect("piped stdout");
+    let reader = BufReader::new(stdout);
 
     for line in reader.lines() {
         let line = line?;
@@ -77,15 +85,14 @@ fn connect_and_listen(
         if line.is_empty() {
             continue;
         }
-        eprintln!("[serve] RAW: {line}");
 
         let Some(msg) = parse_dds_message(&line) else {
-            eprintln!("[serve] Failed to parse DDS message: {line}");
+            eprintln!("[serve] Failed to parse: {line}");
             continue;
         };
 
         let Some(job) = parse_job(&msg.body) else {
-            eprintln!("[serve] Failed to parse job body: {}", msg.body);
+            eprintln!("[serve] Failed to parse body: {}", msg.body);
             continue;
         };
 
@@ -103,6 +110,8 @@ fn connect_and_listen(
         }
     }
 
+    let status = child.wait()?;
+    eprintln!("[serve] ya sub exited with: {status}");
     Ok(())
 }
 
