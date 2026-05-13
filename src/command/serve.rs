@@ -5,13 +5,12 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream, SocketAddr},
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::{AtomicUsize, Ordering}, mpsc},
+    sync::{Arc, atomic::{AtomicUsize, Ordering}},
     thread,
     time::{Duration, Instant},
 };
 
 const BIND_ADDR: &str = "127.0.0.1:33582";
-const MAX_WORKERS: usize = 10;
 
 /// Run as a background service, listening for vimg jobs via TCP.
 #[derive(clap::Parser, Debug)]
@@ -28,26 +27,7 @@ pub struct Send {
 
 impl Serve {
     pub fn run(self) -> anyhow::Result<()> {
-        let (tx, rx) = mpsc::sync_channel::<Job>(MAX_WORKERS * 10);
-        let rx = Arc::new(Mutex::new(rx));
         let pending_count = Arc::new(AtomicUsize::new(0));
-
-        for worker_id in 0..MAX_WORKERS {
-            let rx = Arc::clone(&rx);
-            let pending_count = Arc::clone(&pending_count);
-            thread::spawn(move || {
-                loop {
-                    let job = rx.lock().unwrap().recv();
-                    match job {
-                        Ok(job) => {
-                            process_job(worker_id, &job);
-                            pending_count.fetch_sub(1, Ordering::Relaxed);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
 
         let addr: SocketAddr = BIND_ADDR.parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -59,10 +39,9 @@ impl Serve {
 
         for stream in listener.incoming() {
             let stream = stream?;
-            let tx = tx.clone();
             let pending_count = Arc::clone(&pending_count);
             thread::spawn(move || {
-                handle_client(stream, &tx, &pending_count);
+                handle_client(stream, &pending_count);
             });
         }
 
@@ -72,7 +51,6 @@ impl Serve {
 
 fn handle_client(
     mut stream: TcpStream,
-    tx: &mpsc::SyncSender<Job>,
     pending_count: &AtomicUsize,
 ) {
     let peer = stream.peer_addr().ok();
@@ -112,19 +90,40 @@ fn handle_client(
 
     let pending = pending_count.load(Ordering::Relaxed);
     println!(
-        "[serve] Queued: {} ({} pending)",
+        "[serve] Processing: {} ({} pending)",
         job.file_name(),
         pending
     );
 
-    if tx.try_send(job).is_err() {
-        let _ = stream.write_all(b"error: queue full\n");
-        return;
+    pending_count.fetch_add(1, Ordering::Relaxed);
+
+    // Process job inline so client blocks until done
+    let start = Instant::now();
+    println!(
+        "[serve] Processing: {} -> {}",
+        job.file_name(),
+        job.cache.display()
+    );
+
+    let result = run_vcs(&job.file, &job.cache);
+
+    match result {
+        Ok(()) => {
+            let elapsed = start.elapsed();
+            println!(
+                "[serve] Done: {} ({:.1}s)",
+                job.file_name(),
+                elapsed.as_secs_f32()
+            );
+            let _ = stream.write_all(b"done\n");
+        }
+        Err(e) => {
+            eprintln!("[serve] Error: {}: {e}", job.file_name());
+            let _ = stream.write_all(b"error\n");
+        }
     }
 
-    pending_count.fetch_add(1, Ordering::Relaxed);
-    let _ = stream.write_all(b"ok\n");
-    eprintln!("[serve] Sent ok to {:?}", peer);
+    pending_count.fetch_sub(1, Ordering::Relaxed);
 }
 
 impl Send {
@@ -146,7 +145,7 @@ impl Send {
         reader.read_line(&mut response)?;
 
         let response = response.trim();
-        if response == "ok" {
+        if response == "done" {
             Ok(())
         } else {
             anyhow::bail!("{response}");
@@ -175,31 +174,6 @@ impl Job {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("?")
-    }
-}
-
-fn process_job(worker_id: usize, job: &Job) {
-    let start = Instant::now();
-    println!(
-        "[serve] #{worker_id} Processing: {} -> {}",
-        job.file_name(),
-        job.cache.display()
-    );
-
-    let result = run_vcs(&job.file, &job.cache);
-
-    match result {
-        Ok(()) => {
-            let elapsed = start.elapsed();
-            println!(
-                "[serve] #{worker_id} Done: {} ({:.1}s)",
-                job.file_name(),
-                elapsed.as_secs_f32()
-            );
-        }
-        Err(e) => {
-            eprintln!("[serve] #{worker_id} Error: {}: {e}", job.file_name());
-        }
     }
 }
 

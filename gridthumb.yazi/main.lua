@@ -109,14 +109,15 @@ function M:preload(job)
 	-- method 2: request vimg avif generation via TCP
 	local cache_avif = tostring(cache) .. ".avif"
 	pending[cache_avif] = tostring(job.file.url)
-	ya.dbg("[gridthumb] calling vimg send...")
-	local st, err = Command("vimg"):arg({
+	ya.dbg("[gridthumb] vimg send:", tostring(job.file.url), "->", cache_avif)
+	local out, err = Command("vimg"):arg({
 		"send", tostring(job.file.url), cache_avif,
-	}):status()
-	if st then
-		ya.dbg("[gridthumb] vimg send exit:", st.success, st.code)
+	}):output()
+	if out then
+		ya.dbg("[gridthumb] vimg send stdout:", out.stdout)
+		ya.dbg("[gridthumb] vimg send stderr:", out.stderr)
 	else
-		ya.dbg("[gridthumb] vimg send error:", tostring(err))
+		ya.dbg("[gridthumb] vimg send FAILED:", tostring(err))
 	end
 
 	return true
