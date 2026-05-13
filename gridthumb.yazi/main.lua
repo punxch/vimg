@@ -3,11 +3,8 @@ local M = {}
 -- Track pending vimg requests: cache_path -> file_url
 local pending = {}
 
-local JOB_DIR = os.getenv("TEMP") or os.getenv("TMP") or "/tmp"
-JOB_DIR = JOB_DIR .. "/vimg-serve"
-
 function M:setup()
-	ya.dbg("[gridthumb] setup called, job_dir=" .. JOB_DIR)
+	ya.dbg("[gridthumb] setup called")
 end
 
 function M:peek(job)
@@ -50,15 +47,19 @@ function M:seek(job)
 end
 
 function M:preload(job)
+	ya.dbg("[gridthumb] preload start:", tostring(job.file.url))
 	local cache = ya.file_cache(job)
 	if not cache then
+		ya.dbg("[gridthumb] preload: no cache path")
 		return true
 	end
 
 	local cha = fs.cha(cache)
 	if cha and cha.len > 0 then
+		ya.dbg("[gridthumb] preload: cache exists, skip")
 		return true
 	end
+	ya.dbg("[gridthumb] preload: cache not found, generating...")
 
 	local meta, err = self.list_meta(job.file.url, "format=duration:stream_disposition=attached_pic")
 	if not meta then
@@ -105,23 +106,17 @@ function M:preload(job)
 		return false, Err("`ffmpeg` exited with error code: %s", status.code)
 	end
 
-	-- method 2: request vimg avif generation via job file
+	-- method 2: request vimg avif generation via TCP
 	local cache_avif = tostring(cache) .. ".avif"
 	pending[cache_avif] = tostring(job.file.url)
-	local file_escaped = tostring(job.file.url):gsub('\\', '\\\\')
-	local cache_escaped = cache_avif:gsub('\\', '\\\\')
-	local json = string.format('{"file":"%s","cache":"%s"}',
-		file_escaped, cache_escaped)
-	local job_id = string.format("%08x", math.random(0, 0xFFFFFFFF))
-	local job_path = JOB_DIR .. "/" .. job_id .. ".json"
-	Command("mkdir"):arg({"-p", JOB_DIR}):status()
-	local f = io.open(job_path, "w")
-	if f then
-		f:write(json)
-		f:close()
-		ya.dbg("[gridthumb] Wrote job:", job_path)
+	ya.dbg("[gridthumb] calling vimg send...")
+	local st, err = Command("vimg"):arg({
+		"send", tostring(job.file.url), cache_avif,
+	}):status()
+	if st then
+		ya.dbg("[gridthumb] vimg send exit:", st.success, st.code)
 	else
-		ya.err("[gridthumb] Failed to write job:", job_path)
+		ya.dbg("[gridthumb] vimg send error:", tostring(err))
 	end
 
 	return true

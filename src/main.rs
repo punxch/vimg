@@ -11,6 +11,7 @@ enum Command {
     Join(command::Join),
     Extract(command::Extract),
     Serve(command::Serve),
+    Send(command::Send),
     PrintCompletions(command::PrintCompletions),
 }
 
@@ -40,6 +41,7 @@ fn run(cmd: Command) -> anyhow::Result<()> {
             }
         }
         Command::Serve(c) => c.run()?,
+        Command::Send(c) => c.run()?,
         Command::PrintCompletions(c) => c.run(),
     }
 
