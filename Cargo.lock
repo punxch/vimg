@@ -1358,6 +1358,7 @@ dependencies = [
  "image",
  "indicatif",
  "rayon",
+ "serde_json",
  "shell-escape",
 ]
 
