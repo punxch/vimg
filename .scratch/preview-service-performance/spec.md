@@ -55,7 +55,14 @@ Requests may carry a Media descriptor so the service can avoid redundant probing
 - A Validated preview cache requires a source identity that matches the requested Media descriptor. A Published preview cache requires both its AVIF and identity manifest to be atomically published in the cache directory.
 - The client must require a matching manifest before rendering an animated cache. Cache publication must avoid exposing an incomplete AVIF, including when staging and cache locations use different filesystems.
 - VCS must use a bounded, ordered producer-to-encoder pipeline as required by ADR-0002. It may retain only a small bounded number of grid frames awaiting encoding and must propagate extraction, composition, encoder, and publication errors to every requester.
-- Extraction keeps one ffmpeg process per sampling point but uses a configurable, adaptive concurrency cap that starts at four. The ffmpeg process-level thread setting is controlled separately and both values are benchmarked together.
+- The current FFmpeg CFR output is the authority for the Frame selection contract. Every Capture backend must preserve exact source PTS, frame/capture order, dimensions, and labels; pixel differences must remain within the accepted visual-golden tolerance.
+- Backend fallback is atomic at the Capture attempt level. A failed attempt is fully cleaned and restarted from frame zero with the next backend; frames from different backends are never mixed.
+- Capture backend failures are classified as `Unavailable`, `AttemptFailed`, or `Fatal`. Only the first two allow automatic fallback; shared input, encoder, publication, disk, and cancellation failures terminate the Capture job.
+- The automatic macOS preference order is VideoToolbox Nonref, software libav Nonref, then the existing FFmpeg subprocess. A named-backend policy is fail-fast and never silently falls back.
+- In-process decoding is an optional build capability. Software libav is cross-platform when enabled; VideoToolbox is macOS-only. Default builds continue to require only the FFmpeg executable.
+- Initial in-process eligibility is limited to the fixed Preview profile, H.264/HEVC, bicubic scaling, and no custom video filter. The Nonref recovery margin is a fixed internal 0.5 seconds.
+- Backend choice is diagnostic information, not part of cache identity or the client protocol.
+- Capture-point concurrency is bounded and configurable. `-T 0` selects a per-backend automatic value after 3/4/6/9-way measurement; an explicit `-T` caps capture-point concurrency. Decoder-internal thread counts are controlled and benchmarked separately.
 - The CPU path is mandatory. CUDA is optional on supported Windows/NVIDIA systems and must fall back safely to CPU with output-equivalent results.
 - Timestamp labels are drawn into the destination grid region and reuse parsed font state rather than cloning and converting whole capture tiles.
 - The service continues to report progress in a form suitable for local diagnostics.
@@ -67,8 +74,12 @@ Requests may carry a Media descriptor so the service can avoid redundant probing
 - Compatibility tests submit both legacy requests and requests containing a Media descriptor.
 - Cache tests verify that a matching manifest permits rendering, a changed source identity invalidates the cache, and no partial or unmatched AVIF is considered published.
 - VCS integration tests verify ordered animated output, the fixed Preview profile, successful failure propagation, and stable timestamp-label appearance through structural and visual golden comparisons.
+- Capture backend contract tests require exact source PTS/order and per-frame SSIM of at least 0.999 before and after AVIF encoding. Production performs structural checks only and never shadow-runs FFmpeg.
+- Fallback tests inject unavailable, early, mid-stream, and late backend failures and verify complete worker/encoder/temp cleanup before the next attempt starts at frame zero. Encoder, publication, disk, and cancellation failures must remain terminal.
+- The media corpus covers H.264/HEVC GOP/B-frame/VFR/short/tail cases plus 8/10-bit, color range and matrix, rotation, SAR, interlacing, unsupported chroma formats, corruption, and truncation.
 - CPU-only and CUDA-capable configurations are tested for the same externally visible output semantics; CUDA failures must exercise CPU fallback.
 - Performance benchmarks record cold-cache and warm-cache interactive latency, active-job peak RSS, and the one-executing-plus-nine-queued service scenario. A benchmark report, rather than a single timing-sensitive unit test, is the regression signal.
+- Promoting `auto` to the default requires at least 30 interleaved warm runs with VideoToolbox P95 below 1.0 second, at least 15% wall-time improvement and 70% user-CPU improvement over software Nonref, and peak RSS no greater than 512MB. ADR-0001's general 1.3-second P95 contract remains unchanged.
 - The representative `input.mkv` command is the initial benchmark fixture. Existing test coverage is effectively absent, so this feature establishes the first relevant integration and golden-test prior art.
 
 ## Out of Scope
@@ -77,6 +88,10 @@ Requests may carry a Media descriptor so the service can avoid redundant probing
 - More than one simultaneously executing Capture job.
 - Cancelling an already executing ffmpeg pipeline when requesters disconnect.
 - Replacing per-sampling-point extraction with a single monolithic ffmpeg seek pipeline.
+- Accelerating arbitrary VCS profiles, custom video filters, or codecs other than H.264/HEVC in the first in-process release.
+- Making libav development libraries a dependency of the default feature-off build.
+- Mixing frames from multiple Capture backends in one animation, adding backend identity to the cache key, or exposing backend fallback through the client protocol.
+- Treating a timeout as a safe in-process fallback while an FFI decoder thread may still be blocked.
 - Requiring NVIDIA hardware, removing CPU fallback, or adding GPU-specific output semantics.
 - Remote, distributed, or multi-host preview services.
 - A general cache-eviction policy unrelated to validating and publishing the current source video.

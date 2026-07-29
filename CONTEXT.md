@@ -8,6 +8,26 @@ Vimg generates visual contact sheets from video and can run as a local service f
 A request to generate one visual contact sheet from one video for a preview client.
 _Avoid_: task, conversion
 
+**Capture attempt**:
+One complete execution of a Capture job by a single Capture backend. A failed attempt never contributes partial frames or output to another attempt.
+_Avoid_: backend run, partial retry
+
+**Capture backend**:
+A strategy that supplies one ordered stream of source frames for a Capture attempt while preserving the Preview profile.
+_Avoid_: decoder, extraction command
+
+**Capture backend policy**:
+The rule that selects which Capture backends a Capture job may attempt. The automatic policy permits Backend fallback in preference order; a named-backend policy permits exactly one fail-fast Capture attempt.
+_Avoid_: decoder flag, hardware mode
+
+**Backend fallback**:
+Selection of the next Capture backend after the preferred backend is unavailable or its Capture attempt fails. Shared input, encoding, publication, and cancellation failures do not cause Backend fallback.
+_Avoid_: frame retry, decoder retry
+
+**Frame selection contract**:
+The required mapping from sampling points and animation positions to ordered source presentation timestamps, dimensions, and labels shared by every Capture backend. Pixel output may vary only within the approved visual-golden tolerance.
+_Avoid_: similar output, frame-count match
+
 **Coalesced capture job**:
 A capture job shared by requests for the same output cache, producing one result for all requesters.
 _Avoid_: duplicate request, retry

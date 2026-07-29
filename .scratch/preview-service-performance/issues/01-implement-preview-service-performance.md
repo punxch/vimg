@@ -8,6 +8,8 @@ Implement the accepted design in `../spec.md`, preserving the two linked ADRs an
 
 本轮只优化 VCS 与本地服务的运行效率：提取/编码的数据流、CPU 与内存占用、并发上限、缓存发布，以及可重复的性能测量。保持现有 TCP 请求协议和现有 Yazi 调用方式，不将协议迁移作为本轮验收条件。
 
+进程内后端的产品化顺序、整次 attempt 回退语义、正确性门槛和默认晋级条件见 [`../capture-backend-fallback-plan.md`](../capture-backend-fallback-plan.md)。实施按该计划的七个独立阶段推进；在 Frame selection contract、扩充语料和性能门槛完成前，`auto` 只能显式启用，不能成为默认路径。
+
 ## 暂不执行：Ya / DDS 集成
 
 以下工作已记录，但明确延后，不能阻塞运行效率优化：
@@ -87,3 +89,25 @@ bash src/bin/prototype_preroll_corpus.sh ./sample/input.mkv
 ```
 
 这一结果将进程内 libav + nonref 预滚从“继续调研”提升为“可产品化候选”。正式实现应先作为可选软件后端，保留 0.5 秒余量，并在不支持的 codec、无时间戳、seek/解码失败或输出异常时回退现有 FFmpeg 子进程路径；Ya/DDS 仍不在本轮范围内。
+
+## 原型结论：VideoToolbox + Nonref 预滚
+
+问题：以已经稳定低于 1 秒、且通过跨语料验证的进程内软件 nonref 方案为基线，只把解码器替换为 VideoToolbox，并保留 0.5 秒恢复完整解码余量，能否进一步降低墙钟和 CPU，同时保持全部 270 个目标帧严格等价？
+
+结论：目标样本上成立。三种路径以轮换顺序交错运行六次，结果如下：
+
+| 指标 | 软件 Nonref | VideoToolbox 完整预滚 | VideoToolbox Nonref | VT Nonref 相对软件 |
+|---|---:|---:|---:|---:|
+| 实际墙钟平均 | 0.932s | 1.158s | 0.743s | -20.2% |
+| profile total 平均 | 0.916s | 1.147s | 0.735s | -19.8% |
+| 首个完整网格平均 | 0.549s | 0.832s | 0.417s | -24.1% |
+| 用户态 CPU 平均 | 5.798s | 1.182s | 1.073s | -81.5% |
+| 峰值 RSS 平均 | 450.1MB | 359.0MB | 376.3MB | -16.4% |
+
+六次组合原型墙钟均为 0.74–0.75s。相对 VideoToolbox 完整预滚，组合策略将墙钟从 1.158s 降至 0.743s，降低 35.8%；解码帧数从 1092 降至 632，预滚帧数从 822 降至 362，而硬件下载帧数仍为 270、软件回退为 0。VideoToolbox 只替换解码，demux 仍使用 libavformat，缩放/RGB 转换仍使用 libswscale，最终 AVIF 仍由 `libsvtav1` 编码。
+
+正确性以软件 nonref 方案为基线：软件 nonref、VideoToolbox 完整预滚和 VideoToolbox nonref 的 270 条源 PTS、36,806,400 字节 RGB tile 流和最终动画 AVIF 均逐字节一致。RGB SHA-256 都是 `88d9b4594cfe86f9aa7e6c34ce88009f0e3714016b5f04c7dcb4fa221650fa64`，AVIF SHA-256 都是 `1646e7f4e42f2261f785dc5e6d466dcac85b326f7ed96a7a06ae15c649973985`。
+
+另做的正式 FFmpeg 子进程路径配对中，正式路径与组合原型实际墙钟平均为 1.207s 和 0.747s，组合原型快 38.1%；用户态 CPU 为 8.927s 和 1.047s，降低 88.3%。但正式 FFmpeg CLI 的 CFR 取帧与原型显式 PTS 选择不完全相同，两边动画均为 852×480、20fps、1.5 秒、30 帧，像素 SSIM 为 0.9685，因此这组数据只作为部署量级参考，不能替代前述逐字节等价对照。组合原型 RSS 为 366.7MB，高于正式路径的 297.8MB，约 23.1%。
+
+原型作为 primary source 保存在本地 Jujutsu bookmark `prototype-videotoolbox-nonref`，提交 `210fcda9`。下一步建议将它作为 macOS 可选后端候选，回退顺序为 **VideoToolbox nonref → 软件 libav nonref → 现有 FFmpeg 子进程**。产品化前必须复跑 11 个 H.264/H.265、GOP/B-frame、VFR、短片和文件尾部样本，并覆盖无硬件支持、设备创建失败、无时间戳、seek/解码失败和硬件帧传输失败的回退测试；Ya/DDS 仍不在当前执行范围。
