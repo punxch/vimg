@@ -7,6 +7,7 @@ use std::{
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
     sync::{Arc, Condvar, Mutex},
     thread,
     time::Instant,
@@ -26,20 +27,48 @@ pub struct Send {
     pub file: PathBuf,
     /// Output cache path.
     pub cache: PathBuf,
+    /// Target Yazi instance to notify when the preview is ready.
+    #[arg(long)]
+    pub yazi_id: Option<String>,
+    /// Source file size captured by the preview client.
+    #[arg(long)]
+    pub source_size: Option<u64>,
+    /// Source modification time, as Unix seconds, captured by the preview client.
+    #[arg(long)]
+    pub source_modified_s: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SourceDescriptor {
+    size: u64,
+    modified_s: u64,
 }
 
 #[derive(Clone, Debug)]
 struct Job {
     file: PathBuf,
     cache: PathBuf,
+    source: Option<SourceDescriptor>,
+    yazi_id: Option<String>,
 }
 
 impl Job {
     fn from_json(line: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let source_size = value.get("source_size").and_then(serde_json::Value::as_u64);
+        let source_modified_s = value
+            .get("source_modified_s")
+            .and_then(serde_json::Value::as_u64);
         Some(Self {
             file: PathBuf::from(value.get("file")?.as_str()?),
             cache: PathBuf::from(value.get("cache")?.as_str()?),
+            source: source_size
+                .zip(source_modified_s)
+                .map(|(size, modified_s)| SourceDescriptor { size, modified_s }),
+            yazi_id: value
+                .get("yazi_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
         })
     }
 
@@ -178,12 +207,15 @@ fn worker(scheduler: Arc<Scheduler>) {
             job.cache.display()
         );
         match run_vcs(&job.file, &job.cache) {
-            Ok(()) => match publish_manifest(&job.file, &job.cache) {
-                Ok(()) => println!(
-                    "[serve] Done: {} ({:.1}s)",
-                    job.file_name(),
-                    started.elapsed().as_secs_f32()
-                ),
+            Ok(()) => match publish_manifest(&job) {
+                Ok(()) => {
+                    notify_yazi(&job);
+                    println!(
+                        "[serve] Done: {} ({:.1}s)",
+                        job.file_name(),
+                        started.elapsed().as_secs_f32()
+                    );
+                }
                 Err(error) => eprintln!("[serve] Manifest error: {}: {error}", job.file_name()),
             },
             Err(error) => eprintln!("[serve] Error: {}: {error}", job.file_name()),
@@ -192,18 +224,38 @@ fn worker(scheduler: Arc<Scheduler>) {
     }
 }
 
-fn publish_manifest(video: &Path, cache: &Path) -> anyhow::Result<()> {
+fn source_descriptor(video: &Path) -> anyhow::Result<SourceDescriptor> {
     let metadata = fs::metadata(video)?;
-    let modified_ms = metadata
+    let modified_s = metadata
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis();
+        .as_secs();
+    Ok(SourceDescriptor {
+        size: metadata.len(),
+        modified_s,
+    })
+}
+
+fn manifest_path(cache: &Path, source: &SourceDescriptor) -> PathBuf {
+    PathBuf::from(format!(
+        "{}.{}-{}.json",
+        cache.display(),
+        source.size,
+        source.modified_s
+    ))
+}
+
+fn publish_manifest(job: &Job) -> anyhow::Result<()> {
+    let source = match &job.source {
+        Some(source) => source.clone(),
+        None => source_descriptor(&job.file)?,
+    };
     let manifest = serde_json::json!({
-        "source_size": metadata.len(),
-        "source_modified_ms": modified_ms,
+        "source_size": source.size,
+        "source_modified_s": source.modified_s,
     });
-    let manifest_path = PathBuf::from(format!("{}.json", cache.display()));
+    let manifest_path = manifest_path(&job.cache, &source);
     let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = parent.join(format!(".{}.tmp", fastrand::u64(..)));
     fs::write(&temporary, manifest.to_string())?;
@@ -218,6 +270,28 @@ fn publish_manifest(video: &Path, cache: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn notify_yazi(job: &Job) {
+    let Some(yazi_id) = &job.yazi_id else {
+        return;
+    };
+    let payload = serde_json::json!({ "file": job.file.to_string_lossy() });
+    let payload = payload.to_string();
+    match ProcessCommand::new("ya")
+        .args([
+            "pub-to",
+            yazi_id,
+            "gridthumb-avif-ready",
+            "--json",
+            &payload,
+        ])
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => eprintln!("[serve] Yazi notification exited with {status}"),
+        Err(error) => eprintln!("[serve] Cannot notify Yazi: {error}"),
+    }
+}
+
 impl Send {
     pub fn run(self) -> anyhow::Result<()> {
         let mut stream = TcpStream::connect(BIND_ADDR)
@@ -225,6 +299,9 @@ impl Send {
         let request = serde_json::json!({
             "file": self.file.to_string_lossy(),
             "cache": self.cache.to_string_lossy(),
+            "yazi_id": self.yazi_id,
+            "source_size": self.source_size,
+            "source_modified_s": self.source_modified_s,
         });
         stream.write_all(request.to_string().as_bytes())?;
         stream.write_all(b"\n")?;
@@ -274,6 +351,8 @@ mod tests {
         Job {
             file: PathBuf::from("video.mkv"),
             cache: PathBuf::from(cache),
+            source: None,
+            yazi_id: None,
         }
     }
 
@@ -305,5 +384,32 @@ mod tests {
         assert_eq!(scheduler.next().cache, PathBuf::from("newest.avif"));
         let state = scheduler.state.lock().unwrap();
         assert!(!state.jobs.contains(&PathBuf::from("0.avif")));
+    }
+
+    #[test]
+    fn manifest_path_is_bound_to_the_source_identity() {
+        let path = manifest_path(
+            Path::new("preview.avif"),
+            &SourceDescriptor {
+                size: 42,
+                modified_s: 7,
+            },
+        );
+        assert_eq!(path, PathBuf::from("preview.avif.42-7.json"));
+    }
+
+    #[test]
+    fn accepts_an_optional_source_descriptor_from_the_protocol() {
+        let job = Job::from_json(
+            r#"{"file":"video.mkv","cache":"preview.avif","source_size":42,"source_modified_s":7}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            job.source,
+            Some(SourceDescriptor {
+                size: 42,
+                modified_s: 7,
+            })
+        );
     }
 }

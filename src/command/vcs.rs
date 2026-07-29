@@ -153,11 +153,8 @@ impl Vcs {
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."));
         fs::create_dir_all(out_parent)?;
-        let temp_out_file = out_parent.join(format!(
-            ".{file_prefix}.{}.{}.tmp",
-            fastrand::u64(..),
-            suffix
-        ));
+        let nonce = fastrand::u64(..);
+        let temp_out_file = out_parent.join(format!(".{file_prefix}.{nonce}.tmp.{suffix}"));
 
         let capture_count = extract.captures.len() as u32;
         let (rows, cols) = if self.columns == 0 || capture_count <= self.columns {
