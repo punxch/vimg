@@ -1,5 +1,6 @@
 mod authority;
 mod extract;
+mod frame_schedule;
 mod join;
 mod print_completions;
 mod serve;

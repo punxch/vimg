@@ -1,6 +1,7 @@
 use crate::{
     command::{
-        DurationOrPercent, HumanDuration, SourceSelection, label, parse_source_frames, sh_escape,
+        DurationOrPercent, HumanDuration, SourceSelection, frame_schedule::CaptureWindow, label,
+        parse_source_frames, sh_escape,
     },
     process::CommandExt,
 };
@@ -254,27 +255,33 @@ impl Extract {
             "invalid negative video duration minus offsets"
         );
 
-        let starts: Vec<_> = (0..*number)
+        let windows = (0..*number)
             .map(|capture_index| {
                 let interval = duration_s / *number as f32;
                 let start_s = ignore_start.to_secs(video_duration_s)
                     + interval * 0.5
                     + interval * capture_index as f32;
-                (
+                CaptureWindow::new(
                     capture_index as usize,
                     start_s.min(video_duration_s - self.capture_time.seconds),
+                    self.capture_time.seconds,
+                    self.capture_frames() as usize,
                 )
             })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let labels = windows
+            .iter()
+            .map(|window| label::seconds_text(window.start_s() as u32))
             .collect();
         // Every grid frame needs one image from each sampling point. Start one
         // single-threaded process per point and synchronize after each frame so a
         // fast producer cannot fill the bounded channel with future frames.
-        let process_count = starts.len().max(1);
+        let process_count = windows.len().max(1);
         let (sender, receiver) = sync_channel((process_count * 2).max(1));
         let frame_barrier = Arc::new(FrameBarrier::new(process_count));
         let authority_records = authority.then(|| Arc::new(Mutex::new(vec![None; process_count])));
         let mut workers = Vec::with_capacity(process_count);
-        for (capture_index, start_s) in starts {
+        for window in windows {
             let extract = self.clone();
             let sender = sender.clone();
             let frame_barrier = Arc::clone(&frame_barrier);
@@ -282,8 +289,7 @@ impl Extract {
             workers.push(thread::spawn(move || {
                 if let Err(error) = extract.capture_pipe_stream(
                     PipeCapture {
-                        capture_index,
-                        start_s,
+                        window,
                         width: frame_w,
                         height: frame_h,
                         authority_records,
@@ -306,16 +312,7 @@ impl Extract {
             capture_frames: self.capture_frames() as usize,
             frame_width: frame_w,
             frame_height: frame_h,
-            labels: (0..*number)
-                .map(|capture_index| {
-                    label::seconds_text(
-                        (ignore_start.to_secs(video_duration_s)
-                            + duration_s / *number as f32 * (0.5 + capture_index as f32))
-                            .min(video_duration_s - self.capture_time.seconds)
-                            as u32,
-                    )
-                })
-                .collect(),
+            labels,
         })
     }
 
@@ -364,20 +361,18 @@ impl Extract {
         frame_barrier: &FrameBarrier,
     ) -> anyhow::Result<()> {
         let PipeCapture {
-            capture_index,
-            start_s,
+            window,
             width,
             height,
             authority_records,
         } = capture;
+        let capture_index = window.capture_index();
+        let start_s = window.start_s();
         let authority = authority_records.is_some();
-        let Self {
-            capture_time,
-            vfilter,
-            video,
-            ..
-        } = self;
-        let capture_frames = self.capture_frames();
+        let Self { vfilter, video, .. } = self;
+        let capture_frames = window.frame_count() as u32;
+        let capture_time_s = window.duration_s();
+        let capture_frame_rate = window.ffmpeg_frame_rate_arg();
         let frame_size = (width * height * 3) as usize;
 
         let run_ffmpeg = |use_cuda: bool| -> anyhow::Result<()> {
@@ -395,9 +390,9 @@ impl Extract {
             cmd.arg2("-v", "error")
                 .arg2("-threads", FFMPEG_THREADS_PER_CAPTURE)
                 .arg2("-ss", start_s)
-                .arg2("-t", capture_time.seconds)
+                .arg2("-t", capture_time_s)
                 .arg2("-i", video)
-                .arg2("-r", format!("{capture_frames}/{}", capture_time.seconds))
+                .arg2("-r", &capture_frame_rate)
                 .arg2("-fps_mode", "cfr")
                 .arg2_opt("-vf", authority_filter.as_ref().or(vfilter.as_ref()))
                 .arg2("-vframes", capture_frames)
@@ -502,7 +497,7 @@ impl Extract {
                     status.success(),
                     "decoding failed: FFmpeg capture exited {:?} (cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {}",
                     status.code(),
-                    capture_time.seconds,
+                    capture_time_s,
                     video.display(),
                     String::from_utf8_lossy(&stderr).trim(),
                 );
@@ -511,7 +506,7 @@ impl Extract {
                     status.success(),
                     "ffmpeg capture failed (exit {:?}, cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {}",
                     status.code(),
-                    capture_time.seconds,
+                    capture_time_s,
                     video.display(),
                     String::from_utf8_lossy(&stderr).trim(),
                 );
@@ -613,8 +608,7 @@ type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
 
 #[derive(Clone)]
 struct PipeCapture {
-    capture_index: usize,
-    start_s: f32,
+    window: CaptureWindow,
     width: u32,
     height: u32,
     authority_records: Option<AuthorityRecords>,
