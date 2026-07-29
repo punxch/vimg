@@ -97,7 +97,7 @@ impl Join {
 
 /// Join same-sized images from memory into a single grid image.
 pub fn join_from_memory(
-    images: &[&image::RgbImage],
+    images: &[image::RgbImage],
     columns: u32,
     labels: &[String],
 ) -> anyhow::Result<image::RgbImage> {
@@ -113,7 +113,8 @@ pub fn join_from_memory(
         (rows, columns)
     };
 
-    let mut all = image::RgbImage::new(cap_w * cols, cap_h * rows);
+    let mut all = image::RgbaImage::new(cap_w * cols, cap_h * rows);
+    let all_w = cap_w * cols;
 
     for (idx, img) in images.iter().enumerate() {
         let label = labels.get(idx).map(|s| s.as_str()).unwrap_or("");
@@ -122,17 +123,29 @@ pub fn join_from_memory(
         let x0 = col * cap_w;
         let y0 = row * cap_h;
 
-        all.copy_from(*img, x0, y0)?;
-        label::draw_rgb_region(
-            &mut all,
-            x0,
-            y0,
-            cap_w,
-            cap_h,
-            label,
-            &label::Config::default(),
-        )?;
+        if label.is_empty() {
+            // Fast path: no label, direct RGB-to-RGBA copy
+            let src = img.as_raw();
+            let all_buf = all.as_mut();
+            for y in 0..cap_h {
+                let src_row = (y * cap_w * 3) as usize;
+                let dst_row = ((y0 + y) * all_w * 4 + x0 * 4) as usize;
+                for x in 0..cap_w {
+                    let si = src_row + (x * 3) as usize;
+                    let di = dst_row + (x * 4) as usize;
+                    all_buf[di] = src[si];
+                    all_buf[di + 1] = src[si + 1];
+                    all_buf[di + 2] = src[si + 2];
+                    all_buf[di + 3] = 255;
+                }
+            }
+        } else {
+            // Label path: draw label then copy
+            let img = image::DynamicImage::ImageRgb8(img.clone());
+            let img = label::draw(img, label, &label::Config::default())?;
+            all.copy_from(&img, x0 as _, y0 as _)?;
+        }
     }
 
-    Ok(all)
+    Ok(image::DynamicImage::from(all).into_rgb8())
 }
