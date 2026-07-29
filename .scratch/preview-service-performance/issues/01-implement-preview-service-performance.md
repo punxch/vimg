@@ -63,4 +63,27 @@ Implement the accepted design in `../spec.md`, preserving the two linked ADRs an
 
 正确性验证在 encoder 前导出了全部 270 个 RGB tile。基线与 nonref 的 36,806,400 字节逐字节相同，SHA-256 都是 `88d9b4594cfe86f9aa7e6c34ce88009f0e3714016b5f04c7dcb4fa221650fa64`；最终动画 AVIF 也逐字节相同。0.25 秒和 0.125 秒余量在本样本仍相同，但 0 秒余量已经产生画面差异，证明必须为 frame threading 和帧重排序保留恢复窗口。
 
-原型作为 primary source 保存在本地 Jujutsu bookmark `prototype-mtn-preroll-nonref`，提交 `982bae84`。这一结果足以重新评估此前暂不合入的进程内 libav 路径，但单个 H.264 样本不足以直接产品化；下一步必须以 0.5 秒保守余量覆盖 H.264/H.265、不同 GOP/B-frame、VFR、短片和文件尾部采样，并逐项比较 270 个 tile、PTS 和补帧数。
+原型作为 primary source 保存在本地 Jujutsu bookmark `prototype-mtn-preroll-nonref`，提交 `982bae84`。这一结果足以重新评估此前暂不合入的进程内 libav 路径；跨语料门槛已在下一节完成。
+
+## 原型结论：Nonref 预滚跨语料验证
+
+问题：0.5 秒恢复完整解码余量能否在 H.264/H.265、不同 GOP/B-frame、VFR、短片和远离关键帧的文件尾部采样中，保持全部 270 个目标 tile 及其源 PTS 与完整预滚严格一致？
+
+结论：本轮预定门槛全部通过。语料包含真实 1080p H.264 MKV，以及 H.264/H.265 的 GOP 240+B-frame、GOP 12+无 B-frame、VFR、1.627 秒短片、GOP 360+8 B-frame+整个文件只有一个关键帧的尾部压力样本，共 11 个。每个样本都分别运行完整预滚和 0.5 秒 nonref 预滚。
+
+所有 11 个样本均满足：
+
+- encoder 前的 270 个 RGB tile 逐字节一致；
+- 270 条“动画帧、采样点、源 PTS”记录逐字节一致；
+- 最终动画 AVIF 逐字节一致，动画流均为 30 帧；
+- 9 路解码器均恢复 `AVDISCARD_DEFAULT`，补帧数均为 0。
+
+真实样本本次从 1.246s 降到 0.886s。小型 640×360 正确性语料只有一次计时且经常由 encoder tail 主导，不作为性能结论；其中 H.264 long-GOP 样本出现 0.271s→0.297s 的小幅反向波动，不影响严格等价结果，也不能说明该类媒体必然变慢。
+
+可复现原型保存在本地 Jujutsu bookmark `prototype-mtn-preroll-corpus`，提交 `3eb3ea8f`；单命令为：
+
+```sh
+bash src/bin/prototype_preroll_corpus.sh ./sample/input.mkv
+```
+
+这一结果将进程内 libav + nonref 预滚从“继续调研”提升为“可产品化候选”。正式实现应先作为可选软件后端，保留 0.5 秒余量，并在不支持的 codec、无时间戳、seek/解码失败或输出异常时回退现有 FFmpeg 子进程路径；Ya/DDS 仍不在本轮范围内。
