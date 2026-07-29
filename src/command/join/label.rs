@@ -3,8 +3,12 @@ use glyph_brush_layout::{
     ab_glyph::{Font, FontRef, PxScale, Rect, point},
 };
 use image::Pixel;
+use std::sync::LazyLock;
 
 const CANTARELL: &[u8] = include_bytes!("Cantarell-Regular.ttf");
+static FONT: LazyLock<FontRef<'static>> = LazyLock::new(|| {
+    FontRef::try_from_slice(CANTARELL).expect("embedded Cantarell font must be valid")
+});
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -36,7 +40,7 @@ pub fn draw(
 
     let (imgw, imgh) = (img.width() as f32, img.height() as f32);
     let min_dim = imgw.min(imgh);
-    let font = FontRef::try_from_slice(CANTARELL)?;
+    let font = &*FONT;
     let scale = PxScale::from(min_dim * conf.scale_percent);
     let margin = min_dim * conf.margin_percent;
     let pad = min_dim * conf.padding_percent;

@@ -3,10 +3,11 @@ use anyhow::{Context, ensure};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashSet, VecDeque},
+    fs,
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex},
     thread,
     time::Instant,
 };
@@ -52,64 +53,82 @@ impl Job {
 
 #[derive(Default)]
 struct QueueState {
-    known: HashSet<PathBuf>,
-    queued: VecDeque<PathBuf>,
+    jobs: HashSet<PathBuf>,
+    queued: VecDeque<Job>,
+    active: Option<PathBuf>,
 }
 
 struct Scheduler {
-    sender: mpsc::Sender<Job>,
     state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubmitResult {
+    Queued,
+    Shared,
+    Busy,
+}
+
+impl SubmitResult {
+    fn protocol(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Shared => "shared",
+            Self::Busy => "busy",
+        }
+    }
 }
 
 impl Scheduler {
-    fn submit(&self, job: Job) -> &'static str {
+    fn submit(&self, job: Job) -> SubmitResult {
         let mut state = self.state.lock().unwrap();
-        if state.known.contains(&job.cache) {
-            return "shared";
+        if state.jobs.contains(&job.cache) {
+            return SubmitResult::Shared;
         }
 
         // Keep the running job and evict the oldest job that has not started.
-        if state.known.len() >= MAX_JOBS {
+        if state.jobs.len() >= MAX_JOBS {
             if let Some(evicted) = state.queued.pop_front() {
-                state.known.remove(&evicted);
+                state.jobs.remove(&evicted.cache);
             } else {
-                return "busy";
+                return SubmitResult::Busy;
             }
         }
 
-        state.known.insert(job.cache.clone());
-        state.queued.push_back(job.cache.clone());
-        if self.sender.send(job).is_err() {
-            let cache = state.queued.pop_back().unwrap();
-            state.known.remove(&cache);
-            return "error";
-        }
-        "queued"
+        state.jobs.insert(job.cache.clone());
+        state.queued.push_back(job);
+        self.ready.notify_one();
+        SubmitResult::Queued
     }
 
-    fn begin(&self, cache: &Path) -> bool {
+    fn next(&self) -> Job {
         let mut state = self.state.lock().unwrap();
-        if !state.known.contains(cache) {
-            return false;
+        while state.queued.is_empty() {
+            state = self.ready.wait(state).unwrap();
         }
-        state.queued.retain(|queued| queued != cache);
-        true
+        // Taking the newest entry preserves interactive priority. The oldest
+        // queued entry is the one replaced at the Admission limit.
+        let job = state.queued.pop_back().unwrap();
+        state.active = Some(job.cache.clone());
+        job
     }
 
     fn finish(&self, cache: &Path) {
-        self.state.lock().unwrap().known.remove(cache);
+        let mut state = self.state.lock().unwrap();
+        state.jobs.remove(cache);
+        state.active = None;
     }
 }
 
 impl Serve {
     pub fn run(self) -> anyhow::Result<()> {
-        let (sender, receiver) = mpsc::channel();
         let scheduler = Arc::new(Scheduler {
-            sender,
             state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
         });
         let worker_scheduler = Arc::clone(&scheduler);
-        thread::spawn(move || worker(receiver, worker_scheduler));
+        thread::spawn(move || worker(worker_scheduler));
 
         let addr: SocketAddr = BIND_ADDR.parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -120,17 +139,17 @@ impl Serve {
         println!("[serve] Listening on {BIND_ADDR}");
 
         for stream in listener.incoming() {
-            let scheduler = Arc::clone(&scheduler);
-            thread::spawn(move || match stream {
-                Ok(stream) => handle_client(stream, scheduler),
+            match stream {
+                Ok(stream) => handle_client(stream, &scheduler),
                 Err(error) => eprintln!("[serve] Accept error: {error}"),
-            });
+            }
         }
         Ok(())
     }
 }
 
-fn handle_client(mut stream: TcpStream, scheduler: Arc<Scheduler>) {
+fn handle_client(mut stream: TcpStream, scheduler: &Scheduler) {
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let mut line = String::new();
     if BufReader::new(&stream)
         .read_line(&mut line)
@@ -146,14 +165,12 @@ fn handle_client(mut stream: TcpStream, scheduler: Arc<Scheduler>) {
         return;
     };
     let state = scheduler.submit(job);
-    let _ = stream.write_all(format!("{state}\n").as_bytes());
+    let _ = stream.write_all(format!("{}\n", state.protocol()).as_bytes());
 }
 
-fn worker(receiver: mpsc::Receiver<Job>, scheduler: Arc<Scheduler>) {
-    for job in receiver {
-        if !scheduler.begin(&job.cache) {
-            continue;
-        }
+fn worker(scheduler: Arc<Scheduler>) {
+    loop {
+        let job = scheduler.next();
         let started = Instant::now();
         println!(
             "[serve] Processing: {} -> {}",
@@ -161,15 +178,44 @@ fn worker(receiver: mpsc::Receiver<Job>, scheduler: Arc<Scheduler>) {
             job.cache.display()
         );
         match run_vcs(&job.file, &job.cache) {
-            Ok(()) => println!(
-                "[serve] Done: {} ({:.1}s)",
-                job.file_name(),
-                started.elapsed().as_secs_f32()
-            ),
+            Ok(()) => match publish_manifest(&job.file, &job.cache) {
+                Ok(()) => println!(
+                    "[serve] Done: {} ({:.1}s)",
+                    job.file_name(),
+                    started.elapsed().as_secs_f32()
+                ),
+                Err(error) => eprintln!("[serve] Manifest error: {}: {error}", job.file_name()),
+            },
             Err(error) => eprintln!("[serve] Error: {}: {error}", job.file_name()),
         }
         scheduler.finish(&job.cache);
     }
+}
+
+fn publish_manifest(video: &Path, cache: &Path) -> anyhow::Result<()> {
+    let metadata = fs::metadata(video)?;
+    let modified_ms = metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let manifest = serde_json::json!({
+        "source_size": metadata.len(),
+        "source_modified_ms": modified_ms,
+    });
+    let manifest_path = PathBuf::from(format!("{}.json", cache.display()));
+    let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+    let temporary = parent.join(format!(".{}.tmp", fastrand::u64(..)));
+    fs::write(&temporary, manifest.to_string())?;
+    if let Err(error) = fs::rename(&temporary, &manifest_path) {
+        if manifest_path.exists() {
+            fs::remove_file(&manifest_path)?;
+            fs::rename(&temporary, &manifest_path)?;
+        } else {
+            return Err(error.into());
+        }
+    }
+    Ok(())
 }
 
 impl Send {
@@ -233,32 +279,31 @@ mod tests {
 
     #[test]
     fn coalesces_requests_for_the_same_preview_cache() {
-        let (sender, receiver) = mpsc::channel();
         let scheduler = Scheduler {
-            sender,
             state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
         };
 
-        assert_eq!(scheduler.submit(job("preview.avif")), "queued");
-        assert_eq!(scheduler.submit(job("preview.avif")), "shared");
-        assert_eq!(receiver.try_iter().count(), 1);
+        assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Queued);
+        assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Shared);
+        assert_eq!(scheduler.next().cache, PathBuf::from("preview.avif"));
     }
 
     #[test]
     fn replaces_the_oldest_unstarted_preview_at_capacity() {
-        let (sender, receiver) = mpsc::channel();
         let scheduler = Scheduler {
-            sender,
             state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
         };
         for index in 0..MAX_JOBS {
-            assert_eq!(scheduler.submit(job(&format!("{index}.avif"))), "queued");
+            assert_eq!(
+                scheduler.submit(job(&format!("{index}.avif"))),
+                SubmitResult::Queued
+            );
         }
-        assert_eq!(scheduler.submit(job("newest.avif")), "queued");
-
-        let queued: Vec<_> = receiver.try_iter().collect();
-        assert!(!scheduler.begin(&queued[0].cache));
-        assert!(scheduler.begin(&queued[1].cache));
-        assert!(scheduler.begin(&queued[MAX_JOBS].cache));
+        assert_eq!(scheduler.submit(job("newest.avif")), SubmitResult::Queued);
+        assert_eq!(scheduler.next().cache, PathBuf::from("newest.avif"));
+        let state = scheduler.state.lock().unwrap();
+        assert!(!state.jobs.contains(&PathBuf::from("0.avif")));
     }
 }
