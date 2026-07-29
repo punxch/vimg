@@ -3,8 +3,8 @@ use crate::{
     process::CommandExt,
 };
 use anyhow::{Context, ensure};
-use rayon::prelude::*;
 use image::RgbImage;
+use rayon::prelude::*;
 use std::{
     fmt, fs,
     path::{Path, PathBuf},
@@ -43,7 +43,7 @@ pub struct Extract {
     pub vfilter: Option<String>,
 
     /// Number of threads / concurrent ffmpeg calls. 0=auto.
-    #[arg(long, short = 'T', default_value_t = 8)]
+    #[arg(long, short = 'T', default_value_t = 4)]
     pub threads: usize,
 
     /// Directory to write capture images into. Defaults to the current directory.
@@ -111,10 +111,7 @@ impl Extract {
 
                 let warnings = self.fix_missing(&out_templates, &out_dir)?;
 
-                Ok(ExtractData {
-                    out_templates,
-                    warnings,
-                })
+                Ok(ExtractData { warnings })
             })
     }
 
@@ -212,7 +209,11 @@ impl Extract {
         Ok(warnings)
     }
 
-    pub fn run_pipe(&self, capture_height: Option<u32>, capture_width: Option<u32>) -> anyhow::Result<PipeExtractData> {
+    pub fn run_pipe(
+        &self,
+        capture_height: Option<u32>,
+        capture_width: Option<u32>,
+    ) -> anyhow::Result<PipeExtractData> {
         let Self {
             number,
             ignore_start,
@@ -289,6 +290,7 @@ impl Extract {
                 cmd.arg2("-hwaccel", "cuda");
             }
             cmd.arg2("-v", "error")
+                .arg2("-threads", "1")
                 .arg2("-ss", start_s)
                 .arg2("-t", capture_time.seconds)
                 .arg2("-i", video)
@@ -358,8 +360,6 @@ impl Extract {
 }
 
 pub struct ExtractData {
-    /// All ffmpeg capture output templates.
-    pub out_templates: Vec<OutTemplate>,
     pub warnings: Vec<String>,
 }
 
@@ -432,7 +432,12 @@ pub struct PipeExtractData {
     pub warnings: Vec<String>,
 }
 
-fn scaled_dimensions(orig_w: u32, orig_h: u32, target_h: Option<u32>, target_w: Option<u32>) -> (u32, u32) {
+fn scaled_dimensions(
+    orig_w: u32,
+    orig_h: u32,
+    target_h: Option<u32>,
+    target_w: Option<u32>,
+) -> (u32, u32) {
     match (target_w, target_h) {
         (_, Some(h)) => {
             let w = ((orig_w as f64 * h as f64) / orig_h as f64).round() as u32;

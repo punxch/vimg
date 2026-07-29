@@ -18,3 +18,17 @@ baseline exe placed at: D:\Apps\ffmpeg\vimg.exe~~
 启动的服务需要实时打印更新出状态，最多同时处理10个文件。
 处理完成后发送给gridthumb.yazi，gridthumb的路径在当前工程的子目录
 gridthumb.yazi接收到消息后preview_widget file_cache.avif
+
+## Agent skills
+
+### Issue tracker
+
+Issues are tracked as local Markdown under `.scratch/`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Uses the default five canonical triage labels. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Uses a single-context layout. See `docs/agents/domain.md`.

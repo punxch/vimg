@@ -97,7 +97,7 @@ impl Join {
 
 /// Join same-sized images from memory into a single grid image.
 pub fn join_from_memory(
-    images: &[image::RgbImage],
+    images: &[&image::RgbImage],
     columns: u32,
     labels: &[String],
 ) -> anyhow::Result<image::RgbImage> {
@@ -141,7 +141,7 @@ pub fn join_from_memory(
             }
         } else {
             // Label path: draw label then copy
-            let img = image::DynamicImage::ImageRgb8(img.clone());
+            let img = image::DynamicImage::ImageRgb8((*img).clone());
             let img = label::draw(img, label, &label::Config::default())?;
             all.copy_from(&img, x0 as _, y0 as _)?;
         }

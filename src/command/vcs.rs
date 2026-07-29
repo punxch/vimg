@@ -1,12 +1,11 @@
 use crate::{
-    command::{self, label, sh_escape, sh_escape_filename},
+    command::{self, label, sh_escape_filename},
     process::CommandExt,
-    temporary,
 };
 use anyhow::ensure;
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use std::{
-    fs, io::Write,
+    fs,
+    io::Write,
     path::PathBuf,
     process::{Command, Stdio},
     time::Duration,
@@ -75,15 +74,12 @@ pub struct Vcs {
 
 impl Vcs {
     pub fn run(mut self) -> anyhow::Result<()> {
-        let is_jpg = self
-            .output
-            .as_ref()
-            .is_some_and(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|ext| ext == "jpg" || ext.is_empty())
-                    .unwrap_or(false)
-            });
+        let is_jpg = self.output.as_ref().is_some_and(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| ext == "jpg" || ext.is_empty())
+                .unwrap_or(false)
+        });
         let is_webp = self.webp != 0;
         ensure!(
             !is_jpg || (self.args.capture_frames.unwrap_or(1) == 1),
@@ -115,31 +111,22 @@ impl Vcs {
 
         // Extract frames in memory (pipe-based, no temp BMP files)
         spinner.set_message("Extracting");
-        let extract = self.args.run_pipe(self.capture_height, self.capture_width)?;
+        let extract = self
+            .args
+            .run_pipe(self.capture_height, self.capture_width)?;
 
         for msg in &extract.warnings {
             spinner.println(format!("Warning: {msg}"));
         }
 
-        // Join frames in memory
+        // Join and encode one frame at a time. Keeping only the current grid avoids
+        // retaining the whole animation before the encoder can start consuming it.
         spinner.set_message("Joining");
         let labels: Vec<String> = extract
             .captures
             .iter()
             .map(|c| label::seconds_text(c.seconds))
             .collect();
-
-        let joined_frames: Vec<image::RgbImage> = (0..self.args.capture_frames())
-            .into_par_iter()
-            .map(|f| {
-                let frame_images: Vec<image::RgbImage> = extract
-                    .captures
-                    .iter()
-                    .map(|c| c.frames[f as usize].clone())
-                    .collect();
-                command::join_from_memory(&frame_images, self.columns, &labels)
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
 
         // Output file path
         let file_prefix = self.args.video.with_extension("");
@@ -149,12 +136,12 @@ impl Vcs {
             .to_string_lossy()
             .replace('%', "");
 
-        let suffix = if is_jpg { "jpg" } else if is_webp { "webp" } else { "avif" };
-        let temp_dir = temporary::process_dir(self.args.output_dir.clone(), !self.keep);
-        let temp_out_file = {
-            let mut o = temp_dir.clone();
-            o.push(format!("{file_prefix}.{suffix}"));
-            o
+        let suffix = if is_jpg {
+            "jpg"
+        } else if is_webp {
+            "webp"
+        } else {
+            "avif"
         };
         let out_file = self.output.unwrap_or_else(|| {
             let mut o = parent_dir;
@@ -162,15 +149,40 @@ impl Vcs {
             o
         });
 
-        if self.keep {
-            spinner.println(format!(
-                "Keeping temporary files in {}",
-                sh_escape(&temp_dir)
-            ));
-        }
+        let out_parent = out_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        fs::create_dir_all(out_parent)?;
+        let temp_out_file = out_parent.join(format!(
+            ".{file_prefix}.{}.{}.tmp",
+            fastrand::u64(..),
+            suffix
+        ));
+
+        let capture_count = extract.captures.len() as u32;
+        let (rows, cols) = if self.columns == 0 || capture_count <= self.columns {
+            (1, capture_count)
+        } else {
+            (capture_count.div_ceil(self.columns), self.columns)
+        };
+        let grid_w = extract.frame_width * cols;
+        let grid_h = extract.frame_height * rows;
+        let write_frames =
+            |writer: &mut std::io::BufWriter<std::process::ChildStdin>| -> anyhow::Result<()> {
+                for frame_index in 0..self.args.capture_frames() as usize {
+                    let images: Vec<&image::RgbImage> = extract
+                        .captures
+                        .iter()
+                        .map(|capture| &capture.frames[frame_index])
+                        .collect();
+                    let grid = command::join_from_memory(&images, self.columns, &labels)?;
+                    writer.write_all(grid.as_raw())?;
+                }
+                writer.flush()?;
+                Ok(())
+            };
 
         // Encode by piping raw frames to ffmpeg (no intermediate BMP files)
-        let (grid_w, grid_h) = (joined_frames[0].width(), joined_frames[0].height());
         spinner.set_message(format!("Encoding {}", sh_escape_filename(&out_file)));
 
         if is_jpg {
@@ -191,17 +203,11 @@ impl Vcs {
             {
                 let stdin = child.stdin.take().unwrap();
                 let mut writer = std::io::BufWriter::new(stdin);
-                for frame in &joined_frames {
-                    writer.write_all(frame.as_raw())?;
-                }
-                writer.flush()?;
+                write_frames(&mut writer)?;
             }
 
             let out = child.wait_with_output()?;
-            ensure!(
-                out.status.success(),
-                "ffmpeg convert-to-jpg failed"
-            );
+            ensure!(out.status.success(), "ffmpeg convert-to-jpg failed");
         } else if is_webp {
             let mut child = Command::new("ffmpeg")
                 .arg2("-v", "quiet")
@@ -227,10 +233,7 @@ impl Vcs {
             {
                 let stdin = child.stdin.take().unwrap();
                 let mut writer = std::io::BufWriter::new(stdin);
-                for frame in &joined_frames {
-                    writer.write_all(frame.as_raw())?;
-                }
-                writer.flush()?;
+                write_frames(&mut writer)?;
             }
 
             let out = child.wait_with_output()?;
@@ -271,10 +274,7 @@ impl Vcs {
             {
                 let stdin = child.stdin.take().unwrap();
                 let mut writer = std::io::BufWriter::new(stdin);
-                for frame in &joined_frames {
-                    writer.write_all(frame.as_raw())?;
-                }
-                writer.flush()?;
+                write_frames(&mut writer)?;
             }
 
             let out = child.wait_with_output()?;
@@ -285,8 +285,17 @@ impl Vcs {
             );
         }
 
-        fs::rename(&temp_out_file, &out_file)
-            .or_else(|_| fs::copy(&temp_out_file, &out_file).map(|_| ()))?;
+        if let Err(rename_error) = fs::rename(&temp_out_file, &out_file) {
+            // Windows does not replace an existing destination with rename. Both
+            // files are in the cache directory, so this fallback never exposes a
+            // partially copied AVIF; readers see either the old file or no file.
+            if out_file.exists() {
+                fs::remove_file(&out_file)?;
+                fs::rename(&temp_out_file, &out_file)?;
+            } else {
+                return Err(rename_error.into());
+            }
+        }
 
         spinner.finish();
         Ok(())
