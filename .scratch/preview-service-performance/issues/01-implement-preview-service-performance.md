@@ -46,3 +46,21 @@ Implement the accepted design in `../spec.md`, preserving the two linked ADRs an
 主要收益是 CPU：原型用户态 CPU 约 1.09–1.25s，正式路径约 8.85–9.09s，降低约 86%。每个硬解上下文 1 线程略优于 3 线程；增加 codec worker 对硬件吞吐没有帮助。暖态峰值 RSS 约 348MB，高于正式路径约 298MB；首次动态库冷装载曾测到 1.98s。日志确认全部 270 帧均来自 VideoToolbox，没有软件回退；输出保持 852×480，抽查画面与标签一致。
 
 原型作为 primary source 保存在本地 Jujutsu bookmark `prototype-videotoolbox`，提交 `fe0276c9`。若优先级包含 CPU、功耗和 macOS 连续预览吞吐，建议将它继续产品化为有软件回退的 macOS 可选路径；若只看单次命令墙钟和跨平台分发，当前 5–8% 收益还不足以直接替换默认实现。
+
+## 原型结论：Bilinear 缩放
+
+问题：将 VCS 提取缩放从 bicubic 改为 bilinear，能否在允许缩放质量变化的前提下带来至少 3% 的稳定端到端收益？
+
+结论：否。通过同一 release 二进制交错切换 scaler，排除第一组动态装载后的五组热态配对中，bicubic 与 bilinear 的 profile total 平均分别为 1.255s 和 1.223s，bilinear 只快约 2.6%；中位数只快约 2.2%，用户态 CPU 只降低约 2.9%。两边都输出 852×480、20fps、30 帧，但编码后 SSIM 为 0.9951，画面不是像素等价。
+
+原型作为 primary source 保存在本地 Jujutsu bookmark `prototype-mtn-bilinear`，提交 `cefff0a8`。该方向未达到 3% 阈值，不应改变默认 bicubic；只有未来明确提供快速/低质量缩放档时才考虑复用。
+
+## 原型结论：预滚阶段丢弃非参考帧
+
+问题：进程内软件解码 seek 后先使用 `AVDISCARD_NONREF`，在采样起点前恢复 `AVDISCARD_DEFAULT`，能否降低长 GOP 预滚成本，同时完整保留 9×30 个目标帧？
+
+结论：当前样本上成立，并稳定进入 1 秒以内。采用 0.5 秒完整解码余量的六组交错配对中，进程内完整预滚与 nonref 预滚的实际墙钟平均分别为 1.208s 和 0.928s，降低约 23.2%；profile total 从 1.195s 降到 0.916s，首个完整网格从 0.815s 降到 0.553s，用户态 CPU 从 8.525s 降到 5.782s。六次 nonref 实际墙钟均为 0.91–0.97s，9 路解码器都成功恢复完整解码且补帧数为 0。
+
+正确性验证在 encoder 前导出了全部 270 个 RGB tile。基线与 nonref 的 36,806,400 字节逐字节相同，SHA-256 都是 `88d9b4594cfe86f9aa7e6c34ce88009f0e3714016b5f04c7dcb4fa221650fa64`；最终动画 AVIF 也逐字节相同。0.25 秒和 0.125 秒余量在本样本仍相同，但 0 秒余量已经产生画面差异，证明必须为 frame threading 和帧重排序保留恢复窗口。
+
+原型作为 primary source 保存在本地 Jujutsu bookmark `prototype-mtn-preroll-nonref`，提交 `982bae84`。这一结果足以重新评估此前暂不合入的进程内 libav 路径，但单个 H.264 样本不足以直接产品化；下一步必须以 0.5 秒保守余量覆盖 H.264/H.265、不同 GOP/B-frame、VFR、短片和文件尾部采样，并逐项比较 270 个 tile、PTS 和补帧数。

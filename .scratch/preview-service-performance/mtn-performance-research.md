@@ -8,12 +8,12 @@
 
 **mtn 的整体实现不适合替换当前动画 VCS 管线，预计不会改善端到端墙钟时间。** 它针对的是“每个时间点取一张静态图，最后保存一张静态网格”：单个 demux/decoder 上下文串行执行 9 次 seek，每次只解出一张图，所有图完成后才保存网格。当前 vimg 则让 9 个采样点并行解码各自连续的 30 帧，并通过有界 lockstep 流与 AVIF 编码重叠。把 mtn 的串行模型扩展到本负载会把九路解码放回关键路径，且 mtn 没有动画输出、硬件解码或跨阶段流水线。
 
-mtn 只有两个值得单独做微型基准的细节：
+mtn 只有两个值得单独做微型基准的细节；两项原型已经完成：
 
-1. **仅在 seek 后的预滚阶段使用 `AVDISCARD_NONREF`，接近采样起点前恢复完整解码。** 这可能减少软件解码长 GOP 的预滚 CPU，但 mtn 是全程丢弃非参考帧；直接照搬会丢掉动画所需帧，破坏 20 fps 时序。此方向风险高、预期收益小，并且只适用于进程内软件解码路径。
-2. **将缩放从 bicubic 改为 bilinear，作为显式的速度/质量选项。** mtn 使用 bilinear，而 vimg 使用 bicubic。它可能减少 270 次 1080p→160p 缩放成本，但属于输出质量变化，不是等价优化，且不会减少 seek、解码和 AVIF 编码成本。
+1. **仅在 seek 后的预滚阶段使用 `AVDISCARD_NONREF`，接近采样起点前恢复完整解码。** 0.5 秒恢复余量的六组配对测量把进程内 libav 原型平均墙钟从 1.208s 降至 0.928s，约 23.2%；用户态 CPU 从 8.525s 降至 5.782s，约 32.2%。全部 270 个原始 tile 与基线逐字节一致。这一结果足以把该方向提升为下一轮跨媒体语料验证的首选。
+2. **将缩放从 bicubic 改为 bilinear，作为显式的速度/质量选项。** 同一二进制的热态配对结果仅快约 2.6%，未达到 3% 阈值；输出 SSIM 为 0.9951，并非等价画面，因此否决默认替换。
 
-不建议原型化 mtn 的单上下文串行 seek、GD 像素拷贝或静态 AVIF 保存路径。若主要目标是 CPU/功耗，已经验证的进程内 VideoToolbox 路径远比 mtn 的软件技巧有效；若主要目标仍是稳定低于 1 秒，应继续优化首帧 seek/预滚与 AVIF 编码尾部，而不是移植 mtn。
+不建议原型化 mtn 的单上下文串行 seek、GD 像素拷贝或静态 AVIF 保存路径。若主要目标是 CPU/功耗，进程内 VideoToolbox 仍最有效；若主要目标是单次墙钟，`AVDISCARD_NONREF` 预滚原型已经在当前样本上稳定进入 1 秒以内，但尚需跨 codec、GOP、B-frame 和 VFR 语料验证后才能进入正式路径。
 
 ## 1. mtn 的实际数据流
 
@@ -96,18 +96,19 @@ mtn 的优势是单进程、单次 open/probe、没有 rawvideo 子进程 pipe�
 FFmpeg 对 `AVDISCARD_NONREF` 的定义就是“discard all non-reference frames”；这不是保持所有展示帧、只跳过无用计算的无损开关。[FFmpeg `AVDiscard`](https://ffmpeg.org/doxygen/7.0/group__lavc__decoding.html)  
 FFmpeg 将 bilinear 与 bicubic 定义为不同的 scaler 算法，当前文档默认是 bicubic，因此改用 bilinear 应当被视为显式质量策略，而非内部等价重构。[FFmpeg scaler documentation](https://www.ffmpeg.org/ffmpeg-scaler.html)
 
-## 4. 推荐的后续优先级
+## 4. 原型后的优先级
 
-### 可迁移原型
+### 继续推进
 
-1. **低成本基准：bilinear 质量档。** 在不改默认行为的前提下，对同一输入测量 `bicubic` 与 `bilinear` 的 `receive_wait`、首网格和总时间，并做像素/视觉对照。如果端到端收益不足 3%，直接关闭方向。
-2. **条件式原型：软件解码预滚丢非参考帧。** 只在进程内 libavcodec 分支验证：seek 后先以 `AVDISCARD_NONREF` 逼近目标，在足够的重排序余量前恢复 `AVDISCARD_DEFAULT`，确认输出 270 个目标帧的 PTS/画面与基线一致。任何缺帧、重复帧或边界漂移都应否决。
+1. **跨语料验证软件解码预滚丢非参考帧。** 保持 0.5 秒保守恢复余量，覆盖 H.264/H.265、不同 GOP/B-frame、VFR、短片和临近文件尾部的采样点；逐个比较 270 个原始 tile、选中 PTS 和补帧数。
+2. **验证通过后重新评估进程内 libav 路径。** 单独的进程内迁移原本只有约 2.8% 墙钟收益；叠加预滚优化后已达到约 23.2%，足以改变此前“暂不合入”的结论。
 
 ### 不建议
 
-1. **不要实现 mtn 式单上下文串行采样。** 它更可能减少总 CPU 和内存，而不是减少端到端墙钟；与当前“优先运行效率、冲击 1 秒”的目标不一致。
-2. **不要移植 GD 合成或静态 AVIF 保存路径。** 前者引入逐像素转换，后者不能表达 30 帧动画。
-3. **继续保留 VideoToolbox 为主要 CPU 方向。** mtn 没有硬解机制，也没有能接近其约 86% 用户态 CPU 降幅的软件技巧。
+1. **不要把 bilinear 设为默认。** 热态配对收益低于 3% 阈值，且画面发生变化。
+2. **不要实现 mtn 式单上下文串行采样。** 它更可能减少总 CPU 和内存，而不是减少端到端墙钟；与当前“优先运行效率、冲击 1 秒”的目标不一致。
+3. **不要移植 GD 合成或静态 AVIF 保存路径。** 前者引入逐像素转换，后者不能表达 30 帧动画。
+4. **继续保留 VideoToolbox 为主要 CPU 方向。** mtn 没有硬解机制；预滚优化降低约 32% 用户态 CPU，仍不及 VideoToolbox 的约 86%。
 
 ## 5. 证据边界
 
@@ -120,3 +121,43 @@ ffprobe -v error -select_streams v:0 \
   -show_entries stream=codec_name,width,height,avg_frame_rate,r_frame_rate \
   -show_entries format=duration -of json ./sample/input.mkv
 ```
+
+## 6. 两项原型结果
+
+### 6.1 Bilinear 缩放
+
+原型在同一 release 二进制中通过 `VIMG_PROTOTYPE_SCALE_FLAGS=bicubic|bilinear` 切换 scaler，避免重新编译影响配对结果。书签为 `prototype-mtn-bilinear`，提交 `cefff0a8`。
+
+六组交错配对中，排除第一组动态装载后：
+
+| 指标 | Bicubic | Bilinear | 变化 |
+|---|---:|---:|---:|
+| profile total 平均 | 1.255s | 1.223s | -2.6% |
+| profile total 中位数 | 1.257s | 1.229s | -2.2% |
+| 用户态 CPU 平均 | 8.932s | 8.672s | -2.9% |
+
+两边都输出 852×480、20fps、30 帧。编码后画面 SSIM 为 0.9951，说明差异可见于像素层；收益未达到预设 3% 阈值。结论：**关闭默认替换方向**，只有未来明确提供“快速/较低缩放质量”选项时才考虑复用。
+
+### 6.2 预滚阶段 `AVDISCARD_NONREF`
+
+原型基于九路进程内 libavcodec 解码器：seek 后先设置 `AVDISCARD_NONREF`，当 packet DTS/PTS 到达采样起点前 0.5 秒时恢复 `AVDISCARD_DEFAULT`，不 flush 已建立的参考帧状态。书签为 `prototype-mtn-preroll-nonref`，提交 `982bae84`。
+
+六组交错配对结果：
+
+| 指标 | 完整预滚基线 | Nonref 预滚 | 变化 |
+|---|---:|---:|---:|
+| 实际墙钟平均 | 1.208s | 0.928s | -23.2% |
+| profile total 平均 | 1.195s | 0.916s | -23.3% |
+| 首个完整网格平均 | 0.815s | 0.553s | -32.1% |
+| 用户态 CPU 平均 | 8.525s | 5.782s | -32.2% |
+| 峰值 RSS 平均 | 453.3MB | 449.7MB | -0.8% |
+
+六次 nonref 墙钟均为 0.91–0.97s；每次都完成 9 次恢复正常解码，补帧数为 0。
+
+验证运行在 encoder 前按“30 个动画时刻 × 9 个采样点”的顺序写出全部 270 个 RGB tile：
+
+- 基线与 0.5 秒余量都是 36,806,400 字节；
+- 两者 SHA-256 都是 `88d9b4594cfe86f9aa7e6c34ce88009f0e3714016b5f04c7dcb4fa221650fa64`；
+- 两个动画 AVIF 也逐字节相同，SHA-256 都是 `1646e7f4e42f2261f785dc5e6d466dcac85b326f7ed96a7a06ae15c649973985`。
+
+余量扫描中，0.25 秒和 0.125 秒仍与基线逐字节一致；0 秒已经不同，编码后 SSIM 降至 0.9966。这确认“目标前恢复完整解码”是正确性条件，不应为了样本内的少量收益把余量压到 0。当前结论：**保留 0.5 秒作为保守候选，并立即扩大语料验证；尚不直接合入正式路径。**
