@@ -7,6 +7,7 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(version, about)]
 enum Command {
+    Authority(command::Authority),
     Vcs(command::Vcs),
     Join(command::Join),
     Extract(command::Extract),
@@ -32,6 +33,7 @@ fn main() -> anyhow::Result<()> {
 
 fn run(cmd: Command) -> anyhow::Result<()> {
     match cmd {
+        Command::Authority(c) => c.run()?,
         Command::Vcs(c) => c.run()?,
         Command::Join(c) => c.run()?,
         Command::Extract(c) => {

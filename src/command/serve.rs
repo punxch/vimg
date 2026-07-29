@@ -380,6 +380,7 @@ fn run_vcs(
         keep: false,
         webp: 0,
         profile: false,
+        authority_manifest: None,
     }
     .run()
 }

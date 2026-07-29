@@ -1,9 +1,11 @@
+mod authority;
 mod extract;
 mod join;
 mod print_completions;
 mod serve;
 mod vcs;
 
+pub use authority::*;
 pub use extract::*;
 pub use join::*;
 pub use print_completions::*;

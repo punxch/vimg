@@ -103,3 +103,42 @@ Each sampling process uses three ffmpeg threads. One thread produced approximate
 `/usr/bin/time -lp` reported a maximum resident set size of approximately 298 MB. Summing the resident sets of the vimg process and all direct ffmpeg children peaked near 879 MiB, but that value double-counts shared mappings. Both figures are recorded because the ADR's memory accounting boundary needs to be made explicit before treating 512 MB as a hard process-tree gate.
 
 The generated AVIF retains its animation stream: AV1, 852×480, 20 fps, 1.5 seconds, and 30 frames.
+
+## FFmpeg Authority Regression Guard (2026-07-30, macOS)
+
+Ticket 01 adds an explicit validation-only command without enabling instrumentation
+on the production `vcs` path:
+
+```sh
+./target/release/vimg authority record \
+  --manifest /tmp/vimg-authority/authority.json \
+  -c3 -H160 -n9 ./sample/input.mkv \
+  --output /tmp/vimg-authority/output.avif
+```
+
+The authority run records the exact 270 FFmpeg-selected integer source PTS values
+and their original time bases, 30 lossless pre-encoder RGB grids, and 30 decoded
+AVIF reference frames. Repeating the same run produced byte-identical JSON and
+AVIF artifacts. The authority AVIF was also byte-identical to the existing
+production output.
+
+Authority publication serializes concurrent writers for the same manifest or
+output. Reference frames live in immutable content-addressed generations; AVIF
+and manifest replacement have rollback guards, and stale owned generations are
+removed after a successful publish.
+
+The normal production command remained within its established warm range:
+
+| Warm run | Wall time |
+|---|---:|
+| 1 | 1.23s |
+| 2 | 1.19s |
+| 3 | 1.30s |
+| 4 | 1.22s |
+| 5 | 1.21s |
+| **Average** | **1.230s** |
+
+The validation-only authority run took 2.24 seconds because it also writes and
+decodes 60 PNG references. `/usr/bin/time -lp` reported a maximum resident set
+size of approximately 299 MB. Its additional work is absent from normal `vcs`
+invocations.

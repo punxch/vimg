@@ -1,5 +1,7 @@
 use crate::{
-    command::{DurationOrPercent, HumanDuration, label, sh_escape},
+    command::{
+        DurationOrPercent, HumanDuration, SourceSelection, label, parse_source_frames, sh_escape,
+    },
     process::CommandExt,
 };
 use anyhow::{Context, ensure};
@@ -231,6 +233,7 @@ impl Extract {
         &self,
         capture_height: Option<u32>,
         capture_width: Option<u32>,
+        authority: bool,
     ) -> anyhow::Result<PipeExtractStream> {
         let Self {
             number,
@@ -269,17 +272,22 @@ impl Extract {
         let process_count = starts.len().max(1);
         let (sender, receiver) = sync_channel((process_count * 2).max(1));
         let frame_barrier = Arc::new(FrameBarrier::new(process_count));
+        let authority_records = authority.then(|| Arc::new(Mutex::new(vec![None; process_count])));
         let mut workers = Vec::with_capacity(process_count);
         for (capture_index, start_s) in starts {
             let extract = self.clone();
             let sender = sender.clone();
             let frame_barrier = Arc::clone(&frame_barrier);
+            let authority_records = authority_records.clone();
             workers.push(thread::spawn(move || {
                 if let Err(error) = extract.capture_pipe_stream(
-                    capture_index,
-                    start_s,
-                    frame_w,
-                    frame_h,
+                    PipeCapture {
+                        capture_index,
+                        start_s,
+                        width: frame_w,
+                        height: frame_h,
+                        authority_records,
+                    },
                     &sender,
                     &frame_barrier,
                 ) {
@@ -293,6 +301,7 @@ impl Extract {
         Ok(PipeExtractStream {
             receiver: Some(receiver),
             workers,
+            authority_records,
             capture_count: *number as usize,
             capture_frames: self.capture_frames() as usize,
             frame_width: frame_w,
@@ -350,13 +359,18 @@ impl Extract {
 
     fn capture_pipe_stream(
         &self,
-        capture_index: usize,
-        start_s: f32,
-        width: u32,
-        height: u32,
+        capture: PipeCapture,
         sender: &SyncSender<anyhow::Result<PipeFrame>>,
         frame_barrier: &FrameBarrier,
     ) -> anyhow::Result<()> {
+        let PipeCapture {
+            capture_index,
+            start_s,
+            width,
+            height,
+            authority_records,
+        } = capture;
+        let authority = authority_records.is_some();
         let Self {
             capture_time,
             vfilter,
@@ -368,67 +382,154 @@ impl Extract {
 
         let run_ffmpeg = |use_cuda: bool| -> anyhow::Result<()> {
             let mut cmd = Command::new("ffmpeg");
+            if authority {
+                cmd.arg("-copyts");
+            }
             if use_cuda {
                 cmd.arg2("-hwaccel", "cuda");
             }
-            let mut child = cmd
-                .arg2("-v", "error")
+            let authority_filter = authority.then(|| match vfilter {
+                Some(vfilter) => format!("setpts=PTS-round({start_s}/TB),{vfilter}"),
+                None => format!("setpts=PTS-round({start_s}/TB)"),
+            });
+            cmd.arg2("-v", "error")
                 .arg2("-threads", FFMPEG_THREADS_PER_CAPTURE)
                 .arg2("-ss", start_s)
                 .arg2("-t", capture_time.seconds)
                 .arg2("-i", video)
                 .arg2("-r", format!("{capture_frames}/{}", capture_time.seconds))
                 .arg2("-fps_mode", "cfr")
-                .arg2_opt("-vf", vfilter.as_ref())
+                .arg2_opt("-vf", authority_filter.as_ref().or(vfilter.as_ref()))
                 .arg2("-vframes", capture_frames)
                 .arg2("-f", "rawvideo")
-                .arg2("-pix_fmt", "rgb24")
+                .arg2("-pix_fmt", "rgb24");
+            if authority {
+                cmd.arg2("-stats_enc_pre", "pipe:2")
+                    .arg2("-stats_enc_pre_fmt", "{n} {ni} {ptsi} {tbi}");
+            }
+            let mut child = cmd
                 .arg("-y")
                 .arg("pipe:1")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()?;
+                .spawn()
+                .with_context(|| {
+                    if authority {
+                        "decoding failed: could not start instrumented FFmpeg capture"
+                    } else {
+                        "could not start FFmpeg capture"
+                    }
+                })?;
 
-            let stdout = child.stdout.take().context("ffmpeg stdout was not piped")?;
+            let stdout = child.stdout.take().context(if authority {
+                "decoding failed: FFmpeg stdout was not piped"
+            } else {
+                "FFmpeg stdout was not piped"
+            })?;
+            let mut stderr_worker = if authority {
+                let child_stderr = child
+                    .stderr
+                    .take()
+                    .context("PTS extraction failed: FFmpeg stderr was not piped")?;
+                Some(thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    BufReader::new(child_stderr)
+                        .read_to_end(&mut bytes)
+                        .map(|_| bytes)
+                }))
+            } else {
+                None
+            };
             let mut reader = BufReader::new(stdout);
             let mut last_frame = None;
             for frame_index in 0..capture_frames as usize {
                 let mut raw = vec![0; frame_size];
                 let image = match reader.read_exact(&mut raw) {
-                    Ok(()) => RgbImage::from_raw(width, height, raw)
-                        .context("ffmpeg emitted an invalid raw RGB frame")?,
-                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => last_frame
-                        .clone()
-                        .context("ffmpeg produced 0 frames for capture")?,
-                    Err(error) => return Err(error.into()),
+                    Ok(()) => RgbImage::from_raw(width, height, raw).context(if authority {
+                        "decoding failed: FFmpeg emitted an invalid raw RGB frame"
+                    } else {
+                        "FFmpeg emitted an invalid raw RGB frame"
+                    })?,
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                        last_frame.clone().context(if authority {
+                            "decoding failed: FFmpeg produced 0 frames for capture"
+                        } else {
+                            "FFmpeg produced 0 frames for capture"
+                        })?
+                    }
+                    Err(error) => {
+                        return Err(error).context(if authority {
+                            "decoding failed: could not read FFmpeg RGB output"
+                        } else {
+                            "could not read FFmpeg RGB output"
+                        });
+                    }
                 };
                 last_frame = Some(image.clone());
-                if sender
-                    .send(Ok(PipeFrame {
+                if !send_pipe_frame(
+                    sender,
+                    frame_barrier,
+                    PipeFrame {
                         capture_index,
                         frame_index,
                         image,
-                    }))
-                    .is_err()
-                {
+                    },
+                ) {
                     frame_barrier.cancel();
                     let _ = child.kill();
-                    return Ok(());
-                }
-                if !frame_barrier.wait() {
-                    let _ = child.kill();
+                    let _ = child.wait();
+                    if let Some(stderr_worker) = stderr_worker.take() {
+                        let _ = stderr_worker.join();
+                    }
                     return Ok(());
                 }
             }
-            let output = child.wait_with_output()?;
-            ensure!(
-                output.status.success(),
-                "ffmpeg capture failed (exit {:?}, cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {}",
-                output.status.code(),
-                capture_time.seconds,
-                video.display(),
-                String::from_utf8_lossy(&output.stderr).trim(),
-            );
+            let (status, stderr) = if let Some(stderr_worker) = stderr_worker {
+                let status = child
+                    .wait()
+                    .context("decoding failed: could not wait for FFmpeg capture")?;
+                let stderr = stderr_worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("PTS extraction failed: stderr reader panicked"))?
+                    .context("PTS extraction failed: could not read FFmpeg encoder stats")?;
+                (status, stderr)
+            } else {
+                let output = child.wait_with_output()?;
+                (output.status, output.stderr)
+            };
+            if authority {
+                ensure!(
+                    status.success(),
+                    "decoding failed: FFmpeg capture exited {:?} (cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {}",
+                    status.code(),
+                    capture_time.seconds,
+                    video.display(),
+                    String::from_utf8_lossy(&stderr).trim(),
+                );
+            } else {
+                ensure!(
+                    status.success(),
+                    "ffmpeg capture failed (exit {:?}, cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {}",
+                    status.code(),
+                    capture_time.seconds,
+                    video.display(),
+                    String::from_utf8_lossy(&stderr).trim(),
+                );
+            }
+            if let Some(authority_records) = &authority_records {
+                let selected = parse_source_frames(
+                    &String::from_utf8_lossy(&stderr),
+                    capture_frames as usize,
+                )?;
+                let mut records = authority_records
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("PTS extraction failed: record lock poisoned"))?;
+                ensure!(
+                    records[capture_index].is_none(),
+                    "PTS extraction failed: duplicate capture record {capture_index}"
+                );
+                records[capture_index] = Some(selected);
+            }
             Ok(())
         };
 
@@ -508,6 +609,16 @@ impl fmt::Display for OutTemplate {
 
 static CUDA_AVAILABLE: AtomicBool = AtomicBool::new(false);
 const FFMPEG_THREADS_PER_CAPTURE: u8 = 3;
+type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
+
+#[derive(Clone)]
+struct PipeCapture {
+    capture_index: usize,
+    start_s: f32,
+    width: u32,
+    height: u32,
+    authority_records: Option<AuthorityRecords>,
+}
 
 pub struct PipeFrame {
     pub capture_index: usize,
@@ -515,9 +626,15 @@ pub struct PipeFrame {
     pub image: RgbImage,
 }
 
+pub struct CaptureAuthority {
+    pub capture_index: usize,
+    pub frames: Vec<SourceSelection>,
+}
+
 pub struct PipeExtractStream {
     receiver: Option<Receiver<anyhow::Result<PipeFrame>>>,
     workers: Vec<JoinHandle<()>>,
+    authority_records: Option<AuthorityRecords>,
     pub capture_count: usize,
     pub capture_frames: usize,
     pub frame_width: u32,
@@ -582,15 +699,40 @@ impl PipeExtractStream {
             .context("extraction stream ended before all frames were produced")?
     }
 
-    pub fn finish(mut self) -> anyhow::Result<()> {
+    pub fn finish(mut self) -> anyhow::Result<Vec<CaptureAuthority>> {
         self.receiver.take();
         for worker in self.workers.drain(..) {
             worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("extraction worker panicked"))?;
         }
-        Ok(())
+        let Some(authority_records) = self.authority_records.take() else {
+            return Ok(Vec::new());
+        };
+        let mut records = authority_records
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTS extraction failed: record lock poisoned"))?;
+        records
+            .iter_mut()
+            .enumerate()
+            .map(|(capture_index, frames)| {
+                Ok(CaptureAuthority {
+                    capture_index,
+                    frames: frames.take().context(format!(
+                        "PTS extraction failed: capture {capture_index} produced no timestamp record"
+                    ))?,
+                })
+            })
+            .collect()
     }
+}
+
+fn send_pipe_frame(
+    sender: &SyncSender<anyhow::Result<PipeFrame>>,
+    frame_barrier: &FrameBarrier,
+    frame: PipeFrame,
+) -> bool {
+    sender.send(Ok(frame)).is_ok() && frame_barrier.wait()
 }
 
 impl Drop for PipeExtractStream {
