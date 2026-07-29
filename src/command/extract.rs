@@ -1,5 +1,5 @@
 use crate::{
-    command::{DurationOrPercent, HumanDuration, sh_escape},
+    command::{DurationOrPercent, HumanDuration, label, sh_escape},
     process::CommandExt,
 };
 use anyhow::{Context, ensure};
@@ -7,9 +7,15 @@ use image::RgbImage;
 use rayon::prelude::*;
 use std::{
     fmt, fs,
+    io::{BufReader, ErrorKind, Read},
     path::{Path, PathBuf},
     process::Command,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
+    },
+    thread::{self, JoinHandle},
 };
 
 /// Generate capture bmp images from a video using ffmpeg.
@@ -53,6 +59,18 @@ pub struct Extract {
     /// Video file input.
     #[arg(required = true)]
     pub video: PathBuf,
+
+    /// Media properties supplied by a caller that has already probed the video.
+    #[arg(skip)]
+    pub media: Option<MediaDescriptor>,
+}
+
+/// Optional media properties used to avoid repeating ffprobe work in preview services.
+#[derive(Clone, Debug, Default)]
+pub struct MediaDescriptor {
+    pub duration_s: Option<f32>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
 }
 
 impl Extract {
@@ -209,35 +227,19 @@ impl Extract {
         Ok(warnings)
     }
 
-    pub fn run_pipe(
+    pub fn stream_pipe(
         &self,
         capture_height: Option<u32>,
         capture_width: Option<u32>,
-    ) -> anyhow::Result<PipeExtractData> {
+    ) -> anyhow::Result<PipeExtractStream> {
         let Self {
             number,
             ignore_start,
             ignore_end,
-            threads,
-            video,
             ..
         } = self;
 
-        let probe = ffprobe::ffprobe(video)?;
-        let video_duration_s = probe
-            .format
-            .duration
-            .context("invalid video duration")?
-            .parse::<f32>()
-            .context("invalid video duration")?;
-
-        let stream = probe
-            .streams
-            .iter()
-            .find(|s| s.codec_type.as_deref() == Some("video"))
-            .context("no video stream found")?;
-        let orig_w = stream.width.context("no width")? as u32;
-        let orig_h = stream.height.context("no height")? as u32;
+        let (video_duration_s, orig_w, orig_h) = self.pipe_media()?;
         let (frame_w, frame_h) = scaled_dimensions(orig_w, orig_h, capture_height, capture_width);
 
         let duration_s = video_duration_s
@@ -249,32 +251,112 @@ impl Extract {
             "invalid negative video duration minus offsets"
         );
 
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(*threads)
-            .build()?
-            .install(|| {
-                let captures = (0..*number)
-                    .into_par_iter()
-                    .map(|n| {
-                        let interval = duration_s / *number as f32;
-                        let start_s = ignore_start.to_secs(video_duration_s)
-                            + interval * 0.5
-                            + interval * n as f32;
-                        let start_s = start_s.min(video_duration_s - self.capture_time.seconds);
-                        self.capture_pipe(start_s, frame_w, frame_h)
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-
-                Ok(PipeExtractData {
-                    captures,
-                    frame_width: frame_w,
-                    frame_height: frame_h,
-                    warnings: Vec::new(),
-                })
+        let starts: Vec<_> = (0..*number)
+            .map(|capture_index| {
+                let interval = duration_s / *number as f32;
+                let start_s = ignore_start.to_secs(video_duration_s)
+                    + interval * 0.5
+                    + interval * capture_index as f32;
+                (
+                    capture_index as usize,
+                    start_s.min(video_duration_s - self.capture_time.seconds),
+                )
             })
+            .collect();
+        // Every grid frame needs one image from each sampling point. Start one
+        // single-threaded process per point and synchronize after each frame so a
+        // fast producer cannot fill the bounded channel with future frames.
+        let process_count = starts.len().max(1);
+        let (sender, receiver) = sync_channel((process_count * 2).max(1));
+        let frame_barrier = Arc::new(FrameBarrier::new(process_count));
+        let mut workers = Vec::with_capacity(process_count);
+        for (capture_index, start_s) in starts {
+            let extract = self.clone();
+            let sender = sender.clone();
+            let frame_barrier = Arc::clone(&frame_barrier);
+            workers.push(thread::spawn(move || {
+                if let Err(error) = extract.capture_pipe_stream(
+                    capture_index,
+                    start_s,
+                    frame_w,
+                    frame_h,
+                    &sender,
+                    &frame_barrier,
+                ) {
+                    frame_barrier.cancel();
+                    let _ = sender.send(Err(error));
+                }
+            }));
+        }
+        drop(sender);
+
+        Ok(PipeExtractStream {
+            receiver: Some(receiver),
+            workers,
+            capture_count: *number as usize,
+            capture_frames: self.capture_frames() as usize,
+            frame_width: frame_w,
+            frame_height: frame_h,
+            labels: (0..*number)
+                .map(|capture_index| {
+                    label::seconds_text(
+                        (ignore_start.to_secs(video_duration_s)
+                            + duration_s / *number as f32 * (0.5 + capture_index as f32))
+                            .min(video_duration_s - self.capture_time.seconds)
+                            as u32,
+                    )
+                })
+                .collect(),
+        })
     }
 
-    fn capture_pipe(&self, start_s: f32, width: u32, height: u32) -> anyhow::Result<CaptureFrames> {
+    fn pipe_media(&self) -> anyhow::Result<(f32, u32, u32)> {
+        let descriptor = self.media.as_ref();
+        let needs_probe = descriptor.is_none_or(|media| {
+            media.duration_s.is_none() || media.width.is_none() || media.height.is_none()
+        });
+        let probe = needs_probe
+            .then(|| ffprobe::ffprobe(&self.video))
+            .transpose()?;
+        let duration_s = descriptor
+            .and_then(|media| media.duration_s)
+            .or_else(|| {
+                probe
+                    .as_ref()?
+                    .format
+                    .duration
+                    .as_ref()?
+                    .parse::<f32>()
+                    .ok()
+            })
+            .context("invalid video duration")?;
+        let stream = || {
+            probe
+                .as_ref()?
+                .streams
+                .iter()
+                .find(|stream| stream.codec_type.as_deref() == Some("video"))
+        };
+        let width = descriptor
+            .and_then(|media| media.width)
+            .or_else(|| stream().and_then(|stream| stream.width.map(|width| width as u32)))
+            .context("no width")?;
+        let height = descriptor
+            .and_then(|media| media.height)
+            .or_else(|| stream().and_then(|stream| stream.height.map(|height| height as u32)))
+            .context("no height")?;
+        Ok((duration_s, width, height))
+    }
+
+    fn capture_pipe_stream(
+        &self,
+        capture_index: usize,
+        start_s: f32,
+        width: u32,
+        height: u32,
+        sender: &SyncSender<anyhow::Result<PipeFrame>>,
+        frame_barrier: &FrameBarrier,
+    ) -> anyhow::Result<()> {
         let Self {
             capture_time,
             vfilter,
@@ -284,13 +366,14 @@ impl Extract {
         let capture_frames = self.capture_frames();
         let frame_size = (width * height * 3) as usize;
 
-        let run_ffmpeg = |use_cuda: bool| -> anyhow::Result<Vec<u8>> {
+        let run_ffmpeg = |use_cuda: bool| -> anyhow::Result<()> {
             let mut cmd = Command::new("ffmpeg");
             if use_cuda {
                 cmd.arg2("-hwaccel", "cuda");
             }
-            cmd.arg2("-v", "error")
-                .arg2("-threads", "1")
+            let mut child = cmd
+                .arg2("-v", "error")
+                .arg2("-threads", FFMPEG_THREADS_PER_CAPTURE)
                 .arg2("-ss", start_s)
                 .arg2("-t", capture_time.seconds)
                 .arg2("-i", video)
@@ -301,61 +384,66 @@ impl Extract {
                 .arg2("-f", "rawvideo")
                 .arg2("-pix_fmt", "rgb24")
                 .arg("-y")
-                .arg("pipe:1");
+                .arg("pipe:1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()?;
 
-            let output = cmd.output()?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let stderr = stderr.trim();
-                anyhow::bail!(
-                    "ffmpeg capture failed (exit {:?}, cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {stderr}\nstdout: {} bytes",
-                    output.status.code(),
-                    capture_time.seconds,
-                    video.display(),
-                    output.stdout.len(),
-                );
+            let stdout = child.stdout.take().context("ffmpeg stdout was not piped")?;
+            let mut reader = BufReader::new(stdout);
+            let mut last_frame = None;
+            for frame_index in 0..capture_frames as usize {
+                let mut raw = vec![0; frame_size];
+                let image = match reader.read_exact(&mut raw) {
+                    Ok(()) => RgbImage::from_raw(width, height, raw)
+                        .context("ffmpeg emitted an invalid raw RGB frame")?,
+                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => last_frame
+                        .clone()
+                        .context("ffmpeg produced 0 frames for capture")?,
+                    Err(error) => return Err(error.into()),
+                };
+                last_frame = Some(image.clone());
+                if sender
+                    .send(Ok(PipeFrame {
+                        capture_index,
+                        frame_index,
+                        image,
+                    }))
+                    .is_err()
+                {
+                    frame_barrier.cancel();
+                    let _ = child.kill();
+                    return Ok(());
+                }
+                if !frame_barrier.wait() {
+                    let _ = child.kill();
+                    return Ok(());
+                }
             }
-            Ok(output.stdout)
+            let output = child.wait_with_output()?;
+            ensure!(
+                output.status.success(),
+                "ffmpeg capture failed (exit {:?}, cuda={use_cuda}, ss={start_s}, t={})\nvideo: {}\nstderr: {}",
+                output.status.code(),
+                capture_time.seconds,
+                video.display(),
+                String::from_utf8_lossy(&output.stderr).trim(),
+            );
+            Ok(())
         };
 
         let use_cuda = CUDA_AVAILABLE.load(Ordering::Relaxed);
-        let raw = if use_cuda {
+        if use_cuda {
             match run_ffmpeg(true) {
-                Ok(data) => data,
+                Ok(()) => Ok(()),
                 Err(_) => {
                     CUDA_AVAILABLE.store(false, Ordering::Relaxed);
-                    run_ffmpeg(false)?
+                    run_ffmpeg(false)
                 }
             }
         } else {
-            run_ffmpeg(false)?
-        };
-
-        let expected = frame_size * capture_frames as usize;
-        ensure!(
-            raw.len() >= expected,
-            "ffmpeg output too short: expected {expected} bytes, got {}",
-            raw.len()
-        );
-
-        let mut frames: Vec<RgbImage> = raw
-            .chunks(frame_size)
-            .take(capture_frames as usize)
-            .map(|chunk| RgbImage::from_raw(width, height, chunk.to_vec()).unwrap())
-            .collect();
-
-        while frames.len() < capture_frames as usize {
-            if let Some(last) = frames.last().cloned() {
-                frames.push(last);
-            } else {
-                anyhow::bail!("ffmpeg produced 0 frames for capture at {start_s}s");
-            }
+            run_ffmpeg(false)
         }
-
-        Ok(CaptureFrames {
-            seconds: start_s as u32,
-            frames,
-        })
     }
 }
 
@@ -416,20 +504,102 @@ impl fmt::Display for OutTemplate {
     }
 }
 
-// --- In-memory pipe-based extraction ---
+// --- Bounded pipe-based extraction ---
 
 static CUDA_AVAILABLE: AtomicBool = AtomicBool::new(false);
+const FFMPEG_THREADS_PER_CAPTURE: u8 = 3;
 
-pub struct CaptureFrames {
-    pub seconds: u32,
-    pub frames: Vec<RgbImage>,
+pub struct PipeFrame {
+    pub capture_index: usize,
+    pub frame_index: usize,
+    pub image: RgbImage,
 }
 
-pub struct PipeExtractData {
-    pub captures: Vec<CaptureFrames>,
+pub struct PipeExtractStream {
+    receiver: Option<Receiver<anyhow::Result<PipeFrame>>>,
+    workers: Vec<JoinHandle<()>>,
+    pub capture_count: usize,
+    pub capture_frames: usize,
     pub frame_width: u32,
     pub frame_height: u32,
-    pub warnings: Vec<String>,
+    pub labels: Vec<String>,
+}
+
+struct FrameBarrier {
+    parties: usize,
+    state: Mutex<FrameBarrierState>,
+    ready: Condvar,
+}
+
+#[derive(Default)]
+struct FrameBarrierState {
+    arrived: usize,
+    generation: usize,
+    cancelled: bool,
+}
+
+impl FrameBarrier {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            state: Mutex::new(FrameBarrierState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.cancelled {
+            return false;
+        }
+        let generation = state.generation;
+        state.arrived += 1;
+        if state.arrived == self.parties {
+            state.arrived = 0;
+            state.generation += 1;
+            self.ready.notify_all();
+            return true;
+        }
+        while !state.cancelled && state.generation == generation {
+            state = self.ready.wait(state).unwrap();
+        }
+        !state.cancelled
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.cancelled = true;
+        self.ready.notify_all();
+    }
+}
+
+impl PipeExtractStream {
+    pub fn recv(&self) -> anyhow::Result<PipeFrame> {
+        self.receiver
+            .as_ref()
+            .context("extraction stream has already been closed")?
+            .recv()
+            .context("extraction stream ended before all frames were produced")?
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        self.receiver.take();
+        for worker in self.workers.drain(..) {
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("extraction worker panicked"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PipeExtractStream {
+    fn drop(&mut self) {
+        self.receiver.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn scaled_dimensions(

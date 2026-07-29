@@ -1,14 +1,15 @@
 use crate::{
-    command::{self, label, sh_escape_filename},
+    command::{self, sh_escape_filename},
     process::CommandExt,
 };
 use anyhow::ensure;
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Create a new contact sheet for a video.
@@ -70,10 +71,16 @@ pub struct Vcs {
     /// Output as webp instead of avif.
     #[arg(long, default_value_t = 0)]
     pub webp: u8,
+
+    /// Print extraction, composition, and encoder phase timings.
+    #[arg(long, default_value_t = false)]
+    pub profile: bool,
 }
 
 impl Vcs {
     pub fn run(mut self) -> anyhow::Result<()> {
+        let profile = self.profile;
+        let total_started = Instant::now();
         let is_jpg = self.output.as_ref().is_some_and(|p| {
             p.extension()
                 .and_then(|e| e.to_str())
@@ -109,24 +116,19 @@ impl Vcs {
         );
         spinner.enable_steady_tick(Duration::from_millis(100));
 
-        // Extract frames in memory (pipe-based, no temp BMP files)
+        // Start bounded extraction before the encoder. The workers block on a small
+        // frame channel while the encoder consumes complete grids in order.
         spinner.set_message("Extracting");
+        let setup_started = Instant::now();
         let extract = self
             .args
-            .run_pipe(self.capture_height, self.capture_width)?;
+            .stream_pipe(self.capture_height, self.capture_width)?;
+        let setup_elapsed = setup_started.elapsed();
 
-        for msg in &extract.warnings {
-            spinner.println(format!("Warning: {msg}"));
-        }
-
-        // Join and encode one frame at a time. Keeping only the current grid avoids
-        // retaining the whole animation before the encoder can start consuming it.
+        // Join and encode one frame at a time. The stream holds at most two frames
+        // per extraction worker, plus the single grid currently being encoded.
         spinner.set_message("Joining");
-        let labels: Vec<String> = extract
-            .captures
-            .iter()
-            .map(|c| label::seconds_text(c.seconds))
-            .collect();
+        let labels = &extract.labels;
 
         // Output file path
         let file_prefix = self.args.video.with_extension("");
@@ -156,7 +158,7 @@ impl Vcs {
         let nonce = fastrand::u64(..);
         let temp_out_file = out_parent.join(format!(".{file_prefix}.{nonce}.tmp.{suffix}"));
 
-        let capture_count = extract.captures.len() as u32;
+        let capture_count = extract.capture_count as u32;
         let (rows, cols) = if self.columns == 0 || capture_count <= self.columns {
             (1, capture_count)
         } else {
@@ -164,23 +166,10 @@ impl Vcs {
         };
         let grid_w = extract.frame_width * cols;
         let grid_h = extract.frame_height * rows;
-        let write_frames =
-            |writer: &mut std::io::BufWriter<std::process::ChildStdin>| -> anyhow::Result<()> {
-                for frame_index in 0..self.args.capture_frames() as usize {
-                    let images: Vec<&image::RgbImage> = extract
-                        .captures
-                        .iter()
-                        .map(|capture| &capture.frames[frame_index])
-                        .collect();
-                    let grid = command::join_from_memory(&images, self.columns, &labels)?;
-                    writer.write_all(grid.as_raw())?;
-                }
-                writer.flush()?;
-                Ok(())
-            };
-
         // Encode by piping raw frames to ffmpeg (no intermediate BMP files)
         spinner.set_message(format!("Encoding {}", sh_escape_filename(&out_file)));
+        let stream_timings;
+        let encoder_tail;
 
         if is_jpg {
             let mut child = Command::new("ffmpeg")
@@ -200,10 +189,13 @@ impl Vcs {
             {
                 let stdin = child.stdin.take().unwrap();
                 let mut writer = std::io::BufWriter::new(stdin);
-                write_frames(&mut writer)?;
+                stream_timings =
+                    write_stream_frames(&extract, self.columns, labels, &mut writer, profile)?;
             }
 
+            let tail_started = Instant::now();
             let out = child.wait_with_output()?;
+            encoder_tail = tail_started.elapsed();
             ensure!(out.status.success(), "ffmpeg convert-to-jpg failed");
         } else if is_webp {
             let mut child = Command::new("ffmpeg")
@@ -230,10 +222,13 @@ impl Vcs {
             {
                 let stdin = child.stdin.take().unwrap();
                 let mut writer = std::io::BufWriter::new(stdin);
-                write_frames(&mut writer)?;
+                stream_timings =
+                    write_stream_frames(&extract, self.columns, labels, &mut writer, profile)?;
             }
 
+            let tail_started = Instant::now();
             let out = child.wait_with_output()?;
+            encoder_tail = tail_started.elapsed();
             ensure!(
                 out.status.success(),
                 "ffmpeg convert-to-webp failed\n---stderr---\n{}\n------",
@@ -271,16 +266,21 @@ impl Vcs {
             {
                 let stdin = child.stdin.take().unwrap();
                 let mut writer = std::io::BufWriter::new(stdin);
-                write_frames(&mut writer)?;
+                stream_timings =
+                    write_stream_frames(&extract, self.columns, labels, &mut writer, profile)?;
             }
 
+            let tail_started = Instant::now();
             let out = child.wait_with_output()?;
+            encoder_tail = tail_started.elapsed();
             ensure!(
                 out.status.success(),
                 "ffmpeg convert-to-avif failed\n---stderr---\n{}\n------",
                 String::from_utf8_lossy(&out.stderr).trim(),
             );
         }
+
+        extract.finish()?;
 
         if let Err(rename_error) = fs::rename(&temp_out_file, &out_file) {
             // Windows does not replace an existing destination with rename. Both
@@ -295,6 +295,19 @@ impl Vcs {
         }
 
         spinner.finish();
+        if profile {
+            eprintln!(
+                "[profile] setup={:.3}s first_grid={:.3}s frames_before_first_grid={} receive_wait={:.3}s join={:.3}s encoder_write={:.3}s encoder_tail={:.3}s total={:.3}s",
+                setup_elapsed.as_secs_f64(),
+                stream_timings.first_grid.as_secs_f64(),
+                stream_timings.frames_before_first_grid,
+                stream_timings.receive_wait.as_secs_f64(),
+                stream_timings.join.as_secs_f64(),
+                stream_timings.encoder_write.as_secs_f64(),
+                encoder_tail.as_secs_f64(),
+                total_started.elapsed().as_secs_f64(),
+            );
+        }
         Ok(())
     }
 
@@ -305,4 +318,81 @@ impl Vcs {
         let w = self.capture_width?;
         Some(format!("scale={w}:-1:flags=bicubic"))
     }
+}
+
+#[derive(Default)]
+struct StreamTimings {
+    first_grid: Duration,
+    frames_before_first_grid: usize,
+    receive_wait: Duration,
+    join: Duration,
+    encoder_write: Duration,
+}
+
+fn write_stream_frames(
+    stream: &command::PipeExtractStream,
+    columns: u32,
+    labels: &[String],
+    writer: &mut std::io::BufWriter<std::process::ChildStdin>,
+    profile: bool,
+) -> anyhow::Result<StreamTimings> {
+    let started = Instant::now();
+    let mut timings = StreamTimings::default();
+    let mut pending: BTreeMap<usize, Vec<Option<image::RgbImage>>> = BTreeMap::new();
+    for expected_frame in 0..stream.capture_frames {
+        while pending
+            .get(&expected_frame)
+            .is_none_or(|captures| captures.iter().any(Option::is_none))
+        {
+            let receive_started = profile.then(Instant::now);
+            let frame = stream.recv()?;
+            if expected_frame == 0 {
+                timings.frames_before_first_grid += 1;
+            }
+            if let Some(receive_started) = receive_started {
+                timings.receive_wait += receive_started.elapsed();
+            }
+            ensure!(
+                frame.frame_index >= expected_frame && frame.frame_index < stream.capture_frames,
+                "extraction emitted an out-of-order frame {} while waiting for {expected_frame}",
+                frame.frame_index,
+            );
+            ensure!(
+                frame.capture_index < stream.capture_count,
+                "extraction emitted an invalid capture index {}",
+                frame.capture_index,
+            );
+            let captures = pending
+                .entry(frame.frame_index)
+                .or_insert_with(|| (0..stream.capture_count).map(|_| None).collect());
+            ensure!(
+                captures[frame.capture_index].is_none(),
+                "extraction emitted a duplicate frame for capture {} index {}",
+                frame.capture_index,
+                frame.frame_index,
+            );
+            captures[frame.capture_index] = Some(frame.image);
+        }
+
+        let captures = pending.remove(&expected_frame).unwrap();
+        let images: Vec<_> = captures
+            .iter()
+            .map(|image| image.as_ref().expect("complete frame was checked above"))
+            .collect();
+        if expected_frame == 0 {
+            timings.first_grid = started.elapsed();
+        }
+        let join_started = profile.then(Instant::now);
+        let grid = command::join_from_memory(&images, columns, labels)?;
+        if let Some(join_started) = join_started {
+            timings.join += join_started.elapsed();
+        }
+        let write_started = profile.then(Instant::now);
+        writer.write_all(grid.as_raw())?;
+        if let Some(write_started) = write_started {
+            timings.encoder_write += write_started.elapsed();
+        }
+    }
+    writer.flush()?;
+    Ok(timings)
 }

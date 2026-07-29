@@ -36,6 +36,15 @@ pub struct Send {
     /// Source modification time, as Unix seconds, captured by the preview client.
     #[arg(long)]
     pub source_modified_s: Option<u64>,
+    /// Source duration in seconds captured by the preview client.
+    #[arg(long)]
+    pub duration_s: Option<f32>,
+    /// Source video width captured by the preview client.
+    #[arg(long)]
+    pub width: Option<u32>,
+    /// Source video height captured by the preview client.
+    #[arg(long)]
+    pub height: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,6 +58,7 @@ struct Job {
     file: PathBuf,
     cache: PathBuf,
     source: Option<SourceDescriptor>,
+    media: Option<command::MediaDescriptor>,
     yazi_id: Option<String>,
 }
 
@@ -59,12 +69,34 @@ impl Job {
         let source_modified_s = value
             .get("source_modified_s")
             .and_then(serde_json::Value::as_u64);
+        let duration_s = value
+            .get("duration_s")
+            .and_then(serde_json::Value::as_f64)
+            .map(|duration| duration as f32)
+            .filter(|duration| duration.is_finite() && *duration > 0.0);
+        let width = value
+            .get("width")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|width| u32::try_from(width).ok())
+            .filter(|width| *width > 0);
+        let height = value
+            .get("height")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|height| u32::try_from(height).ok())
+            .filter(|height| *height > 0);
         Some(Self {
             file: PathBuf::from(value.get("file")?.as_str()?),
             cache: PathBuf::from(value.get("cache")?.as_str()?),
             source: source_size
                 .zip(source_modified_s)
                 .map(|(size, modified_s)| SourceDescriptor { size, modified_s }),
+            media: (duration_s.is_some() || width.is_some() || height.is_some()).then_some(
+                command::MediaDescriptor {
+                    duration_s,
+                    width,
+                    height,
+                },
+            ),
             yazi_id: value
                 .get("yazi_id")
                 .and_then(serde_json::Value::as_str)
@@ -206,7 +238,7 @@ fn worker(scheduler: Arc<Scheduler>) {
             job.file_name(),
             job.cache.display()
         );
-        match run_vcs(&job.file, &job.cache) {
+        match run_vcs(&job.file, &job.cache, job.media.as_ref()) {
             Ok(()) => match publish_manifest(&job) {
                 Ok(()) => {
                     notify_yazi(&job);
@@ -302,6 +334,9 @@ impl Send {
             "yazi_id": self.yazi_id,
             "source_size": self.source_size,
             "source_modified_s": self.source_modified_s,
+            "duration_s": self.duration_s,
+            "width": self.width,
+            "height": self.height,
         });
         stream.write_all(request.to_string().as_bytes())?;
         stream.write_all(b"\n")?;
@@ -315,7 +350,11 @@ impl Send {
     }
 }
 
-fn run_vcs(video: &Path, output: &Path) -> anyhow::Result<()> {
+fn run_vcs(
+    video: &Path,
+    output: &Path,
+    media: Option<&command::MediaDescriptor>,
+) -> anyhow::Result<()> {
     ensure!(video.exists(), "Video file not found: {}", video.display());
     command::Vcs {
         columns: 3,
@@ -336,9 +375,11 @@ fn run_vcs(video: &Path, output: &Path) -> anyhow::Result<()> {
             threads: 4,
             output_dir: None,
             video: video.to_path_buf(),
+            media: media.cloned(),
         },
         keep: false,
         webp: 0,
+        profile: false,
     }
     .run()
 }
@@ -352,6 +393,7 @@ mod tests {
             file: PathBuf::from("video.mkv"),
             cache: PathBuf::from(cache),
             source: None,
+            media: None,
             yazi_id: None,
         }
     }
@@ -411,5 +453,17 @@ mod tests {
                 modified_s: 7,
             })
         );
+    }
+
+    #[test]
+    fn accepts_duration_and_dimensions_from_the_media_descriptor() {
+        let job = Job::from_json(
+            r#"{"file":"video.mkv","cache":"preview.avif","duration_s":12.5,"width":1920,"height":1080}"#,
+        )
+        .unwrap();
+        let media = job.media.unwrap();
+        assert_eq!(media.duration_s, Some(12.5));
+        assert_eq!(media.width, Some(1920));
+        assert_eq!(media.height, Some(1080));
     }
 }

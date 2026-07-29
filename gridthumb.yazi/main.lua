@@ -1,4 +1,5 @@
 local M = {}
+local media_descriptors = {}
 
 local function source_descriptor(url)
 	local cha = fs.cha(url)
@@ -17,6 +18,26 @@ local function avif_is_current(file_url, cache_avif)
 	local manifest = Url(string.format("%s.%d-%d.json", tostring(cache_avif), source.size, source.modified_s))
 	local cha_manifest = fs.cha(manifest)
 	return cha_avif and cha_avif.len > 0 and cha_manifest and cha_manifest.len > 0
+end
+
+local function media_descriptor(url, meta)
+	local source = source_descriptor(url)
+	if not source then
+		return nil
+	end
+	local descriptor = {
+		size = source.size,
+		modified_s = source.modified_s,
+		duration_s = tonumber(meta.format.duration),
+	}
+	for _, stream in ipairs(meta.streams or {}) do
+		if stream.codec_type == "video" and stream.width and stream.height then
+			descriptor.width = stream.width
+			descriptor.height = stream.height
+			break
+		end
+	end
+	return descriptor
 end
 
 function M:setup()
@@ -79,12 +100,13 @@ function M:preload(job)
 		return true
 	end
 
-	local meta, err = self.list_meta(job.file.url, "format=duration:stream_disposition=attached_pic")
+	local meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_type,width,height:stream_disposition=attached_pic")
 	if not meta then
 		return true, err
 	elseif not meta.format.duration then
 		return true, Err("Failed to get video duration")
 	end
+	media_descriptors[tostring(job.file.url)] = media_descriptor(job.file.url, meta)
 
 	local pic = M.has_pic(meta)
 	local percent = (pic and 0 or 5) + job.skip
@@ -138,7 +160,7 @@ function M:generate_avif(job, cache)
 	end
 
 	local file_url = tostring(job.file.url)
-	local source = source_descriptor(job.file.url)
+	local source = media_descriptors[file_url] or source_descriptor(job.file.url)
 	if not source then
 		return
 	end
@@ -147,6 +169,16 @@ function M:generate_avif(job, cache)
 		"--source-size", tostring(source.size),
 		"--source-modified-s", tostring(source.modified_s),
 	}
+	if source.duration_s then
+		table.insert(args, "--duration-s")
+		table.insert(args, tostring(source.duration_s))
+	end
+	if source.width and source.height then
+		table.insert(args, "--width")
+		table.insert(args, tostring(source.width))
+		table.insert(args, "--height")
+		table.insert(args, tostring(source.height))
+	end
 	local yazi_id = os.getenv("YAZI_ID")
 	if yazi_id and yazi_id ~= "" then
 		table.insert(args, "--yazi-id")

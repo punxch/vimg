@@ -80,6 +80,10 @@ Requests may carry a Media descriptor so the service can avoid redundant probing
 - Requiring NVIDIA hardware, removing CPU fallback, or adding GPU-specific output semantics.
 - Remote, distributed, or multi-host preview services.
 - A general cache-eviction policy unrelated to validating and publishing the current source video.
+- Migrating the existing local TCP request transport to `ya` / DDS, including DDS lifecycle
+  responses and requester-disconnect orphan handling. This is tracked as deferred in
+  `issues/01-implement-preview-service-performance.md` and must not block the current
+  runtime-efficiency work.
 
 ## Further Notes
 
