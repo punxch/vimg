@@ -7,7 +7,7 @@
 use crate::command::frame_schedule::SourceFrame;
 use crate::command::{
     CaptureAttempt, CaptureAuthority, CaptureBackendPolicy, CaptureCompletion, CaptureDiagnostics,
-    CaptureFrame, CapturePlan, SourceSelection,
+    CaptureFrame, CaptureMetrics, CapturePlan, SourceSelection,
 };
 use anyhow::{Context, ensure};
 use ffmpeg::codec::{discard::Discard, threading};
@@ -36,7 +36,8 @@ pub(super) fn availability(plan: &CapturePlan) -> anyhow::Result<()> {
     plan.ensure_in_process_preview_profile(CaptureBackendPolicy::VideoToolbox)?;
     ffmpeg::init().context("initializing VideoToolbox libav support")?;
     let codec = decoder_for_media_codec(&plan.media().codec)?;
-    ensure_videotoolbox_support(codec)
+    ensure_videotoolbox_support(codec)?;
+    shared_device().map(|_| ())
 }
 
 pub(super) fn start(
@@ -97,7 +98,7 @@ struct VideoToolboxCaptureAttempt {
     receivers: Mutex<Vec<Receiver<anyhow::Result<CaptureFrame>>>>,
     next: Mutex<usize>,
     capture_count: usize,
-    workers: Vec<JoinHandle<anyhow::Result<()>>>,
+    workers: Vec<JoinHandle<anyhow::Result<CaptureMetrics>>>,
     records: Option<AuthorityRecords>,
     cancelled: Arc<AtomicBool>,
 }
@@ -120,13 +121,16 @@ impl CaptureAttempt for VideoToolboxCaptureAttempt {
         let workers = std::mem::take(&mut self.workers);
         let records = self.records.take();
         let mut worker_error = None;
+        let mut metrics = CaptureMetrics::default();
         for worker in workers {
             let result = worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("videotoolbox decoder worker panicked"))
                 .and_then(|result| result);
-            if worker_error.is_none() {
-                worker_error = result.err();
+            match result {
+                Ok(worker_metrics) => metrics.include_worker(worker_metrics),
+                Err(error) if worker_error.is_none() => worker_error = Some(error),
+                Err(_) => {}
             }
         }
         if let Some(error) = worker_error {
@@ -159,6 +163,9 @@ impl CaptureAttempt for VideoToolboxCaptureAttempt {
             authority,
             diagnostics: CaptureDiagnostics {
                 backend: "videotoolbox",
+                availability: std::time::Duration::ZERO,
+                setup: std::time::Duration::ZERO,
+                metrics,
             },
         })
     }
@@ -186,7 +193,8 @@ struct DecodeRequest<'a> {
     device: &'a VideoToolboxDevice,
 }
 
-fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
+fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> {
+    let started = std::time::Instant::now();
     let DecodeRequest {
         video,
         capture_index,
@@ -257,6 +265,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
     let mut packet_durations = HashMap::new();
     let mut nonref = true;
     let mut selected = Vec::new();
+    let mut metrics = CaptureMetrics::default();
     for (packet_stream, packet) in input.packets() {
         ensure!(
             !cancelled.load(Ordering::Acquire),
@@ -297,6 +306,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
             &mut last_duration,
             &packet_durations,
             &mut selected,
+            &mut metrics,
         )?;
         if schedule.is_complete() {
             break;
@@ -322,6 +332,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
             &mut last_duration,
             &packet_durations,
             &mut selected,
+            &mut metrics,
         )?;
     }
     if !schedule.is_complete() {
@@ -341,6 +352,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
             sender,
             &mut previous_decoded,
             &mut selected,
+            &mut metrics,
         )?;
     }
     ensure!(
@@ -354,7 +366,8 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
         );
         records.lock().unwrap()[capture_index] = Some(selected);
     }
-    Ok(())
+    metrics.decode = started.elapsed();
+    Ok(metrics)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -374,8 +387,10 @@ fn receive_frames(
     last_duration: &mut Option<i64>,
     packet_durations: &HashMap<i64, i64>,
     selected: &mut Vec<SourceSelection>,
+    metrics: &mut CaptureMetrics,
 ) -> anyhow::Result<()> {
     while decoder.receive_frame(decoded).is_ok() {
+        metrics.decoded_frames += 1;
         ensure!(
             decoded.format() == Pixel::VIDEOTOOLBOX,
             "videotoolbox decode fell back to software pixel format {:?}",
@@ -393,6 +408,7 @@ fn receive_frames(
         };
         *input_frame_index += 1;
         if current.pts < schedule.source_pts_offset() {
+            metrics.preroll_frames += 1;
             continue;
         }
         if let Some(pending) = pending_decoded.take() {
@@ -414,6 +430,7 @@ fn receive_frames(
                 sender,
                 previous_decoded,
                 selected,
+                metrics,
             )?;
         }
         *pending_decoded = Some(current);
@@ -441,6 +458,7 @@ fn emit_scheduled_frames(
     sender: &SyncSender<anyhow::Result<CaptureFrame>>,
     previous_decoded: &mut Option<Video>,
     selected: &mut Vec<SourceSelection>,
+    metrics: &mut CaptureMetrics,
 ) -> anyhow::Result<()> {
     let scheduled = schedule.push(SourceFrame {
         input_frame_index: current.input_frame_index,
@@ -455,7 +473,7 @@ fn emit_scheduled_frames(
                 "videotoolbox frame schedule selected a previous source frame that was not retained",
             )?
         };
-        let image = transfer_and_scale(source, scaler, software, rgb, dimensions)?;
+        let image = transfer_and_scale(source, scaler, software, rgb, dimensions, metrics)?;
         selected.push(SourceSelection {
             source_pts: frame.source_pts,
             source_time_base: format!(
@@ -482,7 +500,9 @@ fn transfer_and_scale(
     software: &mut Video,
     rgb: &mut Video,
     dimensions: (u32, u32),
+    metrics: &mut CaptureMetrics,
 ) -> anyhow::Result<RgbImage> {
+    let transfer_started = std::time::Instant::now();
     ensure!(
         source.format() == Pixel::VIDEOTOOLBOX,
         "videotoolbox transfer received a non-hardware source frame"
@@ -516,7 +536,10 @@ fn transfer_and_scale(
         .expect("scaler was initialized above")
         .run(software, rgb)
         .context("videotoolbox transfer failed while scaling RGB frame")?;
-    copy_rgb(rgb)
+    let image = copy_rgb(rgb)?;
+    metrics.hardware_transfers += 1;
+    metrics.transfer += transfer_started.elapsed();
+    Ok(image)
 }
 
 fn copy_rgb(frame: &Video) -> anyhow::Result<RgbImage> {
@@ -636,12 +659,41 @@ impl Drop for VideoToolboxDevice {
 
 fn shared_device() -> anyhow::Result<Arc<VideoToolboxDevice>> {
     static DEVICE: OnceLock<Result<Arc<VideoToolboxDevice>, String>> = OnceLock::new();
-    match DEVICE.get_or_init(|| {
-        VideoToolboxDevice::new()
-            .map(Arc::new)
-            .map_err(|error| format!("{error:#}"))
-    }) {
+    cached_device(&DEVICE, VideoToolboxDevice::new)
+}
+
+fn cached_device<T>(
+    cache: &OnceLock<Result<Arc<T>, String>>,
+    create: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<Arc<T>> {
+    match cache.get_or_init(|| create().map(Arc::new).map_err(|error| format!("{error:#}"))) {
         Ok(device) => Ok(Arc::clone(device)),
         Err(error) => anyhow::bail!("creating shared VideoToolbox device failed: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn deterministic_device_failure_is_cached_for_later_capture_jobs() {
+        let cache = OnceLock::<Result<Arc<()>, String>>::new();
+        let attempts = Cell::new(0);
+
+        for _ in 0..2 {
+            let error = cached_device(&cache, || {
+                attempts.set(attempts.get() + 1);
+                anyhow::bail!("no VideoToolbox device")
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "creating shared VideoToolbox device failed: no VideoToolbox device"
+            );
+        }
+
+        assert_eq!(attempts.get(), 1);
     }
 }

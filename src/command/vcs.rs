@@ -189,13 +189,16 @@ impl Vcs {
         for failure in &selected.failures {
             eprintln!("capture fallback: {failure}; retrying the next backend");
         }
-        if profile {
-            for unavailable in &selected.skipped {
-                eprintln!("[profile] attempt {unavailable}");
-            }
+        eprintln!(
+            "capture selected backend={}",
+            selected.value.capture_completion.diagnostics.backend
+        );
+        for unavailable in &selected.skipped {
+            eprintln!("capture fallback: {unavailable}; skipping unavailable backend");
         }
         let mut attempt = selected.value;
-        let capture_backend = attempt.capture_completion.diagnostics.backend;
+        let capture_diagnostics = attempt.capture_completion.diagnostics;
+        let capture_backend = capture_diagnostics.backend;
         let stream_timings = attempt.stream_timings;
         let encoder_tail = attempt.encoder_tail;
         let prepared_authority = if let Some(mut authority) = attempt.authority.take() {
@@ -256,7 +259,15 @@ impl Vcs {
         spinner.finish();
         if profile {
             eprintln!(
-                "[profile] backend={capture_backend} setup={:.3}s first_grid={:.3}s frames_before_first_grid={} receive_wait={:.3}s join={:.3}s encoder_write={:.3}s encoder_tail={:.3}s total={:.3}s",
+                "[profile] backend={capture_backend} availability={:.3}s backend_setup={:.3}s decode={:.3}s decoded_frames={} preroll_frames={} hardware_transfers={} transfer={:.3}s cleanup={:.3}s plan_setup={:.3}s first_grid={:.3}s frames_before_first_grid={} receive_wait={:.3}s join={:.3}s encoder_write={:.3}s encoder_tail={:.3}s total={:.3}s",
+                capture_diagnostics.availability.as_secs_f64(),
+                capture_diagnostics.setup.as_secs_f64(),
+                capture_diagnostics.metrics.decode.as_secs_f64(),
+                capture_diagnostics.metrics.decoded_frames,
+                capture_diagnostics.metrics.preroll_frames,
+                capture_diagnostics.metrics.hardware_transfers,
+                capture_diagnostics.metrics.transfer.as_secs_f64(),
+                capture_diagnostics.metrics.cleanup.as_secs_f64(),
                 setup_elapsed.as_secs_f64(),
                 stream_timings.first_grid.as_secs_f64(),
                 stream_timings.frames_before_first_grid,
@@ -272,21 +283,30 @@ impl Vcs {
 }
 
 fn ensure_in_process_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> anyhow::Result<()> {
+    ensure_backend_preview_profile(vcs, vcs.capture_backend, is_jpg, is_webp)
+}
+
+fn ensure_backend_preview_profile(
+    vcs: &Vcs,
+    backend: command::CaptureBackendPolicy,
+    is_jpg: bool,
+    is_webp: bool,
+) -> anyhow::Result<()> {
     if !matches!(
-        vcs.capture_backend,
+        backend,
         command::CaptureBackendPolicy::Libav | command::CaptureBackendPolicy::VideoToolbox
     ) {
         return Ok(());
     }
     ensure!(
-        is_libav_preview_profile(vcs, is_jpg, is_webp),
+        is_in_process_preview_profile(vcs, is_jpg, is_webp),
         "Capture backend {} is unavailable: requires the fixed Preview profile",
-        vcs.capture_backend.name(),
+        backend.name(),
     );
     Ok(())
 }
 
-fn is_libav_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> bool {
+fn is_in_process_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> bool {
     vcs.columns == 3
         && vcs.capture_height == Some(160)
         && vcs.capture_width.is_none()
@@ -490,16 +510,9 @@ fn run_vcs_attempt(
     backend: command::CaptureBackendPolicy,
     context: &VcsAttemptContext,
 ) -> Result<VcsAttempt, command::CaptureAttemptError> {
-    if backend == command::CaptureBackendPolicy::Libav
-        && !is_libav_preview_profile(vcs, context.is_jpg, context.is_webp)
-    {
-        return Err(command::CaptureBackendFailure::unavailable(
-            backend,
-            "eligibility",
-            anyhow::anyhow!("requires the fixed Preview profile"),
-        )
-        .into());
-    }
+    ensure_backend_preview_profile(vcs, backend, context.is_jpg, context.is_webp).map_err(
+        |error| command::CaptureBackendFailure::unavailable(backend, "eligibility", error),
+    )?;
 
     context.spinner.set_message("Extracting");
     let stream = capture.start(backend, context.authority_manifest.is_some())?;
@@ -763,6 +776,37 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "Capture backend videotoolbox is unavailable: requires the fixed Preview profile"
+        );
+    }
+
+    #[test]
+    fn direct_vcs_skips_in_process_candidates_for_a_non_preview_profile() {
+        let mut vcs = Vcs::try_parse_from(["vimg", "-c3", "-H160", "-n9", "input.mkv"]).unwrap();
+        vcs.args.capture_frames = Some(30);
+        vcs.avif_crf = 31;
+
+        for backend in [
+            command::CaptureBackendPolicy::VideoToolbox,
+            command::CaptureBackendPolicy::Libav,
+        ] {
+            assert_eq!(
+                ensure_backend_preview_profile(&vcs, backend, false, false)
+                    .unwrap_err()
+                    .to_string(),
+                format!(
+                    "Capture backend {} is unavailable: requires the fixed Preview profile",
+                    backend.name()
+                )
+            );
+        }
+        assert!(
+            ensure_backend_preview_profile(
+                &vcs,
+                command::CaptureBackendPolicy::Ffmpeg,
+                false,
+                false,
+            )
+            .is_ok()
         );
     }
 

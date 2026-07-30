@@ -3,7 +3,7 @@
 use crate::command::frame_schedule::SourceFrame;
 use crate::command::{
     CaptureAttempt, CaptureAuthority, CaptureCompletion, CaptureDiagnostics, CaptureFrame,
-    CapturePlan, SourceSelection,
+    CaptureMetrics, CapturePlan, SourceSelection,
 };
 use anyhow::{Context, ensure};
 use ffmpeg::codec::{discard::Discard, threading};
@@ -83,7 +83,7 @@ struct LibavCaptureAttempt {
     receivers: Mutex<Vec<Receiver<anyhow::Result<CaptureFrame>>>>,
     next: Mutex<usize>,
     capture_count: usize,
-    workers: Vec<JoinHandle<anyhow::Result<()>>>,
+    workers: Vec<JoinHandle<anyhow::Result<CaptureMetrics>>>,
     records: Option<AuthorityRecords>,
     cancelled: Arc<AtomicBool>,
 }
@@ -106,13 +106,16 @@ impl CaptureAttempt for LibavCaptureAttempt {
         let workers = std::mem::take(&mut self.workers);
         let records = self.records.take();
         let mut worker_error = None;
+        let mut metrics = CaptureMetrics::default();
         for worker in workers {
             let result = worker
                 .join()
                 .map_err(|_| anyhow::anyhow!("libav decoder worker panicked"))
                 .and_then(|result| result);
-            if worker_error.is_none() {
-                worker_error = result.err();
+            match result {
+                Ok(worker_metrics) => metrics.include_worker(worker_metrics),
+                Err(error) if worker_error.is_none() => worker_error = Some(error),
+                Err(_) => {}
             }
         }
         if let Some(error) = worker_error {
@@ -143,7 +146,12 @@ impl CaptureAttempt for LibavCaptureAttempt {
             .unwrap_or_default();
         Ok(CaptureCompletion {
             authority,
-            diagnostics: CaptureDiagnostics { backend: "libav" },
+            diagnostics: CaptureDiagnostics {
+                backend: "libav",
+                availability: std::time::Duration::ZERO,
+                setup: std::time::Duration::ZERO,
+                metrics,
+            },
         })
     }
 }
@@ -169,7 +177,8 @@ struct DecodeRequest<'a> {
     cancelled: &'a AtomicBool,
 }
 
-fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
+fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> {
+    let started = std::time::Instant::now();
     let DecodeRequest {
         video,
         capture_index,
@@ -228,6 +237,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
     let mut packet_durations = HashMap::new();
     let mut nonref = true;
     let mut selected = Vec::new();
+    let mut metrics = CaptureMetrics::default();
     for (packet_stream, packet) in input.packets() {
         ensure!(
             !cancelled.load(Ordering::Acquire),
@@ -264,6 +274,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
             &mut last_duration,
             &packet_durations,
             &mut selected,
+            &mut metrics,
         )?;
         if schedule.is_complete() {
             break;
@@ -285,6 +296,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
             &mut last_duration,
             &packet_durations,
             &mut selected,
+            &mut metrics,
         )?;
     }
     if !schedule.is_complete() {
@@ -314,7 +326,8 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
         );
         records.lock().unwrap()[capture_index] = Some(selected);
     }
-    Ok(())
+    metrics.decode = started.elapsed();
+    Ok(metrics)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -332,8 +345,10 @@ fn receive_frames(
     last_duration: &mut Option<i64>,
     packet_durations: &HashMap<i64, i64>,
     selected: &mut Vec<SourceSelection>,
+    metrics: &mut CaptureMetrics,
 ) -> anyhow::Result<()> {
     while decoder.receive_frame(decoded).is_ok() {
+        metrics.decoded_frames += 1;
         let pts = decoded
             .timestamp()
             .or_else(|| decoded.pts())
@@ -349,6 +364,7 @@ fn receive_frames(
         // source timestamp at or after the planned start. libav seeking may expose
         // a few earlier display frames, which must remain preroll only.
         if current.pts < schedule.source_pts_offset() {
+            metrics.preroll_frames += 1;
             continue;
         }
         if let Some(pending) = pending_decoded.take() {

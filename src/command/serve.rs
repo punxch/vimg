@@ -549,6 +549,8 @@ mod tests {
         for policy in [
             command::CaptureBackendPolicy::Ffmpeg,
             command::CaptureBackendPolicy::Auto,
+            command::CaptureBackendPolicy::Libav,
+            command::CaptureBackendPolicy::VideoToolbox,
         ] {
             let scheduler = Scheduler {
                 state: Mutex::new(QueueState::default()),
