@@ -7,7 +7,10 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
+  # --- Default (feature-off) builds ---
+
+  test-linux:
+    name: Test (Linux, default features)
     runs-on: ubuntu-latest
     env:
       RUST_BACKTRACE: 1
@@ -19,6 +22,44 @@ jobs:
     - run: cargo run --locked -- print-completions bash
     - run: cargo run --locked -- print-completions fish
     - run: cargo run --locked -- print-completions zsh
+
+  test-macos:
+    name: Test (macOS, default features)
+    runs-on: macos-latest
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+    - run: rustup update stable
+    - uses: actions/checkout@v4
+    - run: cargo test --locked
+
+  # --- Feature-on builds (in-process-decode) ---
+
+  test-linux-feature-on:
+    name: Test (Linux, --features in-process-decode)
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+    - run: rustup update stable
+    - uses: actions/checkout@v4
+    - name: Install FFmpeg dev libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libavcodec-dev libavformat-dev libavfilter-dev libavutil-dev libswscale-dev
+    - run: cargo test --features in-process-decode --locked
+
+  test-macos-feature-on:
+    name: Test (macOS, --features in-process-decode)
+    runs-on: macos-latest
+    env:
+      RUST_BACKTRACE: 1
+    steps:
+    - run: rustup update stable
+    - uses: actions/checkout@v4
+    - name: Install FFmpeg
+      run: brew install ffmpeg
+    - run: cargo test --features in-process-decode --locked
 
   rustfmt:
     runs-on: ubuntu-latest
