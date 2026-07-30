@@ -2,7 +2,7 @@ use crate::command;
 use anyhow::{Context, ensure};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs,
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -18,7 +18,11 @@ const MAX_JOBS: usize = 10;
 
 /// Run as a background service, listening for vimg jobs via TCP.
 #[derive(clap::Parser, Debug)]
-pub struct Serve {}
+pub struct Serve {
+    /// Capture implementation fixed for every job in this service process.
+    #[arg(long, value_enum, default_value_t = command::CaptureBackendPolicy::Ffmpeg)]
+    pub capture_backend: command::CaptureBackendPolicy,
+}
 
 /// Send a vimg job to the running service.
 #[derive(clap::Parser, Debug)]
@@ -140,6 +144,7 @@ impl Job {
 #[derive(Default)]
 struct QueueState {
     jobs: HashSet<PathBuf>,
+    subscribers: HashMap<PathBuf, HashSet<String>>,
     queued: VecDeque<Job>,
     active: Option<PathBuf>,
 }
@@ -170,6 +175,7 @@ impl Scheduler {
     fn submit(&self, job: Job) -> SubmitResult {
         let mut state = self.state.lock().unwrap();
         if state.jobs.contains(&job.cache) {
+            add_subscriber(&mut state, &job);
             return SubmitResult::Shared;
         }
 
@@ -177,11 +183,13 @@ impl Scheduler {
         if state.jobs.len() >= MAX_JOBS {
             if let Some(evicted) = state.queued.pop_front() {
                 state.jobs.remove(&evicted.cache);
+                state.subscribers.remove(&evicted.cache);
             } else {
                 return SubmitResult::Busy;
             }
         }
 
+        add_subscriber(&mut state, &job);
         state.jobs.insert(job.cache.clone());
         state.queued.push_back(job);
         self.ready.notify_one();
@@ -200,10 +208,26 @@ impl Scheduler {
         job
     }
 
-    fn finish(&self, cache: &Path) {
+    fn finish(&self, cache: &Path) -> Vec<String> {
         let mut state = self.state.lock().unwrap();
         state.jobs.remove(cache);
         state.active = None;
+        state
+            .subscribers
+            .remove(cache)
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
+    }
+}
+
+fn add_subscriber(state: &mut QueueState, job: &Job) {
+    if let Some(yazi_id) = &job.yazi_id {
+        state
+            .subscribers
+            .entry(job.cache.clone())
+            .or_default()
+            .insert(yazi_id.clone());
     }
 }
 
@@ -214,7 +238,7 @@ impl Serve {
             ready: Condvar::new(),
         });
         let worker_scheduler = Arc::clone(&scheduler);
-        thread::spawn(move || worker(worker_scheduler));
+        thread::spawn(move || worker(worker_scheduler, self.capture_backend));
 
         let addr: SocketAddr = BIND_ADDR.parse().unwrap();
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -246,15 +270,19 @@ fn handle_client(mut stream: TcpStream, scheduler: &Scheduler) {
         let _ = stream.write_all(b"error: invalid request\n");
         return;
     }
-    let Some(job) = Job::from_json(line.trim()) else {
+    let Ok(state) = submit_request(line.trim(), scheduler) else {
         let _ = stream.write_all(b"error: invalid json\n");
         return;
     };
-    let state = scheduler.submit(job);
     let _ = stream.write_all(format!("{}\n", state.protocol()).as_bytes());
 }
 
-fn worker(scheduler: Arc<Scheduler>) {
+fn submit_request(line: &str, scheduler: &Scheduler) -> Result<SubmitResult, ()> {
+    let job = Job::from_json(line).ok_or(())?;
+    Ok(scheduler.submit(job))
+}
+
+fn worker(scheduler: Arc<Scheduler>, capture_backend: command::CaptureBackendPolicy) {
     loop {
         let job = scheduler.next();
         let started = Instant::now();
@@ -263,21 +291,71 @@ fn worker(scheduler: Arc<Scheduler>) {
             job.file_name(),
             job.cache.display()
         );
-        match run_vcs(&job.file, &job.cache, job.media.as_ref()) {
-            Ok(()) => match publish_manifest(&job) {
-                Ok(()) => {
-                    notify_yazi(&job);
-                    println!(
-                        "[serve] Done: {} ({:.1}s)",
-                        job.file_name(),
-                        started.elapsed().as_secs_f32()
-                    );
-                }
-                Err(error) => eprintln!("[serve] Manifest error: {}: {error}", job.file_name()),
-            },
-            Err(error) => eprintln!("[serve] Error: {}: {error}", job.file_name()),
+        let completion = complete_job(
+            &scheduler,
+            &job,
+            capture_backend,
+            |backend| run_vcs(&job.file, &job.cache, job.media.as_ref(), backend),
+            || publish_manifest(&job),
+        );
+        match completion.outcome {
+            ServiceJobOutcome::Published => {
+                notify_yazi(
+                    &job.file,
+                    &completion.subscribers,
+                    "gridthumb-avif-ready",
+                    None,
+                );
+                println!(
+                    "[serve] Done: {} ({:.1}s)",
+                    job.file_name(),
+                    started.elapsed().as_secs_f32()
+                );
+            }
+            ServiceJobOutcome::Failed(reason) => notify_yazi(
+                &job.file,
+                &completion.subscribers,
+                "gridthumb-avif-failed",
+                Some(&reason),
+            ),
         }
-        scheduler.finish(&job.cache);
+    }
+}
+
+struct ServiceCompletion {
+    outcome: ServiceJobOutcome,
+    subscribers: Vec<String>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ServiceJobOutcome {
+    Published,
+    Failed(String),
+}
+
+fn complete_job(
+    scheduler: &Scheduler,
+    job: &Job,
+    capture_backend: command::CaptureBackendPolicy,
+    run_capture: impl FnOnce(command::CaptureBackendPolicy) -> anyhow::Result<()>,
+    publish: impl FnOnce() -> anyhow::Result<()>,
+) -> ServiceCompletion {
+    let outcome = match run_capture(capture_backend) {
+        Ok(()) => match publish() {
+            Ok(()) => ServiceJobOutcome::Published,
+            Err(error) => {
+                eprintln!("[serve] Manifest error: {}: {error}", job.file_name());
+                ServiceJobOutcome::Failed(error.to_string())
+            }
+        },
+        Err(error) => {
+            eprintln!("[serve] Error: {}: {error}", job.file_name());
+            ServiceJobOutcome::Failed(error.to_string())
+        }
+    };
+    ServiceCompletion {
+        outcome,
+        subscribers: scheduler.finish(&job.cache),
     }
 }
 
@@ -327,25 +405,21 @@ fn publish_manifest(job: &Job) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn notify_yazi(job: &Job) {
-    let Some(yazi_id) = &job.yazi_id else {
-        return;
+fn notify_yazi(video: &Path, subscribers: &[String], event: &str, failure_reason: Option<&str>) {
+    let payload = match failure_reason {
+        Some(reason) => serde_json::json!({ "file": video.to_string_lossy(), "error": reason }),
+        None => serde_json::json!({ "file": video.to_string_lossy() }),
     };
-    let payload = serde_json::json!({ "file": job.file.to_string_lossy() });
     let payload = payload.to_string();
-    match ProcessCommand::new("ya")
-        .args([
-            "pub-to",
-            yazi_id,
-            "gridthumb-avif-ready",
-            "--json",
-            &payload,
-        ])
-        .status()
-    {
-        Ok(status) if status.success() => {}
-        Ok(status) => eprintln!("[serve] Yazi notification exited with {status}"),
-        Err(error) => eprintln!("[serve] Cannot notify Yazi: {error}"),
+    for yazi_id in subscribers {
+        match ProcessCommand::new("ya")
+            .args(["pub-to", yazi_id, event, "--json", &payload])
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => eprintln!("[serve] Yazi notification exited with {status}"),
+            Err(error) => eprintln!("[serve] Cannot notify Yazi: {error}"),
+        }
     }
 }
 
@@ -381,8 +455,18 @@ fn run_vcs(
     video: &Path,
     output: &Path,
     media: Option<&command::MediaDescriptor>,
+    capture_backend: command::CaptureBackendPolicy,
 ) -> anyhow::Result<()> {
     ensure!(video.exists(), "Video file not found: {}", video.display());
+    vcs_for_job(video, output, media, capture_backend).run()
+}
+
+fn vcs_for_job(
+    video: &Path,
+    output: &Path,
+    media: Option<&command::MediaDescriptor>,
+    capture_backend: command::CaptureBackendPolicy,
+) -> command::Vcs {
     command::Vcs {
         columns: 3,
         output: Some(output.to_path_buf()),
@@ -407,15 +491,16 @@ fn run_vcs(
         keep: false,
         webp: 0,
         profile: false,
-        capture_backend: command::CaptureBackendPolicy::Ffmpeg,
+        capture_backend,
         authority_manifest: None,
     }
-    .run()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+    use std::cell::Cell;
 
     fn job(cache: &str) -> Job {
         Job {
@@ -437,6 +522,89 @@ mod tests {
         assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Queued);
         assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Shared);
         assert_eq!(scheduler.next().cache, PathBuf::from("preview.avif"));
+    }
+
+    #[test]
+    fn coalesced_capture_job_completes_for_every_waiting_yazi_subscriber() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let mut first = job("preview.avif");
+        first.yazi_id = Some("first".to_owned());
+        let mut second = job("preview.avif");
+        second.yazi_id = Some("second".to_owned());
+
+        assert_eq!(scheduler.submit(first), SubmitResult::Queued);
+        assert_eq!(scheduler.submit(second), SubmitResult::Shared);
+        let active = scheduler.next();
+        let mut subscribers = scheduler.finish(&active.cache);
+        subscribers.sort();
+
+        assert_eq!(subscribers, ["first", "second"]);
+    }
+
+    #[test]
+    fn service_execution_seam_uses_the_startup_policy_for_explicit_and_auto_jobs() {
+        for policy in [
+            command::CaptureBackendPolicy::Ffmpeg,
+            command::CaptureBackendPolicy::Auto,
+        ] {
+            let scheduler = Scheduler {
+                state: Mutex::new(QueueState::default()),
+                ready: Condvar::new(),
+            };
+            assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Queued);
+            let active = scheduler.next();
+            let applied_policy = Cell::new(None);
+
+            let completion = complete_job(
+                &scheduler,
+                &active,
+                policy,
+                |backend| {
+                    applied_policy.set(Some(backend));
+                    Ok(())
+                },
+                || Ok(()),
+            );
+
+            assert_eq!(completion.outcome, ServiceJobOutcome::Published);
+            assert_eq!(applied_policy.get(), Some(policy));
+        }
+    }
+
+    #[test]
+    fn fatal_service_capture_error_skips_publication_and_releases_the_next_job() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let mut active_job = job("active.avif");
+        active_job.yazi_id = Some("waiting".to_owned());
+        assert_eq!(scheduler.submit(active_job), SubmitResult::Queued);
+        let active = scheduler.next();
+        assert_eq!(scheduler.submit(job("next.avif")), SubmitResult::Queued);
+        let published = Cell::new(false);
+
+        let completion = complete_job(
+            &scheduler,
+            &active,
+            command::CaptureBackendPolicy::Auto,
+            |_| anyhow::bail!("injected fatal capture error"),
+            || {
+                published.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            completion.outcome,
+            ServiceJobOutcome::Failed("injected fatal capture error".to_owned())
+        );
+        assert_eq!(completion.subscribers, ["waiting"]);
+        assert!(!published.get());
+        assert_eq!(scheduler.next().cache, PathBuf::from("next.avif"));
     }
 
     #[test]
@@ -498,5 +666,80 @@ mod tests {
             media.source_time_base,
             Some(command::frame_schedule::Rational::new(1, 1_000))
         );
+    }
+
+    #[test]
+    fn service_startup_policy_is_propagated_to_each_vcs_job() {
+        let vcs = vcs_for_job(
+            Path::new("video.mkv"),
+            Path::new("preview.avif"),
+            None,
+            command::CaptureBackendPolicy::Auto,
+        );
+
+        assert_eq!(vcs.capture_backend, command::CaptureBackendPolicy::Auto);
+    }
+
+    #[test]
+    fn service_accepts_the_same_named_backend_policy_values_as_vcs() {
+        let serve = Serve::try_parse_from(["vimg", "--capture-backend", "libav"]).unwrap();
+
+        assert_eq!(serve.capture_backend, command::CaptureBackendPolicy::Libav);
+    }
+
+    #[test]
+    fn request_backend_field_does_not_change_service_policy_or_cache_identity() {
+        let job = Job::from_json(
+            r#"{"file":"video.mkv","cache":"preview.avif","capture_backend":"libav"}"#,
+        )
+        .unwrap();
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+
+        assert_eq!(scheduler.submit(job.clone()), SubmitResult::Queued);
+        assert_eq!(scheduler.submit(job), SubmitResult::Shared);
+    }
+
+    #[test]
+    fn service_request_seam_remains_backend_agnostic() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let request = r#"{"file":"video.mkv","cache":"preview.avif","capture_backend":"libav"}"#;
+
+        assert_eq!(
+            submit_request(request, &scheduler).unwrap(),
+            SubmitResult::Queued
+        );
+        assert_eq!(
+            submit_request(request, &scheduler).unwrap(),
+            SubmitResult::Shared
+        );
+    }
+
+    #[test]
+    fn service_fatal_preflight_error_does_not_create_an_output() {
+        let root = temporary_test_dir("fatal-service-policy");
+        let output = root.join("preview.avif");
+        let error = run_vcs(
+            &root.join("missing.mkv"),
+            &output,
+            None,
+            command::CaptureBackendPolicy::Auto,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().starts_with("Video file not found:"));
+        assert!(!output.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temporary_test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("vimg-{label}-{}", fastrand::u64(..)));
+        fs::create_dir(&path).unwrap();
+        path
     }
 }
