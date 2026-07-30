@@ -17,6 +17,7 @@ clap = { version = "4.1.8", features = ["derive", "env", "wrap_help"] }
 clap_complete = "4.1.4"
 ctrlc = { version = "3.2.5", features = ["termination"] }
 fastrand = "2"
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["filter", "format"], optional = true }
 ffprobe = "0.4"
 glyph_brush_layout = "0.2.3"
 humantime = "2.1"
@@ -27,6 +28,9 @@ serde_json = "1"
 shell-escape = "0.1.5"
 socket2 = "0.5"
 
+[features]
+in-process-decode = ["dep:ffmpeg-next"]
+
 [profile.release]
 lto = true
 strip = true
@@ -36,4 +40,3 @@ unused_crate_dependencies = "deny"
 
 [profile.dev]
 debug = false
-

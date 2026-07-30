@@ -28,6 +28,14 @@ pub(crate) struct CapturePlan {
     schedules: Vec<FrameSchedule>,
     video: std::path::PathBuf,
     vfilter: Option<String>,
+    #[cfg_attr(
+        not(feature = "in-process-decode"),
+        allow(
+            dead_code,
+            reason = "only the optional libav backend distinguishes custom filters from planned scaling"
+        )
+    )]
+    has_custom_video_filter: bool,
     windows: Vec<CaptureWindow>,
     frame_width: u32,
     frame_height: u32,
@@ -95,6 +103,7 @@ impl CapturePlan {
             schedules,
             video: extract.video.clone(),
             vfilter,
+            has_custom_video_filter: extract.vfilter.is_some(),
             windows,
             frame_width,
             frame_height,
@@ -162,11 +171,29 @@ impl CapturePlan {
     pub(crate) fn vfilter(&self) -> Option<&str> {
         self.vfilter.as_deref()
     }
+
+    #[cfg_attr(
+        not(feature = "in-process-decode"),
+        allow(
+            dead_code,
+            reason = "only the optional libav backend distinguishes custom filters from planned scaling"
+        )
+    )]
+    pub(crate) const fn has_custom_video_filter(&self) -> bool {
+        self.has_custom_video_filter
+    }
 }
 
 /// The only Capture interface used by VCS orchestration in this stage.
 pub(crate) struct Capture {
     plan: CapturePlan,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CaptureBackendPolicy {
+    #[default]
+    Ffmpeg,
+    Libav,
 }
 
 impl Capture {
@@ -185,12 +212,30 @@ impl Capture {
         &self.plan
     }
 
-    pub(crate) fn start(&self, authority: bool) -> anyhow::Result<CaptureStream<'_>> {
+    pub(crate) fn start(
+        &self,
+        policy: CaptureBackendPolicy,
+        authority: bool,
+    ) -> anyhow::Result<CaptureStream<'_>> {
+        let inner: Box<dyn CaptureAttempt> = match policy {
+            CaptureBackendPolicy::Ffmpeg => FfmpegCaptureBackend.start(&self.plan, authority)?,
+            CaptureBackendPolicy::Libav => libav_attempt(&self.plan, authority)?,
+        };
         Ok(CaptureStream {
-            inner: FfmpegCaptureBackend.start(&self.plan, authority)?,
+            inner,
             plan: &self.plan,
         })
     }
+}
+
+#[cfg(feature = "in-process-decode")]
+fn libav_attempt(plan: &CapturePlan, authority: bool) -> anyhow::Result<Box<dyn CaptureAttempt>> {
+    crate::command::libav::start(plan, authority)
+}
+
+#[cfg(not(feature = "in-process-decode"))]
+fn libav_attempt(_: &CapturePlan, _: bool) -> anyhow::Result<Box<dyn CaptureAttempt>> {
+    anyhow::bail!("Capture backend libav is unavailable: rebuild with --features in-process-decode")
 }
 
 trait CaptureBackend {
@@ -234,7 +279,7 @@ pub(crate) struct CaptureDiagnostics {
     pub(crate) backend: &'static str,
 }
 
-trait CaptureAttempt {
+pub(crate) trait CaptureAttempt {
     fn recv(&self) -> anyhow::Result<CaptureFrame>;
     fn finish(self: Box<Self>) -> anyhow::Result<CaptureCompletion>;
 }
@@ -420,11 +465,27 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "in-process-decode"))]
+    #[test]
+    fn explicit_libav_policy_fails_fast_without_the_optional_build_feature() {
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+
+        let error = capture
+            .start(CaptureBackendPolicy::Libav, false)
+            .err()
+            .expect("feature-off libav policy must be unavailable");
+
+        assert_eq!(
+            error.to_string(),
+            "Capture backend libav is unavailable: rebuild with --features in-process-decode"
+        );
+    }
+
     #[test]
     #[ignore = "requires FFmpeg and the representative Preview input"]
     fn ffmpeg_capture_stream_emits_complete_preview_frames_and_authority() {
         let capture = Capture::plan(&preview_extract("sample/input.mkv"), Some(160), None).unwrap();
-        let stream = capture.start(true).unwrap();
+        let stream = capture.start(CaptureBackendPolicy::Ffmpeg, true).unwrap();
         let plan = stream.plan();
         let capture_count = plan.capture_count();
         let capture_frames = plan.capture_frames();

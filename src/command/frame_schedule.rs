@@ -279,6 +279,7 @@ fn format_source_pts(frame: &ScheduledFrame) -> String {
     )
 }
 
+#[derive(Clone)]
 pub(crate) struct FrameSchedule {
     capture_index: usize,
     source_time_base: Rational,
@@ -324,6 +325,17 @@ impl FrameSchedule {
 
     pub(crate) const fn source_time_base(&self) -> Rational {
         self.source_time_base
+    }
+
+    #[cfg_attr(
+        not(feature = "in-process-decode"),
+        allow(
+            dead_code,
+            reason = "the optional libav backend excludes seek preroll before scheduling"
+        )
+    )]
+    pub(crate) const fn source_pts_offset(&self) -> i64 {
+        self.source_pts_offset
     }
 
     pub(crate) const fn frame_count(&self) -> usize {

@@ -406,6 +406,7 @@ fn run_vcs(
         keep: false,
         webp: 0,
         profile: false,
+        capture_backend: command::CaptureBackendPolicy::Ffmpeg,
         authority_manifest: None,
     }
     .run()

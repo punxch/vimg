@@ -76,6 +76,10 @@ pub struct Vcs {
     #[arg(long, default_value_t = false)]
     pub profile: bool,
 
+    /// Capture implementation. `libav` is an explicit feature-on Preview-only backend.
+    #[arg(long, value_enum, default_value_t = command::CaptureBackendPolicy::Ffmpeg)]
+    pub capture_backend: command::CaptureBackendPolicy,
+
     /// Test-only authority manifest requested by `vimg authority record`.
     #[arg(skip)]
     pub(crate) authority_manifest: Option<PathBuf>,
@@ -109,6 +113,7 @@ impl Vcs {
             .unwrap_or_else(|| PathBuf::from("."));
 
         self.args.capture_frames = self.args.capture_frames.or(Some(30));
+        ensure_libav_preview_profile(&self, is_jpg, is_webp)?;
 
         let file_prefix = self.args.video.with_extension("");
         let file_prefix = file_prefix
@@ -148,7 +153,7 @@ impl Vcs {
         spinner.set_message("Extracting");
         let setup_started = Instant::now();
         let capture = command::Capture::plan(&self.args, self.capture_height, self.capture_width)?;
-        let extract = capture.start(authority_enabled)?;
+        let extract = capture.start(self.capture_backend, authority_enabled)?;
         let setup_elapsed = setup_started.elapsed();
 
         // Join and encode one frame at a time. The stream holds at most two frames
@@ -376,6 +381,31 @@ impl Vcs {
     }
 }
 
+fn ensure_libav_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> anyhow::Result<()> {
+    if vcs.capture_backend != command::CaptureBackendPolicy::Libav {
+        return Ok(());
+    }
+    ensure!(
+        vcs.columns == 3
+            && vcs.capture_height == Some(160)
+            && vcs.capture_width.is_none()
+            && vcs.args.number == 9
+            && vcs.args.capture_frames == Some(30)
+            && vcs.args.capture_time.seconds == 1.5
+            && vcs.args.vfilter.is_none()
+            && vcs.args.ignore_start == command::DurationOrPercent::Seconds(0.0)
+            && vcs.args.ignore_end == command::DurationOrPercent::Seconds(0.0)
+            && !is_jpg
+            && !is_webp
+            && vcs.avif_fps == 20.0
+            && vcs.avif_crf == 30
+            && vcs.avif_codec == "libsvtav1"
+            && vcs.avif_preset.is_none(),
+        "Capture backend libav is unavailable: requires the fixed Preview profile"
+    );
+    Ok(())
+}
+
 #[derive(Default)]
 struct StreamTimings {
     first_grid: Duration,
@@ -579,6 +609,24 @@ fn write_stream_frames(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn libav_backend_requires_the_fixed_preview_encoding_profile() {
+        let mut vcs = Vcs::try_parse_from(["vimg", "-c3", "-H160", "-n9", "input.mkv"]).unwrap();
+        vcs.args.capture_frames = Some(30);
+        vcs.capture_backend = command::CaptureBackendPolicy::Libav;
+
+        assert!(ensure_libav_preview_profile(&vcs, false, false).is_ok());
+
+        vcs.avif_crf = 31;
+        assert_eq!(
+            ensure_libav_preview_profile(&vcs, false, false)
+                .unwrap_err()
+                .to_string(),
+            "Capture backend libav is unavailable: requires the fixed Preview profile"
+        );
+    }
 
     #[test]
     fn uncommitted_output_publication_restores_previous_output() {

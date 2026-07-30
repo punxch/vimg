@@ -3,6 +3,8 @@ mod capture;
 mod extract;
 mod frame_schedule;
 mod join;
+#[cfg(feature = "in-process-decode")]
+mod libav;
 mod print_completions;
 mod serve;
 mod vcs;
