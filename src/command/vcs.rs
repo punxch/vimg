@@ -76,7 +76,7 @@ pub struct Vcs {
     #[arg(long, default_value_t = false)]
     pub profile: bool,
 
-    /// Capture implementation. `libav` is an explicit feature-on Preview-only backend.
+    /// Capture implementation. In-process backends are explicit, feature-on Preview-only options.
     #[arg(long, value_enum, default_value_t = command::CaptureBackendPolicy::Ffmpeg)]
     pub capture_backend: command::CaptureBackendPolicy,
 
@@ -112,7 +112,7 @@ impl Vcs {
             .unwrap_or_else(|| PathBuf::from("."));
 
         self.args.capture_frames = self.args.capture_frames.or(Some(30));
-        ensure_libav_preview_profile(&self, is_jpg, is_webp)?;
+        ensure_in_process_preview_profile(&self, is_jpg, is_webp)?;
 
         let file_prefix = self.args.video.with_extension("");
         let file_prefix = file_prefix
@@ -271,13 +271,17 @@ impl Vcs {
     }
 }
 
-fn ensure_libav_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> anyhow::Result<()> {
-    if vcs.capture_backend != command::CaptureBackendPolicy::Libav {
+fn ensure_in_process_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> anyhow::Result<()> {
+    if !matches!(
+        vcs.capture_backend,
+        command::CaptureBackendPolicy::Libav | command::CaptureBackendPolicy::VideoToolbox
+    ) {
         return Ok(());
     }
     ensure!(
         is_libav_preview_profile(vcs, is_jpg, is_webp),
-        "Capture backend libav is unavailable: requires the fixed Preview profile"
+        "Capture backend {} is unavailable: requires the fixed Preview profile",
+        vcs.capture_backend.name(),
     );
     Ok(())
 }
@@ -738,19 +742,46 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn libav_backend_requires_the_fixed_preview_encoding_profile() {
+    fn in_process_backends_require_the_fixed_preview_encoding_profile() {
         let mut vcs = Vcs::try_parse_from(["vimg", "-c3", "-H160", "-n9", "input.mkv"]).unwrap();
         vcs.args.capture_frames = Some(30);
         vcs.capture_backend = command::CaptureBackendPolicy::Libav;
 
-        assert!(ensure_libav_preview_profile(&vcs, false, false).is_ok());
+        assert!(ensure_in_process_preview_profile(&vcs, false, false).is_ok());
 
         vcs.avif_crf = 31;
         assert_eq!(
-            ensure_libav_preview_profile(&vcs, false, false)
+            ensure_in_process_preview_profile(&vcs, false, false)
                 .unwrap_err()
                 .to_string(),
             "Capture backend libav is unavailable: requires the fixed Preview profile"
+        );
+
+        vcs.capture_backend = command::CaptureBackendPolicy::VideoToolbox;
+        assert_eq!(
+            ensure_in_process_preview_profile(&vcs, false, false)
+                .unwrap_err()
+                .to_string(),
+            "Capture backend videotoolbox is unavailable: requires the fixed Preview profile"
+        );
+    }
+
+    #[test]
+    fn videotoolbox_uses_the_documented_capture_backend_value() {
+        let vcs = Vcs::try_parse_from([
+            "vimg",
+            "--capture-backend",
+            "videotoolbox",
+            "-c3",
+            "-H160",
+            "-n9",
+            "input.mkv",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            vcs.capture_backend,
+            command::CaptureBackendPolicy::VideoToolbox
         );
     }
 

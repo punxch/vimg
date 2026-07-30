@@ -1,21 +1,27 @@
-//! Optional software libav Capture backend for the fixed Preview profile.
+//! macOS VideoToolbox Capture backend for the fixed Preview profile.
+//!
+//! Each capture owns its demuxer and decoder context, while all contexts retain
+//! a reference to one process-wide VideoToolbox device. Decoded frames remain
+//! on the hardware surface until the shared schedule selects them.
 
 use crate::command::frame_schedule::SourceFrame;
 use crate::command::{
-    CaptureAttempt, CaptureAuthority, CaptureCompletion, CaptureDiagnostics, CaptureFrame,
-    CapturePlan, SourceSelection,
+    CaptureAttempt, CaptureAuthority, CaptureBackendPolicy, CaptureCompletion, CaptureDiagnostics,
+    CaptureFrame, CapturePlan, SourceSelection,
 };
 use anyhow::{Context, ensure};
 use ffmpeg::codec::{discard::Discard, threading};
-use ffmpeg::filter;
+use ffmpeg::format::Pixel;
 use ffmpeg::media::Type as MediaType;
+use ffmpeg::software::scaling::{context::Context as ScalingContext, flag::Flags};
 use ffmpeg::util::frame::video::Video;
 use ffmpeg_next as ffmpeg;
 use image::RgbImage;
 use std::{
     collections::HashMap,
+    ptr,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
@@ -23,14 +29,22 @@ use std::{
 };
 
 const NONREF_RECOVERY_MARGIN_S: f64 = 0.5;
-const DECODER_THREADS: usize = 3;
+const DECODER_THREADS: usize = 1;
 type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
+
+pub(super) fn availability(plan: &CapturePlan) -> anyhow::Result<()> {
+    plan.ensure_in_process_preview_profile(CaptureBackendPolicy::VideoToolbox)?;
+    ffmpeg::init().context("initializing VideoToolbox libav support")?;
+    let codec = decoder_for_media_codec(&plan.media().codec)?;
+    ensure_videotoolbox_support(codec)
+}
 
 pub(super) fn start(
     plan: &CapturePlan,
     authority: bool,
 ) -> anyhow::Result<Box<dyn CaptureAttempt>> {
-    ffmpeg::init().context("initializing software libav")?;
+    ffmpeg::init().context("initializing VideoToolbox libav support")?;
+    let device = shared_device()?;
 
     let mut receivers = Vec::with_capacity(plan.capture_count());
     let mut workers = Vec::with_capacity(plan.capture_count());
@@ -48,6 +62,7 @@ pub(super) fn start(
         let dimensions = plan.frame_dimensions();
         let records = records.clone();
         let cancelled = Arc::clone(&cancelled);
+        let device = Arc::clone(&device);
         workers.push(thread::spawn(move || {
             let result = decode_capture(DecodeRequest {
                 video: &video,
@@ -58,14 +73,17 @@ pub(super) fn start(
                 sender: &sender,
                 records,
                 cancelled: &cancelled,
+                device: &device,
             });
             if let Err(error) = &result {
-                let _ = sender.send(Err(anyhow::anyhow!("libav capture failed: {error:#}")));
+                let _ = sender.send(Err(anyhow::anyhow!(
+                    "videotoolbox capture failed: {error:#}"
+                )));
             }
             result
         }));
     }
-    Ok(Box::new(LibavCaptureAttempt {
+    Ok(Box::new(VideoToolboxCaptureAttempt {
         receivers: Mutex::new(receivers),
         next: Mutex::new(0),
         capture_count: plan.capture_count(),
@@ -75,11 +93,7 @@ pub(super) fn start(
     }))
 }
 
-pub(super) fn availability(plan: &CapturePlan) -> anyhow::Result<()> {
-    plan.ensure_in_process_preview_profile(crate::command::CaptureBackendPolicy::Libav)
-}
-
-struct LibavCaptureAttempt {
+struct VideoToolboxCaptureAttempt {
     receivers: Mutex<Vec<Receiver<anyhow::Result<CaptureFrame>>>>,
     next: Mutex<usize>,
     capture_count: usize,
@@ -88,7 +102,7 @@ struct LibavCaptureAttempt {
     cancelled: Arc<AtomicBool>,
 }
 
-impl CaptureAttempt for LibavCaptureAttempt {
+impl CaptureAttempt for VideoToolboxCaptureAttempt {
     fn recv(&self) -> anyhow::Result<CaptureFrame> {
         let capture_index = {
             let mut next = self.next.lock().unwrap();
@@ -98,7 +112,7 @@ impl CaptureAttempt for LibavCaptureAttempt {
         };
         self.receivers.lock().unwrap()[capture_index]
             .recv()
-            .context("libav capture stream ended before all frames were produced")?
+            .context("videotoolbox capture stream ended before all frames were produced")?
     }
 
     fn finish(mut self: Box<Self>) -> anyhow::Result<CaptureCompletion> {
@@ -109,7 +123,7 @@ impl CaptureAttempt for LibavCaptureAttempt {
         for worker in workers {
             let result = worker
                 .join()
-                .map_err(|_| anyhow::anyhow!("libav decoder worker panicked"))
+                .map_err(|_| anyhow::anyhow!("videotoolbox decoder worker panicked"))
                 .and_then(|result| result);
             if worker_error.is_none() {
                 worker_error = result.err();
@@ -123,7 +137,7 @@ impl CaptureAttempt for LibavCaptureAttempt {
                 Arc::try_unwrap(records)
                     .map_err(|_| {
                         anyhow::anyhow!(
-                            "libav decoder records remained shared after worker completion"
+                            "videotoolbox decoder records remained shared after worker completion"
                         )
                     })?
                     .into_inner()
@@ -134,7 +148,7 @@ impl CaptureAttempt for LibavCaptureAttempt {
                         Ok(CaptureAuthority {
                             capture_index,
                             frames: frames
-                                .context("libav decoder produced no source PTS record")?,
+                                .context("videotoolbox decoder produced no source PTS record")?,
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()
@@ -143,12 +157,14 @@ impl CaptureAttempt for LibavCaptureAttempt {
             .unwrap_or_default();
         Ok(CaptureCompletion {
             authority,
-            diagnostics: CaptureDiagnostics { backend: "libav" },
+            diagnostics: CaptureDiagnostics {
+                backend: "videotoolbox",
+            },
         })
     }
 }
 
-impl Drop for LibavCaptureAttempt {
+impl Drop for VideoToolboxCaptureAttempt {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Release);
         self.receivers.get_mut().unwrap().clear();
@@ -167,6 +183,7 @@ struct DecodeRequest<'a> {
     sender: &'a SyncSender<anyhow::Result<CaptureFrame>>,
     records: Option<AuthorityRecords>,
     cancelled: &'a AtomicBool,
+    device: &'a VideoToolboxDevice,
 }
 
 fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
@@ -179,17 +196,18 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
         sender,
         records,
         cancelled,
+        device,
     } = request;
     let mut input = ffmpeg::format::input(video)
-        .with_context(|| format!("opening input {}", video.display()))?;
+        .with_context(|| format!("videotoolbox opening input {}", video.display()))?;
     let stream = input
         .streams()
         .best(MediaType::Video)
-        .context("libav capture is unavailable: input has no video stream")?;
+        .context("videotoolbox decode unavailable: input has no video stream")?;
     let codec_id = stream.parameters().id();
     ensure!(
         matches!(codec_id, ffmpeg::codec::Id::H264 | ffmpeg::codec::Id::HEVC),
-        "libav capture is unavailable: only H.264 and HEVC are supported"
+        "videotoolbox decode unavailable: only H.264 and HEVC are supported"
     );
     let stream_index = stream.index();
     let time_base = stream.time_base();
@@ -199,7 +217,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
     );
     ensure!(
         source_time_base == schedule.source_time_base(),
-        "libav capture is unavailable: planned and decoded source time bases differ"
+        "videotoolbox decode unavailable: planned and decoded source time bases differ"
     );
     let parameters = stream.parameters();
     let mut context = ffmpeg::codec::context::Context::from_parameters(parameters)?;
@@ -207,19 +225,30 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
         kind: threading::Type::Frame,
         count: DECODER_THREADS,
     });
+    let codec = ffmpeg::decoder::find(context.id())
+        .context("videotoolbox setup unavailable: video decoder is unsupported")?;
+    ensure_videotoolbox_support(codec)?;
+    unsafe {
+        let context = context.as_mut_ptr();
+        (*context).get_format = Some(select_videotoolbox_format);
+        (*context).hw_device_ctx = device.new_reference()?;
+    }
     let mut decoder = context
         .decoder()
+        .open_as(codec)
+        .context("videotoolbox setup failed while opening hardware decoder")?
         .video()
-        .context("libav capture is unavailable: video decoder is unsupported")?;
-    let mut scaler = production_scale_filter(&decoder, dimensions, time_base)?;
+        .context("videotoolbox setup unavailable: hardware decoder is not video")?;
     decoder.skip_frame(Discard::NonReference);
     let target = (f64::from(start_s) * ffmpeg::ffi::AV_TIME_BASE as f64).round() as i64;
     input
         .seek(target, ..target)
-        .context("libav capture seek failed")?;
+        .context("videotoolbox seek failed")?;
     decoder.flush();
 
     let mut decoded = Video::empty();
+    let mut scaler = None;
+    let mut software = Video::empty();
     let mut rgb = Video::empty();
     let mut input_frame_index = 0_i64;
     let mut previous_decoded = None;
@@ -231,7 +260,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
     for (packet_stream, packet) in input.packets() {
         ensure!(
             !cancelled.load(Ordering::Acquire),
-            "libav capture cancelled"
+            "videotoolbox capture cancelled"
         );
         if packet_stream.index() != stream_index {
             continue;
@@ -249,12 +278,16 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
             decoder.skip_frame(Discard::Default);
             nonref = false;
         }
-        decoder.send_packet(&packet)?;
+        decoder
+            .send_packet(&packet)
+            .context("videotoolbox decode failed while submitting packet")?;
         receive_frames(
             &mut decoder,
-            &mut scaler,
             &mut decoded,
+            &mut scaler,
+            &mut software,
             &mut rgb,
+            dimensions,
             &mut schedule,
             source_time_base,
             sender,
@@ -270,12 +303,16 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
         }
     }
     if !schedule.is_complete() {
-        decoder.send_eof()?;
+        decoder
+            .send_eof()
+            .context("videotoolbox decode failed while flushing")?;
         receive_frames(
             &mut decoder,
-            &mut scaler,
             &mut decoded,
+            &mut scaler,
+            &mut software,
             &mut rgb,
+            dimensions,
             &mut schedule,
             source_time_base,
             sender,
@@ -289,13 +326,16 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
     }
     if !schedule.is_complete() {
         let pending =
-            pending_decoded.context("libav decoder produced no timestamped source frame")?;
-        let duration = last_duration.context("libav decoder produced no source-frame duration")?;
+            pending_decoded.context("videotoolbox decoder produced no timestamped source frame")?;
+        let duration =
+            last_duration.context("videotoolbox decoder produced no source-frame duration")?;
         emit_scheduled_frames(
             pending,
             duration,
             &mut scaler,
+            &mut software,
             &mut rgb,
+            dimensions,
             &mut schedule,
             source_time_base,
             sender,
@@ -305,12 +345,12 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
     }
     ensure!(
         schedule.is_complete(),
-        "libav capture ended before its 30 planned frames"
+        "videotoolbox decode ended before its 30 planned frames"
     );
     if let Some(records) = records {
         ensure!(
             !selected.is_empty(),
-            "libav decoder produced no selected frames"
+            "videotoolbox decoder produced no selected frames"
         );
         records.lock().unwrap()[capture_index] = Some(selected);
     }
@@ -320,9 +360,11 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn receive_frames(
     decoder: &mut ffmpeg::decoder::Video,
-    scaler: &mut filter::Graph,
     decoded: &mut Video,
+    scaler: &mut Option<ScalingContext>,
+    software: &mut Video,
     rgb: &mut Video,
+    dimensions: (u32, u32),
     schedule: &mut crate::command::frame_schedule::FrameSchedule,
     source_time_base: crate::command::frame_schedule::Rational,
     sender: &SyncSender<anyhow::Result<CaptureFrame>>,
@@ -334,10 +376,15 @@ fn receive_frames(
     selected: &mut Vec<SourceSelection>,
 ) -> anyhow::Result<()> {
     while decoder.receive_frame(decoded).is_ok() {
+        ensure!(
+            decoded.format() == Pixel::VIDEOTOOLBOX,
+            "videotoolbox decode fell back to software pixel format {:?}",
+            decoded.format()
+        );
         let pts = decoded
             .timestamp()
             .or_else(|| decoded.pts())
-            .context("libav capture is unavailable: decoded frame has no timestamp")?;
+            .context("videotoolbox decode unavailable: decoded frame has no timestamp")?;
         let current = PendingDecoded {
             image: decoded.clone(),
             pts,
@@ -345,9 +392,6 @@ fn receive_frames(
             duration: packet_durations.get(&pts).copied(),
         };
         *input_frame_index += 1;
-        // FFmpeg's input-side `-ss` begins the CFR filter at the first decoded
-        // source timestamp at or after the planned start. libav seeking may expose
-        // a few earlier display frames, which must remain preroll only.
         if current.pts < schedule.source_pts_offset() {
             continue;
         }
@@ -355,14 +399,16 @@ fn receive_frames(
             let duration = pending.duration.unwrap_or(current.pts - pending.pts);
             ensure!(
                 duration > 0,
-                "libav decoder produced non-monotonic source timestamps"
+                "videotoolbox decoder produced non-monotonic source timestamps"
             );
             *last_duration = Some(duration);
             emit_scheduled_frames(
                 pending,
                 duration,
                 scaler,
+                software,
                 rgb,
+                dimensions,
                 schedule,
                 source_time_base,
                 sender,
@@ -386,8 +432,10 @@ struct PendingDecoded {
 fn emit_scheduled_frames(
     current: PendingDecoded,
     duration: i64,
-    scaler: &mut filter::Graph,
+    scaler: &mut Option<ScalingContext>,
+    software: &mut Video,
     rgb: &mut Video,
+    dimensions: (u32, u32),
     schedule: &mut crate::command::frame_schedule::FrameSchedule,
     source_time_base: crate::command::frame_schedule::Rational,
     sender: &SyncSender<anyhow::Result<CaptureFrame>>,
@@ -404,22 +452,10 @@ fn emit_scheduled_frames(
             &current.image
         } else {
             previous_decoded.as_ref().context(
-                "libav frame schedule selected a previous source frame that was not retained",
+                "videotoolbox frame schedule selected a previous source frame that was not retained",
             )?
         };
-        scaler
-            .get("in")
-            .context("libav scale filter has no input")?
-            .source()
-            // av_buffersrc_add_frame may take ownership of the supplied frame;
-            // retain our decoded reference because CFR can select it again.
-            .add(&source.clone())?;
-        scaler
-            .get("out")
-            .context("libav scale filter has no output")?
-            .sink()
-            .frame(rgb)?;
-        let image = copy_rgb(rgb)?;
+        let image = transfer_and_scale(source, scaler, software, rgb, dimensions)?;
         selected.push(SourceSelection {
             source_pts: frame.source_pts,
             source_time_base: format!(
@@ -434,45 +470,53 @@ fn emit_scheduled_frames(
                 animation_index: frame.animation_index,
                 image,
             }))
-            .context("libav frame consumer stopped")?;
+            .context("videotoolbox frame consumer stopped")?;
     }
     *previous_decoded = Some(current.image);
     Ok(())
 }
 
-fn production_scale_filter(
-    decoder: &ffmpeg::decoder::Video,
+fn transfer_and_scale(
+    source: &Video,
+    scaler: &mut Option<ScalingContext>,
+    software: &mut Video,
+    rgb: &mut Video,
     dimensions: (u32, u32),
-    time_base: ffmpeg::Rational,
-) -> anyhow::Result<filter::Graph> {
-    let mut graph = filter::Graph::new();
-    let args = format!(
-        "video_size={}x{}:pix_fmt={}:time_base={}:pixel_aspect=1/1",
-        decoder.width(),
-        decoder.height(),
-        decoder
-            .format()
-            .descriptor()
-            .context("libav capture is unavailable: decoder pixel format is unsupported")?
-            .name(),
-        time_base,
+) -> anyhow::Result<RgbImage> {
+    ensure!(
+        source.format() == Pixel::VIDEOTOOLBOX,
+        "videotoolbox transfer received a non-hardware source frame"
     );
-    graph.add(
-        &filter::find("buffer").context("libav scale filter is unavailable")?,
-        "in",
-        &args,
-    )?;
-    graph.add(
-        &filter::find("buffersink").context("libav scale filter is unavailable")?,
-        "out",
-        "",
-    )?;
-    graph.output("in", 0)?.input("out", 0)?.parse(&format!(
-        "scale=-1:{}:flags=bicubic,format=rgb24",
-        dimensions.1
-    ))?;
-    graph.validate()?;
-    Ok(graph)
+    unsafe {
+        ffmpeg::ffi::av_frame_unref(software.as_mut_ptr());
+    }
+    let result =
+        unsafe { ffmpeg::ffi::av_hwframe_transfer_data(software.as_mut_ptr(), source.as_ptr(), 0) };
+    ensure!(
+        result >= 0,
+        "videotoolbox transfer failed: {}",
+        ffmpeg::Error::from(result)
+    );
+    if scaler.is_none() {
+        *scaler = Some(
+            ScalingContext::get(
+                software.format(),
+                software.width(),
+                software.height(),
+                Pixel::RGB24,
+                dimensions.0,
+                dimensions.1,
+                Flags::BICUBIC,
+            )
+            .context("videotoolbox transfer failed while creating RGB scaler")?,
+        );
+    }
+    scaler
+        .as_mut()
+        .expect("scaler was initialized above")
+        .run(software, rgb)
+        .context("videotoolbox transfer failed while scaling RGB frame")?;
+    copy_rgb(rgb)
 }
 
 fn copy_rgb(frame: &Video) -> anyhow::Result<RgbImage> {
@@ -480,12 +524,124 @@ fn copy_rgb(frame: &Video) -> anyhow::Result<RgbImage> {
     let height = frame.height() as usize;
     let row = width * 3;
     let stride = frame.stride(0);
-    ensure!(stride >= row, "libav capture emitted an invalid RGB stride");
+    ensure!(
+        stride >= row,
+        "videotoolbox transfer emitted an invalid RGB stride"
+    );
     let mut raw = vec![0; row * height];
     for index in 0..height {
         raw[index * row..(index + 1) * row]
             .copy_from_slice(&frame.data(0)[index * stride..index * stride + row]);
     }
     RgbImage::from_raw(width as u32, height as u32, raw)
-        .context("libav capture emitted an invalid RGB frame")
+        .context("videotoolbox transfer emitted an invalid RGB frame")
+}
+
+fn decoder_for_media_codec(codec: &str) -> anyhow::Result<ffmpeg::Codec> {
+    let id = match codec {
+        "h264" => ffmpeg::codec::Id::H264,
+        "hevc" => ffmpeg::codec::Id::HEVC,
+        _ => anyhow::bail!(
+            "Capture backend videotoolbox is unavailable: only H.264 and HEVC are supported (found {codec})"
+        ),
+    };
+    ffmpeg::decoder::find(id)
+        .with_context(|| format!("VideoToolbox decoder for {codec} is unavailable"))
+}
+
+fn ensure_videotoolbox_support(codec: ffmpeg::Codec) -> anyhow::Result<()> {
+    for index in 0.. {
+        let config = unsafe { ffmpeg::ffi::avcodec_get_hw_config(codec.as_ptr(), index) };
+        if config.is_null() {
+            break;
+        }
+        let config = unsafe { &*config };
+        if config.device_type == ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX
+            && config.methods & ffmpeg::ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32 != 0
+            && config.pix_fmt == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "VideoToolbox decoder {} does not expose hardware device support",
+        codec.name()
+    )
+}
+
+unsafe extern "C" fn select_videotoolbox_format(
+    _context: *mut ffmpeg::ffi::AVCodecContext,
+    formats: *const ffmpeg::ffi::AVPixelFormat,
+) -> ffmpeg::ffi::AVPixelFormat {
+    if formats.is_null() {
+        return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
+    }
+    let mut format = formats;
+    loop {
+        let value = unsafe { *format };
+        if value == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
+            return value;
+        }
+        if value == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
+            return value;
+        }
+        format = unsafe { format.add(1) };
+    }
+}
+
+struct VideoToolboxDevice {
+    reference: *mut ffmpeg::ffi::AVBufferRef,
+}
+
+unsafe impl Send for VideoToolboxDevice {}
+unsafe impl Sync for VideoToolboxDevice {}
+
+impl VideoToolboxDevice {
+    fn new() -> anyhow::Result<Self> {
+        let mut reference = ptr::null_mut();
+        let result = unsafe {
+            ffmpeg::ffi::av_hwdevice_ctx_create(
+                &mut reference,
+                ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                ptr::null(),
+                ptr::null_mut(),
+                0,
+            )
+        };
+        ensure!(
+            result >= 0 && !reference.is_null(),
+            "creating VideoToolbox device failed: {}",
+            ffmpeg::Error::from(result)
+        );
+        Ok(Self { reference })
+    }
+
+    fn new_reference(&self) -> anyhow::Result<*mut ffmpeg::ffi::AVBufferRef> {
+        let reference = unsafe { ffmpeg::ffi::av_buffer_ref(self.reference) };
+        ensure!(
+            !reference.is_null(),
+            "referencing VideoToolbox device failed"
+        );
+        Ok(reference)
+    }
+}
+
+impl Drop for VideoToolboxDevice {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(&mut self.reference);
+        }
+    }
+}
+
+fn shared_device() -> anyhow::Result<Arc<VideoToolboxDevice>> {
+    static DEVICE: OnceLock<Result<Arc<VideoToolboxDevice>, String>> = OnceLock::new();
+    match DEVICE.get_or_init(|| {
+        VideoToolboxDevice::new()
+            .map(Arc::new)
+            .map_err(|error| format!("{error:#}"))
+    }) {
+        Ok(device) => Ok(Arc::clone(device)),
+        Err(error) => anyhow::bail!("creating shared VideoToolbox device failed: {error}"),
+    }
 }

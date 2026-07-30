@@ -682,9 +682,12 @@ mod tests {
 
     #[test]
     fn service_accepts_the_same_named_backend_policy_values_as_vcs() {
-        let serve = Serve::try_parse_from(["vimg", "--capture-backend", "libav"]).unwrap();
+        let serve = Serve::try_parse_from(["vimg", "--capture-backend", "videotoolbox"]).unwrap();
 
-        assert_eq!(serve.capture_backend, command::CaptureBackendPolicy::Libav);
+        assert_eq!(
+            serve.capture_backend,
+            command::CaptureBackendPolicy::VideoToolbox
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@ mod libav;
 mod print_completions;
 mod serve;
 mod vcs;
+#[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+mod videotoolbox;
 
 pub use authority::*;
 pub(crate) use capture::*;

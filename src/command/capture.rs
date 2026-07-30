@@ -184,6 +184,42 @@ impl CapturePlan {
     pub(crate) const fn has_custom_video_filter(&self) -> bool {
         self.has_custom_video_filter
     }
+
+    #[cfg_attr(
+        not(feature = "in-process-decode"),
+        allow(
+            dead_code,
+            reason = "only optional in-process Capture backends use the fixed Preview eligibility"
+        )
+    )]
+    pub(crate) fn ensure_in_process_preview_profile(
+        &self,
+        backend: CaptureBackendPolicy,
+    ) -> anyhow::Result<()> {
+        let name = backend.name();
+        ensure!(
+            self.capture_count() == 9,
+            "Capture backend {name} is unavailable: requires the fixed Preview profile (9 captures)"
+        );
+        ensure!(
+            self.capture_frames() == 30,
+            "Capture backend {name} is unavailable: requires the fixed Preview profile (30 frames)"
+        );
+        ensure!(
+            self.frame_dimensions().1 == 160,
+            "Capture backend {name} is unavailable: requires the fixed Preview profile (height 160)"
+        );
+        ensure!(
+            !self.has_custom_video_filter(),
+            "Capture backend {name} is unavailable: custom video filters are unsupported"
+        );
+        ensure!(
+            matches!(self.media().codec.as_str(), "h264" | "hevc"),
+            "Capture backend {name} is unavailable: only H.264 and HEVC are supported (found {})",
+            self.media().codec,
+        );
+        Ok(())
+    }
 }
 
 /// The only Capture interface used by VCS orchestration in this stage.
@@ -197,6 +233,8 @@ pub enum CaptureBackendPolicy {
     #[default]
     Ffmpeg,
     Libav,
+    #[value(name = "videotoolbox")]
+    VideoToolbox,
 }
 
 impl CaptureBackendPolicy {
@@ -205,6 +243,7 @@ impl CaptureBackendPolicy {
             Self::Auto => "auto",
             Self::Ffmpeg => "ffmpeg",
             Self::Libav => "libav",
+            Self::VideoToolbox => "videotoolbox",
         }
     }
 }
@@ -372,6 +411,7 @@ impl Capture {
     ) -> &'static [CaptureBackendPolicy] {
         const FFMPEG: &[CaptureBackendPolicy] = &[CaptureBackendPolicy::Ffmpeg];
         const LIBAV: &[CaptureBackendPolicy] = &[CaptureBackendPolicy::Libav];
+        const VIDEOTOOLBOX: &[CaptureBackendPolicy] = &[CaptureBackendPolicy::VideoToolbox];
         #[cfg(feature = "in-process-decode")]
         const AUTO: &[CaptureBackendPolicy] =
             &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg];
@@ -381,6 +421,7 @@ impl Capture {
             CaptureBackendPolicy::Auto => AUTO,
             CaptureBackendPolicy::Ffmpeg => FFMPEG,
             CaptureBackendPolicy::Libav => LIBAV,
+            CaptureBackendPolicy::VideoToolbox => VIDEOTOOLBOX,
         }
     }
 
@@ -398,6 +439,13 @@ impl Capture {
                     CaptureBackendFailure::unavailable(policy, "eligibility", error)
                 })?;
                 libav_attempt(&self.plan, authority)
+                    .map_err(|error| CaptureBackendFailure::attempt(policy, "setup", error))?
+            }
+            CaptureBackendPolicy::VideoToolbox => {
+                videotoolbox_availability(&self.plan).map_err(|error| {
+                    CaptureBackendFailure::unavailable(policy, "eligibility", error)
+                })?;
+                videotoolbox_attempt(&self.plan, authority)
                     .map_err(|error| CaptureBackendFailure::attempt(policy, "setup", error))?
             }
             CaptureBackendPolicy::Auto => {
@@ -434,6 +482,29 @@ fn libav_attempt(plan: &CapturePlan, authority: bool) -> anyhow::Result<Box<dyn 
 #[cfg(not(feature = "in-process-decode"))]
 fn libav_attempt(_: &CapturePlan, _: bool) -> anyhow::Result<Box<dyn CaptureAttempt>> {
     anyhow::bail!("Capture backend libav is unavailable: rebuild with --features in-process-decode")
+}
+
+#[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+fn videotoolbox_availability(plan: &CapturePlan) -> anyhow::Result<()> {
+    crate::command::videotoolbox::availability(plan)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "in-process-decode")))]
+fn videotoolbox_availability(_: &CapturePlan) -> anyhow::Result<()> {
+    anyhow::bail!("requires macOS and --features in-process-decode")
+}
+
+#[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+fn videotoolbox_attempt(
+    plan: &CapturePlan,
+    authority: bool,
+) -> anyhow::Result<Box<dyn CaptureAttempt>> {
+    crate::command::videotoolbox::start(plan, authority)
+}
+
+#[cfg(not(all(target_os = "macos", feature = "in-process-decode")))]
+fn videotoolbox_attempt(_: &CapturePlan, _: bool) -> anyhow::Result<Box<dyn CaptureAttempt>> {
+    anyhow::bail!("requires macOS and --features in-process-decode")
 }
 
 trait CaptureBackend {
@@ -811,7 +882,7 @@ mod tests {
                     )
                     .into(),
                 ),
-                CaptureBackendPolicy::Auto => unreachable!(),
+                CaptureBackendPolicy::Auto | CaptureBackendPolicy::VideoToolbox => unreachable!(),
             },
         )
         .unwrap_err();
@@ -885,6 +956,22 @@ mod tests {
         );
     }
 
+    #[cfg(not(all(target_os = "macos", feature = "in-process-decode")))]
+    #[test]
+    fn explicit_videotoolbox_policy_fails_fast_without_macos_feature_support() {
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+
+        let error = capture
+            .start(CaptureBackendPolicy::VideoToolbox, false)
+            .err()
+            .expect("unsupported VideoToolbox policy must be unavailable");
+
+        assert_eq!(
+            error.to_string(),
+            "videotoolbox unavailable during eligibility: requires macOS and --features in-process-decode"
+        );
+    }
+
     #[cfg(feature = "in-process-decode")]
     #[test]
     fn libav_policy_skips_unsupported_codecs_before_starting_an_attempt() {
@@ -900,6 +987,24 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "libav unavailable during eligibility: Capture backend libav is unavailable: only H.264 and HEVC are supported (found vp9)"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+    #[test]
+    fn videotoolbox_policy_skips_unsupported_codecs_before_creating_a_device() {
+        let mut extract = preview_extract("preview.mkv");
+        extract.media.as_mut().unwrap().codec = Some("vp9".to_owned());
+        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+
+        let error = capture
+            .start(CaptureBackendPolicy::VideoToolbox, false)
+            .err()
+            .expect("unsupported codec must be unavailable before VideoToolbox starts");
+
+        assert_eq!(
+            error.to_string(),
+            "videotoolbox unavailable during eligibility: Capture backend videotoolbox is unavailable: only H.264 and HEVC are supported (found vp9)"
         );
     }
 
