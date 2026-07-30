@@ -263,6 +263,7 @@ pub(crate) struct CaptureBackendFailure {
     class: CaptureFailureClass,
     phase: &'static str,
     reason: anyhow::Error,
+    diagnostics: Option<Box<CaptureDiagnostics>>,
 }
 
 impl CaptureBackendFailure {
@@ -276,6 +277,7 @@ impl CaptureBackendFailure {
             class: CaptureFailureClass::Unavailable,
             phase,
             reason,
+            diagnostics: None,
         }
     }
 
@@ -289,7 +291,13 @@ impl CaptureBackendFailure {
             class: CaptureFailureClass::AttemptFailed,
             phase,
             reason,
+            diagnostics: None,
         }
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: CaptureDiagnostics) -> Self {
+        self.diagnostics = Some(Box::new(diagnostics));
+        self
     }
 
     pub(crate) const fn class(&self) -> CaptureFailureClass {
@@ -305,6 +313,10 @@ impl CaptureBackendFailure {
     )]
     pub(crate) const fn backend(&self) -> CaptureBackendPolicy {
         self.backend
+    }
+
+    pub(crate) fn diagnostics(&self) -> Option<CaptureDiagnostics> {
+        self.diagnostics.as_deref().copied()
     }
 }
 
@@ -345,6 +357,13 @@ pub(crate) enum CaptureAttemptError {
 impl CaptureAttemptError {
     pub(crate) fn fatal(error: anyhow::Error) -> Self {
         Self::Fatal(error)
+    }
+
+    pub(crate) fn diagnostics(&self) -> Option<CaptureDiagnostics> {
+        match self {
+            Self::Backend(failure) => failure.diagnostics(),
+            Self::Fatal(_) => None,
+        }
     }
 }
 
@@ -630,26 +649,37 @@ impl CaptureAttempt for FfmpegCaptureAttempt {
 }
 
 impl CaptureStream<'_> {
+    fn diagnostics(&self) -> CaptureDiagnostics {
+        CaptureDiagnostics {
+            backend: self.backend.name(),
+            availability: self.availability,
+            setup: self.setup,
+            metrics: CaptureMetrics::default(),
+        }
+    }
+
     pub(crate) fn attempt_failure(
         &self,
         phase: &'static str,
         error: anyhow::Error,
     ) -> CaptureBackendFailure {
         CaptureBackendFailure::attempt(self.backend, phase, error)
+            .with_diagnostics(self.diagnostics())
     }
 
     pub(crate) fn recv(&self) -> Result<CaptureFrame, CaptureBackendFailure> {
         self.inner
             .recv()
-            .map_err(|error| CaptureBackendFailure::attempt(self.backend, "decode", error))
+            .map_err(|error| self.attempt_failure("decode", error))
     }
 
     pub(crate) fn finish(self) -> Result<CaptureCompletion, CaptureBackendFailure> {
         let cleanup_started = Instant::now();
-        let mut completion = self
-            .inner
-            .finish()
-            .map_err(|error| CaptureBackendFailure::attempt(self.backend, "completion", error))?;
+        let diagnostics = self.diagnostics();
+        let mut completion = self.inner.finish().map_err(|error| {
+            CaptureBackendFailure::attempt(self.backend, "completion", error)
+                .with_diagnostics(diagnostics)
+        })?;
         completion.diagnostics.availability = self.availability;
         completion.diagnostics.setup = self.setup;
         completion.diagnostics.metrics.cleanup = cleanup_started.elapsed();

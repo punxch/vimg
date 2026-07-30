@@ -4,7 +4,7 @@
 
 **Blocked by:** 07 — Propagate Capture backend policy through the local service; 08 — Deliver the explicit VideoToolbox Nonref backend.
 
-**Status:** claimed
+**Status:** complete
 
 - [x] macOS `auto` assembles VideoToolbox, software libav, and FFmpeg in the accepted order.
 - [x] A deterministic process-level VideoToolbox device failure is cached and skipped by later Capture jobs.
@@ -14,5 +14,5 @@
 - [x] Forced policies never participate in automatic fallback.
 - [x] No decoder context, child process, channel, frame buffer, encoder, or temporary output overlaps the next attempt.
 - [x] Normal diagnostics identify the selected backend and fallback reason without changing client responses.
-- [ ] Profiling includes availability, first frame/grid, decoded/preroll frames, hardware transfers, cleanup, encoder, and total timings per attempt.
+- [x] Profiling includes availability, first frame/grid, decoded/preroll frames, hardware transfers, cleanup, encoder, and total timings per attempt.
 - [x] Any successful backend publishes to the same cache identity.

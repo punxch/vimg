@@ -173,12 +173,7 @@ impl Vcs {
             let attempt_started = Instant::now();
             let result = run_vcs_attempt(&self, &capture, backend, &attempt_context);
             if profile {
-                eprintln!(
-                    "[profile] attempt backend={} total={:.3}s outcome={}",
-                    backend.name(),
-                    attempt_started.elapsed().as_secs_f64(),
-                    if result.is_ok() { "success" } else { "failed" },
-                );
+                report_attempt_profile(backend, attempt_started.elapsed(), &result);
             }
             result
         })?;
@@ -458,6 +453,60 @@ struct VcsAttempt {
     stream_timings: StreamTimings,
     encoder_tail: Duration,
     authority: Option<command::AuthorityRecorder>,
+}
+
+fn report_attempt_profile(
+    backend: command::CaptureBackendPolicy,
+    total: Duration,
+    result: &Result<VcsAttempt, command::CaptureAttemptError>,
+) {
+    eprintln!("{}", profile_attempt_line(backend, total, result));
+}
+
+fn profile_attempt_line(
+    backend: command::CaptureBackendPolicy,
+    total: Duration,
+    result: &Result<VcsAttempt, command::CaptureAttemptError>,
+) -> String {
+    let empty_stream = StreamTimings::default();
+    let (outcome, capture, stream, encoder_tail) = match result {
+        Ok(attempt) => (
+            "success",
+            attempt.capture_completion.diagnostics,
+            &attempt.stream_timings,
+            attempt.encoder_tail,
+        ),
+        Err(error) => (
+            "failed",
+            error.diagnostics().unwrap_or(command::CaptureDiagnostics {
+                backend: backend.name(),
+                availability: Duration::ZERO,
+                setup: Duration::ZERO,
+                metrics: command::CaptureMetrics::default(),
+            }),
+            &empty_stream,
+            Duration::ZERO,
+        ),
+    };
+    format!(
+        "[profile] attempt backend={} outcome={outcome} availability={:.3}s backend_setup={:.3}s decode={:.3}s decoded_frames={} preroll_frames={} hardware_transfers={} transfer={:.3}s cleanup={:.3}s first_grid={:.3}s frames_before_first_grid={} receive_wait={:.3}s join={:.3}s encoder_write={:.3}s encoder_tail={:.3}s total={:.3}s",
+        capture.backend,
+        capture.availability.as_secs_f64(),
+        capture.setup.as_secs_f64(),
+        capture.metrics.decode.as_secs_f64(),
+        capture.metrics.decoded_frames,
+        capture.metrics.preroll_frames,
+        capture.metrics.hardware_transfers,
+        capture.metrics.transfer.as_secs_f64(),
+        capture.metrics.cleanup.as_secs_f64(),
+        stream.first_grid.as_secs_f64(),
+        stream.frames_before_first_grid,
+        stream.receive_wait.as_secs_f64(),
+        stream.join.as_secs_f64(),
+        stream.encoder_write.as_secs_f64(),
+        encoder_tail.as_secs_f64(),
+        total.as_secs_f64(),
+    )
 }
 
 struct VcsAttemptContext<'a> {
@@ -841,6 +890,58 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn failed_attempt_profile_keeps_the_full_metric_schema() {
+        let diagnostics = command::CaptureDiagnostics {
+            backend: "libav",
+            availability: Duration::from_millis(10),
+            setup: Duration::from_millis(20),
+            metrics: command::CaptureMetrics {
+                decoded_frames: 42,
+                preroll_frames: 12,
+                hardware_transfers: 0,
+                decode: Duration::from_millis(30),
+                transfer: Duration::from_millis(40),
+                cleanup: Duration::from_millis(50),
+            },
+        };
+        let error = command::CaptureBackendFailure::attempt(
+            command::CaptureBackendPolicy::Libav,
+            "decode",
+            anyhow::anyhow!("injected decoder failure"),
+        )
+        .with_diagnostics(diagnostics)
+        .into();
+        let result: Result<VcsAttempt, command::CaptureAttemptError> = Err(error);
+
+        let line = profile_attempt_line(
+            command::CaptureBackendPolicy::Libav,
+            Duration::from_millis(60),
+            &result,
+        );
+
+        for field in [
+            "attempt backend=libav",
+            "outcome=failed",
+            "availability=0.010s",
+            "backend_setup=0.020s",
+            "decode=0.030s",
+            "decoded_frames=42",
+            "preroll_frames=12",
+            "hardware_transfers=0",
+            "transfer=0.040s",
+            "cleanup=0.050s",
+            "first_grid=0.000s",
+            "receive_wait=0.000s",
+            "join=0.000s",
+            "encoder_write=0.000s",
+            "encoder_tail=0.000s",
+            "total=0.060s",
+        ] {
+            assert!(line.contains(field), "missing {field} in {line}");
+        }
     }
 
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
