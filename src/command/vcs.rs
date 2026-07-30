@@ -169,23 +169,19 @@ impl Vcs {
             profile,
         };
 
-        let selected = command::execute_backend_candidates(
-            self.capture_backend,
-            capture.candidates(self.capture_backend),
-            |backend| {
-                let attempt_started = Instant::now();
-                let result = run_vcs_attempt(&self, &capture, backend, &attempt_context);
-                if profile {
-                    eprintln!(
-                        "[profile] attempt backend={} total={:.3}s outcome={}",
-                        backend.name(),
-                        attempt_started.elapsed().as_secs_f64(),
-                        if result.is_ok() { "success" } else { "failed" },
-                    );
-                }
-                result
-            },
-        )?;
+        let selected = execute_vcs_backend_candidates(&self, &capture, |backend| {
+            let attempt_started = Instant::now();
+            let result = run_vcs_attempt(&self, &capture, backend, &attempt_context);
+            if profile {
+                eprintln!(
+                    "[profile] attempt backend={} total={:.3}s outcome={}",
+                    backend.name(),
+                    attempt_started.elapsed().as_secs_f64(),
+                    if result.is_ok() { "success" } else { "failed" },
+                );
+            }
+            result
+        })?;
         for failure in &selected.failures {
             eprintln!("capture fallback: {failure}; retrying the next backend");
         }
@@ -280,6 +276,18 @@ impl Vcs {
         }
         Ok(())
     }
+}
+
+pub(super) fn execute_vcs_backend_candidates<T>(
+    vcs: &Vcs,
+    capture: &command::Capture,
+    attempt: impl FnMut(command::CaptureBackendPolicy) -> Result<T, command::CaptureAttemptError>,
+) -> anyhow::Result<command::BackendSelection<T>> {
+    command::execute_backend_candidates(
+        vcs.capture_backend,
+        capture.candidates(vcs.capture_backend),
+        attempt,
+    )
 }
 
 fn ensure_in_process_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> anyhow::Result<()> {
@@ -753,6 +761,31 @@ fn write_stream_frames(
 mod tests {
     use super::*;
     use clap::Parser;
+    #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+    use std::cell::RefCell;
+
+    #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+    fn preview_auto_vcs() -> Vcs {
+        let mut vcs = Vcs::try_parse_from([
+            "vimg",
+            "--capture-backend",
+            "auto",
+            "-c3",
+            "-H160",
+            "-n9",
+            "input.mkv",
+        ])
+        .unwrap();
+        vcs.args.capture_frames = Some(30);
+        vcs.args.media = Some(command::MediaDescriptor {
+            duration_s: Some(18.0),
+            width: Some(1920),
+            height: Some(1080),
+            codec: Some("h264".to_owned()),
+            source_time_base: Some(crate::command::frame_schedule::Rational::new(1, 1_000)),
+        });
+        vcs
+    }
 
     #[test]
     fn in_process_backends_require_the_fixed_preview_encoding_profile() {
@@ -808,6 +841,82 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+    #[test]
+    fn direct_vcs_auto_reaches_each_supported_fallback_outcome() {
+        for (case, expected_value, expected_started) in [
+            (
+                0,
+                "libav",
+                vec![
+                    command::CaptureBackendPolicy::VideoToolbox,
+                    command::CaptureBackendPolicy::Libav,
+                ],
+            ),
+            (
+                1,
+                "ffmpeg",
+                vec![
+                    command::CaptureBackendPolicy::VideoToolbox,
+                    command::CaptureBackendPolicy::Libav,
+                    command::CaptureBackendPolicy::Ffmpeg,
+                ],
+            ),
+            (
+                2,
+                "ffmpeg",
+                vec![
+                    command::CaptureBackendPolicy::VideoToolbox,
+                    command::CaptureBackendPolicy::Libav,
+                    command::CaptureBackendPolicy::Ffmpeg,
+                ],
+            ),
+        ] {
+            let vcs = preview_auto_vcs();
+            let capture =
+                command::Capture::plan(&vcs.args, vcs.capture_height, vcs.capture_width).unwrap();
+            let started = RefCell::new(Vec::new());
+            let selected = execute_vcs_backend_candidates(&vcs, &capture, |backend| {
+                started.borrow_mut().push(backend);
+                match (case, backend) {
+                    (0, command::CaptureBackendPolicy::VideoToolbox) => {
+                        Err(command::CaptureBackendFailure::attempt(
+                            backend,
+                            "decode",
+                            anyhow::anyhow!("hardware frame transfer failed"),
+                        )
+                        .into())
+                    }
+                    (0, command::CaptureBackendPolicy::Libav) => Ok("libav"),
+                    (1, command::CaptureBackendPolicy::VideoToolbox)
+                    | (1, command::CaptureBackendPolicy::Libav) => {
+                        Err(command::CaptureBackendFailure::attempt(
+                            backend,
+                            "completion",
+                            anyhow::anyhow!("injected backend failure"),
+                        )
+                        .into())
+                    }
+                    (2, command::CaptureBackendPolicy::VideoToolbox)
+                    | (2, command::CaptureBackendPolicy::Libav) => {
+                        Err(command::CaptureBackendFailure::unavailable(
+                            backend,
+                            "eligibility",
+                            anyhow::anyhow!("unsupported media capability"),
+                        )
+                        .into())
+                    }
+                    (_, command::CaptureBackendPolicy::Ffmpeg) => Ok("ffmpeg"),
+                    _ => unreachable!(),
+                }
+            })
+            .unwrap();
+
+            assert_eq!(selected.value, expected_value);
+            assert_eq!(started.into_inner(), expected_started);
+        }
     }
 
     #[test]

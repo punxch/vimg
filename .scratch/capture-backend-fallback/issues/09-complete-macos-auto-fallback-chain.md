@@ -10,7 +10,7 @@
 - [x] A deterministic process-level VideoToolbox device failure is cached and skipped by later Capture jobs.
 - [x] Codec and media capability failures affect only the current media.
 - [x] A runtime VideoToolbox attempt failure does not permanently disable hardware for later media.
-- [ ] Direct VCS and service tests cover VideoToolbox to libav, VideoToolbox through libav to FFmpeg, and direct capability skip to FFmpeg.
+- [x] Direct VCS and service tests cover VideoToolbox to libav, VideoToolbox through libav to FFmpeg, and direct capability skip to FFmpeg.
 - [x] Forced policies never participate in automatic fallback.
 - [x] No decoder context, child process, channel, frame buffer, encoder, or temporary output overlaps the next attempt.
 - [x] Normal diagnostics identify the selected backend and fallback reason without changing client responses.

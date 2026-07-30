@@ -501,6 +501,8 @@ mod tests {
     use super::*;
     use clap::Parser;
     use std::cell::Cell;
+    #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+    use std::cell::RefCell;
 
     fn job(cache: &str) -> Job {
         Job {
@@ -574,6 +576,84 @@ mod tests {
             assert_eq!(completion.outcome, ServiceJobOutcome::Published);
             assert_eq!(applied_policy.get(), Some(policy));
         }
+    }
+
+    #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
+    #[test]
+    fn service_auto_publishes_the_ffmpeg_result_after_both_in_process_attempts_fail() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Queued);
+        let active = scheduler.next();
+        let mut vcs = command::Vcs::try_parse_from([
+            "vimg",
+            "--capture-backend",
+            "auto",
+            "-c3",
+            "-H160",
+            "-n9",
+            "input.mkv",
+        ])
+        .unwrap();
+        vcs.args.capture_frames = Some(30);
+        vcs.args.media = Some(command::MediaDescriptor {
+            duration_s: Some(18.0),
+            width: Some(1920),
+            height: Some(1080),
+            codec: Some("h264".to_owned()),
+            source_time_base: Some(crate::command::frame_schedule::Rational::new(1, 1_000)),
+        });
+        let capture =
+            command::Capture::plan(&vcs.args, vcs.capture_height, vcs.capture_width).unwrap();
+        let started = RefCell::new(Vec::new());
+        let published = Cell::new(false);
+
+        let completion = complete_job(
+            &scheduler,
+            &active,
+            command::CaptureBackendPolicy::Auto,
+            |policy| {
+                assert_eq!(policy, command::CaptureBackendPolicy::Auto);
+                let _selected = crate::command::vcs::execute_vcs_backend_candidates(
+                    &vcs,
+                    &capture,
+                    |backend| {
+                        started.borrow_mut().push(backend);
+                        match backend {
+                            command::CaptureBackendPolicy::VideoToolbox
+                            | command::CaptureBackendPolicy::Libav => {
+                                Err(command::CaptureBackendFailure::attempt(
+                                    backend,
+                                    "decode",
+                                    anyhow::anyhow!("injected backend failure"),
+                                )
+                                .into())
+                            }
+                            command::CaptureBackendPolicy::Ffmpeg => Ok(()),
+                            command::CaptureBackendPolicy::Auto => unreachable!(),
+                        }
+                    },
+                )?;
+                Ok(())
+            },
+            || {
+                published.set(true);
+                Ok(())
+            },
+        );
+
+        assert_eq!(completion.outcome, ServiceJobOutcome::Published);
+        assert!(published.get());
+        assert_eq!(
+            started.into_inner(),
+            [
+                command::CaptureBackendPolicy::VideoToolbox,
+                command::CaptureBackendPolicy::Libav,
+                command::CaptureBackendPolicy::Ffmpeg,
+            ]
+        );
     }
 
     #[test]
