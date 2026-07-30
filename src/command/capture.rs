@@ -1,7 +1,9 @@
 //! One bounded Capture backend interface for VCS orchestration.
 
 use crate::command::{
-    CaptureAuthority, Extract, PipeExtractStream, frame_schedule::CaptureWindow, label,
+    CaptureAuthority, Extract, PipeExtractStream,
+    frame_schedule::{CaptureWindow, FrameSchedule, Rational},
+    label,
 };
 use anyhow::{Context, ensure};
 use image::RgbImage;
@@ -16,6 +18,14 @@ pub(crate) struct CapturePlan {
         )
     )]
     media: MediaProperties,
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "future Capture backends consume materialized schedules from the shared plan"
+        )
+    )]
+    schedules: Vec<FrameSchedule>,
     video: std::path::PathBuf,
     vfilter: Option<String>,
     windows: Vec<CaptureWindow>,
@@ -29,6 +39,7 @@ pub(crate) struct MediaProperties {
     pub(crate) duration_s: f32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) source_time_base: Rational,
 }
 
 impl CapturePlan {
@@ -74,9 +85,14 @@ impl CapturePlan {
             .iter()
             .map(|window| label::seconds_text(window.start_s() as u32))
             .collect();
+        let schedules = windows
+            .iter()
+            .map(|window| window.schedule(media.source_time_base))
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         Ok(Self {
             media,
+            schedules,
             video: extract.video.clone(),
             vfilter,
             windows,
@@ -127,6 +143,16 @@ impl CapturePlan {
 
     pub(crate) fn windows(&self) -> &[CaptureWindow] {
         &self.windows
+    }
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "future Capture backends consume materialized schedules from the shared plan"
+        )
+    )]
+    pub(crate) fn schedules(&self) -> &[FrameSchedule] {
+        &self.schedules
     }
 
     pub(crate) fn video(&self) -> &std::path::Path {
@@ -252,7 +278,10 @@ impl CaptureStream<'_> {
 fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
     let descriptor = extract.media.as_ref();
     let needs_probe = descriptor.is_none_or(|media| {
-        media.duration_s.is_none() || media.width.is_none() || media.height.is_none()
+        media.duration_s.is_none()
+            || media.width.is_none()
+            || media.height.is_none()
+            || media.source_time_base.is_none()
     });
     let probe = needs_probe
         .then(|| ffprobe::ffprobe(&extract.video))
@@ -284,10 +313,23 @@ fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
         .and_then(|media| media.height)
         .or_else(|| stream().and_then(|stream| stream.height.map(|height| height as u32)))
         .context("no height")?;
+    let source_time_base = match descriptor.and_then(|media| media.source_time_base) {
+        Some(source_time_base) => source_time_base,
+        None => {
+            let time_base = stream()
+                .map(|stream| stream.time_base.as_str())
+                .context("selected video stream has no time base")?;
+            let (numerator, denominator) = time_base
+                .split_once('/')
+                .context("invalid source time base")?;
+            Rational::new(numerator.parse()?, denominator.parse()?)
+        }
+    };
     Ok(MediaProperties {
         duration_s,
         width,
         height,
+        source_time_base,
     })
 }
 
@@ -339,6 +381,7 @@ mod tests {
                 duration_s: Some(18.0),
                 width: Some(1920),
                 height: Some(1080),
+                source_time_base: Some(Rational::new(1, 1_000)),
             }),
         }
     }
@@ -358,8 +401,15 @@ mod tests {
                 duration_s: 18.0,
                 width: 1920,
                 height: 1080,
+                source_time_base: Rational::new(1, 1_000),
             }
         );
+        assert_eq!(plan.schedules().len(), 9);
+        assert!(plan.schedules().iter().all(|schedule| {
+            schedule.source_time_base() == Rational::new(1, 1_000)
+                && schedule.frame_count() == 30
+                && !schedule.is_complete()
+        }));
         assert_eq!(plan.frame_dimensions(), (284, 160));
         assert_eq!(plan.grid_dimensions(3), (852, 480));
         assert_eq!(

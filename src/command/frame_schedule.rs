@@ -322,6 +322,14 @@ impl FrameSchedule {
         })
     }
 
+    pub(crate) const fn source_time_base(&self) -> Rational {
+        self.source_time_base
+    }
+
+    pub(crate) const fn frame_count(&self) -> usize {
+        self.frame_count
+    }
+
     pub(crate) fn push(&mut self, source: SourceFrame) -> anyhow::Result<Vec<ScheduledFrame>> {
         anyhow::ensure!(
             source.duration > 0,

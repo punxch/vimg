@@ -45,6 +45,12 @@ pub struct Send {
     /// Source video height captured by the preview client.
     #[arg(long)]
     pub height: Option<u32>,
+    /// Numerator of the selected video stream's time base, captured by the preview client.
+    #[arg(long)]
+    pub source_time_base_numerator: Option<i32>,
+    /// Denominator of the selected video stream's time base, captured by the preview client.
+    #[arg(long)]
+    pub source_time_base_denominator: Option<i32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -84,19 +90,37 @@ impl Job {
             .and_then(serde_json::Value::as_u64)
             .and_then(|height| u32::try_from(height).ok())
             .filter(|height| *height > 0);
+        let source_time_base = value
+            .get("source_time_base_numerator")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|numerator| i32::try_from(numerator).ok())
+            .filter(|numerator| *numerator > 0)
+            .zip(
+                value
+                    .get("source_time_base_denominator")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|denominator| i32::try_from(denominator).ok())
+                    .filter(|denominator| *denominator > 0),
+            )
+            .map(|(numerator, denominator)| {
+                command::frame_schedule::Rational::new(numerator, denominator)
+            });
         Some(Self {
             file: PathBuf::from(value.get("file")?.as_str()?),
             cache: PathBuf::from(value.get("cache")?.as_str()?),
             source: source_size
                 .zip(source_modified_s)
                 .map(|(size, modified_s)| SourceDescriptor { size, modified_s }),
-            media: (duration_s.is_some() || width.is_some() || height.is_some()).then_some(
-                command::MediaDescriptor {
-                    duration_s,
-                    width,
-                    height,
-                },
-            ),
+            media: (duration_s.is_some()
+                || width.is_some()
+                || height.is_some()
+                || source_time_base.is_some())
+            .then_some(command::MediaDescriptor {
+                duration_s,
+                width,
+                height,
+                source_time_base,
+            }),
             yazi_id: value
                 .get("yazi_id")
                 .and_then(serde_json::Value::as_str)
@@ -337,6 +361,8 @@ impl Send {
             "duration_s": self.duration_s,
             "width": self.width,
             "height": self.height,
+            "source_time_base_numerator": self.source_time_base_numerator,
+            "source_time_base_denominator": self.source_time_base_denominator,
         });
         stream.write_all(request.to_string().as_bytes())?;
         stream.write_all(b"\n")?;
@@ -459,12 +485,16 @@ mod tests {
     #[test]
     fn accepts_duration_and_dimensions_from_the_media_descriptor() {
         let job = Job::from_json(
-            r#"{"file":"video.mkv","cache":"preview.avif","duration_s":12.5,"width":1920,"height":1080}"#,
+            r#"{"file":"video.mkv","cache":"preview.avif","duration_s":12.5,"width":1920,"height":1080,"source_time_base_numerator":1,"source_time_base_denominator":1000}"#,
         )
         .unwrap();
         let media = job.media.unwrap();
         assert_eq!(media.duration_s, Some(12.5));
         assert_eq!(media.width, Some(1920));
         assert_eq!(media.height, Some(1080));
+        assert_eq!(
+            media.source_time_base,
+            Some(command::frame_schedule::Rational::new(1, 1_000))
+        );
     }
 }

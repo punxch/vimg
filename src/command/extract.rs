@@ -1,7 +1,8 @@
 use crate::{
     command::{
         CapturePlan, DurationOrPercent, HumanDuration, SourceSelection,
-        frame_schedule::CaptureWindow, parse_source_frames, sh_escape,
+        frame_schedule::{CaptureWindow, Rational},
+        parse_source_frames, sh_escape,
     },
     process::CommandExt,
 };
@@ -74,6 +75,8 @@ pub struct MediaDescriptor {
     pub duration_s: Option<f32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Time base of the selected video stream, used to materialize frame schedules.
+    pub source_time_base: Option<Rational>,
 }
 
 impl Extract {

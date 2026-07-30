@@ -30,11 +30,27 @@ local function media_descriptor(url, meta)
 		modified_s = source.modified_s,
 		duration_s = tonumber(meta.format.duration),
 	}
+	local video_stream, video_stream_count
 	for _, stream in ipairs(meta.streams or {}) do
-		if stream.codec_type == "video" and stream.width and stream.height then
-			descriptor.width = stream.width
-			descriptor.height = stream.height
-			break
+		if stream.codec_type == "video" and stream.width and stream.height
+			and not (stream.disposition and stream.disposition.attached_pic == 1) then
+			video_stream = video_stream or stream
+			video_stream_count = (video_stream_count or 0) + 1
+		end
+	end
+	if video_stream then
+		descriptor.width = video_stream.width
+		descriptor.height = video_stream.height
+		-- FFmpeg chooses its default video stream. A time base is only safe to
+		-- reuse without probing when there is exactly one non-cover video stream.
+		if video_stream_count == 1 then
+			local numerator, denominator = (video_stream.time_base or ""):match("^(%d+)/(%d+)$")
+			numerator, denominator = tonumber(numerator), tonumber(denominator)
+			if numerator and denominator and numerator > 0 and denominator > 0
+				and numerator <= 2147483647 and denominator <= 2147483647 then
+				descriptor.source_time_base_numerator = numerator
+				descriptor.source_time_base_denominator = denominator
+			end
 		end
 	end
 	return descriptor
@@ -100,7 +116,7 @@ function M:preload(job)
 		return true
 	end
 
-	local meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_type,width,height:stream_disposition=attached_pic")
+	local meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_type,width,height,time_base:stream_disposition=attached_pic")
 	if not meta then
 		return true, err
 	elseif not meta.format.duration then
@@ -178,6 +194,12 @@ function M:generate_avif(job, cache)
 		table.insert(args, tostring(source.width))
 		table.insert(args, "--height")
 		table.insert(args, tostring(source.height))
+	end
+	if source.source_time_base_numerator and source.source_time_base_denominator then
+		table.insert(args, "--source-time-base-numerator")
+		table.insert(args, tostring(source.source_time_base_numerator))
+		table.insert(args, "--source-time-base-denominator")
+		table.insert(args, tostring(source.source_time_base_denominator))
 	end
 	local yazi_id = os.getenv("YAZI_ID")
 	if yazi_id and yazi_id ~= "" then
