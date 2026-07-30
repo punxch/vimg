@@ -1,4 +1,5 @@
 mod authority;
+mod capture;
 mod extract;
 mod frame_schedule;
 mod join;
@@ -7,6 +8,7 @@ mod serve;
 mod vcs;
 
 pub use authority::*;
+pub(crate) use capture::*;
 pub use extract::*;
 pub use join::*;
 pub use print_completions::*;

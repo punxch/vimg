@@ -110,12 +110,6 @@ impl Vcs {
 
         self.args.capture_frames = self.args.capture_frames.or(Some(30));
 
-        let ex_scale = self.extract_scale();
-        self.args.vfilter = match (self.args.vfilter, ex_scale) {
-            (Some(vf), Some(scale)) => Some(format!("{vf},{scale}")),
-            (vf, scale) => vf.or(scale),
-        };
-
         let file_prefix = self.args.video.with_extension("");
         let file_prefix = file_prefix
             .file_name()
@@ -153,15 +147,15 @@ impl Vcs {
         // frame channel while the encoder consumes complete grids in order.
         spinner.set_message("Extracting");
         let setup_started = Instant::now();
-        let extract =
-            self.args
-                .stream_pipe(self.capture_height, self.capture_width, authority_enabled)?;
+        let capture = command::Capture::plan(&self.args, self.capture_height, self.capture_width)?;
+        let extract = capture.start(authority_enabled)?;
         let setup_elapsed = setup_started.elapsed();
 
         // Join and encode one frame at a time. The stream holds at most two frames
         // per extraction worker, plus the single grid currently being encoded.
         spinner.set_message("Joining");
-        let labels = &extract.labels;
+        let plan = extract.plan();
+        let labels = plan.labels();
 
         let out_parent = out_file
             .parent()
@@ -171,17 +165,10 @@ impl Vcs {
         let temp_out_file = out_parent.join(format!(".{file_prefix}.{nonce}.tmp.{suffix}"));
         let mut temp_output_cleanup = TempOutputCleanup::new(temp_out_file.clone());
 
-        let capture_count = extract.capture_count as u32;
-        let (rows, cols) = if self.columns == 0 || capture_count <= self.columns {
-            (1, capture_count)
-        } else {
-            (capture_count.div_ceil(self.columns), self.columns)
-        };
-        let grid_w = extract.frame_width * cols;
-        let grid_h = extract.frame_height * rows;
-        let capture_frames = extract.capture_frames;
-        let capture_width = extract.frame_width;
-        let capture_height = extract.frame_height;
+        let capture_count = plan.capture_count();
+        let (grid_w, grid_h) = plan.grid_dimensions(self.columns);
+        let capture_frames = plan.capture_frames();
+        let (capture_width, capture_height) = plan.frame_dimensions();
         // Encode by piping raw frames to ffmpeg (no intermediate BMP files)
         spinner.set_message(format!("Encoding {}", sh_escape_filename(&out_file)));
         let stream_timings;
@@ -314,9 +301,10 @@ impl Vcs {
             );
         }
 
-        let capture_authority = extract.finish()?;
+        let capture_completion = extract.finish()?;
+        let capture_backend = capture_completion.diagnostics.backend;
         let prepared_authority = if let Some(mut authority) = authority.take() {
-            for capture in capture_authority {
+            for capture in capture_completion.authority {
                 for (animation_index, source) in capture.frames.iter().enumerate() {
                     authority.record(animation_index, capture.capture_index, source);
                 }
@@ -326,7 +314,7 @@ impl Vcs {
                 encoded_output: &temp_out_file,
                 output: &out_file,
                 columns: self.columns,
-                capture_count: capture_count as usize,
+                capture_count,
                 capture_frames,
                 capture_time_s: self.args.capture_time.seconds,
                 capture_width,
@@ -373,7 +361,7 @@ impl Vcs {
         spinner.finish();
         if profile {
             eprintln!(
-                "[profile] setup={:.3}s first_grid={:.3}s frames_before_first_grid={} receive_wait={:.3}s join={:.3}s encoder_write={:.3}s encoder_tail={:.3}s total={:.3}s",
+                "[profile] backend={capture_backend} setup={:.3}s first_grid={:.3}s frames_before_first_grid={} receive_wait={:.3}s join={:.3}s encoder_write={:.3}s encoder_tail={:.3}s total={:.3}s",
                 setup_elapsed.as_secs_f64(),
                 stream_timings.first_grid.as_secs_f64(),
                 stream_timings.frames_before_first_grid,
@@ -385,14 +373,6 @@ impl Vcs {
             );
         }
         Ok(())
-    }
-
-    fn extract_scale(&self) -> Option<String> {
-        if let Some(h) = self.capture_height {
-            return Some(format!("scale=-1:{h}:flags=bicubic"));
-        }
-        let w = self.capture_width?;
-        Some(format!("scale={w}:-1:flags=bicubic"))
     }
 }
 
@@ -517,7 +497,7 @@ impl Drop for OutputPublication {
 }
 
 fn write_stream_frames(
-    stream: &command::PipeExtractStream,
+    stream: &command::CaptureStream,
     columns: u32,
     labels: &[String],
     writer: &mut std::io::BufWriter<std::process::ChildStdin>,
@@ -526,8 +506,9 @@ fn write_stream_frames(
 ) -> anyhow::Result<StreamTimings> {
     let started = Instant::now();
     let mut timings = StreamTimings::default();
-    let mut pending: BTreeMap<usize, Vec<Option<command::PipeFrame>>> = BTreeMap::new();
-    for expected_frame in 0..stream.capture_frames {
+    let plan = stream.plan();
+    let mut pending: BTreeMap<usize, Vec<Option<command::CaptureFrame>>> = BTreeMap::new();
+    for expected_frame in 0..plan.capture_frames() {
         while pending
             .get(&expected_frame)
             .is_none_or(|captures| captures.iter().any(Option::is_none))
@@ -541,23 +522,24 @@ fn write_stream_frames(
                 timings.receive_wait += receive_started.elapsed();
             }
             ensure!(
-                frame.frame_index >= expected_frame && frame.frame_index < stream.capture_frames,
+                frame.animation_index >= expected_frame
+                    && frame.animation_index < plan.capture_frames(),
                 "extraction emitted an out-of-order frame {} while waiting for {expected_frame}",
-                frame.frame_index,
+                frame.animation_index,
             );
             ensure!(
-                frame.capture_index < stream.capture_count,
+                frame.capture_index < plan.capture_count(),
                 "extraction emitted an invalid capture index {}",
                 frame.capture_index,
             );
             let captures = pending
-                .entry(frame.frame_index)
-                .or_insert_with(|| (0..stream.capture_count).map(|_| None).collect());
+                .entry(frame.animation_index)
+                .or_insert_with(|| (0..plan.capture_count()).map(|_| None).collect());
             ensure!(
                 captures[frame.capture_index].is_none(),
                 "extraction emitted a duplicate frame for capture {} index {}",
                 frame.capture_index,
-                frame.frame_index,
+                frame.animation_index,
             );
             let capture_index = frame.capture_index;
             captures[capture_index] = Some(frame);

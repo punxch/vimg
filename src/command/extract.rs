@@ -1,7 +1,7 @@
 use crate::{
     command::{
-        DurationOrPercent, HumanDuration, SourceSelection, frame_schedule::CaptureWindow, label,
-        parse_source_frames, sh_escape,
+        CapturePlan, DurationOrPercent, HumanDuration, SourceSelection,
+        frame_schedule::CaptureWindow, parse_source_frames, sh_escape,
     },
     process::CommandExt,
 };
@@ -230,68 +230,35 @@ impl Extract {
         Ok(warnings)
     }
 
-    pub fn stream_pipe(
-        &self,
-        capture_height: Option<u32>,
-        capture_width: Option<u32>,
+    pub(crate) fn stream_pipe(
+        plan: &CapturePlan,
         authority: bool,
     ) -> anyhow::Result<PipeExtractStream> {
-        let Self {
-            number,
-            ignore_start,
-            ignore_end,
-            ..
-        } = self;
-
-        let (video_duration_s, orig_w, orig_h) = self.pipe_media()?;
-        let (frame_w, frame_h) = scaled_dimensions(orig_w, orig_h, capture_height, capture_width);
-
-        let duration_s = video_duration_s
-            - ignore_start.to_secs(video_duration_s)
-            - ignore_end.to_secs(video_duration_s);
-
-        ensure!(
-            duration_s > 0.0,
-            "invalid negative video duration minus offsets"
-        );
-
-        let windows = (0..*number)
-            .map(|capture_index| {
-                let interval = duration_s / *number as f32;
-                let start_s = ignore_start.to_secs(video_duration_s)
-                    + interval * 0.5
-                    + interval * capture_index as f32;
-                CaptureWindow::new(
-                    capture_index as usize,
-                    start_s.min(video_duration_s - self.capture_time.seconds),
-                    self.capture_time.seconds,
-                    self.capture_frames() as usize,
-                )
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let labels = windows
-            .iter()
-            .map(|window| label::seconds_text(window.start_s() as u32))
-            .collect();
         // Every grid frame needs one image from each sampling point. Start one
         // single-threaded process per point and synchronize after each frame so a
         // fast producer cannot fill the bounded channel with future frames.
-        let process_count = windows.len().max(1);
+        let process_count = plan.capture_count().max(1);
         let (sender, receiver) = sync_channel((process_count * 2).max(1));
         let frame_barrier = Arc::new(FrameBarrier::new(process_count));
         let authority_records = authority.then(|| Arc::new(Mutex::new(vec![None; process_count])));
         let mut workers = Vec::with_capacity(process_count);
-        for window in windows {
-            let extract = self.clone();
+        let (frame_w, frame_h) = plan.frame_dimensions();
+        let video = plan.video().to_path_buf();
+        let vfilter = plan.vfilter().map(str::to_owned);
+        for window in plan.windows().iter().copied() {
             let sender = sender.clone();
             let frame_barrier = Arc::clone(&frame_barrier);
             let authority_records = authority_records.clone();
+            let video = video.clone();
+            let vfilter = vfilter.clone();
             workers.push(thread::spawn(move || {
-                if let Err(error) = extract.capture_pipe_stream(
+                if let Err(error) = Self::capture_pipe_stream(
                     PipeCapture {
                         window,
                         width: frame_w,
                         height: frame_h,
+                        video,
+                        vfilter,
                         authority_records,
                     },
                     &sender,
@@ -308,54 +275,10 @@ impl Extract {
             receiver: Some(receiver),
             workers,
             authority_records,
-            capture_count: *number as usize,
-            capture_frames: self.capture_frames() as usize,
-            frame_width: frame_w,
-            frame_height: frame_h,
-            labels,
         })
     }
 
-    fn pipe_media(&self) -> anyhow::Result<(f32, u32, u32)> {
-        let descriptor = self.media.as_ref();
-        let needs_probe = descriptor.is_none_or(|media| {
-            media.duration_s.is_none() || media.width.is_none() || media.height.is_none()
-        });
-        let probe = needs_probe
-            .then(|| ffprobe::ffprobe(&self.video))
-            .transpose()?;
-        let duration_s = descriptor
-            .and_then(|media| media.duration_s)
-            .or_else(|| {
-                probe
-                    .as_ref()?
-                    .format
-                    .duration
-                    .as_ref()?
-                    .parse::<f32>()
-                    .ok()
-            })
-            .context("invalid video duration")?;
-        let stream = || {
-            probe
-                .as_ref()?
-                .streams
-                .iter()
-                .find(|stream| stream.codec_type.as_deref() == Some("video"))
-        };
-        let width = descriptor
-            .and_then(|media| media.width)
-            .or_else(|| stream().and_then(|stream| stream.width.map(|width| width as u32)))
-            .context("no width")?;
-        let height = descriptor
-            .and_then(|media| media.height)
-            .or_else(|| stream().and_then(|stream| stream.height.map(|height| height as u32)))
-            .context("no height")?;
-        Ok((duration_s, width, height))
-    }
-
     fn capture_pipe_stream(
-        &self,
         capture: PipeCapture,
         sender: &SyncSender<anyhow::Result<PipeFrame>>,
         frame_barrier: &FrameBarrier,
@@ -364,12 +287,13 @@ impl Extract {
             window,
             width,
             height,
+            video,
+            vfilter,
             authority_records,
         } = capture;
         let capture_index = window.capture_index();
         let start_s = window.start_s();
         let authority = authority_records.is_some();
-        let Self { vfilter, video, .. } = self;
         let capture_frames = window.frame_count() as u32;
         let capture_time_s = window.duration_s();
         let capture_frame_rate = window.ffmpeg_frame_rate_arg();
@@ -383,7 +307,7 @@ impl Extract {
             if use_cuda {
                 cmd.arg2("-hwaccel", "cuda");
             }
-            let authority_filter = authority.then(|| match vfilter {
+            let authority_filter = authority.then(|| match &vfilter {
                 Some(vfilter) => format!("setpts=PTS-round({start_s}/TB),{vfilter}"),
                 None => format!("setpts=PTS-round({start_s}/TB)"),
             });
@@ -391,7 +315,7 @@ impl Extract {
                 .arg2("-threads", FFMPEG_THREADS_PER_CAPTURE)
                 .arg2("-ss", start_s)
                 .arg2("-t", capture_time_s)
-                .arg2("-i", video)
+                .arg2("-i", &video)
                 .arg2("-r", &capture_frame_rate)
                 .arg2("-fps_mode", "cfr")
                 .arg2_opt("-vf", authority_filter.as_ref().or(vfilter.as_ref()))
@@ -611,29 +535,26 @@ struct PipeCapture {
     window: CaptureWindow,
     width: u32,
     height: u32,
+    video: PathBuf,
+    vfilter: Option<String>,
     authority_records: Option<AuthorityRecords>,
 }
 
-pub struct PipeFrame {
+pub(crate) struct PipeFrame {
     pub capture_index: usize,
     pub frame_index: usize,
     pub image: RgbImage,
 }
 
-pub struct CaptureAuthority {
+pub(crate) struct CaptureAuthority {
     pub capture_index: usize,
     pub frames: Vec<SourceSelection>,
 }
 
-pub struct PipeExtractStream {
+pub(crate) struct PipeExtractStream {
     receiver: Option<Receiver<anyhow::Result<PipeFrame>>>,
     workers: Vec<JoinHandle<()>>,
     authority_records: Option<AuthorityRecords>,
-    pub capture_count: usize,
-    pub capture_frames: usize,
-    pub frame_width: u32,
-    pub frame_height: u32,
-    pub labels: Vec<String>,
 }
 
 struct FrameBarrier {
@@ -685,7 +606,7 @@ impl FrameBarrier {
 }
 
 impl PipeExtractStream {
-    pub fn recv(&self) -> anyhow::Result<PipeFrame> {
+    pub(crate) fn recv(&self) -> anyhow::Result<PipeFrame> {
         self.receiver
             .as_ref()
             .context("extraction stream has already been closed")?
@@ -693,7 +614,7 @@ impl PipeExtractStream {
             .context("extraction stream ended before all frames were produced")?
     }
 
-    pub fn finish(mut self) -> anyhow::Result<Vec<CaptureAuthority>> {
+    pub(crate) fn finish(mut self) -> anyhow::Result<Vec<CaptureAuthority>> {
         self.receiver.take();
         for worker in self.workers.drain(..) {
             worker
@@ -735,26 +656,5 @@ impl Drop for PipeExtractStream {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
-    }
-}
-
-fn scaled_dimensions(
-    orig_w: u32,
-    orig_h: u32,
-    target_h: Option<u32>,
-    target_w: Option<u32>,
-) -> (u32, u32) {
-    match (target_w, target_h) {
-        (_, Some(h)) => {
-            let w = ((orig_w as f64 * h as f64) / orig_h as f64).round() as u32;
-            let w = if w % 2 != 0 { w + 1 } else { w };
-            (w, h)
-        }
-        (Some(w), _) => {
-            let h = ((orig_h as f64 * w as f64) / orig_w as f64).round() as u32;
-            let h = if h % 2 != 0 { h + 1 } else { h };
-            (w, h)
-        }
-        _ => (orig_w, orig_h),
     }
 }
