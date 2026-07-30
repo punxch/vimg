@@ -30,7 +30,6 @@ pub(super) fn start(
     plan: &CapturePlan,
     authority: bool,
 ) -> anyhow::Result<Box<dyn CaptureAttempt>> {
-    ensure_preview_profile(plan)?;
     ffmpeg::init().context("initializing software libav")?;
 
     let mut receivers = Vec::with_capacity(plan.capture_count());
@@ -76,7 +75,7 @@ pub(super) fn start(
     }))
 }
 
-fn ensure_preview_profile(plan: &CapturePlan) -> anyhow::Result<()> {
+pub(super) fn availability(plan: &CapturePlan) -> anyhow::Result<()> {
     ensure!(
         plan.capture_count() == 9,
         "Capture backend libav is unavailable: requires the fixed Preview profile (9 captures)"
@@ -92,6 +91,11 @@ fn ensure_preview_profile(plan: &CapturePlan) -> anyhow::Result<()> {
     ensure!(
         !plan.has_custom_video_filter(),
         "Capture backend libav is unavailable: custom video filters are unsupported"
+    );
+    ensure!(
+        matches!(plan.media().codec.as_str(), "h264" | "hevc"),
+        "Capture backend libav is unavailable: only H.264 and HEVC are supported (found {})",
+        plan.media().codec,
     );
     Ok(())
 }

@@ -7,6 +7,7 @@ use crate::command::{
 };
 use anyhow::{Context, ensure};
 use image::RgbImage;
+use std::fmt;
 
 /// Normalized shared inputs for one Capture attempt.
 pub(crate) struct CapturePlan {
@@ -42,11 +43,12 @@ pub(crate) struct CapturePlan {
     labels: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MediaProperties {
     pub(crate) duration_s: f32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) codec: String,
     pub(crate) source_time_base: Rational,
 }
 
@@ -122,8 +124,8 @@ impl CapturePlan {
             reason = "future Capture backends inspect normalized media from the shared plan"
         )
     )]
-    pub(crate) const fn media(&self) -> MediaProperties {
-        self.media
+    pub(crate) fn media(&self) -> &MediaProperties {
+        &self.media
     }
 
     pub(crate) fn capture_frames(&self) -> usize {
@@ -191,9 +193,162 @@ pub(crate) struct Capture {
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CaptureBackendPolicy {
+    Auto,
     #[default]
     Ffmpeg,
     Libav,
+}
+
+impl CaptureBackendPolicy {
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ffmpeg => "ffmpeg",
+            Self::Libav => "libav",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CaptureFailureClass {
+    Unavailable,
+    AttemptFailed,
+}
+
+#[derive(Debug)]
+pub(crate) struct CaptureBackendFailure {
+    backend: CaptureBackendPolicy,
+    class: CaptureFailureClass,
+    phase: &'static str,
+    reason: anyhow::Error,
+}
+
+impl CaptureBackendFailure {
+    pub(crate) fn unavailable(
+        backend: CaptureBackendPolicy,
+        phase: &'static str,
+        reason: anyhow::Error,
+    ) -> Self {
+        Self {
+            backend,
+            class: CaptureFailureClass::Unavailable,
+            phase,
+            reason,
+        }
+    }
+
+    pub(crate) fn attempt(
+        backend: CaptureBackendPolicy,
+        phase: &'static str,
+        reason: anyhow::Error,
+    ) -> Self {
+        Self {
+            backend,
+            class: CaptureFailureClass::AttemptFailed,
+            phase,
+            reason,
+        }
+    }
+
+    pub(crate) const fn class(&self) -> CaptureFailureClass {
+        self.class
+    }
+
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "fallback tests assert the skipped backend without coupling to diagnostics"
+        )
+    )]
+    pub(crate) const fn backend(&self) -> CaptureBackendPolicy {
+        self.backend
+    }
+}
+
+impl fmt::Display for CaptureBackendFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let class = match self.class {
+            CaptureFailureClass::Unavailable => "unavailable",
+            CaptureFailureClass::AttemptFailed => "attempt failed",
+        };
+        write!(
+            formatter,
+            "{} {class} during {}: {}",
+            self.backend.name(),
+            self.phase,
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for CaptureBackendFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.reason.root_cause())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendSelection<T> {
+    pub(crate) value: T,
+    pub(crate) skipped: Vec<CaptureBackendFailure>,
+    pub(crate) failures: Vec<CaptureBackendFailure>,
+}
+
+pub(crate) enum CaptureAttemptError {
+    Backend(CaptureBackendFailure),
+    Fatal(anyhow::Error),
+}
+
+impl CaptureAttemptError {
+    pub(crate) fn fatal(error: anyhow::Error) -> Self {
+        Self::Fatal(error)
+    }
+}
+
+impl From<CaptureBackendFailure> for CaptureAttemptError {
+    fn from(error: CaptureBackendFailure) -> Self {
+        Self::Backend(error)
+    }
+}
+
+/// Runs a fresh whole attempt for each eligible automatic candidate. Named
+/// policies execute exactly once, preserving their diagnostic value.
+pub(crate) fn execute_backend_candidates<T>(
+    policy: CaptureBackendPolicy,
+    candidates: &[CaptureBackendPolicy],
+    mut attempt: impl FnMut(CaptureBackendPolicy) -> Result<T, CaptureAttemptError>,
+) -> anyhow::Result<BackendSelection<T>> {
+    let automatic = policy == CaptureBackendPolicy::Auto;
+    let mut skipped = Vec::new();
+    let mut failures = Vec::new();
+    for &backend in candidates {
+        debug_assert_ne!(backend, CaptureBackendPolicy::Auto);
+        match attempt(backend) {
+            Ok(value) => {
+                return Ok(BackendSelection {
+                    value,
+                    skipped,
+                    failures,
+                });
+            }
+            Err(CaptureAttemptError::Fatal(error)) => return Err(error),
+            Err(CaptureAttemptError::Backend(failure))
+                if automatic && failure.class() == CaptureFailureClass::Unavailable =>
+            {
+                skipped.push(failure);
+            }
+            Err(CaptureAttemptError::Backend(failure)) if automatic => failures.push(failure),
+            Err(CaptureAttemptError::Backend(failure)) => return Err(failure.into()),
+        }
+    }
+    let failures = failures
+        .iter()
+        .map(ToString::to_string)
+        .chain(skipped.iter().map(ToString::to_string))
+        .collect::<Vec<_>>()
+        .join("; ");
+    anyhow::bail!("all capture backends failed: {failures}")
 }
 
 impl Capture {
@@ -207,25 +362,68 @@ impl Capture {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) const fn plan_ref(&self) -> &CapturePlan {
+    pub(crate) const fn capture_plan(&self) -> &CapturePlan {
         &self.plan
+    }
+
+    pub(crate) fn candidates(
+        &self,
+        policy: CaptureBackendPolicy,
+    ) -> &'static [CaptureBackendPolicy] {
+        const FFMPEG: &[CaptureBackendPolicy] = &[CaptureBackendPolicy::Ffmpeg];
+        const LIBAV: &[CaptureBackendPolicy] = &[CaptureBackendPolicy::Libav];
+        #[cfg(feature = "in-process-decode")]
+        const AUTO: &[CaptureBackendPolicy] =
+            &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg];
+        #[cfg(not(feature = "in-process-decode"))]
+        const AUTO: &[CaptureBackendPolicy] = FFMPEG;
+        match policy {
+            CaptureBackendPolicy::Auto => AUTO,
+            CaptureBackendPolicy::Ffmpeg => FFMPEG,
+            CaptureBackendPolicy::Libav => LIBAV,
+        }
     }
 
     pub(crate) fn start(
         &self,
         policy: CaptureBackendPolicy,
         authority: bool,
-    ) -> anyhow::Result<CaptureStream<'_>> {
+    ) -> Result<CaptureStream<'_>, CaptureBackendFailure> {
         let inner: Box<dyn CaptureAttempt> = match policy {
-            CaptureBackendPolicy::Ffmpeg => FfmpegCaptureBackend.start(&self.plan, authority)?,
-            CaptureBackendPolicy::Libav => libav_attempt(&self.plan, authority)?,
+            CaptureBackendPolicy::Ffmpeg => FfmpegCaptureBackend
+                .start(&self.plan, authority)
+                .map_err(|error| CaptureBackendFailure::attempt(policy, "setup", error))?,
+            CaptureBackendPolicy::Libav => {
+                libav_availability(&self.plan).map_err(|error| {
+                    CaptureBackendFailure::unavailable(policy, "eligibility", error)
+                })?;
+                libav_attempt(&self.plan, authority)
+                    .map_err(|error| CaptureBackendFailure::attempt(policy, "setup", error))?
+            }
+            CaptureBackendPolicy::Auto => {
+                return Err(CaptureBackendFailure::unavailable(
+                    policy,
+                    "selection",
+                    anyhow::anyhow!("auto must be run through whole-attempt fallback"),
+                ));
+            }
         };
         Ok(CaptureStream {
             inner,
             plan: &self.plan,
+            backend: policy,
         })
     }
+}
+
+#[cfg(feature = "in-process-decode")]
+fn libav_availability(plan: &CapturePlan) -> anyhow::Result<()> {
+    crate::command::libav::availability(plan)
+}
+
+#[cfg(not(feature = "in-process-decode"))]
+fn libav_availability(_: &CapturePlan) -> anyhow::Result<()> {
+    anyhow::bail!("rebuild with --features in-process-decode")
 }
 
 #[cfg(feature = "in-process-decode")]
@@ -261,6 +459,7 @@ impl CaptureBackend for FfmpegCaptureBackend {
 pub(crate) struct CaptureStream<'plan> {
     inner: Box<dyn CaptureAttempt>,
     plan: &'plan CapturePlan,
+    backend: CaptureBackendPolicy,
 }
 
 pub(crate) struct CaptureFrame {
@@ -307,12 +506,24 @@ impl CaptureAttempt for FfmpegCaptureAttempt {
 }
 
 impl CaptureStream<'_> {
-    pub(crate) fn recv(&self) -> anyhow::Result<CaptureFrame> {
-        self.inner.recv()
+    pub(crate) fn attempt_failure(
+        &self,
+        phase: &'static str,
+        error: anyhow::Error,
+    ) -> CaptureBackendFailure {
+        CaptureBackendFailure::attempt(self.backend, phase, error)
     }
 
-    pub(crate) fn finish(self) -> anyhow::Result<CaptureCompletion> {
-        self.inner.finish()
+    pub(crate) fn recv(&self) -> Result<CaptureFrame, CaptureBackendFailure> {
+        self.inner
+            .recv()
+            .map_err(|error| CaptureBackendFailure::attempt(self.backend, "decode", error))
+    }
+
+    pub(crate) fn finish(self) -> Result<CaptureCompletion, CaptureBackendFailure> {
+        self.inner
+            .finish()
+            .map_err(|error| CaptureBackendFailure::attempt(self.backend, "completion", error))
     }
 
     pub(crate) const fn plan(&self) -> &CapturePlan {
@@ -326,6 +537,7 @@ fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
         media.duration_s.is_none()
             || media.width.is_none()
             || media.height.is_none()
+            || media.codec.is_none()
             || media.source_time_base.is_none()
     });
     let probe = needs_probe
@@ -358,6 +570,10 @@ fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
         .and_then(|media| media.height)
         .or_else(|| stream().and_then(|stream| stream.height.map(|height| height as u32)))
         .context("no height")?;
+    let codec = descriptor
+        .and_then(|media| media.codec.clone())
+        .or_else(|| stream().and_then(|stream| stream.codec_name.clone()))
+        .context("selected video stream has no codec")?;
     let source_time_base = match descriptor.and_then(|media| media.source_time_base) {
         Some(source_time_base) => source_time_base,
         None => {
@@ -374,6 +590,7 @@ fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
         duration_s,
         width,
         height,
+        codec,
         source_time_base,
     })
 }
@@ -409,7 +626,10 @@ fn scale_filter(capture_height: Option<u32>, capture_width: Option<u32>) -> Opti
 mod tests {
     use super::*;
     use crate::command::{DurationOrPercent, Extract, HumanDuration, MediaDescriptor};
-    use std::path::PathBuf;
+    use std::{
+        cell::{Cell, RefCell},
+        path::PathBuf,
+    };
 
     fn preview_extract(video: impl Into<PathBuf>) -> Extract {
         Extract {
@@ -426,6 +646,7 @@ mod tests {
                 duration_s: Some(18.0),
                 width: Some(1920),
                 height: Some(1080),
+                codec: Some("h264".to_owned()),
                 source_time_base: Some(Rational::new(1, 1_000)),
             }),
         }
@@ -436,16 +657,17 @@ mod tests {
         let extract = preview_extract("preview.mkv");
 
         let capture = Capture::plan(&extract, Some(160), None).unwrap();
-        let plan = capture.plan_ref();
+        let plan = capture.capture_plan();
 
         assert_eq!(plan.capture_count(), 9);
         assert_eq!(plan.capture_frames(), 30);
         assert_eq!(
             plan.media(),
-            MediaProperties {
+            &MediaProperties {
                 duration_s: 18.0,
                 width: 1920,
                 height: 1080,
+                codec: "h264".to_owned(),
                 source_time_base: Rational::new(1, 1_000),
             }
         );
@@ -465,6 +687,188 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auto_skips_unavailable_backends_and_restarts_after_an_attempt_failure() {
+        let started = RefCell::new(Vec::new());
+        let result = execute_backend_candidates(
+            CaptureBackendPolicy::Auto,
+            &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg],
+            |backend| {
+                started.borrow_mut().push(backend);
+                match backend {
+                    CaptureBackendPolicy::Libav => Err(CaptureBackendFailure::unavailable(
+                        backend,
+                        "eligibility",
+                        anyhow::anyhow!("unsupported profile"),
+                    )
+                    .into()),
+                    CaptureBackendPolicy::Ffmpeg => Ok("ffmpeg"),
+                    _ => unreachable!(),
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.value, "ffmpeg");
+        assert_eq!(
+            result
+                .skipped
+                .iter()
+                .map(CaptureBackendFailure::backend)
+                .collect::<Vec<_>>(),
+            vec![CaptureBackendPolicy::Libav]
+        );
+        assert_eq!(
+            started.into_inner(),
+            vec![CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg]
+        );
+    }
+
+    #[test]
+    fn named_backend_is_fail_fast_and_auto_aggregates_all_attempt_failures() {
+        let named_starts = RefCell::new(Vec::new());
+        let named_error = execute_backend_candidates(
+            CaptureBackendPolicy::Libav,
+            &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg],
+            |backend| {
+                named_starts.borrow_mut().push(backend);
+                Err::<(), _>(
+                    CaptureBackendFailure::attempt(
+                        backend,
+                        "decode",
+                        anyhow::anyhow!("damaged packet"),
+                    )
+                    .into(),
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(named_starts.into_inner(), vec![CaptureBackendPolicy::Libav]);
+        assert_eq!(
+            named_error.to_string(),
+            "libav attempt failed during decode: damaged packet"
+        );
+
+        let auto_error = execute_backend_candidates(
+            CaptureBackendPolicy::Auto,
+            &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg],
+            |backend| {
+                Err::<(), _>(
+                    CaptureBackendFailure::attempt(
+                        backend,
+                        "completion",
+                        anyhow::anyhow!("worker stopped"),
+                    )
+                    .into(),
+                )
+            },
+        )
+        .unwrap_err();
+        assert_eq!(
+            auto_error.to_string(),
+            "all capture backends failed: libav attempt failed during completion: worker stopped; ffmpeg attempt failed during completion: worker stopped"
+        );
+    }
+
+    #[test]
+    fn fatal_attempt_error_stops_auto_without_starting_another_backend() {
+        let started = RefCell::new(Vec::new());
+        let error = execute_backend_candidates(
+            CaptureBackendPolicy::Auto,
+            &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg],
+            |backend| {
+                started.borrow_mut().push(backend);
+                Err::<(), _>(CaptureAttemptError::fatal(anyhow::anyhow!(
+                    "encoder write failed"
+                )))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(started.into_inner(), vec![CaptureBackendPolicy::Libav]);
+        assert_eq!(error.to_string(), "encoder write failed");
+    }
+
+    #[test]
+    fn all_backends_failed_error_keeps_unavailable_phase_and_reason() {
+        let error = execute_backend_candidates(
+            CaptureBackendPolicy::Auto,
+            &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg],
+            |backend| match backend {
+                CaptureBackendPolicy::Libav => Err::<(), _>(
+                    CaptureBackendFailure::unavailable(
+                        backend,
+                        "eligibility",
+                        anyhow::anyhow!("unsupported codec vp9"),
+                    )
+                    .into(),
+                ),
+                CaptureBackendPolicy::Ffmpeg => Err::<(), _>(
+                    CaptureBackendFailure::attempt(
+                        backend,
+                        "decode",
+                        anyhow::anyhow!("executable exited"),
+                    )
+                    .into(),
+                ),
+                CaptureBackendPolicy::Auto => unreachable!(),
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "all capture backends failed: ffmpeg attempt failed during decode: executable exited; libav unavailable during eligibility: unsupported codec vp9"
+        );
+    }
+
+    #[test]
+    fn auto_drops_each_failed_attempt_before_restarting_from_frame_zero() {
+        for phase in ["before first frame", "after first grid", "final frame"] {
+            let resource_is_live = Cell::new(false);
+            let starts = RefCell::new(Vec::new());
+            let result = execute_backend_candidates(
+                CaptureBackendPolicy::Auto,
+                &[CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg],
+                |backend| {
+                    assert!(
+                        !resource_is_live.replace(true),
+                        "the previous {phase} attempt was not cleaned before {backend:?} started"
+                    );
+                    struct AttemptResource<'a>(&'a Cell<bool>);
+                    impl Drop for AttemptResource<'_> {
+                        fn drop(&mut self) {
+                            self.0.set(false);
+                        }
+                    }
+                    let _resource = AttemptResource(&resource_is_live);
+                    starts.borrow_mut().push((backend, 0usize));
+                    if backend == CaptureBackendPolicy::Libav {
+                        Err(CaptureBackendFailure::attempt(
+                            backend,
+                            "decode",
+                            anyhow::anyhow!("injected {phase} failure"),
+                        )
+                        .into())
+                    } else {
+                        Ok("ffmpeg")
+                    }
+                },
+            )
+            .unwrap();
+
+            assert_eq!(result.value, "ffmpeg");
+            assert!(!resource_is_live.get());
+            assert_eq!(
+                starts.into_inner(),
+                vec![
+                    (CaptureBackendPolicy::Libav, 0),
+                    (CaptureBackendPolicy::Ffmpeg, 0),
+                ]
+            );
+        }
+    }
+
     #[cfg(not(feature = "in-process-decode"))]
     #[test]
     fn explicit_libav_policy_fails_fast_without_the_optional_build_feature() {
@@ -477,7 +881,60 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Capture backend libav is unavailable: rebuild with --features in-process-decode"
+            "libav unavailable during eligibility: rebuild with --features in-process-decode"
+        );
+    }
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    fn libav_policy_skips_unsupported_codecs_before_starting_an_attempt() {
+        let mut extract = preview_extract("preview.mkv");
+        extract.media.as_mut().unwrap().codec = Some("vp9".to_owned());
+        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+
+        let error = capture
+            .start(CaptureBackendPolicy::Libav, false)
+            .err()
+            .expect("unsupported codec must be unavailable before libav starts");
+
+        assert_eq!(
+            error.to_string(),
+            "libav unavailable during eligibility: Capture backend libav is unavailable: only H.264 and HEVC are supported (found vp9)"
+        );
+    }
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    fn auto_skips_an_unsupported_codec_before_its_libav_attempt() {
+        let mut extract = preview_extract("preview.mkv");
+        extract.media.as_mut().unwrap().codec = Some("vp9".to_owned());
+        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+        let started = RefCell::new(Vec::new());
+
+        let result = execute_backend_candidates(
+            CaptureBackendPolicy::Auto,
+            capture.candidates(CaptureBackendPolicy::Auto),
+            |backend| {
+                started.borrow_mut().push(backend);
+                if backend == CaptureBackendPolicy::Libav {
+                    return capture
+                        .start(backend, false)
+                        .map(|_| unreachable!())
+                        .map_err(Into::into);
+                }
+                Ok("ffmpeg")
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.value, "ffmpeg");
+        assert_eq!(
+            started.into_inner(),
+            vec![CaptureBackendPolicy::Libav, CaptureBackendPolicy::Ffmpeg]
+        );
+        assert_eq!(
+            result.skipped[0].to_string(),
+            "libav unavailable during eligibility: Capture backend libav is unavailable: only H.264 and HEVC are supported (found vp9)"
         );
     }
 

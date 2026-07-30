@@ -8,7 +8,7 @@ use std::{
     fs,
     io::Write,
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -89,7 +89,6 @@ impl Vcs {
     pub fn run(mut self) -> anyhow::Result<()> {
         let profile = self.profile;
         let authority_manifest = self.authority_manifest.take();
-        let authority_enabled = authority_manifest.is_some();
         let total_started = Instant::now();
         let is_jpg = self.output.as_ref().is_some_and(|p| {
             p.extension()
@@ -138,9 +137,6 @@ impl Vcs {
             .as_ref()
             .map(|manifest| command::AuthorityPublicationLock::acquire(manifest, &out_file))
             .transpose()?;
-        let mut authority = authority_manifest
-            .map(command::AuthorityRecorder::new)
-            .transpose()?;
 
         let spinner = indicatif::ProgressBar::new_spinner().with_style(
             indicatif::ProgressStyle::default_spinner()
@@ -148,175 +144,69 @@ impl Vcs {
         );
         spinner.enable_steady_tick(Duration::from_millis(100));
 
-        // Start bounded extraction before the encoder. The workers block on a small
-        // frame channel while the encoder consumes complete grids in order.
-        spinner.set_message("Extracting");
         let setup_started = Instant::now();
         let capture = command::Capture::plan(&self.args, self.capture_height, self.capture_width)?;
-        let extract = capture.start(self.capture_backend, authority_enabled)?;
-        let setup_elapsed = setup_started.elapsed();
-
-        // Join and encode one frame at a time. The stream holds at most two frames
-        // per extraction worker, plus the single grid currently being encoded.
-        spinner.set_message("Joining");
-        let plan = extract.plan();
-        let labels = plan.labels();
-
-        let out_parent = out_file
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        fs::create_dir_all(out_parent)?;
-        let nonce = fastrand::u64(..);
-        let temp_out_file = out_parent.join(format!(".{file_prefix}.{nonce}.tmp.{suffix}"));
-        let mut temp_output_cleanup = TempOutputCleanup::new(temp_out_file.clone());
-
+        let plan = capture.capture_plan();
+        let labels = plan.labels().to_vec();
         let capture_count = plan.capture_count();
         let (grid_w, grid_h) = plan.grid_dimensions(self.columns);
         let capture_frames = plan.capture_frames();
         let (capture_width, capture_height) = plan.frame_dimensions();
-        // Encode by piping raw frames to ffmpeg (no intermediate BMP files)
-        spinner.set_message(format!("Encoding {}", sh_escape_filename(&out_file)));
-        let stream_timings;
-        let encoder_tail;
+        let setup_elapsed = setup_started.elapsed();
+        let out_parent = out_file
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        fs::create_dir_all(out_parent)?;
+        let attempt_context = VcsAttemptContext {
+            authority_manifest: authority_manifest.as_deref(),
+            spinner: &spinner,
+            out_parent,
+            file_prefix: &file_prefix,
+            suffix,
+            is_jpg,
+            is_webp,
+            labels: &labels,
+            profile,
+        };
 
-        if is_jpg {
-            let mut child = Command::new("ffmpeg")
-                .arg2("-f", "rawvideo")
-                .arg2("-pix_fmt", "rgb24")
-                .arg2("-s", format!("{grid_w}x{grid_h}"))
-                .arg2("-r", self.avif_fps)
-                .arg2("-i", "pipe:0")
-                .arg2("-vframes", "1")
-                .arg2("-v", "quiet")
-                .arg("-y")
-                .arg(&temp_out_file)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .spawn()?;
-
-            {
-                let stdin = child.stdin.take().unwrap();
-                let mut writer = std::io::BufWriter::new(stdin);
-                stream_timings = write_stream_frames(
-                    &extract,
-                    self.columns,
-                    labels,
-                    &mut writer,
-                    profile,
-                    &mut authority,
-                )?;
-            }
-
-            let tail_started = Instant::now();
-            let out = child.wait_with_output()?;
-            encoder_tail = tail_started.elapsed();
-            ensure!(out.status.success(), "ffmpeg convert-to-jpg failed");
-        } else if is_webp {
-            let mut child = Command::new("ffmpeg")
-                .arg2("-v", "quiet")
-                .arg2("-f", "rawvideo")
-                .arg2("-pix_fmt", "rgb24")
-                .arg2("-s", format!("{grid_w}x{grid_h}"))
-                .arg2("-r", self.avif_fps)
-                .arg2("-i", "pipe:0")
-                .arg2("-lossless", "0")
-                .arg2("-loop", "0")
-                .arg2("-c:v", "libwebp")
-                .arg2("-vf", "cropdetect=24:16:0, crop=iw-2*24:ih-2*16")
-                .arg2("-quality", "60")
-                .arg2("-compression_level", "2")
-                .arg2("-crf", self.avif_crf)
-                .arg2("-pix_fmt", "yuv420p10le")
-                .arg("-y")
-                .arg(&temp_out_file)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .spawn()?;
-
-            {
-                let stdin = child.stdin.take().unwrap();
-                let mut writer = std::io::BufWriter::new(stdin);
-                stream_timings = write_stream_frames(
-                    &extract,
-                    self.columns,
-                    labels,
-                    &mut writer,
-                    profile,
-                    &mut authority,
-                )?;
-            }
-
-            let tail_started = Instant::now();
-            let out = child.wait_with_output()?;
-            encoder_tail = tail_started.elapsed();
-            ensure!(
-                out.status.success(),
-                "ffmpeg convert-to-webp failed\n---stderr---\n{}\n------",
-                String::from_utf8_lossy(&out.stderr).trim(),
-            );
-        } else {
-            let mut child = Command::new("ffmpeg")
-                .arg2("-v", "error")
-                .arg2("-f", "rawvideo")
-                .arg2("-pix_fmt", "rgb24")
-                .arg2("-s", format!("{grid_w}x{grid_h}"))
-                .arg2("-r", self.avif_fps)
-                .arg2("-i", "pipe:0")
-                .arg2("-c:v", &self.avif_codec)
-                .arg2(
-                    match self.avif_codec.as_str() {
-                        "libaom-av1" => "-cpu-used",
-                        _ => "-preset",
-                    },
-                    self.avif_preset
-                        .unwrap_or(match self.args.capture_frames() {
-                            1 => 4,
-                            _ => 8,
-                        }),
-                )
-                .arg2("-crf", self.avif_crf)
-                .arg2("-pix_fmt", "yuv420p10le")
-                .arg("-y")
-                .arg(&temp_out_file)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()?;
-
-            {
-                let stdin = child.stdin.take().unwrap();
-                let mut writer = std::io::BufWriter::new(stdin);
-                stream_timings = write_stream_frames(
-                    &extract,
-                    self.columns,
-                    labels,
-                    &mut writer,
-                    profile,
-                    &mut authority,
-                )?;
-            }
-
-            let tail_started = Instant::now();
-            let out = child.wait_with_output()?;
-            encoder_tail = tail_started.elapsed();
-            ensure!(
-                out.status.success(),
-                "ffmpeg convert-to-avif failed\n---stderr---\n{}\n------",
-                String::from_utf8_lossy(&out.stderr).trim(),
-            );
+        let selected = command::execute_backend_candidates(
+            self.capture_backend,
+            capture.candidates(self.capture_backend),
+            |backend| {
+                let attempt_started = Instant::now();
+                let result = run_vcs_attempt(&self, &capture, backend, &attempt_context);
+                if profile {
+                    eprintln!(
+                        "[profile] attempt backend={} total={:.3}s outcome={}",
+                        backend.name(),
+                        attempt_started.elapsed().as_secs_f64(),
+                        if result.is_ok() { "success" } else { "failed" },
+                    );
+                }
+                result
+            },
+        )?;
+        for failure in &selected.failures {
+            eprintln!("capture fallback: {failure}; retrying the next backend");
         }
-
-        let capture_completion = extract.finish()?;
-        let capture_backend = capture_completion.diagnostics.backend;
-        let prepared_authority = if let Some(mut authority) = authority.take() {
-            for capture in capture_completion.authority {
+        if profile {
+            for unavailable in &selected.skipped {
+                eprintln!("[profile] attempt {unavailable}");
+            }
+        }
+        let mut attempt = selected.value;
+        let capture_backend = attempt.capture_completion.diagnostics.backend;
+        let stream_timings = attempt.stream_timings;
+        let encoder_tail = attempt.encoder_tail;
+        let prepared_authority = if let Some(mut authority) = attempt.authority.take() {
+            for capture in attempt.capture_completion.authority {
                 for (animation_index, source) in capture.frames.iter().enumerate() {
                     authority.record(animation_index, capture.capture_index, source);
                 }
             }
             Some(authority.prepare(command::AuthorityProfile {
                 input: &self.args.video,
-                encoded_output: &temp_out_file,
+                encoded_output: &attempt.temp_output.path,
                 output: &out_file,
                 columns: self.columns,
                 capture_count,
@@ -333,8 +223,8 @@ impl Vcs {
         };
 
         if let Some(prepared_authority) = prepared_authority {
-            let publication = OutputPublication::publish(&temp_out_file, &out_file)?;
-            temp_output_cleanup.disarm();
+            let publication = OutputPublication::publish(&attempt.temp_output.path, &out_file)?;
+            attempt.temp_output.disarm();
             let published_authority = match prepared_authority.publish() {
                 Ok(published_authority) => published_authority,
                 Err(error) => {
@@ -348,19 +238,19 @@ impl Vcs {
             };
             publication.commit();
             published_authority.finish();
-        } else if let Err(rename_error) = fs::rename(&temp_out_file, &out_file) {
+        } else if let Err(rename_error) = fs::rename(&attempt.temp_output.path, &out_file) {
             // Windows does not replace an existing destination with rename. Both
             // files are in the cache directory, so this fallback never exposes a
             // partially copied AVIF; readers see either the old file or no file.
             if out_file.exists() {
                 fs::remove_file(&out_file)?;
-                fs::rename(&temp_out_file, &out_file)?;
+                fs::rename(&attempt.temp_output.path, &out_file)?;
             } else {
                 return Err(rename_error.into());
             }
-            temp_output_cleanup.disarm();
+            attempt.temp_output.disarm();
         } else {
-            temp_output_cleanup.disarm();
+            attempt.temp_output.disarm();
         }
 
         spinner.finish();
@@ -386,24 +276,28 @@ fn ensure_libav_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> anyho
         return Ok(());
     }
     ensure!(
-        vcs.columns == 3
-            && vcs.capture_height == Some(160)
-            && vcs.capture_width.is_none()
-            && vcs.args.number == 9
-            && vcs.args.capture_frames == Some(30)
-            && vcs.args.capture_time.seconds == 1.5
-            && vcs.args.vfilter.is_none()
-            && vcs.args.ignore_start == command::DurationOrPercent::Seconds(0.0)
-            && vcs.args.ignore_end == command::DurationOrPercent::Seconds(0.0)
-            && !is_jpg
-            && !is_webp
-            && vcs.avif_fps == 20.0
-            && vcs.avif_crf == 30
-            && vcs.avif_codec == "libsvtav1"
-            && vcs.avif_preset.is_none(),
+        is_libav_preview_profile(vcs, is_jpg, is_webp),
         "Capture backend libav is unavailable: requires the fixed Preview profile"
     );
     Ok(())
+}
+
+fn is_libav_preview_profile(vcs: &Vcs, is_jpg: bool, is_webp: bool) -> bool {
+    vcs.columns == 3
+        && vcs.capture_height == Some(160)
+        && vcs.capture_width.is_none()
+        && vcs.args.number == 9
+        && vcs.args.capture_frames == Some(30)
+        && vcs.args.capture_time.seconds == 1.5
+        && vcs.args.vfilter.is_none()
+        && vcs.args.ignore_start == command::DurationOrPercent::Seconds(0.0)
+        && vcs.args.ignore_end == command::DurationOrPercent::Seconds(0.0)
+        && !is_jpg
+        && !is_webp
+        && vcs.avif_fps == 20.0
+        && vcs.avif_crf == 30
+        && vcs.avif_codec == "libsvtav1"
+        && vcs.avif_preset.is_none()
 }
 
 #[derive(Default)]
@@ -526,6 +420,212 @@ impl Drop for OutputPublication {
     }
 }
 
+struct VcsAttempt {
+    temp_output: TempOutputCleanup,
+    capture_completion: command::CaptureCompletion,
+    stream_timings: StreamTimings,
+    encoder_tail: Duration,
+    authority: Option<command::AuthorityRecorder>,
+}
+
+struct VcsAttemptContext<'a> {
+    authority_manifest: Option<&'a std::path::Path>,
+    spinner: &'a indicatif::ProgressBar,
+    out_parent: &'a std::path::Path,
+    file_prefix: &'a str,
+    suffix: &'a str,
+    is_jpg: bool,
+    is_webp: bool,
+    labels: &'a [String],
+    profile: bool,
+}
+
+struct AttemptEncoder {
+    child: Option<Child>,
+}
+
+impl AttemptEncoder {
+    fn new(child: Child) -> Self {
+        Self { child: Some(child) }
+    }
+
+    fn stdin(&mut self) -> anyhow::Result<std::process::ChildStdin> {
+        self.child
+            .as_mut()
+            .context("encoder attempt has already been closed")?
+            .stdin
+            .take()
+            .context("encoder attempt did not expose stdin")
+    }
+
+    fn finish(&mut self, format: &str) -> anyhow::Result<Duration> {
+        let tail_started = Instant::now();
+        let status = self
+            .child
+            .as_mut()
+            .context("encoder attempt has already been closed")?
+            .wait()?;
+        self.child.take();
+        ensure!(status.success(), "ffmpeg convert-to-{format} failed");
+        Ok(tail_started.elapsed())
+    }
+}
+
+impl Drop for AttemptEncoder {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn run_vcs_attempt(
+    vcs: &Vcs,
+    capture: &command::Capture,
+    backend: command::CaptureBackendPolicy,
+    context: &VcsAttemptContext,
+) -> Result<VcsAttempt, command::CaptureAttemptError> {
+    if backend == command::CaptureBackendPolicy::Libav
+        && !is_libav_preview_profile(vcs, context.is_jpg, context.is_webp)
+    {
+        return Err(command::CaptureBackendFailure::unavailable(
+            backend,
+            "eligibility",
+            anyhow::anyhow!("requires the fixed Preview profile"),
+        )
+        .into());
+    }
+
+    context.spinner.set_message("Extracting");
+    let stream = capture.start(backend, context.authority_manifest.is_some())?;
+    let plan = stream.plan();
+    let (grid_w, grid_h) = plan.grid_dimensions(vcs.columns);
+    let nonce = fastrand::u64(..);
+    let temp_output = TempOutputCleanup::new(context.out_parent.join(format!(
+        ".{}.{nonce}.tmp.{}",
+        context.file_prefix, context.suffix
+    )));
+    context.spinner.set_message(format!(
+        "Encoding {}",
+        sh_escape_filename(&temp_output.path)
+    ));
+    let child = spawn_attempt_encoder(
+        vcs,
+        &temp_output.path,
+        grid_w,
+        grid_h,
+        context.is_jpg,
+        context.is_webp,
+    )
+    .map_err(command::CaptureAttemptError::fatal)?;
+    let mut encoder = AttemptEncoder::new(child);
+    let mut authority = context
+        .authority_manifest
+        .map(|path| command::AuthorityRecorder::new(path.to_owned()))
+        .transpose()
+        .map_err(command::CaptureAttemptError::fatal)?;
+    let stream_timings = {
+        let stdin = encoder
+            .stdin()
+            .map_err(command::CaptureAttemptError::fatal)?;
+        let mut writer = std::io::BufWriter::new(stdin);
+        context.spinner.set_message("Joining");
+        write_stream_frames(
+            &stream,
+            vcs.columns,
+            context.labels,
+            &mut writer,
+            context.profile,
+            &mut authority,
+        )?
+    };
+    let encoder_tail = encoder
+        .finish(if context.is_jpg {
+            "jpg"
+        } else if context.is_webp {
+            "webp"
+        } else {
+            "avif"
+        })
+        .map_err(command::CaptureAttemptError::fatal)?;
+    let capture_completion = stream.finish()?;
+
+    Ok(VcsAttempt {
+        temp_output,
+        capture_completion,
+        stream_timings,
+        encoder_tail,
+        authority,
+    })
+}
+
+fn spawn_attempt_encoder(
+    vcs: &Vcs,
+    output: &std::path::Path,
+    grid_w: u32,
+    grid_h: u32,
+    is_jpg: bool,
+    is_webp: bool,
+) -> anyhow::Result<Child> {
+    let mut command = Command::new("ffmpeg");
+    if is_jpg {
+        command
+            .arg2("-f", "rawvideo")
+            .arg2("-pix_fmt", "rgb24")
+            .arg2("-s", format!("{grid_w}x{grid_h}"))
+            .arg2("-r", vcs.avif_fps)
+            .arg2("-i", "pipe:0")
+            .arg2("-vframes", "1")
+            .arg2("-v", "quiet");
+    } else if is_webp {
+        command
+            .arg2("-v", "quiet")
+            .arg2("-f", "rawvideo")
+            .arg2("-pix_fmt", "rgb24")
+            .arg2("-s", format!("{grid_w}x{grid_h}"))
+            .arg2("-r", vcs.avif_fps)
+            .arg2("-i", "pipe:0")
+            .arg2("-lossless", "0")
+            .arg2("-loop", "0")
+            .arg2("-c:v", "libwebp")
+            .arg2("-vf", "cropdetect=24:16:0, crop=iw-2*24:ih-2*16")
+            .arg2("-quality", "60")
+            .arg2("-compression_level", "2")
+            .arg2("-crf", vcs.avif_crf)
+            .arg2("-pix_fmt", "yuv420p10le");
+    } else {
+        command
+            .arg2("-v", "error")
+            .arg2("-f", "rawvideo")
+            .arg2("-pix_fmt", "rgb24")
+            .arg2("-s", format!("{grid_w}x{grid_h}"))
+            .arg2("-r", vcs.avif_fps)
+            .arg2("-i", "pipe:0")
+            .arg2("-c:v", &vcs.avif_codec)
+            .arg2(
+                match vcs.avif_codec.as_str() {
+                    "libaom-av1" => "-cpu-used",
+                    _ => "-preset",
+                },
+                vcs.avif_preset.unwrap_or(match vcs.args.capture_frames() {
+                    1 => 4,
+                    _ => 8,
+                }),
+            )
+            .arg2("-crf", vcs.avif_crf)
+            .arg2("-pix_fmt", "yuv420p10le");
+    }
+    command
+        .arg("-y")
+        .arg(output)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(Into::into)
+}
+
 fn write_stream_frames(
     stream: &command::CaptureStream,
     columns: u32,
@@ -533,7 +633,7 @@ fn write_stream_frames(
     writer: &mut std::io::BufWriter<std::process::ChildStdin>,
     profile: bool,
     authority: &mut Option<command::AuthorityRecorder>,
-) -> anyhow::Result<StreamTimings> {
+) -> Result<StreamTimings, command::CaptureAttemptError> {
     let started = Instant::now();
     let mut timings = StreamTimings::default();
     let plan = stream.plan();
@@ -551,26 +651,45 @@ fn write_stream_frames(
             if let Some(receive_started) = receive_started {
                 timings.receive_wait += receive_started.elapsed();
             }
-            ensure!(
-                frame.animation_index >= expected_frame
-                    && frame.animation_index < plan.capture_frames(),
-                "extraction emitted an out-of-order frame {} while waiting for {expected_frame}",
-                frame.animation_index,
-            );
-            ensure!(
-                frame.capture_index < plan.capture_count(),
-                "extraction emitted an invalid capture index {}",
-                frame.capture_index,
-            );
+            if frame.animation_index < expected_frame
+                || frame.animation_index >= plan.capture_frames()
+            {
+                return Err(stream
+                    .attempt_failure(
+                        "validation",
+                        anyhow::anyhow!(
+                            "extraction emitted an out-of-order frame {} while waiting for {expected_frame}",
+                            frame.animation_index,
+                        ),
+                    )
+                    .into());
+            }
+            if frame.capture_index >= plan.capture_count() {
+                return Err(stream
+                    .attempt_failure(
+                        "validation",
+                        anyhow::anyhow!(
+                            "extraction emitted an invalid capture index {}",
+                            frame.capture_index,
+                        ),
+                    )
+                    .into());
+            }
             let captures = pending
                 .entry(frame.animation_index)
                 .or_insert_with(|| (0..plan.capture_count()).map(|_| None).collect());
-            ensure!(
-                captures[frame.capture_index].is_none(),
-                "extraction emitted a duplicate frame for capture {} index {}",
-                frame.capture_index,
-                frame.animation_index,
-            );
+            if captures[frame.capture_index].is_some() {
+                return Err(stream
+                    .attempt_failure(
+                        "validation",
+                        anyhow::anyhow!(
+                            "extraction emitted a duplicate frame for capture {} index {}",
+                            frame.capture_index,
+                            frame.animation_index,
+                        ),
+                    )
+                    .into());
+            }
             let capture_index = frame.capture_index;
             captures[capture_index] = Some(frame);
         }
@@ -589,20 +708,27 @@ fn write_stream_frames(
             timings.first_grid = started.elapsed();
         }
         let join_started = profile.then(Instant::now);
-        let grid = command::join_from_memory(&images, columns, labels)?;
+        let grid = command::join_from_memory(&images, columns, labels)
+            .map_err(command::CaptureAttemptError::fatal)?;
         if let Some(join_started) = join_started {
             timings.join += join_started.elapsed();
         }
         if let Some(authority) = authority {
-            authority.record_grid(expected_frame, &grid)?;
+            authority
+                .record_grid(expected_frame, &grid)
+                .map_err(command::CaptureAttemptError::fatal)?;
         }
         let write_started = profile.then(Instant::now);
-        writer.write_all(grid.as_raw())?;
+        writer
+            .write_all(grid.as_raw())
+            .map_err(|error| command::CaptureAttemptError::fatal(error.into()))?;
         if let Some(write_started) = write_started {
             timings.encoder_write += write_started.elapsed();
         }
     }
-    writer.flush()?;
+    writer
+        .flush()
+        .map_err(|error| command::CaptureAttemptError::fatal(error.into()))?;
     Ok(timings)
 }
 

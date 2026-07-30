@@ -119,6 +119,7 @@ impl Job {
                 duration_s,
                 width,
                 height,
+                codec: None,
                 source_time_base,
             }),
             yazi_id: value

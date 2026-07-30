@@ -75,6 +75,8 @@ pub struct MediaDescriptor {
     pub duration_s: Option<f32>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    /// Codec name of the selected video stream, used for backend eligibility.
+    pub codec: Option<String>,
     /// Time base of the selected video stream, used to materialize frame schedules.
     pub source_time_base: Option<Rational>,
 }
