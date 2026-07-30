@@ -12,6 +12,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// 0 means unbounded — the effective limit is the capture count.
+const fn effective_concurrency(requested: usize, capture_count: usize) -> usize {
+    if requested == 0 { capture_count } else { requested }
+}
+
 /// Normalized shared inputs for one Capture attempt.
 pub(crate) struct CapturePlan {
     #[cfg_attr(
@@ -44,6 +49,8 @@ pub(crate) struct CapturePlan {
     frame_width: u32,
     frame_height: u32,
     labels: Vec<String>,
+    /// Maximum concurrent capture points. 0 = unbounded (use `capture_count`).
+    concurrency: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +67,7 @@ impl CapturePlan {
         extract: &Extract,
         capture_height: Option<u32>,
         capture_width: Option<u32>,
+        concurrency: usize,
     ) -> anyhow::Result<Self> {
         let media = media_properties(extract)?;
         let video_duration_s = media.duration_s;
@@ -113,6 +121,7 @@ impl CapturePlan {
             frame_width,
             frame_height,
             labels,
+            concurrency: effective_concurrency(concurrency, extract.number as usize),
         })
     }
 
@@ -175,6 +184,11 @@ impl CapturePlan {
 
     pub(crate) fn vfilter(&self) -> Option<&str> {
         self.vfilter.as_deref()
+    }
+
+    /// Effective capture-point concurrency — 0 maps to the capture count.
+    pub(crate) fn concurrency(&self) -> usize {
+        self.concurrency
     }
 
     #[cfg_attr(
@@ -417,9 +431,10 @@ impl Capture {
         extract: &Extract,
         capture_height: Option<u32>,
         capture_width: Option<u32>,
+        concurrency: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            plan: CapturePlan::from_extract(extract, capture_height, capture_width)?,
+            plan: CapturePlan::from_extract(extract, capture_height, capture_width, concurrency)?,
         })
     }
 
@@ -816,7 +831,7 @@ mod tests {
     fn preview_capture_plan_normalizes_media_windows_dimensions_and_labels_once() {
         let extract = preview_extract("preview.mkv");
 
-        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+        let capture = Capture::plan(&extract, Some(160), None, 0).unwrap();
         let plan = capture.capture_plan();
 
         assert_eq!(plan.capture_count(), 9);
@@ -1068,7 +1083,7 @@ mod tests {
     #[cfg(not(feature = "in-process-decode"))]
     #[test]
     fn explicit_libav_policy_fails_fast_without_the_optional_build_feature() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
 
         let error = capture
             .start(CaptureBackendPolicy::Libav, false)
@@ -1084,7 +1099,7 @@ mod tests {
     #[cfg(not(all(target_os = "macos", feature = "in-process-decode")))]
     #[test]
     fn explicit_videotoolbox_policy_fails_fast_without_macos_feature_support() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
 
         let error = capture
             .start(CaptureBackendPolicy::VideoToolbox, false)
@@ -1102,7 +1117,7 @@ mod tests {
     fn libav_policy_skips_unsupported_codecs_before_starting_an_attempt() {
         let mut extract = preview_extract("preview.mkv");
         extract.media.as_mut().unwrap().codec = Some("vp9".to_owned());
-        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+        let capture = Capture::plan(&extract, Some(160), None, 0).unwrap();
 
         let error = capture
             .start(CaptureBackendPolicy::Libav, false)
@@ -1120,7 +1135,7 @@ mod tests {
     fn videotoolbox_policy_skips_unsupported_codecs_before_creating_a_device() {
         let mut extract = preview_extract("preview.mkv");
         extract.media.as_mut().unwrap().codec = Some("vp9".to_owned());
-        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+        let capture = Capture::plan(&extract, Some(160), None, 0).unwrap();
 
         let error = capture
             .start(CaptureBackendPolicy::VideoToolbox, false)
@@ -1136,7 +1151,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     #[test]
     fn macos_auto_prefers_videotoolbox_before_software_and_ffmpeg() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
 
         assert_eq!(
             capture.candidates(CaptureBackendPolicy::Auto),
@@ -1159,7 +1174,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     #[test]
     fn macos_auto_retries_videotoolbox_then_libav_before_ffmpeg() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
         let started = RefCell::new(Vec::new());
 
         let result = execute_backend_candidates(
@@ -1212,7 +1227,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     #[test]
     fn macos_auto_skips_media_capability_failures_without_disabling_later_attempts() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
         let started = RefCell::new(Vec::new());
 
         for media_index in 0..2 {
@@ -1258,7 +1273,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     #[test]
     fn macos_auto_retries_videotoolbox_for_later_media_after_runtime_failure() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
         let started = RefCell::new(Vec::new());
 
         for media_index in 0..2 {
@@ -1302,7 +1317,7 @@ mod tests {
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     #[test]
     fn macos_auto_releases_each_failed_attempt_before_starting_the_next_backend() {
-        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("preview.mkv"), Some(160), None, 0).unwrap();
         let resource_is_live = Cell::new(false);
         let started = RefCell::new(Vec::new());
 
@@ -1355,7 +1370,7 @@ mod tests {
     fn auto_skips_unsupported_codecs_before_its_in_process_attempts() {
         let mut extract = preview_extract("preview.mkv");
         extract.media.as_mut().unwrap().codec = Some("vp9".to_owned());
-        let capture = Capture::plan(&extract, Some(160), None).unwrap();
+        let capture = Capture::plan(&extract, Some(160), None, 0).unwrap();
         let started = RefCell::new(Vec::new());
         let expected = capture.candidates(CaptureBackendPolicy::Auto).to_vec();
 
@@ -1390,7 +1405,7 @@ mod tests {
     #[test]
     #[ignore = "requires FFmpeg and the representative Preview input"]
     fn ffmpeg_capture_stream_emits_complete_preview_frames_and_authority() {
-        let capture = Capture::plan(&preview_extract("sample/input.mkv"), Some(160), None).unwrap();
+        let capture = Capture::plan(&preview_extract("sample/input.mkv"), Some(160), None, 0).unwrap();
         let stream = capture.start(CaptureBackendPolicy::Ffmpeg, true).unwrap();
         let plan = stream.plan();
         let capture_count = plan.capture_count();

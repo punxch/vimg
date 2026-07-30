@@ -606,7 +606,7 @@ mod tests {
             source_time_base: Some(crate::command::frame_schedule::Rational::new(1, 1_000)),
         });
         let capture =
-            command::Capture::plan(&vcs.args, vcs.capture_height, vcs.capture_width).unwrap();
+            command::Capture::plan(&vcs.args, vcs.capture_height, vcs.capture_width, 0).unwrap();
         let started = RefCell::new(Vec::new());
         let published = Cell::new(false);
 

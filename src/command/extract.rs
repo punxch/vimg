@@ -246,6 +246,7 @@ impl Extract {
         let (sender, receiver) = sync_channel((process_count * 2).max(1));
         let frame_barrier = Arc::new(FrameBarrier::new(process_count));
         let authority_records = authority.then(|| Arc::new(Mutex::new(vec![None; process_count])));
+        let semaphore = Arc::new(Semaphore::new(plan.concurrency().max(1)));
         let mut workers = Vec::with_capacity(process_count);
         let (frame_w, frame_h) = plan.frame_dimensions();
         let video = plan.video().to_path_buf();
@@ -254,6 +255,7 @@ impl Extract {
             let sender = sender.clone();
             let frame_barrier = Arc::clone(&frame_barrier);
             let authority_records = authority_records.clone();
+            let semaphore = Arc::clone(&semaphore);
             let video = video.clone();
             let vfilter = vfilter.clone();
             workers.push(thread::spawn(move || {
@@ -268,6 +270,7 @@ impl Extract {
                     },
                     &sender,
                     &frame_barrier,
+                    &semaphore,
                 ) {
                     frame_barrier.cancel();
                     let _ = sender.send(Err(error));
@@ -287,6 +290,7 @@ impl Extract {
         capture: PipeCapture,
         sender: &SyncSender<anyhow::Result<PipeFrame>>,
         frame_barrier: &FrameBarrier,
+        semaphore: &Semaphore,
     ) -> anyhow::Result<()> {
         let PipeCapture {
             window,
@@ -367,27 +371,31 @@ impl Extract {
             let mut reader = BufReader::new(stdout);
             let mut last_frame = None;
             for frame_index in 0..capture_frames as usize {
-                let mut raw = vec![0; frame_size];
-                let image = match reader.read_exact(&mut raw) {
-                    Ok(()) => RgbImage::from_raw(width, height, raw).context(if authority {
-                        "decoding failed: FFmpeg emitted an invalid raw RGB frame"
-                    } else {
-                        "FFmpeg emitted an invalid raw RGB frame"
-                    })?,
-                    Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
-                        last_frame.clone().context(if authority {
-                            "decoding failed: FFmpeg produced 0 frames for capture"
+                let image = {
+                    let _permit = semaphore.acquire();
+                    let mut raw = vec![0; frame_size];
+                    let image = match reader.read_exact(&mut raw) {
+                        Ok(()) => RgbImage::from_raw(width, height, raw).context(if authority {
+                            "decoding failed: FFmpeg emitted an invalid raw RGB frame"
                         } else {
-                            "FFmpeg produced 0 frames for capture"
-                        })?
-                    }
-                    Err(error) => {
-                        return Err(error).context(if authority {
-                            "decoding failed: could not read FFmpeg RGB output"
-                        } else {
-                            "could not read FFmpeg RGB output"
-                        });
-                    }
+                            "FFmpeg emitted an invalid raw RGB frame"
+                        })?,
+                        Err(error) if error.kind() == ErrorKind::UnexpectedEof => {
+                            last_frame.clone().context(if authority {
+                                "decoding failed: FFmpeg produced 0 frames for capture"
+                            } else {
+                                "FFmpeg produced 0 frames for capture"
+                            })?
+                        }
+                        Err(error) => {
+                            return Err(error).context(if authority {
+                                "decoding failed: could not read FFmpeg RGB output"
+                            } else {
+                                "could not read FFmpeg RGB output"
+                            });
+                        }
+                    };
+                    image
                 };
                 last_frame = Some(image.clone());
                 if !send_pipe_frame(
@@ -661,5 +669,38 @@ impl Drop for PipeExtractStream {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+    }
+}
+
+/// Simple counting semaphore — gate up to `max` concurrent operations.
+pub(crate) struct Semaphore {
+    permits: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl Semaphore {
+    pub(crate) fn new(max: usize) -> Self {
+        Self { permits: Mutex::new(max), ready: Condvar::new() }
+    }
+
+    pub(crate) fn acquire(&self) -> SemaphoreGuard<'_> {
+        let mut permits = self.permits.lock().unwrap();
+        while *permits == 0 {
+            permits = self.ready.wait(permits).unwrap();
+        }
+        *permits -= 1;
+        SemaphoreGuard { semaphore: self }
+    }
+}
+
+pub(crate) struct SemaphoreGuard<'a> {
+    semaphore: &'a Semaphore,
+}
+
+impl Drop for SemaphoreGuard<'_> {
+    fn drop(&mut self) {
+        let mut permits = self.semaphore.permits.lock().unwrap();
+        *permits += 1;
+        self.semaphore.ready.notify_one();
     }
 }
