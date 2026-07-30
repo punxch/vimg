@@ -452,6 +452,7 @@ mod tests {
     use anyhow::Context as _;
     use serde_json::Value;
     use std::{
+        fs,
         path::{Path, PathBuf},
         process::{Command as ProcessCommand, Output},
     };
@@ -749,6 +750,165 @@ mod tests {
         for (case_name, media) in cases {
             verify_media_contract(case_name, &media).unwrap();
         }
+    }
+
+    #[test]
+    #[ignore = "requires FFmpeg and the generated hardware-boundary corpus"]
+    fn hardware_boundary_corpus_records_ffmpeg_authority() {
+        let corpus_dir = std::env::var_os("VIMG_HARDWARE_BOUNDARY_CORPUS")
+            .expect("VIMG_HARDWARE_BOUNDARY_CORPUS must name the generated corpus directory");
+
+        verify_hardware_boundary_corpus(Path::new(&corpus_dir)).unwrap();
+    }
+
+    fn verify_hardware_boundary_corpus(corpus_dir: &Path) -> anyhow::Result<()> {
+        let declarations: Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/hardware-boundary/declarations.json"
+        ))?;
+        let fixtures = declarations["fixtures"]
+            .as_array()
+            .context("hardware-boundary declarations must contain fixtures")?;
+
+        for fixture in fixtures {
+            let name = fixture["name"]
+                .as_str()
+                .context("hardware-boundary fixture must have a name")?;
+            let media = corpus_dir.join(
+                fixture["file"]
+                    .as_str()
+                    .context("hardware-boundary fixture must name its media file")?,
+            );
+            anyhow::ensure!(media.is_file(), "{name}: generated media is missing");
+            let valid = fixture["valid"]
+                .as_bool()
+                .context("hardware-boundary fixture must declare validity")?;
+            let expectation = fixture["videotoolbox"]
+                .as_str()
+                .context("hardware-boundary fixture must declare VideoToolbox expectation")?;
+            anyhow::ensure!(
+                matches!(expectation, "supported" | "backend-fallback" | "failure"),
+                "{name}: invalid VideoToolbox expectation {expectation}"
+            );
+
+            let authority_dir = corpus_dir.join("authority");
+            let manifest_path = authority_dir.join(format!("{name}.json"));
+            let output_path = authority_dir.join(format!("{name}.avif"));
+            if valid {
+                anyhow::ensure!(
+                    expectation != "failure",
+                    "{name}: valid fixture cannot expect decode failure"
+                );
+                verify_hardware_stream(name, &media, &fixture["stream"])?;
+                verify_hardware_authority(name, &manifest_path, &output_path)?;
+            } else {
+                anyhow::ensure!(
+                    expectation == "failure",
+                    "{name}: invalid fixture must expect decode failure"
+                );
+                anyhow::ensure!(
+                    !manifest_path.exists() && !output_path.exists(),
+                    "{name}: invalid fixture published an authority artifact"
+                );
+                let failure_log = corpus_dir.join("failures").join(format!("{name}.log"));
+                anyhow::ensure!(
+                    failure_log.is_file() && fs::metadata(&failure_log)?.len() > 0,
+                    "{name}: invalid fixture did not report an explicit failure"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_hardware_stream(name: &str, media: &Path, expected: &Value) -> anyhow::Result<()> {
+        let output = ProcessCommand::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name,pix_fmt,color_range,color_space,color_transfer,color_primaries,sample_aspect_ratio,field_order:stream_side_data=rotation",
+                "-of",
+                "json",
+            ])
+            .arg(media)
+            .output()?;
+        ensure_process_success("ffprobe hardware fixture", media, &output)?;
+        let probe: Value = serde_json::from_slice(&output.stdout)?;
+        let stream = probe["streams"]
+            .as_array()
+            .and_then(|streams| streams.first())
+            .context("ffprobe hardware fixture did not return a video stream")?;
+        let expected = expected
+            .as_object()
+            .context("valid hardware fixture must declare stream properties")?;
+        for (key, value) in expected {
+            if key == "rotation" {
+                let found_rotation = stream["side_data_list"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|side_data| side_data["rotation"] == *value);
+                anyhow::ensure!(found_rotation, "{name}: expected rotation {value}");
+            } else {
+                anyhow::ensure!(
+                    stream[key] == *value,
+                    "{name}: expected {key} {value}, found {}",
+                    stream[key]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_hardware_authority(
+        name: &str,
+        manifest_path: &Path,
+        output_path: &Path,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(output_path.is_file(), "{name}: authority AVIF is missing");
+        let manifest: Value = serde_json::from_slice(&fs::read(manifest_path)?)?;
+        anyhow::ensure!(
+            manifest["authority"] == "production-ffmpeg-capture",
+            "{name}: authority does not identify the production FFmpeg capture"
+        );
+        anyhow::ensure!(
+            manifest["selected_frames"]
+                .as_array()
+                .is_some_and(|frames| frames.len() == 270),
+            "{name}: authority does not record 270 selected source PTS"
+        );
+        let animation = &manifest["animation"];
+        anyhow::ensure!(
+            animation["width"].as_u64().is_some_and(|width| width > 0)
+                && animation["height"]
+                    .as_u64()
+                    .is_some_and(|height| height > 0)
+                && animation["frame_count"] == 30,
+            "{name}: authority has an incomplete structural record"
+        );
+        for visual_kind in ["pre_encoder_visual_frames", "decoded_visual_frames"] {
+            let frames = animation[visual_kind]
+                .as_array()
+                .context("authority visual record is missing")?;
+            anyhow::ensure!(
+                frames.len() == 30,
+                "{name}: authority has {} {visual_kind}, expected 30",
+                frames.len()
+            );
+            for frame in frames {
+                let path = manifest_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(
+                        frame
+                            .as_str()
+                            .context("authority visual record contains a non-path")?,
+                    );
+                anyhow::ensure!(path.is_file(), "{name}: authority visual frame is missing");
+            }
+        }
+        Ok(())
     }
 
     fn verify_media_contract(case_name: &str, media: &Path) -> anyhow::Result<()> {

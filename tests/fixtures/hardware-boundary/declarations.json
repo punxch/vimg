@@ -1,0 +1,142 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "name": "h264-8-bt601-limited",
+      "file": "h264-8-bt601-limited.mkv",
+      "valid": true,
+      "videotoolbox": "supported",
+      "stream": {
+        "codec_name": "h264",
+        "pix_fmt": "yuv420p",
+        "color_range": "tv",
+        "color_space": "smpte170m",
+        "color_transfer": "smpte170m",
+        "color_primaries": "smpte170m",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "hevc-8-bt709-full",
+      "file": "hevc-8-bt709-full.mkv",
+      "valid": true,
+      "videotoolbox": "supported",
+      "stream": {
+        "codec_name": "hevc",
+        "pix_fmt": "yuvj420p",
+        "color_range": "pc",
+        "color_space": "bt709",
+        "color_transfer": "bt709",
+        "color_primaries": "bt709",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "h264-10-bt2020-limited",
+      "file": "h264-10-bt2020-limited.mkv",
+      "valid": true,
+      "videotoolbox": "backend-fallback",
+      "stream": {
+        "codec_name": "h264",
+        "pix_fmt": "yuv420p10le",
+        "color_range": "tv",
+        "color_space": "bt2020nc",
+        "color_transfer": "bt2020-10",
+        "color_primaries": "bt2020",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "hevc-10-bt2020-full",
+      "file": "hevc-10-bt2020-full.mkv",
+      "valid": true,
+      "videotoolbox": "supported",
+      "stream": {
+        "codec_name": "hevc",
+        "pix_fmt": "yuv420p10le",
+        "color_range": "pc",
+        "color_space": "bt2020nc",
+        "color_transfer": "bt2020-10",
+        "color_primaries": "bt2020",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "h264-rotation-90",
+      "file": "h264-rotation-90.mp4",
+      "valid": true,
+      "videotoolbox": "supported",
+      "stream": {
+        "codec_name": "h264",
+        "pix_fmt": "yuv420p",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive",
+        "rotation": 90
+      }
+    },
+    {
+      "name": "h264-sar-4x3",
+      "file": "h264-sar-4x3.mkv",
+      "valid": true,
+      "videotoolbox": "supported",
+      "stream": {
+        "codec_name": "h264",
+        "pix_fmt": "yuv420p",
+        "sample_aspect_ratio": "4:3",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "h264-interlaced-tff",
+      "file": "h264-interlaced-tff.mkv",
+      "valid": true,
+      "videotoolbox": "backend-fallback",
+      "stream": {
+        "codec_name": "h264",
+        "pix_fmt": "yuv420p",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "tb"
+      }
+    },
+    {
+      "name": "h264-422",
+      "file": "h264-422.mkv",
+      "valid": true,
+      "videotoolbox": "backend-fallback",
+      "stream": {
+        "codec_name": "h264",
+        "pix_fmt": "yuv422p",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "hevc-444",
+      "file": "hevc-444.mkv",
+      "valid": true,
+      "videotoolbox": "backend-fallback",
+      "stream": {
+        "codec_name": "hevc",
+        "pix_fmt": "yuv444p",
+        "sample_aspect_ratio": "1:1",
+        "field_order": "progressive"
+      }
+    },
+    {
+      "name": "corrupt-container",
+      "file": "corrupt-container.mkv",
+      "valid": false,
+      "videotoolbox": "failure"
+    },
+    {
+      "name": "truncated-container",
+      "file": "truncated-container.mkv",
+      "valid": false,
+      "videotoolbox": "failure"
+    }
+  ]
+}
