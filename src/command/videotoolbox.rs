@@ -47,10 +47,10 @@ pub(super) fn start(
     ffmpeg::init().context("initializing VideoToolbox libav support")?;
     let device = shared_device()?;
 
-    // NOTE: Capture-point concurrency limiting for in-process backends requires
-    // per-frame semaphore gating inside `emit_scheduled_frames`. The plan-level
-    // `concurrency` value is stored but not yet enforced here; all capture
-    // workers run concurrently.
+    // NOTE: Capture-point concurrency limiting for in-process backends
+    // requires per-frame semaphore gating inside `emit_scheduled_frames`.
+    // The plan-level `concurrency` value is stored but not yet enforced
+    // here; all capture workers run concurrently.
     let _ = plan.concurrency();
 
     let mut receivers = Vec::with_capacity(plan.capture_count());
