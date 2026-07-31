@@ -551,6 +551,23 @@ worker 开始前 acquire semaphore（permit 数 = -T，默认 4），`recv` 改�
 5. 预滚占慢点总耗时 52-65%，是 Windows 上剩余可优化空间（受 GOP 结构和
    nonref 正确性约束，仅能通过 margin 微调，已从 0.5s 降至 0.25s）。
 
+### 预滚优化实施（2026-07-31）
+
+两项改动（提交于 libav backend）：
+
+1. **预滚帧跳过克隆**：原 `receive_frames` 对每个解码帧（含预滚帧）先
+   `decoded.clone()`（~3MB/帧）再判定 `pts < source_pts_offset()` 丢弃。
+   预滚 272 帧 × 3MB ≈ 800MB 无效内存分配 + 拷贝。改为先判定后克隆，
+   预滚帧零拷贝。
+2. **margin 0.25 → 0.125**：预滚帧 272 → 254（−6.6%），输出仍逐字节一致
+   （SHA-256 3f0fa2be…，本样本验证；mac 上 0.125 亦一致但需语料验证）。
+
+效果（profile total）：1.944s → 1.881-1.95s（−0.06s，~3%），收益在系统
+负载噪声内。结构性限制：预滚段必须解出窗口起点前的全部参考帧（参考链
+正确性），GOP 由源决定，margin 只能微调 nonref/完整解码切换点。剩余大头
+是 first_grid 等待（semaphore=4 下 241 帧才齐集，后 5 个 worker 排队）和
+encode 0.35s。
+
 ## libav 并发门控复测（2026-07-31，Windows + RTX 3090）
 
 ### 目的与方法

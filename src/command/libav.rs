@@ -22,7 +22,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-const NONREF_RECOVERY_MARGIN_S: f64 = 0.25;
+const NONREF_RECOVERY_MARGIN_S: f64 = 0.125;
 const DECODER_THREADS: usize = 3;
 type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
 
@@ -389,20 +389,22 @@ fn receive_frames(
             .timestamp()
             .or_else(|| decoded.pts())
             .context("libav capture is unavailable: decoded frame has no timestamp")?;
+        *input_frame_index += 1;
+        // FFmpeg's input-side `-ss` begins the CFR filter at the first decoded
+        // source timestamp at or after the planned start. libav seeking may expose
+        // a few earlier display frames, which must remain preroll only. Skip them
+        // before cloning: 272 preroll frames at ~3MB each is ~800MB of wasted
+        // allocation + memcpy per run.
+        if pts < schedule.source_pts_offset() {
+            metrics.preroll_frames += 1;
+            continue;
+        }
         let current = PendingDecoded {
             image: decoded.clone(),
             pts,
             input_frame_index: *input_frame_index,
             duration: packet_durations.get(&pts).copied(),
         };
-        *input_frame_index += 1;
-        // FFmpeg's input-side `-ss` begins the CFR filter at the first decoded
-        // source timestamp at or after the planned start. libav seeking may expose
-        // a few earlier display frames, which must remain preroll only.
-        if current.pts < schedule.source_pts_offset() {
-            metrics.preroll_frames += 1;
-            continue;
-        }
         if let Some(pending) = pending_decoded.take() {
             let duration = pending.duration.unwrap_or(current.pts - pending.pts);
             ensure!(
