@@ -854,3 +854,26 @@ no-clone + margin 0.125）：profile total ~1.8s、wall ~2.0s、peak RSS
   movenc 内部；按 ADR 字节一致门槛**暂不集成**。后续若做，先解决
   stream time_base 与 packet pts 单位对齐，再用 raw grid hash + 解码帧数
   + duration + 文件大小验收。
+
+### P1 硬件解码探针（2026-08-01，进程内共享 CUDA）
+
+ffmpeg-next 无 hwaccel API，用 ffmpeg-sys ffi 写临时 `cuda_probe` bin
+（已删除）：共享 CUDA device context + 9 窗口 h264_cuvid 并发解码 +
+av_hwframe_transfer_data 回传 + sws 缩放。
+
+| 发现 | 数据 |
+|---|---|
+| 像素一致性 | CLI 验证 CUDA 硬解 = CPU 软解逐字节一致（h264 确定性） |
+| 共享上下文吞吐 | 9 窗口 30 帧/窗口 makespan **0.53-0.59s**（~460-510fps 含 transfer+sws） |
+| seek | `avformat_seek_file(-1)` 无效（packet pts 全 0）；`av_seek_frame(流索引)` 有效 |
+| **nonref 预滚** | **`skip_frame(AVDISCARD_NONREF)` 对 h264_cuvid 无效**（packets 全解） |
+| 帧 pts | cuvid 输出帧无 pts（需 packet time_base + 权威追踪） |
+
+**收益评估为负**：cuvid 无 nonref 预滚 → 预滚段全解码（含 B 帧），
+每窗口 ~95 帧（vs CPU nonref 的 ~65 帧，+50%）。9 窗口 855 帧 @ 460fps
+≈ 1.86s，劣于 CPU libav 的 1.5s（nonref 预滚）。
+
+**结论：硬件解码方向关闭**。NVDEC 13.1 的按 PTS 跳过输出不承诺跳过参考帧
+解码（调研文档已警示），无法复刻 `AVDISCARD_NONREF` preroll；预滚段全解码
+抵消 GPU 吞吐优势。若要继续，需先验证驱动层跳过 B 帧解码，或改预滚策略
+（但会破坏选帧权威）。
