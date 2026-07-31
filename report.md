@@ -745,3 +745,22 @@ threads 不是足够好的最终方案。
   组成首个网格的流水线性质。
 - 在 512 MB 契约下不应直接回退；下一步最值得做的是减少每 decoder 常驻内存，
   使公平的 9-worker 接收重新可行，并同时修正指标。
+
+### 最终决策与权衡（2026-07-31，提交 `56fc1e4`）
+
+上表建议“在 512 MB 契约下不直接回退”，但后续 A/B 实测推翻了该保守结论：
+
+| 配置 | profile total | first_grid | vimg 峰值 RSS |
+|---|---:|---:|---:|
+| 整 worker 门控（-T4） | 1.88s | 1.32s | ~286 MB |
+| 无门控（`56fc1e4`） | **1.74s** | **1.11s** | ~523 MB |
+
+门控的 3 波排队（5 个 worker 空闲等 permit）在低负载与受控高负载（2 实例
+并行）下均劣于 9 路并发竞争：`-T9` 2.85s vs `-T4` 2.96s（2 实例）。
+serve 模式为单活跃 job，门控无防御价值。
+
+**决策：移除门控（延迟优先）**，接受 RSS ~523MB 超预算 ~11MB。残留风险与
+后续方向：减少每 decoder 常驻内存（释放 `previous_decoded`/`pending_decoded`
+全分辨率引用）使公平 9-worker 回到预算内，并修正 profile 计时边界
+（新增 `gate_wait`/`capture_makespan`）。完整数据归档于
+`benchmarks/windows.md`。
