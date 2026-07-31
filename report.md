@@ -834,3 +834,23 @@ lp=4 在 DT2 下端到端 −15%（profile total），输出逐字节一致
 no-clone + margin 0.125）：profile total ~1.8s、wall ~2.0s、peak RSS
 ~440MB、输出逐字节一致（`3f0fa2be…`）。剩余有价值方向为 P1：
 进程内编码（非解码尾段 0.4-0.5s）与共享上下文硬件解码。
+
+### P1 进程内编码原型（2026-08-01）
+
+用 ffmpeg-next 实现进程内 libsvtav1 编码 + AVIF mux 的独立探针
+（临时 `enc_probe` bin，已删除）：
+
+- **编码收益确认**：30 帧 852×480 libsvtav1（preset 8 / crf 30 / lp=4 /
+  yuv420p10le）进程内 **0.08-0.11s**，packets=30。外部 ffmpeg 的
+  encoder_write+tail 约 0.32s → **可回收 ~0.2s**。
+- **关键坑**：`encoder::find(Id::AV1)` 选到 **libaom-av1**（4.4s 极慢），
+  必须 `find_by_name("libsvtav1")`；SVT 全缓冲（send_eof 后才出包）。
+- **封装障碍**：packet pts 以编码器 time_base（1/20）输出，avif muxer 的
+  track timescale 为 1/10240（CLI 自动 rescale，ffmpeg-next 需手动
+  pts×512 + duration=512）；track duration_ts 对齐后（15360=1.5s），
+  **mvhd 仍不匹配**（stream time_base 1/90000 vs CLI 1/10240，
+  format duration 0.17s vs 1.5s）——非字节一致。
+- **结论**：编码端收益 ~0.2s 可行，但 AVIF 封装 timescale 对齐需深入
+  movenc 内部；按 ADR 字节一致门槛**暂不集成**。后续若做，先解决
+  stream time_base 与 packet pts 单位对齐，再用 raw grid hash + 解码帧数
+  + duration + 文件大小验收。
