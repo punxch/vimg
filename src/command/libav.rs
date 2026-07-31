@@ -23,7 +23,7 @@ use std::{
 };
 
 const NONREF_RECOVERY_MARGIN_S: f64 = 0.125;
-const DECODER_THREADS: usize = 3;
+const DECODER_THREADS: usize = 2;
 type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
 
 pub(super) fn start(
@@ -258,7 +258,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
     let mut decoded = Video::empty();
     let mut rgb = Video::empty();
     let mut input_frame_index = 0_i64;
-    let mut previous_decoded = None;
+    let mut previous_rgb: Option<RgbImage> = None;
     let mut pending_decoded = None;
     let mut last_duration = None;
     let mut packet_durations = HashMap::new();
@@ -296,7 +296,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
             source_time_base,
             sender,
             &mut input_frame_index,
-            &mut previous_decoded,
+            &mut previous_rgb,
             &mut pending_decoded,
             &mut last_duration,
             &packet_durations,
@@ -318,7 +318,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
             source_time_base,
             sender,
             &mut input_frame_index,
-            &mut previous_decoded,
+            &mut previous_rgb,
             &mut pending_decoded,
             &mut last_duration,
             &packet_durations,
@@ -338,7 +338,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
             &mut schedule,
             source_time_base,
             sender,
-            &mut previous_decoded,
+            &mut previous_rgb,
             &mut selected,
         )?;
     }
@@ -367,7 +367,7 @@ fn receive_frames(
     source_time_base: crate::command::frame_schedule::Rational,
     sender: &SyncSender<anyhow::Result<CaptureFrame>>,
     input_frame_index: &mut i64,
-    previous_decoded: &mut Option<Video>,
+    previous_rgb: &mut Option<RgbImage>,
     pending_decoded: &mut Option<PendingDecoded>,
     last_duration: &mut Option<i64>,
     packet_durations: &HashMap<i64, i64>,
@@ -411,7 +411,7 @@ fn receive_frames(
                 schedule,
                 source_time_base,
                 sender,
-                previous_decoded,
+                previous_rgb,
                 selected,
             )?;
         }
@@ -436,7 +436,7 @@ fn emit_scheduled_frames(
     schedule: &mut crate::command::frame_schedule::FrameSchedule,
     source_time_base: crate::command::frame_schedule::Rational,
     sender: &SyncSender<anyhow::Result<CaptureFrame>>,
-    previous_decoded: &mut Option<Video>,
+    previous_rgb: &mut Option<RgbImage>,
     selected: &mut Vec<SourceSelection>,
 ) -> anyhow::Result<()> {
     let scheduled = schedule.push(SourceFrame {
@@ -444,27 +444,31 @@ fn emit_scheduled_frames(
         pts: current.pts,
         duration,
     })?;
+    // Scale the current source frame once. The small RGB is retained as the
+    // previous frame for CFR re-selection instead of the full-resolution YUV,
+    // saving ~3MB resident per worker (9 workers ≈ 27MB).
+    scaler
+        .get("in")
+        .context("libav scale filter has no input")?
+        .source()
+        // av_buffersrc_add_frame may take ownership of the supplied frame;
+        // feed a clone and drop the full-resolution reference afterwards.
+        .add(&current.image.clone())?;
+    scaler
+        .get("out")
+        .context("libav scale filter has no output")?
+        .sink()
+        .frame(rgb)?;
+    let current_rgb = copy_rgb(rgb)?;
     for frame in scheduled {
-        let source = if frame.input_frame_index == current.input_frame_index {
-            &current.image
+        let image = if frame.input_frame_index == current.input_frame_index {
+            current_rgb.clone()
         } else {
-            previous_decoded.as_ref().context(
+            previous_rgb.as_ref().context(
                 "libav frame schedule selected a previous source frame that was not retained",
             )?
+            .clone()
         };
-        scaler
-            .get("in")
-            .context("libav scale filter has no input")?
-            .source()
-            // av_buffersrc_add_frame may take ownership of the supplied frame;
-            // retain our decoded reference because CFR can select it again.
-            .add(&source.clone())?;
-        scaler
-            .get("out")
-            .context("libav scale filter has no output")?
-            .sink()
-            .frame(rgb)?;
-        let image = copy_rgb(rgb)?;
         selected.push(SourceSelection {
             source_pts: frame.source_pts,
             source_time_base: format!(
@@ -481,7 +485,7 @@ fn emit_scheduled_frames(
             }))
             .context("libav frame consumer stopped")?;
     }
-    *previous_decoded = Some(current.image);
+    *previous_rgb = Some(current_rgb);
     Ok(())
 }
 

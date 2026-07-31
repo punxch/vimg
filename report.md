@@ -764,3 +764,27 @@ serve 模式为单活跃 job，门控无防御价值。
 全分辨率引用）使公平 9-worker 回到预算内，并修正 profile 计时边界
 （新增 `gate_wait`/`capture_makespan`）。完整数据归档于
 `benchmarks/windows.md`。
+
+### 每 decoder 常驻内存优化实施（2026-07-31，提交 `实施`）
+
+目标：移除门控后 RSS ~523MB 超 ADR-0001 的 512MB 预算，压缩每 decoder
+常驻内存。
+
+1. **previous 帧改存缩放后 RGB**：`emit_scheduled_frames` 原来把
+   `previous_decoded`（全分辨率 YUV ~3MB/worker）保留给 CFR 补帧；改为
+   每次无条件将当前帧缩放一次（`current_rgb`，284×160 RGB 136KB）并作为
+   previous 保留，补帧直接复用 RGB（不再重新缩放）。省 ~9MB/进程，且缩放
+   次数从“每 scheduled 帧”降到“每源帧一次”。
+2. **DECODER_THREADS 3→2（frame threading）**：decoder 帧线程缓冲池是 RSS
+   大头（DT=3 514.6MB → DT=2 443.3MB）。slice threading 虽降到 363.7MB
+   但 h264 单帧 slice 少、无并行收益（total 2.17s，+25%），放弃。
+
+| 配置 | profile total | 峰值 RSS | 512MB 预算 |
+|---|---:|---:|---|
+| frame threading DT=3 | **1.74s** | 514.6MB | ✗ 超 0.5% |
+| **frame threading DT=2（采用）** | 1.96s | **443.3MB** | ✅ 余 69MB |
+| slice threading DT=3 | 2.17s | 363.7MB | ✅ 余 148MB |
+
+输出与 ffmpeg 后端逐字节一致（SHA-256 3f0fa2be…）。**最终采用 DT=2**：
+预算内最快；性能代价 ~0.22s（相对 DT=3）换取 RSS 余量 69MB（含编码子进程
+与输入语料的缓冲）。
