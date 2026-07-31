@@ -693,6 +693,11 @@ fn spawn_attempt_encoder(
                 }),
             )
             .arg2("-crf", vcs.avif_crf)
+            // SVT-AV1 lp (Level of Parallelism) 4: for the fixed Preview
+            // profile's short 30-frame encode, auto lp=6 over-parallelizes
+            // (PPCS 305 vs 107). lp=4 is ~15% faster end-to-end with
+            // byte-identical output (see docs/research/2026-08-01).
+            .arg2("-svtav1-params", "lp=4")
             .arg2("-pix_fmt", "yuv420p10le");
     }
     command

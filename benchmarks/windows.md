@@ -50,6 +50,28 @@
 | first_grid | 1.75s | **1.11s** | **−37%** |
 | 输出 SHA-256 | `3f0fa2be…` | `3f0fa2be…` | 逐字节一致 |
 
+## 调研后最终配置（2026-08-01：SVT lp=4 + DT2）
+
+调研文档：`docs/research/2026-08-01-windows-runtime-optimization-options.md`。
+端到端 ABBA（warm 6 次/配置）确认：
+
+| 配置 | wall 平均 | profile total | 输出 |
+|---|---:|---:|---|
+| DT2 + SVT 自动 lp（原） | ~2.04s | 1.96s | 3f0fa2be… |
+| **DT2 + lp=4（采用）** | **~1.90s** | **1.67s** | 3f0fa2be… |
+| DT3 + auto lp | ~2.02s | —（RSS 超预算） | — |
+| DT3 + lp=4 | ~1.99s | —（RSS 超预算） | — |
+
+SVT-AV1 `lp`（Level of Parallelism）4：30 帧短编码 auto lp=6 过度并行
+（PPCS 305→107），编码 write+tail 0.36→0.27s。lp4 在 DT2 下有效
+（−15% profile total），DT3 下被解码竞争淹没。DT3 两格仅作正交量化，
+RSS 超 512MB 预算未采纳。
+
+**最终 libav 配置**：无门控 + frame threading DT=2 + margin 0.125 +
+预滚零拷贝 + previous 缩放 RGB + SVT `lp=4`。wall ~1.90s、profile total
+1.67s、peak RSS 445MB（预算内）、输出与 ffmpeg 后端逐字节一致
+（`3f0fa2be…`）。
+
 ## 关键发现（调研结论）
 
 1. **mkv 并发 seek 串行化**（ffmpeg 后端最大瓶颈）：3.2GB/55 流 mkv 的 9 个采样点

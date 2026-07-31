@@ -788,3 +788,25 @@ serve 模式为单活跃 job，门控无防御价值。
 输出与 ffmpeg 后端逐字节一致（SHA-256 3f0fa2be…）。**最终采用 DT=2**：
 预算内最快；性能代价 ~0.22s（相对 DT=3）换取 RSS 余量 69MB（含编码子进程
 与输入语料的缓冲）。
+
+### 调研执行与 SVT lp=4（2026-08-01）
+
+执行调研文档 `docs/research/2026-08-01-windows-runtime-optimization-options.md`
+的 P0 实验（端到端 ABBA，warm 6 次/配置）：
+
+| 配置 | wall 平均 | profile total | 512MB 预算 |
+|---|---:|---:|---|
+| DT2 + SVT 自动 lp（原） | ~2.04s | 1.96s | ✅ |
+| **DT2 + `lp=4`（采用）** | **~1.90s** | **1.67s** | ✅ |
+| DT3 + 自动 lp | ~2.02s | — | ✗ |
+| DT3 + `lp=4` | ~1.99s | — | ✗ |
+
+SVT-AV1 `lp`（Level of Parallelism，0-6）不是 low-power：30 帧 852×480
+短编码自动 lp=6 过度并行（PPCS 305→107），编码 write+tail 0.36→0.27s。
+lp=4 在 DT2 下端到端 −15%（profile total），输出逐字节一致
+（`3f0fa2be…`）；DT3 下收益被解码竞争淹没，且 RSS 超预算。
+
+**最终 libav 配置**：无门控 + frame threading DT=2 + margin 0.125 +
+预滚零拷贝 + previous 缩放 RGB + SVT `lp=4`。wall ~1.90s、profile total
+1.67s、peak RSS 445MB。未做选择性 DT3（收益小于复杂度）与阻塞轮询
+（当前收益上限 1-2%）；进程内编码/硬件后端为 P1 后续方向。
