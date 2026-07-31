@@ -522,6 +522,30 @@ worker 开始前 acquire semaphore（permit 数 = -T，默认 4），`recv` 改�
 输出与 ffmpeg 后端逐字节一致（SHA-256 3f0fa2be…）。尝试了每帧/每 5 帧
 时间片门控（解码器频繁切换，吞吐下降），最终保留整 worker 门控。
 
+### first_grid 并发调度调研与门控移除（2026-07-31）
+
+整 worker 门控（permit=-T，默认 4）让 9 个 worker 分 3 波排队：worker 0-3
+解完全部 30 帧才释放 permit，grid 0 要等最后一波 worker 的帧 0
+（frames_before_first_grid 膨胖到 241）。系统性实验：
+
+| 配置 | first_grid | decode | total(profile) | wall |
+|---|---|---|---|---|
+| 整 worker 门控（-T4） | 1.32s | 0.95s | 1.88s | 2.35s |
+| 帧 0 后释放+重 acquire | 1.39s | — | 2.20s（重新排队停顿） | 2.3-3.3s |
+| 每 5 帧时间片 | 1.26s | 1.57s（切换开销） | 1.88s | 2.0-3.0s |
+| -T9 无门控 | 1.11s | 1.43s | **1.74s** | **1.90s** |
+
+**结论：整 worker 门控是负优化**。3 波排队（后 5 个 worker 空闲等 permit）的
+开销大于 9 路并发竞争（27 线程 vs 24 核）。低负载、高负载（2 实例并行）
+下 -T9 均优于 -T4（2.85s vs 2.96s @ 2 实例）。已移除门控（保留 recv 轮询
+与 margin 0.125/no-clone 优化）。
+
+最终（libav，无门控 + margin 0.125 + no-clone）：first_grid 1.11s
+（vs ffmpeg 后端 1.75s，快 37%），total 1.74s（vs 2.11s，快 12%），
+输出逐字节一致（3f0fa2be…）。frames_before_first_grid=241 的残余是
+慢采样点（长 GOP 预滚 0.6s）的物理下限：grid 0 必须等最慢采样点的帧 0，
+期间 recv 已消费快采样点的帧 1-29。
+
 ### libav 预滚执行效率测量（2026-07-31，Windows + RTX 3090）
 
 对 libav 后端的 9 个采样点逐 worker 计时（setup / nonref 预滚 / 窗口完整解码）：

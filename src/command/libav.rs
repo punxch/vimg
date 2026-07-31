@@ -3,7 +3,7 @@
 use crate::command::frame_schedule::SourceFrame;
 use crate::command::{
     CaptureAttempt, CaptureAuthority, CaptureCompletion, CaptureDiagnostics, CaptureFrame,
-    CaptureMetrics, CapturePlan, SourceSelection, extract::Semaphore,
+    CaptureMetrics, CapturePlan, SourceSelection,
 };
 use anyhow::{Context, ensure};
 use ffmpeg::codec::{discard::Discard, threading};
@@ -38,17 +38,10 @@ pub(super) fn start(
     // workers run concurrently.
     let _ = plan.concurrency();
 
-    // Limit the number of concurrently decoding capture workers to the
-    // effective capture-point concurrency (-T). 9 workers × 3 decoder threads
-    // saturates the CPU; gating keeps per-worker decode throughput high.
-    // `recv` polls every channel so waiting workers cannot deadlock behind
-    // full bounded channels (each worker releases its permit once its frames
-    // have been drained).
     let mut receivers = Vec::with_capacity(plan.capture_count());
     let mut workers = Vec::with_capacity(plan.capture_count());
     let cancelled = Arc::new(AtomicBool::new(false));
     let records = authority.then(|| Arc::new(Mutex::new(vec![None; plan.capture_count()])));
-    let semaphore = Arc::new(Semaphore::new(plan.concurrency().max(1)));
     for (window, schedule) in plan
         .windows()
         .iter()
@@ -61,9 +54,7 @@ pub(super) fn start(
         let dimensions = plan.frame_dimensions();
         let records = records.clone();
         let cancelled = Arc::clone(&cancelled);
-        let semaphore = Arc::clone(&semaphore);
         workers.push(thread::spawn(move || {
-            let _permit = semaphore.acquire();
             let result = decode_capture(DecodeRequest {
                 video: &video,
                 capture_index: window.capture_index(),
