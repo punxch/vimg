@@ -503,3 +503,21 @@ libav 输出与 ffmpeg 后端逐字节一致（SHA-256 3f0fa2be…），预滚�
 
 若需真正达到 1.3s，需要 Windows 硬件解码路径（CUDA 帧传输优化）或降低
 固定 Preview profile 的窗口/帧数契约（ADR-0001）。
+
+### libav 并发门控（semaphore）优化（2026-07-31 追加）
+
+libav 后端 9 个解码 worker 全并发时 CPU 饱和（decode 1.68s）。添加并发门控：
+worker 开始前 acquire semaphore（permit 数 = -T，默认 4），`recv` 改为轮询
+所有 channel（try_recv + yield，跳过已完成的 worker），避免有界 channel
+死锁。
+
+| 配置 | decode（max worker） | first_grid | total（profile） |
+|---|---|---|---|
+| libav 无门控（9 并发） | 1.68s | 0.89s | 2.08s |
+| libav -T4 门控 | 0.95s | 1.32s（241 帧才齐集，后 5 worker 排队） | **1.87s** |
+| 每 5 帧时间片轮转 | 1.57s（解码器切换开销） | 1.26s | 1.88s（更差） |
+
+高负载（CPU 被 dota2/rustdesk 占用）下 libav -T4 门控 1.87s vs ffmpeg 后端
+2.60s（快 28%）；清理负载后两者均 ~2.1-2.2s（CPU 解码吞吐是共同硬下限）。
+输出与 ffmpeg 后端逐字节一致（SHA-256 3f0fa2be…）。尝试了每帧/每 5 帧
+时间片门控（解码器频繁切换，吞吐下降），最终保留整 worker 门控。

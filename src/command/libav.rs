@@ -3,7 +3,7 @@
 use crate::command::frame_schedule::SourceFrame;
 use crate::command::{
     CaptureAttempt, CaptureAuthority, CaptureCompletion, CaptureDiagnostics, CaptureFrame,
-    CaptureMetrics, CapturePlan, SourceSelection,
+    CaptureMetrics, CapturePlan, SourceSelection, extract::Semaphore,
 };
 use anyhow::{Context, ensure};
 use ffmpeg::codec::{discard::Discard, threading};
@@ -38,10 +38,17 @@ pub(super) fn start(
     // workers run concurrently.
     let _ = plan.concurrency();
 
+    // Limit the number of concurrently decoding capture workers to the
+    // effective capture-point concurrency (-T). 9 workers × 3 decoder threads
+    // saturates the CPU; gating keeps per-worker decode throughput high.
+    // `recv` polls every channel so waiting workers cannot deadlock behind
+    // full bounded channels (each worker releases its permit once its frames
+    // have been drained).
     let mut receivers = Vec::with_capacity(plan.capture_count());
     let mut workers = Vec::with_capacity(plan.capture_count());
     let cancelled = Arc::new(AtomicBool::new(false));
     let records = authority.then(|| Arc::new(Mutex::new(vec![None; plan.capture_count()])));
+    let semaphore = Arc::new(Semaphore::new(plan.concurrency().max(1)));
     for (window, schedule) in plan
         .windows()
         .iter()
@@ -54,7 +61,9 @@ pub(super) fn start(
         let dimensions = plan.frame_dimensions();
         let records = records.clone();
         let cancelled = Arc::clone(&cancelled);
+        let semaphore = Arc::clone(&semaphore);
         workers.push(thread::spawn(move || {
+            let _permit = semaphore.acquire();
             let result = decode_capture(DecodeRequest {
                 video: &video,
                 capture_index: window.capture_index(),
@@ -96,15 +105,36 @@ struct LibavCaptureAttempt {
 
 impl CaptureAttempt for LibavCaptureAttempt {
     fn recv(&self) -> anyhow::Result<CaptureFrame> {
-        let capture_index = {
-            let mut next = self.next.lock().unwrap();
-            let capture_index = *next % self.capture_count;
-            *next += 1;
-            capture_index
-        };
-        self.receivers.lock().unwrap()[capture_index]
-            .recv()
-            .context("libav capture stream ended before all frames were produced")?
+        let mut next = self.next.lock().unwrap();
+        loop {
+            let mut any_connected = false;
+            {
+                let receivers = self.receivers.lock().unwrap();
+                for offset in 0..self.capture_count {
+                    let capture_index = (*next + offset) % self.capture_count;
+                    match receivers[capture_index].try_recv() {
+                        Ok(frame) => {
+                            *next += 1;
+                            return frame;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {
+                            any_connected = true;
+                        }
+                        // A worker that has produced all its frames drops its
+                        // sender; skip it and keep polling the others.
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+                    }
+                }
+            }
+            if !any_connected {
+                return Err(anyhow::anyhow!(
+                    "libav capture stream ended before all frames were produced"
+                ));
+            }
+            // Some channels are empty (workers gated on the concurrency
+            // semaphore or still decoding). Yield and retry.
+            std::thread::yield_now();
+        }
     }
 
     fn finish(mut self: Box<Self>) -> anyhow::Result<CaptureCompletion> {
