@@ -1,5 +1,7 @@
 mod authority;
 mod capture;
+#[cfg(feature = "in-process-decode")]
+mod encode;
 mod extract;
 mod frame_schedule;
 mod join;
@@ -13,6 +15,8 @@ mod videotoolbox;
 
 pub use authority::*;
 pub(crate) use capture::*;
+#[cfg(feature = "in-process-decode")]
+pub(crate) use encode::*;
 pub use extract::*;
 pub use join::*;
 pub use print_completions::*;

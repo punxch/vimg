@@ -24,6 +24,13 @@ use std::{
 
 const NONREF_RECOVERY_MARGIN_S: f64 = 0.125;
 const DECODER_THREADS: usize = 2;
+/// Capture windows with a longer preroll (distance from the seek-landing
+/// keyframe to the window start) are the makespan-gating slow workers. Giving
+/// only those decoders a third frame thread recovers most of the all-DT3
+/// makespan (~0.2s) while adding only a few decoder buffer pools to RSS
+/// (~8MB/worker over DT2), keeping the 512MB budget.
+const PREROLL_DT3_THRESHOLD_S: f64 = 1.5;
+const DECODER_THREADS_LONG_PREROLL: usize = 3;
 type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
 
 pub(super) fn start(
@@ -238,22 +245,22 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         "libav capture is unavailable: planned and decoded source time bases differ"
     );
     let parameters = stream.parameters();
-    let mut context = ffmpeg::codec::context::Context::from_parameters(parameters)?;
-    context.set_threading(threading::Config {
-        kind: threading::Type::Frame,
-        count: DECODER_THREADS,
-    });
-    let mut decoder = context
-        .decoder()
-        .video()
-        .context("libav capture is unavailable: video decoder is unsupported")?;
-    let mut scaler = production_scale_filter(&decoder, dimensions, time_base)?;
-    decoder.skip_frame(Discard::NonReference);
+    // Demux only the selected video stream: non-video packets (this input can
+    // carry dozens of subtitle tracks) are dropped inside av_read_frame
+    // instead of being allocated, delivered, and skipped per packet.
+    for mut other in input.streams_mut() {
+        if other.index() != stream_index {
+            unsafe { (*other.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL };
+        }
+    }
     let target = (f64::from(start_s) * ffmpeg::ffi::AV_TIME_BASE as f64).round() as i64;
     input
         .seek(target, ..target)
         .context("libav capture seek failed")?;
-    decoder.flush();
+    // The decoder opens lazily on the first video packet after the seek: its
+    // pts exposes the preroll length, which selects the frame-thread count.
+    let mut decoder: Option<ffmpeg::decoder::Video> = None;
+    let mut scaler: Option<filter::Graph> = None;
 
     let mut decoded = Video::empty();
     let mut rgb = Video::empty();
@@ -278,18 +285,45 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         {
             packet_durations.insert(pts, packet.duration());
         }
+        if decoder.is_none() {
+            // First video packet of the seek: its pts is the preroll start, so
+            // the preroll length is known before any decoding happens.
+            let preroll_s = packet
+                .pts()
+                .map(|pts| (f64::from(start_s) - pts as f64 * f64::from(time_base)).max(0.0))
+                .unwrap_or(0.0);
+            let threads = if preroll_s > PREROLL_DT3_THRESHOLD_S {
+                DECODER_THREADS_LONG_PREROLL
+            } else {
+                DECODER_THREADS
+            };
+            let mut context = ffmpeg::codec::context::Context::from_parameters(parameters.clone())?;
+            context.set_threading(threading::Config {
+                kind: threading::Type::Frame,
+                count: threads,
+            });
+            let mut opened = context
+                .decoder()
+                .video()
+                .context("libav capture is unavailable: video decoder is unsupported")?;
+            opened.skip_frame(Discard::NonReference);
+            scaler = Some(production_scale_filter(&opened, dimensions, time_base)?);
+            decoder = Some(opened);
+        }
+        let active_decoder = decoder.as_mut().expect("decoder opened above");
+        let active_scaler = scaler.as_mut().expect("scaler created above");
         if nonref
             && packet.dts().or_else(|| packet.pts()).is_some_and(|pts| {
                 pts as f64 * f64::from(time_base) >= f64::from(start_s) - NONREF_RECOVERY_MARGIN_S
             })
         {
-            decoder.skip_frame(Discard::Default);
+            active_decoder.skip_frame(Discard::Default);
             nonref = false;
         }
-        decoder.send_packet(&packet)?;
+        active_decoder.send_packet(&packet)?;
         receive_frames(
-            &mut decoder,
-            &mut scaler,
+            active_decoder,
+            active_scaler,
             &mut decoded,
             &mut rgb,
             &mut schedule,
@@ -308,10 +342,13 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         }
     }
     if !schedule.is_complete() {
-        decoder.send_eof()?;
+        let mut active_decoder =
+            decoder.context("libav capture received no video packets")?;
+        let active_scaler = scaler.as_mut().expect("scaler created with decoder");
+        active_decoder.send_eof()?;
         receive_frames(
-            &mut decoder,
-            &mut scaler,
+            &mut active_decoder,
+            active_scaler,
             &mut decoded,
             &mut rgb,
             &mut schedule,
@@ -330,10 +367,11 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         let pending =
             pending_decoded.context("libav decoder produced no timestamped source frame")?;
         let duration = last_duration.context("libav decoder produced no source-frame duration")?;
+        let active_scaler = scaler.as_mut().expect("scaler created with decoder");
         emit_scheduled_frames(
             pending,
             duration,
-            &mut scaler,
+            active_scaler,
             &mut rgb,
             &mut schedule,
             source_time_base,

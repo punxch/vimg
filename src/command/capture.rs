@@ -726,6 +726,102 @@ impl CaptureStream<'_> {
     }
 }
 
+/// Optional probe fields shared by the in-process libavformat probe and the
+/// ffprobe subprocess fallback.
+struct ProbeFields {
+    duration_s: Option<f32>,
+    width: Option<u32>,
+    height: Option<u32>,
+    codec: Option<String>,
+    source_time_base: Option<Rational>,
+}
+
+fn probe_video(video: &std::path::Path) -> anyhow::Result<ProbeFields> {
+    // In-process libavformat probing avoids the ~0.1s ffprobe subprocess
+    // (Windows process + FFmpeg DLL load) on the single-run critical path.
+    // It reads the same container headers ffprobe reads; any failure or
+    // missing field falls back to the ffprobe subprocess unchanged.
+    #[cfg(feature = "in-process-decode")]
+    if let Ok(fields) = in_process_probe(video) {
+        return Ok(fields);
+    }
+    ffprobe_fields(video)
+}
+
+#[cfg(feature = "in-process-decode")]
+fn in_process_probe(video: &std::path::Path) -> anyhow::Result<ProbeFields> {
+    use ffmpeg_next as ffmpeg;
+    use ffmpeg_next::media::Type as MediaType;
+
+    ffmpeg::init().context("initializing software libav")?;
+    let input = ffmpeg::format::input(video)?;
+    let duration = input.duration();
+    // Match ffprobe's six-decimal duration string exactly so planned capture
+    // windows are identical to the ffprobe fallback.
+    let duration_s = (duration > 0)
+        .then(|| {
+            format!("{:.6}", duration as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE))
+                .parse::<f32>()
+        })
+        .transpose()?;
+    let stream = input
+        .streams()
+        .find(|stream| stream.parameters().medium() == MediaType::Video);
+    let Some(stream) = stream else {
+        return Ok(ProbeFields {
+            duration_s,
+            width: None,
+            height: None,
+            codec: None,
+            source_time_base: None,
+        });
+    };
+    let parameters = stream.parameters();
+    let (width, height) = unsafe {
+        let parameters = parameters.as_ptr();
+        ((*parameters).width, (*parameters).height)
+    };
+    let time_base = stream.time_base();
+    Ok(ProbeFields {
+        duration_s,
+        width: (width > 0).then_some(width as u32),
+        height: (height > 0).then_some(height as u32),
+        codec: Some(parameters.id().name().to_owned()),
+        source_time_base: Some(Rational::new(
+            time_base.numerator(),
+            time_base.denominator(),
+        )),
+    })
+}
+
+fn ffprobe_fields(video: &std::path::Path) -> anyhow::Result<ProbeFields> {
+    let probe = ffprobe::ffprobe(video)?;
+    let stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type.as_deref() == Some("video"));
+    let source_time_base = stream
+        .map(|stream| {
+            let (numerator, denominator) = stream
+                .time_base
+                .split_once('/')
+                .context("invalid source time base")?;
+            anyhow::Ok(Rational::new(numerator.parse()?, denominator.parse()?))
+        })
+        .transpose()?;
+    Ok(ProbeFields {
+        duration_s: probe
+            .format
+            .duration
+            .as_ref()
+            .and_then(|duration| duration.parse::<f32>().ok()),
+        width: stream.and_then(|stream| stream.width.map(|width| width as u32)),
+        height: stream.and_then(|stream| stream.height.map(|height| height as u32)),
+        codec: stream.and_then(|stream| stream.codec_name.clone()),
+        source_time_base,
+    })
+}
+
 fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
     let descriptor = extract.media.as_ref();
     let needs_probe = descriptor.is_none_or(|media| {
@@ -736,51 +832,28 @@ fn media_properties(extract: &Extract) -> anyhow::Result<MediaProperties> {
             || media.source_time_base.is_none()
     });
     let probe = needs_probe
-        .then(|| ffprobe::ffprobe(&extract.video))
+        .then(|| probe_video(&extract.video))
         .transpose()?;
     let duration_s = descriptor
         .and_then(|media| media.duration_s)
-        .or_else(|| {
-            probe
-                .as_ref()?
-                .format
-                .duration
-                .as_ref()?
-                .parse::<f32>()
-                .ok()
-        })
+        .or_else(|| probe.as_ref()?.duration_s)
         .context("invalid video duration")?;
-    let stream = || {
-        probe
-            .as_ref()?
-            .streams
-            .iter()
-            .find(|stream| stream.codec_type.as_deref() == Some("video"))
-    };
     let width = descriptor
         .and_then(|media| media.width)
-        .or_else(|| stream().and_then(|stream| stream.width.map(|width| width as u32)))
+        .or_else(|| probe.as_ref()?.width)
         .context("no width")?;
     let height = descriptor
         .and_then(|media| media.height)
-        .or_else(|| stream().and_then(|stream| stream.height.map(|height| height as u32)))
+        .or_else(|| probe.as_ref()?.height)
         .context("no height")?;
     let codec = descriptor
         .and_then(|media| media.codec.clone())
-        .or_else(|| stream().and_then(|stream| stream.codec_name.clone()))
+        .or_else(|| probe.as_ref()?.codec.clone())
         .context("selected video stream has no codec")?;
-    let source_time_base = match descriptor.and_then(|media| media.source_time_base) {
-        Some(source_time_base) => source_time_base,
-        None => {
-            let time_base = stream()
-                .map(|stream| stream.time_base.as_str())
-                .context("selected video stream has no time base")?;
-            let (numerator, denominator) = time_base
-                .split_once('/')
-                .context("invalid source time base")?;
-            Rational::new(numerator.parse()?, denominator.parse()?)
-        }
-    };
+    let source_time_base = descriptor
+        .and_then(|media| media.source_time_base)
+        .or_else(|| probe.as_ref()?.source_time_base)
+        .context("selected video stream has no time base")?;
     Ok(MediaProperties {
         duration_s,
         width,

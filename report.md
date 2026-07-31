@@ -966,3 +966,114 @@ PATH 中保留 scoop ffmpeg 8.1.2 作为编码器子进程。默认命令实测�
 
 相比改前默认 ffmpeg 后端（total ~2.1–2.3s），默认命令提速约 30%，
 first_grid 提速约 40%，峰值 RSS ~348 MiB 仍远低于 512MB 预算。
+
+## Windows 单次运行优化第三轮（2026-08-01，RTX 3090 + gyan FFmpeg 8.1.2 shared）
+
+目标：在 libav 后端 ~1.45s 的基础上继续压缩单次运行时间。所有改动保持输出
+SHA-256 `3f0fa2be…` 逐字节一致。
+
+### 改动一：进程内探测（plan_setup 0.098-0.135s → 0.008s）
+
+`capture.rs` 新增 `probe_video()`：启用 `in-process-decode` 时先用 libavformat
+进程内探测（`format::input`，读容器头 + find_stream_info），失败或缺字段时
+回退 ffprobe 子进程。duration 用 `"{:.6}"` 格式化与 ffprobe 输出完全一致，
+保证 CapturePlan 逐位相同。ffprobe 子进程（Windows 进程 + DLL 装载 ~0.1s）
+从单次运行关键路径消失。serve 模式本已缓存 Media descriptor，此改动只影响
+CLI 单次运行。
+
+### 改动二：libav worker 丢弃非视频流
+
+`decode_capture` 在 seek 前对除选中视频流外的所有流设置
+`AVStream.discard = AVDISCARD_ALL`（通过 ffi）。55 流 mkv（52 字幕轨）的
+非视频 packet 在 `av_read_frame` 内部被丢弃，不再分配、投递、逐个跳过。
+ffmpeg 8.x 的 seek 文档明确把 `discard < AVDISCARD_ALL` 的流视为 active，
+因此 seek 行为不受影响。
+
+### 改动三：预滚自适应 decoder 线程（选择性 DT3）
+
+`decode_capture` 的 decoder 改为在 seek 后、读到第一个视频 packet 时惰性
+打开：该 packet 的 pts 即预滚起点，据此选择帧线程数——预滚 > 1.5s（长 GOP
+慢窗口，本样本 cap 6/7）用 DT3，其余 DT2。makespan 由最慢窗口主导，只给
+它们加线程回收了全 DT3 的大部分收益（decode max 1.29→1.13s），而 RSS 只
+增加 ~20MB（2 个 worker）。ABBA 复测 t=1.0 与 t=1.5 性能相同，取 t=1.5
+（RSS 更小）。
+
+### 改动四：进程内 SVT-AV1 编码 + AVIF 封装（ABBA total 1.265→1.252s，P95 1.376→1.295s）
+
+新增 `src/command/encode.rs`（feature-gated）：独立编码线程 + channel 喂帧，
+替换外部 ffmpeg 子进程。encoder_write 0.07→0.012s，encoder_tail
+0.15→0.135s；干净环境下 ABBA 差额约 0.10s。输出与 CLI 管线**逐字节一致**，
+复刻配方：
+
+1. 输出流 time_base 设为编码器 time_base（1/20），movenc 自动推导 track
+   timescale 10240（20→×2 至 ≥10000）并重写流 time_base——与 CLI 相同。
+2. packet 显式 `rescale_ts(1/20 → 1/10240)` 后写盘（此路径 muxer 不隐式
+   重缩放；packet 的 pts 域与 CLI 的 ost mux_timebase 缩放等价）。
+3. packet duration 显式置 1 tick/帧（libsvtav1 不输出 duration，CLI 在编码
+   层用帧 duration 补丁——缺了它 track duration 只有 1.45s）。
+4. 编码器设 `GLOBAL_HEADER`（mov/avif muxer 请求时 CLI 会设）：SVT 把
+   sequence header 放入 extradata → av1C box 12B、每 packet −4B in-band。
+5. 编码器 ctx `field_order = PROGRESSIVE`：CLI 的 codecpar 经滤镜链得到
+   PROGRESSIVE，movenc 据此写 av01 的 `fiel` box。
+6. 输出流 metadata `encoder = "Lavc{maj}.{min}.{micro} libsvtav1"`：
+   movenc 的 compressor name 来自该 metadata（否则 32 字节全零）。
+7. RGB→yuv420p10le 用 swscale bicubic（与 CLI auto_scale_0 flags 0x4
+   相同），帧 range=MPEG；实测与 CLI 转换逐字节一致（mdat 完全相等）。
+
+关键坑：**SVT-AV1 构建版本决定 bitstream**。进程内 DLL 若用 BtbN n8.1
+（SVT-AV1 v4.1.0-279），输出与 CLI（gyan 8.1.2，SVT-AV1 v4.1.0-259）
+不同（mdat 各包 ±2-62B，总 +120B）。已切换到 **gyan 8.1.2 full_build-shared**
+DLL（新部署目录 `D:\ffmpeg-dev\libav-deploy` 已更新），SVT 版本对齐后
+mdat 逐字节一致。
+
+`lp` 实验：lp=4/2/1 输出全部逐字节一致（lp 不影响 bitstream，只影响并行度
+与内存）。lp=4 峰值 WS 660MB → lp=2 553MB（PPCS 59→42）→ lp=1 528MB 但
+编码串行化（total 1.39-1.48s，+0.2s）。**采用 lp=2**（字节一致 + 内存与
+耗时平衡）。
+
+逃生门：`VIMG_SUBPROCESS_ENCODER=1` 强制回退外部 ffmpeg 编码（输出仍
+3f0fa2be…）。
+
+### RSS 精确测量（GetProcessMemoryInfo PeakWorkingSetSize）
+
+此前 4ms WorkingSet 采样严重低估峰值（短生命周期进程）。改用 OS 维护的
+`PeakWorkingSetSize` 轮询（`benchmarks/peak_ws.py`）：
+
+| 配置 | vimg 峰值 WS | 说明 |
+|---|---:|---|
+| 子进程编码（当前基线） | ~490MB | 另有 ffmpeg 子进程 ~150MB |
+| 进程内编码 lp=4 | ~660MB | SVT 线程池 + PPCS |
+| 进程内编码 lp=2（采用） | **~553MB** | 超 512 预算 41MB |
+
+预算口径：ADR-0001 的 512MB 是 active-job 峰值 RSS。vimg 自身口径下 lp=2
+超 41MB；但**进程树口径**下 lp=2（553MB，无子进程）反而比子进程编码
+（490+150≈640MB）小 87MB。按本仓库"延迟优先、接受小幅度超预算"的先例
+（移除门控时接受 523MB 超 11MB），采用 lp=2 并记录此口径问题供 ADR 修订。
+
+### 最终 warm 指标（gyan 8.1.2 shared，默认 auto→libav）
+
+| 阶段 | 优化前 | 优化后 |
+|---|---:|---:|
+| plan_setup | 0.098-0.135s | **0.008s** |
+| decode（max worker） | ~1.29s | **~1.13s** |
+| first_grid | ~1.00s | **~0.85-0.95s** |
+| encoder_write | ~0.07s | **~0.012s** |
+| encoder_tail | ~0.15s | **~0.135s** |
+| profile total | ~1.45-1.59s | **~1.19-1.28s** |
+| 峰值 WS | ~490MB | ~553MB |
+
+ABBA（交错 12 轮/臂）：进程内编码 med 1.252s / P95 1.295s vs 子进程编码
+med 1.265s / P95 1.376s；输出全部 SHA-256 `3f0fa2be…`，跨 capture backend
+（libav/ffmpeg）一致。cargo test 49 通过。mp4 冒烟（探测回退路径）通过。
+
+### 构建与部署变更
+
+- 构建依赖从 BtbN n8.1 改为 **gyan 8.1.2 full_build-shared**
+  （`D:\ffmpeg-dev\ffmpeg-8.1.2-full_build-shared`，含 include/lib/`lib/pkgconfig`
+  手建 .pc 文件，SVT-AV1 v4.1.0-259 与 CLI 子进程同版）。
+- 部署目录 `D:\ffmpeg-dev\libav-deploy\` 已更新为 gyan 8.1.2 的 8 个 DLL +
+  新 vimg.exe；运行时 PATH 需要该目录，编码器子进程仍是 scoop ffmpeg 8.1.2
+  （静态，与 DLL 同版同 SVT）。
+- 注意：若部署回 BtbN DLL，进程内编码将因 SVT 版本不同产生非字节一致输出
+  （容器/时长正确，仅 bitstream 不同），设置 `VIMG_SUBPROCESS_ENCODER=1`
+  可强制一致。

@@ -6,7 +6,6 @@ use anyhow::{Context, ensure};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
     path::PathBuf,
     process::{Child, Command, Stdio},
     time::{Duration, Instant},
@@ -526,25 +525,117 @@ struct VcsAttemptContext<'a> {
     profile: bool,
 }
 
+/// Grid encoding sink: the in-process SVT-AV1 encoder when eligible, else the
+/// external ffmpeg subprocess fed with raw RGB over a pipe.
+enum GridEncoder {
+    Subprocess(AttemptEncoder),
+    #[cfg(feature = "in-process-decode")]
+    InProcess(command::InProcessAvifEncoder),
+}
+
+impl GridEncoder {
+    fn new(
+        vcs: &Vcs,
+        output: &std::path::Path,
+        grid_w: u32,
+        grid_h: u32,
+        is_jpg: bool,
+        is_webp: bool,
+    ) -> Result<Self, command::CaptureAttemptError> {
+        #[cfg(feature = "in-process-decode")]
+        if std::env::var_os("VIMG_SUBPROCESS_ENCODER").is_none()
+            && !is_jpg
+            && !is_webp
+            && vcs.avif_codec == "libsvtav1"
+        {
+            let preset = vcs.avif_preset.unwrap_or(match vcs.args.capture_frames() {
+                1 => 4,
+                _ => 8,
+            });
+            match command::InProcessAvifEncoder::start(
+                output,
+                grid_w,
+                grid_h,
+                vcs.avif_fps,
+                vcs.avif_crf,
+                preset,
+            ) {
+                Ok(encoder) => return Ok(Self::InProcess(encoder)),
+                Err(error) => eprintln!(
+                    "in-process AVIF encoder unavailable ({error:#}); falling back to ffmpeg subprocess"
+                ),
+            }
+        }
+        let child = spawn_attempt_encoder(vcs, output, grid_w, grid_h, is_jpg, is_webp)
+            .map_err(command::CaptureAttemptError::fatal)?;
+        Ok(Self::Subprocess(AttemptEncoder::new(child)))
+    }
+
+    fn write_grid(&mut self, grid: &image::RgbImage) -> Result<(), command::CaptureAttemptError> {
+        match self {
+            Self::Subprocess(encoder) => encoder
+                .write_grid(grid)
+                .map_err(command::CaptureAttemptError::fatal),
+            #[cfg(feature = "in-process-decode")]
+            Self::InProcess(encoder) => encoder
+                .write_grid(grid)
+                .map_err(command::CaptureAttemptError::fatal),
+        }
+    }
+
+    fn finish(&mut self, format: &str) -> Result<Duration, command::CaptureAttemptError> {
+        match self {
+            Self::Subprocess(encoder) => encoder
+                .finish(format)
+                .map_err(command::CaptureAttemptError::fatal),
+            #[cfg(feature = "in-process-decode")]
+            Self::InProcess(encoder) => {
+                let tail_started = Instant::now();
+                encoder
+                    .finish()
+                    .map_err(command::CaptureAttemptError::fatal)?;
+                Ok(tail_started.elapsed())
+            }
+        }
+    }
+}
+
 struct AttemptEncoder {
     child: Option<Child>,
+    writer: Option<std::io::BufWriter<std::process::ChildStdin>>,
 }
 
 impl AttemptEncoder {
     fn new(child: Child) -> Self {
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            writer: None,
+        }
     }
 
-    fn stdin(&mut self) -> anyhow::Result<std::process::ChildStdin> {
-        self.child
-            .as_mut()
-            .context("encoder attempt has already been closed")?
-            .stdin
-            .take()
-            .context("encoder attempt did not expose stdin")
+    fn write_grid(&mut self, grid: &image::RgbImage) -> anyhow::Result<()> {
+        if self.writer.is_none() {
+            let stdin = self
+                .child
+                .as_mut()
+                .context("encoder attempt has already been closed")?
+                .stdin
+                .take()
+                .context("encoder attempt did not expose stdin")?;
+            self.writer = Some(std::io::BufWriter::new(stdin));
+        }
+        std::io::Write::write_all(
+            self.writer.as_mut().expect("writer initialized above"),
+            grid.as_raw(),
+        )?;
+        Ok(())
     }
 
     fn finish(&mut self, format: &str) -> anyhow::Result<Duration> {
+        // Flushing and dropping the writer closes stdin so ffmpeg sees EOF.
+        if let Some(mut writer) = self.writer.take() {
+            std::io::Write::flush(&mut writer)?;
+        }
         let tail_started = Instant::now();
         let status = self
             .child
@@ -589,45 +680,35 @@ fn run_vcs_attempt(
         "Encoding {}",
         sh_escape_filename(&temp_output.path)
     ));
-    let child = spawn_attempt_encoder(
+    let mut encoder = GridEncoder::new(
         vcs,
         &temp_output.path,
         grid_w,
         grid_h,
         context.is_jpg,
         context.is_webp,
-    )
-    .map_err(command::CaptureAttemptError::fatal)?;
-    let mut encoder = AttemptEncoder::new(child);
+    )?;
     let mut authority = context
         .authority_manifest
         .map(|path| command::AuthorityRecorder::new(path.to_owned()))
         .transpose()
         .map_err(command::CaptureAttemptError::fatal)?;
-    let stream_timings = {
-        let stdin = encoder
-            .stdin()
-            .map_err(command::CaptureAttemptError::fatal)?;
-        let mut writer = std::io::BufWriter::new(stdin);
-        context.spinner.set_message("Joining");
-        write_stream_frames(
-            &stream,
-            vcs.columns,
-            context.labels,
-            &mut writer,
-            context.profile,
-            &mut authority,
-        )?
-    };
-    let encoder_tail = encoder
-        .finish(if context.is_jpg {
-            "jpg"
-        } else if context.is_webp {
-            "webp"
-        } else {
-            "avif"
-        })
-        .map_err(command::CaptureAttemptError::fatal)?;
+    context.spinner.set_message("Joining");
+    let stream_timings = write_stream_frames(
+        &stream,
+        vcs.columns,
+        context.labels,
+        &mut encoder,
+        context.profile,
+        &mut authority,
+    )?;
+    let encoder_tail = encoder.finish(if context.is_jpg {
+        "jpg"
+    } else if context.is_webp {
+        "webp"
+    } else {
+        "avif"
+    })?;
     let capture_completion = stream.finish()?;
 
     Ok(VcsAttempt {
@@ -714,7 +795,7 @@ fn write_stream_frames(
     stream: &command::CaptureStream,
     columns: u32,
     labels: &[String],
-    writer: &mut std::io::BufWriter<std::process::ChildStdin>,
+    encoder: &mut GridEncoder,
     profile: bool,
     authority: &mut Option<command::AuthorityRecorder>,
 ) -> Result<StreamTimings, command::CaptureAttemptError> {
@@ -803,16 +884,11 @@ fn write_stream_frames(
                 .map_err(command::CaptureAttemptError::fatal)?;
         }
         let write_started = profile.then(Instant::now);
-        writer
-            .write_all(grid.as_raw())
-            .map_err(|error| command::CaptureAttemptError::fatal(error.into()))?;
+        encoder.write_grid(&grid)?;
         if let Some(write_started) = write_started {
             timings.encoder_write += write_started.elapsed();
         }
     }
-    writer
-        .flush()
-        .map_err(|error| command::CaptureAttemptError::fatal(error.into()))?;
     Ok(timings)
 }
 
