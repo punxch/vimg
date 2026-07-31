@@ -1,3 +1,6 @@
 /target
 /aur
 /sample
+.DS_Store
+/.codegraph/
+/output.avif

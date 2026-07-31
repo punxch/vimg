@@ -360,3 +360,87 @@ VT 路径总耗时 0.74s 中解码占 0.636s（88%），由 seek + 0.5s nonref �
 真正瓶颈是固定 Preview profile（1.5s 窗口）的解码吞吐，预滚优化空间约
 2–4%。若需更大幅度提速，只能降低 profile（改 ADR-0001 契约）或减少采样点
 并发（-T 调优，但此前实测无墙钟收益）。
+
+## Windows 性能测试（2026-07-31，Windows + RTX 3090）
+
+### 环境
+
+- 系统：Windows，NVIDIA GeForce RTX 3090（24 GB，CUDA 13.3，WDDM），多核 CPU
+- FFmpeg：8.0-full_build-www.gyan.dev（CPU 解码路径）
+- 输入：`sample/input.mkv`（3.2 GB，3295s，55 分钟）
+- 测试命令（固定 Preview profile）：
+
+```sh
+./target/release/vimg.exe vcs -c3 -H160 -n9 .\sample\input.mkv --output output.avif
+```
+
+### Baseline（原始 vimg.exe，D:\Apps\ffmpeg\vimg.exe，2026-05-14 构建）
+
+| Run | Time |
+|-----|------|
+| 1（冷缓存） | 3.539s |
+| 2 | 2.478s |
+| 3 | 2.494s |
+| **热平均** | **~2.49s** |
+
+### 最新代码（含 macOS streaming pipeline 优化，2026-07-31 构建）
+
+| Run | Time |
+|-----|------|
+| 1（冷缓存） | 3.192s |
+| 2 | 2.427s |
+| 3 | 2.535s |
+| 4 | 2.438s |
+| 5 | 2.403s |
+| 6 | 2.558s |
+| **热平均** | **~2.47s** |
+
+### 参数实验（最新代码）
+
+| 配置 | 耗时 |
+|------|------|
+| 默认 -T4 | ~2.47s |
+| -T2 | ~2.43s |
+| -T8 | ~2.93–3.11s（资源竞争，更慢） |
+| --capture-backend auto | ~3.06s（含 libav 尝试失败回退） |
+
+### Profile 阶段分解（最新代码，默认 -T4）
+
+| 阶段 | 耗时 |
+|------|------|
+| plan_setup（探测+规划） | 0.138s |
+| first_grid（首个完整网格可用） | 1.681s |
+| receive_wait（9 采样点同步等待，最慢 worker） | 1.740s |
+| join（网格合成） | 0.049s |
+| encoder_write（编码输入） | 0.256s |
+| encoder_tail（编码收尾） | 0.298s |
+| **total** | **2.509s** |
+
+### 结果
+
+- **最新代码 ≈ baseline**（2.47s vs 2.49s，+0.6%），mac 优化（bounded channel +
+  frame barrier 同步）在 Windows 上无显著收益，瓶颈同样是解码/提取
+  （receive_wait 1.74s 占总耗时 69%）。
+- 输出与 baseline **逐字节一致**（SHA-256
+  `0e0e34e99006231097fa1678752f880bf7f4928eaaa5136e795da5a86991e70b`，85 KB AVIF），
+  正确性保持。
+- **CUDA 硬件加速保持禁用**（`CUDA_AVAILABLE=false`）：与早期 Windows 结论一致，
+  短视频捕获中 CUDA 初始化开销大于收益；RTX 3090 上启用未见加速。
+- **-T8 更慢**：9 个采样点并发 8 个 ffmpeg 进程导致资源竞争；-T2/-T4 相当，
+  默认 -T4 合理。
+- **auto 更慢**（3.06s）：Windows 上先尝试进程内 libav 失败后再回退 ffmpeg，
+  白耗约 0.5s。
+
+### 与 macOS 对比
+
+| 平台/后端 | 平均耗时 |
+|---|---:|
+| macOS Apple M4 / VideoToolbox | **0.759s** |
+| macOS Apple M4 / 软件 libav | 0.966s |
+| macOS Apple M4 / ffmpeg | 1.197s |
+| **Windows / ffmpeg（最新代码）** | **2.472s** |
+| Windows / ffmpeg（baseline） | 2.486s |
+
+Windows 比 mac 慢约 2 倍，差距来自解码/提取阶段（Windows 上无 VT 硬件解码路径，
+9 采样点 × 1.5s 窗口的 CPU 解码是硬成本），而非 vimg 自身处理逻辑
+（join 0.049s + encode 0.55s 仅占总耗时 ~24%）。
