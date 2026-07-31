@@ -810,3 +810,27 @@ lp=4 在 DT2 下端到端 −15%（profile total），输出逐字节一致
 预滚零拷贝 + previous 缩放 RGB + SVT `lp=4`。wall ~1.90s、profile total
 1.67s、peak RSS 445MB。未做选择性 DT3（收益小于复杂度）与阻塞轮询
 （当前收益上限 1-2%）；进程内编码/硬件后端为 P1 后续方向。
+
+### 调研 P0 剩余项执行结果（2026-08-01）
+
+按调研文档建议实验顺序执行剩余 P0，**两项均端到端实测失败并回退**：
+
+| 步骤 | 方案 | 端到端实测 | 结论 |
+|---|---|---|---|
+| S1 | busy poll → 阻塞 round-robin | first_grid 0.73s（−39%✅）但 **total 1.94s（更慢）+ RSS 507MB（超预算）** | ❌ 回退 polling |
+| S2 | lazy scale（只缩放被选帧） | 输出一致但 **wall 无收益 + RSS 510MB（Deferred 全分辨率保留）** | ❌ 回退无条件缩放 |
+| S3 | 选择性 DT3（慢窗口） | 未实施：per-window 线程需 open 时配置 + 运行时慢窗口判定，复杂度 > 估计收益 <0.22s | 跳过 |
+
+关键发现（与调研隔离数据矛盾处）：
+
+- **阻塞 round-robin 的 channel 背压使快 worker 停顿**（解码吞吐下降，total
+  反而变慢），且 worker 暂停时保留 decoder buffer（RSS +67MB 超预算）。
+  调研隔离数据（blocking 1.895s vs polling 1.922s）未计入 RSS 与端到端
+  背压交互，本机端到端 ABBA 结论相反。
+- **lazy scale 的 Deferred 全分辨率保留**使 RSS 超预算；本 sample 缩放不占
+  profile 大头（无 wall 收益）。
+
+**最终保留配置 = 调研前状态**（DT2 + lp4 + polling + previous RGB +
+no-clone + margin 0.125）：profile total ~1.8s、wall ~2.0s、peak RSS
+~440MB、输出逐字节一致（`3f0fa2be…`）。剩余有价值方向为 P1：
+进程内编码（非解码尾段 0.4-0.5s）与共享上下文硬件解码。
