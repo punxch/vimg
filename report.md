@@ -444,3 +444,62 @@ VT 路径总耗时 0.74s 中解码占 0.636s（88%），由 seek + 0.5s nonref �
 Windows 比 mac 慢约 2 倍，差距来自解码/提取阶段（Windows 上无 VT 硬件解码路径，
 9 采样点 × 1.5s 窗口的 CPU 解码是硬成本），而非 vimg 自身处理逻辑
 （join 0.049s + encode 0.55s 仅占总耗时 ~24%）。
+
+## Windows 1.3s 优化调研（2026-07-31，Windows + RTX 3090）
+
+目标：将 Windows 版本从 ~2.5s 优化到 1.3s 以内。Profile 显示瓶颈是解码/提取
+阶段（receive_wait 1.74s 占 69%），系统性调研了所有可行路径。
+
+### 瓶颈根因（ffmpeg CLI 后端）
+
+1. **mkv 并发 seek 串行化**（最大单一瓶颈）：3.2 GB mkv（55 流，含 52 字幕）的
+   9 个采样点 seek 完全串行，每点 ~0.1-0.2s，总 ~1.9s。
+   - 单点 seek+解码：0.26-0.31s
+   - 9 并发 seek+1帧：1.89s（同位置 0.998s vs 不同位置 1.89s）
+   - 9 并发**无 seek** 解码：仅 1.075s（有并行）→ seek 是串行化元凶
+   - 同文件并发访问串行化（9 个不同文件并发 seek 仅 1.22s）
+   - mp4 faststart / 硬链接 / 页缓存预热均无改善
+2. **ffmpeg 进程启动 0.137s/进程**（Windows DLL 加载）
+3. **CPU 解码吞吐饱和**：~340-400 fps，9 点 × 65 帧（含预滚）需要并发解码
+
+### 已尝试的优化及结果
+
+| 方案 | 结果 |
+|---|---|
+| -T8（更高并发） | 2.93-3.11s，更慢（资源竞争） |
+| FFMPEG_THREADS_PER_CAPTURE=2 | 3.15s，更慢（barrier 同步放大） |
+| 3 worker × 3 点串行 | 1.80-2.40s（不稳定，受负载影响） |
+| 单进程多输入（9 输入） | 2.95s，更慢（交错调度） |
+| -probesize 100K | 无改善 |
+| -map 0:v -sn（忽略字幕） | 无改善 |
+| CUDA 硬件解码 | 单点 1.6s（CPU 0.38s 的 4 倍），9 并发 2.75s，更慢 |
+| dxva2 硬件解码 | 9 并发 2.64s，比 CPU 慢 |
+| mkv→mp4 faststart 转码 | 9 并发 seek 1.93s vs 2.06s，无改善 |
+| **libav 进程内后端** | **2.35s（比 ffmpeg 后端快 9%），输出逐字节一致** |
+
+### libav 后端集成（Windows）
+
+在 Windows 上编译 `in-process-decode` feature 需要 FFmpeg 开发库：
+
+1. 下载 GyanD/codexffmpeg 8.1.2 full_build-shared（GitHub，101 MB，含 include/lib）
+2. 手动创建 pkgconfig .pc 文件指向其 lib 目录
+3. 设置 `PKG_CONFIG_PATH` 编译；运行时 `PATH` 需含其 bin 目录（avcodec-62.dll 等）
+
+ffmpeg-sys-next 8.1.0 仅匹配到 FFmpeg 8.1（lavc 62）；BtbN master（lavc 63）
+API 不兼容（AV_CODEC_ID_V308 等被移除，AVCodec 字段改为 avcodec_get_supported_config）。
+
+### 结论
+
+**Windows 上 1.3s 不可达**。两个后端的瓶颈都是 Windows CPU 解码吞吐
+（~340-400 fps），与进程启动/seek 策略无关：
+
+- ffmpeg CLI 后端：~2.57s（mkv seek 串行化 1.9s + 解码竞争）
+- libav 进程内后端：~2.35s（decode 1.75s 是最大 worker，9 路并发 CPU 竞争）
+- macOS M4 的 1.197s（ffmpeg）/ 0.759s（VideoToolbox）依赖硬件解码路径，
+  Windows 上 CUDA/dxva2 的 GPU→CPU 帧传输开销使其更慢（与早期结论一致）
+
+附带改动：`NONREF_RECOVERY_MARGIN_S` 0.5→0.25（mac 已验证安全），Windows 上
+libav 输出与 ffmpeg 后端逐字节一致（SHA-256 3f0fa2be…），预滚帧 310→272。
+
+若需真正达到 1.3s，需要 Windows 硬件解码路径（CUDA 帧传输优化）或降低
+固定 Preview profile 的窗口/帧数契约（ADR-0001）。

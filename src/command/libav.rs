@@ -22,7 +22,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-const NONREF_RECOVERY_MARGIN_S: f64 = 0.5;
+const NONREF_RECOVERY_MARGIN_S: f64 = 0.25;
 const DECODER_THREADS: usize = 3;
 type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
 
