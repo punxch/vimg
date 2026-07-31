@@ -680,7 +680,10 @@ pub(crate) struct Semaphore {
 
 impl Semaphore {
     pub(crate) fn new(max: usize) -> Self {
-        Self { permits: Mutex::new(max), ready: Condvar::new() }
+        Self {
+            permits: Mutex::new(max),
+            ready: Condvar::new(),
+        }
     }
 
     pub(crate) fn acquire(&self) -> SemaphoreGuard<'_> {

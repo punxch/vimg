@@ -14,7 +14,11 @@ use std::{
 
 /// 0 means unbounded — the effective limit is the capture count.
 const fn effective_concurrency(requested: usize, capture_count: usize) -> usize {
-    if requested == 0 { capture_count } else { requested }
+    if requested == 0 {
+        capture_count
+    } else {
+        requested
+    }
 }
 
 /// Normalized shared inputs for one Capture attempt.
@@ -1405,7 +1409,8 @@ mod tests {
     #[test]
     #[ignore = "requires FFmpeg and the representative Preview input"]
     fn ffmpeg_capture_stream_emits_complete_preview_frames_and_authority() {
-        let capture = Capture::plan(&preview_extract("sample/input.mkv"), Some(160), None, 0).unwrap();
+        let capture =
+            Capture::plan(&preview_extract("sample/input.mkv"), Some(160), None, 0).unwrap();
         let stream = capture.start(CaptureBackendPolicy::Ffmpeg, true).unwrap();
         let plan = stream.plan();
         let capture_count = plan.capture_count();

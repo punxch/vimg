@@ -145,7 +145,12 @@ impl Vcs {
         spinner.enable_steady_tick(Duration::from_millis(100));
 
         let setup_started = Instant::now();
-        let capture = command::Capture::plan(&self.args, self.capture_height, self.capture_width, self.args.threads)?;
+        let capture = command::Capture::plan(
+            &self.args,
+            self.capture_height,
+            self.capture_width,
+            self.args.threads,
+        )?;
         let plan = capture.capture_plan();
         let labels = plan.labels().to_vec();
         let capture_count = plan.capture_count();
@@ -977,7 +982,8 @@ mod tests {
         ] {
             let vcs = preview_auto_vcs();
             let capture =
-                command::Capture::plan(&vcs.args, vcs.capture_height, vcs.capture_width, 0).unwrap();
+                command::Capture::plan(&vcs.args, vcs.capture_height, vcs.capture_width, 0)
+                    .unwrap();
             let started = RefCell::new(Vec::new());
             let selected = execute_vcs_backend_candidates(&vcs, &capture, |backend| {
                 started.borrow_mut().push(backend);

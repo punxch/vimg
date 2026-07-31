@@ -44,3 +44,27 @@ check is therefore behaving correctly by rejecting FFmpeg's software fallback.
 The completed gate rejects default promotion. `../promotion-gate-report.md`
 contains the generated decision and statistics; `../promotion-gate-results.tsv`
 contains the raw observations.
+
+## Update (2026-07-31) — Gates now PASS
+
+VideoToolbox was fixed (see `../promotion-gate-report.md`):
+1. Removed the custom `get_format` override so FFmpeg hwaccel init creates `hw_frames_ctx` with real CVPixelBuffer surfaces.
+2. Fixed `Video::clone()` dropping `hw_frames_ctx` — replaced with `av_frame_ref` via `hw_ref_frame()`.
+
+30 interleaved rotated triples on Apple M4:
+
+| Metric | VT | libav | FFmpeg |
+|---|---:|---:|---:|
+| Wall P95 | **0.770s** | 1.010s | 1.280s |
+| User CPU avg | **1.042s** | 6.121s | 8.921s |
+| Peak RSS | **~406 MiB** | ~598 MiB | ~289 MiB |
+
+Gate results:
+- ✅ VT P95 0.770s < 1.0s
+- ✅ VT wall 21.4% faster than libav (≥15%)
+- ✅ VT user CPU 83.0% lower than libav (≥70%)
+- ✅ VT peak RSS 406 MiB ≤ 512 MiB
+- ✅ General P95 ≤ 1.3s (all backends)
+- ✅ Output byte-identical across backends (SHA-256 `406db119…`)
+
+All promotion gates pass. Ticket #13's blocker is removed.

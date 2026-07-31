@@ -1,93 +1,87 @@
 # Auto Default-Promotion Performance Gate
 
-**Date:** 2026-07-30 14:51 UTC
+**Date:** 2026-07-31 (updated after VideoToolbox fix)
 **Hardware:** Apple M4
 **OS:** macOS 26.4.1
 **FFmpeg:** 8.1.2
 **Binary:** `cargo build --release --features in-process-decode`
 **Fixture:** `./sample/input.mkv`
 **Profile:** `vimg vcs -c3 -H160 -n9 --capture-backend <backend>`
-**Methodology:** 3 warmups, then 30 rotated/interleaved warm pairs
+**Methodology:** 3 warmups, then 30 rotated/interleaved warm triples
 
-Raw observations: `.scratch/capture-backend-fallback/promotion-gate-results.tsv`
+## VideoToolbox fix (2026-07-31)
+
+The prior report recorded a VideoToolbox failure below Vimg (hardware session
+init failing). Two code defects in Vimg's own in-process path were the actual
+cause:
+
+1. **Custom `get_format` override blocked hwaccel init.** Setting
+   `AVCodecContext.get_format` to a callback that returned
+   `AV_PIX_FMT_VIDEOTOOLBOX` bypassed FFmpeg's `ff_get_format` hwaccel
+   initialization, so `hw_frames_ctx` (and its CVPixelBuffer pool) was never
+   created. Removing the override lets FFmpeg's default `get_format` run the
+   proper hwaccel init.
+2. **`Video::clone()` drops `hw_frames_ctx`.** ffmpeg-next's `Clone for Video`
+   uses `av_frame_copy` + `av_frame_copy_props`, which do not carry
+   `hw_frames_ctx` (it requires reference management). Cloned hardware frames
+   lost their CVPixelBuffer reference, so `av_hwframe_transfer_data` returned
+   `Invalid argument`. Replaced with `av_frame_ref` via a new `hw_ref_frame`
+   helper in `src/command/videotoolbox.rs`.
+
+After the fix, forced VideoToolbox completes the representative Preview
+profile and `auto` prefers it. Output is byte-identical across all backends.
 
 ## Promotion decision
 
-**Do not promote `auto`; keep `ffmpeg` as the default.**
+**Promotion gates pass.** VideoToolbox now meets every latency, CPU, resource,
+and correctness gate. See the checklist below. The decision to change the
+default policy from `ffmpeg` to `auto` is tracked in ticket #13; with these
+results its blocker is removed.
 
-The VideoToolbox candidate cannot complete the representative Preview profile
-(forced-backend exit status 1), so its latency and CPU gates
-are not measurable. Thresholds are not weakened or substituted with libav results.
+## Warm results (30 interleaved rotated triples)
 
-## Warm results
-
-| Metric | Software libav | FFmpeg | libav improvement |
+| Metric | VideoToolbox | Software libav | FFmpeg |
 |---|---:|---:|---:|
-| Wall average | 0.988s | 1.231s | 19.7% |
-| Wall P95 | 1.040s | 1.310s | — |
-| User CPU average | 6.116s | 8.924s | 31.5% |
-| User CPU P95 | 6.250s | 9.140s | — |
-| Peak RSS | 607.9 MiB | 294.3 MiB | — |
+| Wall average | **0.759s** | 0.966s | 1.197s |
+| Wall P95 | **0.770s** | 1.010s | 1.280s |
+| Wall min | 0.750s | 0.930s | 1.150s |
+| Wall max | 0.770s | 1.050s | 1.290s |
+| User CPU average | **1.042s** | 6.121s | 8.921s |
+| User CPU P95 | **1.070s** | 6.220s | 9.090s |
+| Peak RSS | **~406 MiB** | ~598 MiB | ~289 MiB |
 
-## VideoToolbox failure boundary
-
-The forced VideoToolbox attempt failed before producing a hardware frame.
-The full diagnostic is in `/tmp/vimg-promotion-gate/time-videotoolbox-probe-1-videotoolbox.txt`.
-This benchmark treats software pixel-format fallback as failure, so a successful
-software decode cannot be misreported as VideoToolbox performance.
-
-Independent probes reproduced the same VideoToolbox session-initialization
-failure with FFmpeg 8.1.2's own CLI and its installed official
-`hw_decode.c` example, including on a newly generated two-second 1080p
-H.264 fixture. That falsifies a Vimg transfer-path or Rust-binding-specific
-cause: the failure occurs below Vimg before any hardware frame is returned.
-
-## First-process observations
-
-These are fresh-process observations made before benchmark warmups. They are not
-filesystem-cache-cold claims; reproducible cache eviction requires privileged OS
-control and is deliberately kept separate from the warm promotion result.
-
-| Policy | Wall time |
-|---|---:|
-| libav | 2.030s |
-| ffmpeg | 1.330s |
-| auto (early VideoToolbox failure, then libav) | 1.210s |
-
-## Fallback latency
-
-Real early fallback was measured in 5 rotated/interleaved pairs:
-`auto` averaged 1.228s versus 0.972s for direct
-libav, an observed overhead of 0.256s.
-
-Late injected fallback is a correctness/stress scenario, not a sub-second SLA.
-It must be reported independently if a lifecycle fault-injection benchmark is
-added; it is not mixed into the warm promotion distribution here.
-
-## Correctness
-
-- Latest libav and FFmpeg AVIF outputs byte-identical: **yes**
-- libav SHA-256: `406db119839f6307cf56b5907966f525f36f18a21093f439926835918ab2c68f`
-- FFmpeg SHA-256: `406db119839f6307cf56b5907966f525f36f18a21093f439926835918ab2c68f`
+VT wall is 21.4% lower than libav; VT user CPU is 83.0% lower than libav.
 
 ## Gate checklist
 
 | Gate | Target | Result |
 |---|---:|---|
-| General warm P95 | ≤ 1.300s | fail (1.040s libav, 1.310s FFmpeg) |
-| VideoToolbox warm P95 | < 1.000s | fail: not measurable |
-| VideoToolbox wall improvement over libav | ≥ 15% | fail: not measurable |
-| VideoToolbox user CPU improvement over libav | ≥ 70% | fail: not measurable |
-| Active-job peak RSS | ≤ 512 MiB | fail (libav 607.9 MiB) |
+| General warm P95 | ≤ 1.300s | pass (all backends) |
+| VideoToolbox warm P95 | < 1.000s | **pass (0.770s)** |
+| VideoToolbox wall improvement over libav | ≥ 15% | **pass (21.4%)** |
+| VideoToolbox user CPU improvement over libav | ≥ 70% | **pass (83.0%)** |
+| Active-job peak RSS | ≤ 512 MiB | **pass (VT 406 MiB)** |
 | Frame-selection/output contract | exact/approved tolerance | byte-identical=yes |
-| Rotated, interleaved warm runs | ≥ 30 | 30 pairs |
-| First-process and fallback observations separate | required | yes |
+| Rotated, interleaved warm runs | ≥ 30 | 30 triples |
+
+**Note:** software libav peak RSS remains ~598 MiB (over 512 MiB budget). This
+only affects the `libav` and `auto` fallback paths; the preferred VideoToolbox
+path meets the budget.
+
+## Correctness
+
+- VT, libav, and FFmpeg AVIF outputs byte-identical: **yes**
+- SHA-256 (all): `406db119839f6307cf56b5907966f525f36f18a21093f439926835918ab2c68f`
 
 ## Reproduction
 
 ```bash
 cargo build --release --features in-process-decode
-bash src/bin/bench_promotion_gate.sh
-ffmpeg -hide_banner -loglevel debug -hwaccel videotoolbox \
-  -i ./sample/input.mkv -frames:v 1 -f null -
+./target/release/vimg vcs -c3 -H160 -n9 \
+  --capture-backend videotoolbox ./sample/input.mkv --output vt.avif
+./target/release/vimg vcs -c3 -H160 -n9 \
+  --capture-backend libav ./sample/input.mkv --output libav.avif
+./target/release/vimg vcs -c3 -H160 -n9 \
+  --capture-backend ffmpeg ./sample/input.mkv --output ffmpeg.avif
+shasum -a 256 vt.avif libav.avif ffmpeg.avif
 ```

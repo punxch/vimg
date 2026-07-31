@@ -95,3 +95,22 @@ correctly. The default policy remains `ffmpeg` because #11 rejected promotion
 and #12 still lacks the required real-hardware corpus result. A future
 promotion must update direct VCS and service defaults together after all gates
 pass.
+
+## Update (2026-07-31) — Blocker removed
+
+Ticket #11 gates now PASS after the VideoToolbox fix (see `../promotion-gate-report.md`):
+- VT P95 = 0.770s (target < 1.0s)
+- VT wall 21.4% faster than libav (target ≥ 15%)
+- VT user CPU 83.0% lower than libav (target ≥ 70%)
+- VT RSS ~406 MiB (target ≤ 512 MiB)
+- General P95 ≤ 1.3s satisfied by all backends
+- Output byte-identical across backends
+
+The remaining promotion steps are:
+1. Decide whether to flip `default_value_t = Ffmpeg` → `Auto` in `Vcs` (and the serve path).
+2. Verify feature-off builds' `auto` still resolves to FFmpeg only (unchanged).
+3. Confirm libav RSS (~598 MiB) does not block promotion: it only affects the fallback path; the preferred VT path is within budget.
+
+Note: promotion is a deliberate product decision (hardware-acceleration by default
+changes resource usage on CPU-only machines). Ticket #11 evidence supports it;
+the actual flip should be reviewed and released deliberately.

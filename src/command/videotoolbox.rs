@@ -244,7 +244,6 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
     ensure_videotoolbox_support(codec)?;
     unsafe {
         let context = context.as_mut_ptr();
-        (*context).get_format = Some(select_videotoolbox_format);
         (*context).hw_device_ctx = device.new_reference()?;
     }
     let mut decoder = context
@@ -407,7 +406,7 @@ fn receive_frames(
             .or_else(|| decoded.pts())
             .context("videotoolbox decode unavailable: decoded frame has no timestamp")?;
         let current = PendingDecoded {
-            image: decoded.clone(),
+            image: hw_ref_frame(decoded),
             pts,
             input_frame_index: *input_frame_index,
             duration: packet_durations.get(&pts).copied(),
@@ -449,6 +448,19 @@ struct PendingDecoded {
     pts: i64,
     input_frame_index: i64,
     duration: Option<i64>,
+}
+
+/// Reference a decoded frame rather than copying it.
+///
+/// `Video::clone()` uses `av_frame_copy` + `av_frame_copy_props`, neither of
+/// which carry `hw_frames_ctx` — the hardware frame loses its CVPixelBuffer
+/// and `av_hwframe_transfer_data` then fails with EINVAL. `av_frame_ref`
+/// increments the reference on every buffer, including `hw_frames_ctx`.
+fn hw_ref_frame(source: &Video) -> Video {
+    let mut cloned = Video::empty();
+    let result = unsafe { ffmpeg::ffi::av_frame_ref(cloned.as_mut_ptr(), source.as_ptr()) };
+    assert!(result >= 0, "av_frame_ref failed with {result}");
+    cloned
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -596,26 +608,6 @@ fn ensure_videotoolbox_support(codec: ffmpeg::Codec) -> anyhow::Result<()> {
         "VideoToolbox decoder {} does not expose hardware device support",
         codec.name()
     )
-}
-
-unsafe extern "C" fn select_videotoolbox_format(
-    _context: *mut ffmpeg::ffi::AVCodecContext,
-    formats: *const ffmpeg::ffi::AVPixelFormat,
-) -> ffmpeg::ffi::AVPixelFormat {
-    if formats.is_null() {
-        return ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
-    }
-    let mut format = formats;
-    loop {
-        let value = unsafe { *format };
-        if value == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VIDEOTOOLBOX {
-            return value;
-        }
-        if value == ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-            return value;
-        }
-        format = unsafe { format.add(1) };
-    }
 }
 
 struct VideoToolboxDevice {
