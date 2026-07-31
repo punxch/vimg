@@ -248,15 +248,31 @@ pub(crate) struct Capture {
     plan: CapturePlan,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CaptureBackendPolicy {
     Auto,
-    #[default]
     Ffmpeg,
     Libav,
     #[value(name = "videotoolbox")]
     VideoToolbox,
 }
+
+impl Default for CaptureBackendPolicy {
+    fn default() -> Self {
+        DEFAULT_CAPTURE_BACKEND
+    }
+}
+
+/// Default capture backend. On non-macOS this is `auto`, which prefers the
+/// in-process libav decoder and falls back to the ffmpeg subprocess when the
+/// fixed Preview profile is not met or decoding is unavailable. macOS keeps
+/// `ffmpeg` to preserve the recorded VideoToolbox promotion-gate decision
+/// (default stays ffmpeg). Without the `in-process-decode` feature, `auto`
+/// already resolves to the ffmpeg subprocess only.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_CAPTURE_BACKEND: CaptureBackendPolicy = CaptureBackendPolicy::Ffmpeg;
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_CAPTURE_BACKEND: CaptureBackendPolicy = CaptureBackendPolicy::Auto;
 
 impl CaptureBackendPolicy {
     pub(crate) const fn name(self) -> &'static str {

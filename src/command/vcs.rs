@@ -77,7 +77,7 @@ pub struct Vcs {
     pub profile: bool,
 
     /// Capture implementation. In-process backends are explicit, feature-on Preview-only options.
-    #[arg(long, value_enum, default_value_t = command::CaptureBackendPolicy::Ffmpeg)]
+    #[arg(long, value_enum, default_value_t = command::DEFAULT_CAPTURE_BACKEND)]
     pub capture_backend: command::CaptureBackendPolicy,
 
     /// Test-only authority manifest requested by `vimg authority record`.

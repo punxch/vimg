@@ -877,3 +877,92 @@ av_hwframe_transfer_data 回传 + sws 缩放。
 解码（调研文档已警示），无法复刻 `AVDISCARD_NONREF` preroll；预滚段全解码
 抵消 GPU 吞吐优势。若要继续，需先验证驱动层跳过 B 帧解码，或改预滚策略
 （但会破坏选帧权威）。
+
+### 首帧延迟（first_grid）专项调研（2026-08-01）
+
+目标：默认 ffmpeg 后端的 `first_grid`（首个完整 3×3 网格）约 1.5s，占 total
+~2.24s 的 67%。定位其构成，寻找不破坏选帧权威的 CLI 级优化。
+
+实测基线（默认 ffmpeg 后端，warm，3 次）：`first_grid` 1.50–1.63s、
+`receive_wait` 1.53–1.64s、`total` 2.08–2.31s。
+
+构成分解（本机实测）：
+
+1. **9 路 ffmpeg 子进程启动约 270ms/进程，并发重叠后约 350ms 总量**。
+   `ffmpeg -version` 稳定 236–313ms（Windows 进程 + FFmpeg DLL 装载）；
+   9 个原生并发启动（Rust `std::process` / CreateProcess）makespan 约
+   310–370ms，说明 DLL 装载高度重叠，不是主要瓶颈。
+2. **H.264 预滚解码是主导**。`-ss` 前置于 `-i` 为 fast-seek，落到起点前的
+   关键帧再顺序解码到采样点。本样本关键帧间隔 4–8s（探测：窗口 1281.56s
+   前关键帧 1276.11s → 预滚 5.45s；窗口 2746.21s 前关键帧 2738.19s →
+   预滚 8.02s）。孤立单窗口解码耗时与预滚长度正相关：2746s 窗口 928–1103ms，
+   3112s 窗口（近文件尾、预滚短）296–335ms。
+3. **每进程线程数已最优**。原生并发 9 窗口测 makespan：
+   threads=1/2/3 → 2373/1863/1659ms，当前 `FFMPEG_THREADS_PER_CAPTURE=3`
+   为最佳。
+4. **缩放不是预滚瓶颈**。预滚帧会经过 scale 但开销可忽略
+   （`select='gte(t,start)'` 前置拦截无收益；不缩放输出 1080p 反而更慢）。
+
+已排除的 CLI 方案（会破坏选帧权威，不可用）：
+
+- `-noaccurate_seek`：速度提升 3×（2746s 窗口 1103→412ms）但输出从关键帧
+  开始（showinfo 首帧 type=I、pts=-8.016s），帧内容整体前移，违背 ADR-0003。
+- `-skip_frame nonref`：预滚期跳 B 帧可行，但会对目标窗口同样丢弃非参考帧，
+  CFR 取帧得到错误内容。
+
+结论：默认 ffmpeg 后端 `first_grid` 对本样本已接近下限。唯一能实质降低
+`first_grid` 的是进程内 libav 后端的 nonref 预滚（仅预滚期丢弃非参考帧、
+目标窗口恢复完整解码）。该后端 feature-gated、本机原先无 FFmpeg dev 库无法
+构建、且未晋级默认。服务端重复请求已通过 Media descriptor 跳过 plan_setup
+探测（约 0.2s），无需额外改动。构建解锁与实测见下节。
+
+### 进程内 libav 构建解锁与实测（2026-08-01）
+
+构建环境：本机原先 `--features in-process-decode` 因缺少 FFmpeg dev 库无法
+链接（`ffmpeg-sys-next` 需要 `libavutil.pc`）。从 BtbN 下载与
+`ffmpeg-next 8.1.0` 版本匹配的 `ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip`
+（含 `include/`、`lib/pkgconfig/*.pc`、共享 DLL），设置 `PKG_CONFIG_PATH`
+指向其 `lib/pkgconfig` 后 `cargo build --release --features in-process-decode`
+成功。运行需把该包 `bin/` 置于 PATH（进程内解码器 DLL 与编码器子进程共用 8.1）。
+
+同编码器（ffmpeg 8.1）下 warm 3 次实测：
+
+| 指标 | libav 后端 | ffmpeg 后端 | 差异 |
+|---|---:|---:|---:|
+| first_grid | 0.95–1.02s | 1.20–1.22s | −19% |
+| receive_wait | 1.05–1.11s | 1.23–1.25s | −15% |
+| total | 1.40–1.47s | 1.74–1.76s | −18% |
+| 峰值 RSS（vimg 进程，采样） | 348 MiB | — | 512MB 预算内 |
+
+输出与 ffmpeg 后端在相同编码器下逐字节一致（SHA-256 `7e3e22df…`），满足
+ADR-0003 选帧权威。`--capture-backend auto` 在 Windows 上实测会选中 libav。
+
+附带发现：编码器子进程从 ffmpeg 8.0 升到 8.1 本身就让 ffmpeg 后端 total
+从 ~2.24s 降到 ~1.75s（SVT-AV1 编码端差异），是独立于解码后端的部署级收益。
+
+结论：进程内 libav 后端在可构建机器上收益明确（first_grid −19%、total −18%、
+RSS 预算内、输出逐字节一致）。**已实施：非 macOS 默认后端改为 `auto`**。
+
+### 默认后端改为 auto（Windows 使用 libav）（2026-08-01）
+
+变更：`capture.rs` 新增平台条件默认常量
+`DEFAULT_CAPTURE_BACKEND`（非 macOS = `auto`，macOS 保留 `ffmpeg` 以维持
+VideoToolbox 晋级决策）；`vcs.rs` 与 `serve.rs` 的 `--capture-backend`
+默认值改为该常量。`auto` 在 Windows（带 `in-process-decode` feature）解析为
+`[Libav, Ffmpeg]`：libav 仅当满足固定 Preview profile（3×3、160px、30 帧、
+CRF 30、libsvtav1、无自定义 vfilter）时可用，否则以 `Unavailable` 回退到
+ffmpeg 子进程，不会 fail-fast。无 feature 构建下 `auto` 等价于 `ffmpeg`。
+
+部署：libav 版 `vimg.exe` 运行时需 FFmpeg 8.1 共享 DLL（avcodec-62.dll 等）。
+已搭建可独立运行的目录 `D:\ffmpeg-dev\libav-deploy\`（vimg.exe + 8 个 DLL），
+PATH 中保留 scoop ffmpeg 8.1.2 作为编码器子进程。默认命令实测（warm）：
+
+| 指标 | 值 |
+|---|---:|
+| 默认选中后端 | libav |
+| first_grid | ~0.96–1.00s |
+| total | ~1.42–1.63s |
+| 输出 | `3f0fa2be…`（与 ffmpeg 后端逐字节一致） |
+
+相比改前默认 ffmpeg 后端（total ~2.1–2.3s），默认命令提速约 30%，
+first_grid 提速约 40%，峰值 RSS ~348 MiB 仍远低于 512MB 预算。

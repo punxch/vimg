@@ -20,7 +20,7 @@ const MAX_JOBS: usize = 10;
 #[derive(clap::Parser, Debug)]
 pub struct Serve {
     /// Capture implementation fixed for every job in this service process.
-    #[arg(long, value_enum, default_value_t = command::CaptureBackendPolicy::Ffmpeg)]
+    #[arg(long, value_enum, default_value_t = command::DEFAULT_CAPTURE_BACKEND)]
     pub capture_backend: command::CaptureBackendPolicy,
 }
 
