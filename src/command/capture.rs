@@ -790,6 +790,8 @@ fn in_process_probe(video: &std::path::Path) -> anyhow::Result<ProbeFields> {
     };
     let parameters = stream.parameters();
     let (width, height) = unsafe {
+        // Safe: `parameters` owns the AVCodecParameters; width/height are
+        // plain integers initialized by the demuxer's stream header.
         let parameters = parameters.as_ptr();
         ((*parameters).width, (*parameters).height)
     };
@@ -1534,5 +1536,66 @@ mod tests {
                 .iter()
                 .all(|capture| capture.frames.len() == capture_frames)
         );
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn preview_avif() -> PathBuf {
+        // Reuse the in-process encoder to build a tiny real AVIF (1.5s, 64x64,
+        // 20fps, 30 frames) that the probe can read, with no external fixtures.
+        let path = std::env::temp_dir().join(format!(
+            "vimg-probe-test-{}.avif",
+            std::process::id()
+        ));
+        let mut encoder = crate::command::InProcessAvifEncoder::start(&path, 64, 64, 20.0, 30, 8)
+            .expect("starting the in-process encoder");
+        for frame in 0..30 {
+            let grid = image::RgbImage::from_fn(64, 64, |x, y| {
+                let v = ((x + y + frame * 3) % 256) as u8;
+                image::Rgb([v, v.wrapping_mul(2), v.wrapping_mul(3)])
+            });
+            encoder.write_grid(&grid).unwrap();
+        }
+        encoder.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn probe_fields_complete_requires_every_field() {
+        let none = ProbeFields {
+            duration_s: None,
+            width: None,
+            height: None,
+            codec: None,
+            source_time_base: None,
+        };
+        assert!(!none.complete());
+        assert!(ProbeFields {
+            duration_s: Some(1.5),
+            width: Some(64),
+            height: Some(64),
+            codec: Some("av1".to_owned()),
+            source_time_base: Some(Rational::new(1, 1_024)),
+        }
+        .complete());
+    }
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    fn in_process_probe_reads_preview_timeline_fields() {
+        let path = preview_avif();
+        let fields = in_process_probe(&path).expect("probing the encoded AVIF");
+        assert_eq!(fields.duration_s, Some(1.5));
+        assert_eq!(fields.width, Some(64));
+        assert_eq!(fields.height, Some(64));
+        assert_eq!(fields.codec.as_deref(), Some("av1"));
+        // The AVIF demuxer exposes stream time base 1/1; the probe mirrors
+        // exactly what ffprobe would report for the same file.
+        assert_eq!(fields.source_time_base, Some(Rational::new(1, 1)));
+        let _ = std::fs::remove_file(&path);
     }
 }

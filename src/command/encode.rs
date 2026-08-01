@@ -26,6 +26,7 @@ use std::{
 
 /// Streaming grid encoder: grids are converted and fed to SVT on a dedicated
 /// thread so RGB→YUV conversion overlaps grid composition on the main thread.
+#[derive(Debug)]
 pub(crate) struct InProcessAvifEncoder {
     sender: Option<SyncSender<RgbImage>>,
     worker: Option<JoinHandle<anyhow::Result<()>>>,
@@ -253,5 +254,93 @@ impl EncoderState {
         unsafe { (*yuv.as_mut_ptr()).duration = 1 };
         self.encoder.send_frame(&yuv)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn grid(frame: u32) -> RgbImage {
+        RgbImage::from_fn(64, 64, |x, y| {
+            let v = ((x + y + frame * 7) % 256) as u8;
+            image::Rgb([v, v.wrapping_mul(2), v.wrapping_mul(3)])
+        })
+    }
+
+    fn temp_output(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "vimg-encode-test-{name}-{}.avif",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn rejects_a_non_integer_frame_rate() {
+        let path = temp_output("fps");
+        let error = InProcessAvifEncoder::start(&path, 64, 64, 23.976, 30, 8)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("integer frame rate"),
+            "unexpected error: {error}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn round_trip_writes_a_30_frame_avif_with_the_preview_timeline() {
+        let path = temp_output("roundtrip");
+        let mut encoder = InProcessAvifEncoder::start(&path, 64, 64, 20.0, 30, 8).unwrap();
+        for frame in 0..30 {
+            encoder.write_grid(&grid(frame)).unwrap();
+        }
+        encoder.finish().unwrap();
+
+        let mut input = ffmpeg::format::input(&path).expect("reopening the encoded AVIF");
+        let stream = input.streams().next().expect("one video stream");
+        assert_eq!(stream.parameters().medium(), ffmpeg::media::Type::Video);
+        assert_eq!(stream.parameters().id(), ffmpeg::codec::Id::AV1);
+        let (width, height) = unsafe {
+            let parameters = stream.parameters().as_ptr();
+            ((*parameters).width, (*parameters).height)
+        };
+        assert_eq!((width, height), (64, 64));
+        // 30 frames at 20fps = 1.5s in the demuxer's time base.
+        assert_eq!(input.duration(), 1_500_000);
+
+        // The AVIF demuxer reports its own stream time base (1/1) and image-
+        // sequence frame counts, so verify the muxer recipe against the
+        // container boxes directly: mdhd timescale 10240 (20 doubled until
+        // >= 10000, matching the CLI) and stsz entry count 30.
+        let bytes = std::fs::read(&path).expect("reading the encoded AVIF");
+        let mdhd = bytes
+            .windows(4)
+            .position(|window| window == b"mdhd")
+            .expect("mdhd box");
+        // version/flags (4) + creation/modification (8 for v0, 16 for v1) +
+        // timescale (4).
+        let version = bytes[mdhd + 4];
+        let timescale_offset = mdhd + 4 + 4 + if version == 1 { 16 } else { 8 };
+        let timescale = u32::from_be_bytes(
+            bytes[timescale_offset..timescale_offset + 4]
+                .try_into()
+                .expect("timescale bytes"),
+        );
+        assert_eq!(timescale, 10_240);
+        let stsz = bytes
+            .windows(4)
+            .position(|window| window == b"stsz")
+            .expect("stsz box");
+        // version/flags (4) + sample_size (4) + sample_count (4).
+        let sample_count = u32::from_be_bytes(
+            bytes[stsz + 12..stsz + 16]
+                .try_into()
+                .expect("sample count bytes"),
+        );
+        assert_eq!(sample_count, 30);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

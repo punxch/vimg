@@ -259,8 +259,9 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         .context("libav capture seek failed")?;
     // The decoder opens lazily on the first video packet after the seek: its
     // pts exposes the preroll length, which selects the frame-thread count.
-    let mut decoder: Option<ffmpeg::decoder::Video> = None;
-    let mut scaler: Option<filter::Graph> = None;
+    // The scaler is created together with the decoder and always lives as
+    // long as it does.
+    let mut decode_pipeline: Option<(ffmpeg::decoder::Video, filter::Graph)> = None;
 
     let mut decoded = Video::empty();
     let mut rgb = Video::empty();
@@ -285,7 +286,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         {
             packet_durations.insert(pts, packet.duration());
         }
-        if decoder.is_none() {
+        if decode_pipeline.is_none() {
             // First video packet of the seek: its pts is the preroll start, so
             // the preroll length is known before any decoding happens.
             let preroll_s = packet
@@ -307,11 +308,12 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
                 .video()
                 .context("libav capture is unavailable: video decoder is unsupported")?;
             opened.skip_frame(Discard::NonReference);
-            scaler = Some(production_scale_filter(&opened, dimensions, time_base)?);
-            decoder = Some(opened);
+            let opened_scaler = production_scale_filter(&opened, dimensions, time_base)?;
+            decode_pipeline = Some((opened, opened_scaler));
         }
-        let active_decoder = decoder.as_mut().expect("decoder opened above");
-        let active_scaler = scaler.as_mut().expect("scaler created above");
+        let (active_decoder, active_scaler) = decode_pipeline
+            .as_mut()
+            .expect("decoder opened above");
         if nonref
             && packet.dts().or_else(|| packet.pts()).is_some_and(|pts| {
                 pts as f64 * f64::from(time_base) >= f64::from(start_s) - NONREF_RECOVERY_MARGIN_S
@@ -341,14 +343,16 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
             break;
         }
     }
+    // The packet loop ended: if the schedule still isn't full, drain the
+    // decoder (EOF) and emit any pending source frame. No video packets at
+    // all is an error.
+    let (mut active_decoder, mut active_scaler) =
+        decode_pipeline.context("libav capture received no video packets")?;
     if !schedule.is_complete() {
-        let mut active_decoder =
-            decoder.context("libav capture received no video packets")?;
-        let active_scaler = scaler.as_mut().expect("scaler created with decoder");
         active_decoder.send_eof()?;
         receive_frames(
             &mut active_decoder,
-            active_scaler,
+            &mut active_scaler,
             &mut decoded,
             &mut rgb,
             &mut schedule,
@@ -367,11 +371,10 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         let pending =
             pending_decoded.context("libav decoder produced no timestamped source frame")?;
         let duration = last_duration.context("libav decoder produced no source-frame duration")?;
-        let active_scaler = scaler.as_mut().expect("scaler created with decoder");
         emit_scheduled_frames(
             pending,
             duration,
-            active_scaler,
+            &mut active_scaler,
             &mut rgb,
             &mut schedule,
             source_time_base,
