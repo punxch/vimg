@@ -1,5 +1,8 @@
 local M = {}
 local media_descriptors = {}
+local publish_avif_request = ya.sync(function(_, request)
+	ps.pub_to(0, "vimg-gridthumb-request", request)
+end)
 
 local function source_descriptor(url)
 	local cha = fs.cha(url)
@@ -60,6 +63,7 @@ function M:setup()
 	ps.sub_remote("gridthumb-avif-ready", function(body)
 		local hovered = cx.active.current.hovered
 		if hovered and body and body.file == tostring(hovered.url) then
+			ya.dbg("[gridthumb] avif ready:", tostring(body.cache))
 			ya.emit("peek", { 0, only_if = hovered.url })
 		end
 	end)
@@ -180,37 +184,25 @@ function M:generate_avif(job, cache)
 	if not source then
 		return
 	end
-	local args = {
-		"send", file_url, cache_avif,
-		"--source-size", tostring(source.size),
-		"--source-modified-s", tostring(source.modified_s),
+	local request = {
+		file = file_url,
+		cache = cache_avif,
+		source_size = source.size,
+		source_modified_s = source.modified_s,
 	}
 	if source.duration_s then
-		table.insert(args, "--duration-s")
-		table.insert(args, tostring(source.duration_s))
+		request.duration_s = source.duration_s
 	end
 	if source.width and source.height then
-		table.insert(args, "--width")
-		table.insert(args, tostring(source.width))
-		table.insert(args, "--height")
-		table.insert(args, tostring(source.height))
+		request.width = source.width
+		request.height = source.height
 	end
 	if source.source_time_base_numerator and source.source_time_base_denominator then
-		table.insert(args, "--source-time-base-numerator")
-		table.insert(args, tostring(source.source_time_base_numerator))
-		table.insert(args, "--source-time-base-denominator")
-		table.insert(args, tostring(source.source_time_base_denominator))
+		request.source_time_base_numerator = source.source_time_base_numerator
+		request.source_time_base_denominator = source.source_time_base_denominator
 	end
-	local yazi_id = os.getenv("YAZI_ID")
-	if yazi_id and yazi_id ~= "" then
-		table.insert(args, "--yazi-id")
-		table.insert(args, yazi_id)
-	end
-	ya.dbg("[gridthumb] vimg send:", file_url, "->", cache_avif)
-	local child, err = Command("vimg"):arg(args):spawn()
-	if not child then
-		ya.dbg("[gridthumb] vimg failed:", tostring(err))
-	end
+	ya.dbg("[gridthumb] vimg DDS:", file_url, "->", cache_avif)
+	publish_avif_request(request)
 end
 
 function M:spot(job)

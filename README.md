@@ -29,6 +29,25 @@ Join same-sized capture images into a single grid image.
 vimg join [OPTIONS] --columns <COLUMNS> --output <OUTPUT> <CAPTURE_IMAGES>...
 ```
 
+### Command: serve
+
+Run the long-lived preview service used by `gridthumb.yazi`:
+
+```sh
+vimg serve --capture-backend auto
+```
+
+The plugin publishes `vimg-gridthumb-request` messages through Yazi DDS. The
+service receives them with `ya sub`, runs the equivalent of
+`vimg vcs -c3 -H160 -n9 <video> --output <file-cache>.avif` in-process, and
+publishes `gridthumb-avif-ready` back to the requesting Yazi instance with
+`ya pub-to`. Duplicate cache requests share one job, and no more than 10 jobs
+run at once.
+
+Copy [`gridthumb.yazi`](gridthumb.yazi) into Yazi's plugin directory and call
+`require("gridthumb"):setup()` from `init.lua`. `vimg send` remains available
+as a command-line DDS publisher for diagnostics and compatibility.
+
 ## Install
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/vimg).

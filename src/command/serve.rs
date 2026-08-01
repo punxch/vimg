@@ -1,22 +1,22 @@
 use crate::command;
 use anyhow::{Context, ensure};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{BufRead, BufReader, Write},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{BufRead, BufReader},
     path::{Path, PathBuf},
-    process::Command as ProcessCommand,
+    process::{Command as ProcessCommand, Stdio},
     sync::{Arc, Condvar, Mutex},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
-const BIND_ADDR: &str = "127.0.0.1:33582";
+const REQUEST_EVENT: &str = "vimg-gridthumb-request";
+const READY_EVENT: &str = "gridthumb-avif-ready";
+const FAILED_EVENT: &str = "gridthumb-avif-failed";
 const MAX_JOBS: usize = 10;
 
-/// Run as a background service, listening for vimg jobs via TCP.
+/// Run as a service, receiving vimg jobs from Yazi DDS.
 #[derive(clap::Parser, Debug)]
 pub struct Serve {
     /// Capture implementation fixed for every job in this service process.
@@ -146,7 +146,7 @@ struct QueueState {
     jobs: HashSet<PathBuf>,
     subscribers: HashMap<PathBuf, HashSet<String>>,
     queued: VecDeque<Job>,
-    active: Option<PathBuf>,
+    active: HashSet<PathBuf>,
 }
 
 struct Scheduler {
@@ -204,14 +204,14 @@ impl Scheduler {
         // Taking the newest entry preserves interactive priority. The oldest
         // queued entry is the one replaced at the Admission limit.
         let job = state.queued.pop_back().unwrap();
-        state.active = Some(job.cache.clone());
+        state.active.insert(job.cache.clone());
         job
     }
 
     fn finish(&self, cache: &Path) -> Vec<String> {
         let mut state = self.state.lock().unwrap();
         state.jobs.remove(cache);
-        state.active = None;
+        state.active.remove(cache);
         state
             .subscribers
             .remove(cache)
@@ -237,57 +237,85 @@ impl Serve {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         });
-        let worker_scheduler = Arc::clone(&scheduler);
-        thread::spawn(move || worker(worker_scheduler, self.capture_backend));
+        for worker_id in 1..=MAX_JOBS {
+            let worker_scheduler = Arc::clone(&scheduler);
+            let capture_backend = self.capture_backend;
+            thread::Builder::new()
+                .name(format!("vimg-worker-{worker_id}"))
+                .spawn(move || worker(worker_id, worker_scheduler, capture_backend))
+                .context("Cannot start a vimg service worker")?;
+        }
 
-        let addr: SocketAddr = BIND_ADDR.parse().unwrap();
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
-        socket.bind(&addr.into())?;
-        socket.listen(128)?;
-        let listener: TcpListener = socket.into();
-        println!("[serve] Listening on {BIND_ADDR}");
+        println!("[serve] Started {MAX_JOBS} workers; waiting for Yazi DDS");
+        receive_yazi_requests(scheduler)
+    }
+}
 
-        for stream in listener.incoming() {
-            match stream {
-                Ok(stream) => handle_client(stream, &scheduler),
-                Err(error) => eprintln!("[serve] Accept error: {error}"),
+fn receive_yazi_requests(scheduler: Arc<Scheduler>) -> anyhow::Result<()> {
+    loop {
+        let mut child = ProcessCommand::new("ya")
+            .args(["sub", REQUEST_EVENT])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .context("Cannot start `ya sub`; is Yazi installed?")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("Cannot read messages from `ya sub`")?;
+        println!("[serve] Subscribed to Yazi DDS event {REQUEST_EVENT}");
+
+        for line in BufReader::new(stdout).lines() {
+            match line {
+                Ok(line) => match submit_dds_message(&line, &scheduler) {
+                    Ok(result) => println!("[serve] DDS request: {}", result.protocol()),
+                    Err(error) => eprintln!("[serve] Invalid DDS request: {error}"),
+                },
+                Err(error) => {
+                    eprintln!("[serve] Cannot read Yazi DDS: {error}");
+                    break;
+                }
             }
         }
-        Ok(())
+
+        match child.wait() {
+            Ok(status) => eprintln!("[serve] `ya sub` disconnected ({status}); retrying"),
+            Err(error) => eprintln!("[serve] Cannot wait for `ya sub`: {error}; retrying"),
+        }
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn handle_client(mut stream: TcpStream, scheduler: &Scheduler) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-    let mut line = String::new();
-    if BufReader::new(&stream)
-        .read_line(&mut line)
-        .ok()
-        .filter(|n| *n > 0)
-        .is_none()
-    {
-        let _ = stream.write_all(b"error: invalid request\n");
-        return;
-    }
-    let Ok(state) = submit_request(line.trim(), scheduler) else {
-        let _ = stream.write_all(b"error: invalid json\n");
-        return;
-    };
-    let _ = stream.write_all(format!("{}\n", state.protocol()).as_bytes());
-}
-
+#[cfg(test)]
 fn submit_request(line: &str, scheduler: &Scheduler) -> Result<SubmitResult, ()> {
     let job = Job::from_json(line).ok_or(())?;
     Ok(scheduler.submit(job))
 }
 
-fn worker(scheduler: Arc<Scheduler>, capture_backend: command::CaptureBackendPolicy) {
+fn submit_dds_message(line: &str, scheduler: &Scheduler) -> anyhow::Result<SubmitResult> {
+    let mut fields = line.splitn(4, ',');
+    let kind = fields.next().context("missing event kind")?;
+    ensure!(kind == REQUEST_EVENT, "unexpected event kind {kind}");
+    let _receiver = fields.next().context("missing receiver")?;
+    let sender = fields.next().context("missing sender")?;
+    let body = fields.next().context("missing JSON body")?;
+    let mut job = Job::from_json(body).context("invalid JSON body")?;
+    if job.yazi_id.is_none() && sender != "0" {
+        job.yazi_id = Some(sender.to_owned());
+    }
+    Ok(scheduler.submit(job))
+}
+
+fn worker(
+    worker_id: usize,
+    scheduler: Arc<Scheduler>,
+    capture_backend: command::CaptureBackendPolicy,
+) {
     loop {
         let job = scheduler.next();
         let started = Instant::now();
         println!(
-            "[serve] Processing: {} -> {}",
+            "[serve:{worker_id}] Processing: {} -> {}",
             job.file_name(),
             job.cache.display()
         );
@@ -302,20 +330,22 @@ fn worker(scheduler: Arc<Scheduler>, capture_backend: command::CaptureBackendPol
             ServiceJobOutcome::Published => {
                 notify_yazi(
                     &job.file,
+                    &job.cache,
                     &completion.subscribers,
-                    "gridthumb-avif-ready",
+                    READY_EVENT,
                     None,
                 );
                 println!(
-                    "[serve] Done: {} ({:.1}s)",
+                    "[serve:{worker_id}] Done: {} ({:.1}s)",
                     job.file_name(),
                     started.elapsed().as_secs_f32()
                 );
             }
             ServiceJobOutcome::Failed(reason) => notify_yazi(
                 &job.file,
+                &job.cache,
                 &completion.subscribers,
-                "gridthumb-avif-failed",
+                FAILED_EVENT,
                 Some(&reason),
             ),
         }
@@ -405,10 +435,23 @@ fn publish_manifest(job: &Job) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn notify_yazi(video: &Path, subscribers: &[String], event: &str, failure_reason: Option<&str>) {
+fn notify_yazi(
+    video: &Path,
+    cache: &Path,
+    subscribers: &[String],
+    event: &str,
+    failure_reason: Option<&str>,
+) {
     let payload = match failure_reason {
-        Some(reason) => serde_json::json!({ "file": video.to_string_lossy(), "error": reason }),
-        None => serde_json::json!({ "file": video.to_string_lossy() }),
+        Some(reason) => serde_json::json!({
+            "file": video.to_string_lossy(),
+            "cache": cache.to_string_lossy(),
+            "error": reason,
+        }),
+        None => serde_json::json!({
+            "file": video.to_string_lossy(),
+            "cache": cache.to_string_lossy(),
+        }),
     };
     let payload = payload.to_string();
     for yazi_id in subscribers {
@@ -425,8 +468,6 @@ fn notify_yazi(video: &Path, subscribers: &[String], event: &str, failure_reason
 
 impl Send {
     pub fn run(self) -> anyhow::Result<()> {
-        let mut stream = TcpStream::connect(BIND_ADDR)
-            .context("Cannot connect to vimg serve. Is it running?")?;
         let request = serde_json::json!({
             "file": self.file.to_string_lossy(),
             "cache": self.cache.to_string_lossy(),
@@ -438,16 +479,14 @@ impl Send {
             "height": self.height,
             "source_time_base_numerator": self.source_time_base_numerator,
             "source_time_base_denominator": self.source_time_base_denominator,
-        });
-        stream.write_all(request.to_string().as_bytes())?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-        let mut response = String::new();
-        BufReader::new(&stream).read_line(&mut response)?;
-        match response.trim() {
-            "queued" | "shared" | "done" => Ok(()),
-            response => anyhow::bail!(response.to_owned()),
-        }
+        })
+        .to_string();
+        let status = ProcessCommand::new("ya")
+            .args(["pub-to", "0", REQUEST_EVENT, "--json", &request])
+            .status()
+            .context("Cannot publish the request through `ya`")?;
+        ensure!(status.success(), "`ya pub-to` exited with {status}");
+        Ok(())
     }
 }
 
@@ -705,6 +744,65 @@ mod tests {
         assert_eq!(scheduler.next().cache, PathBuf::from("newest.avif"));
         let state = scheduler.state.lock().unwrap();
         assert!(!state.jobs.contains(&PathBuf::from("0.avif")));
+    }
+
+    #[test]
+    fn never_runs_more_than_ten_jobs_at_once() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        for index in 0..MAX_JOBS {
+            assert_eq!(
+                scheduler.submit(job(&format!("{index}.avif"))),
+                SubmitResult::Queued
+            );
+            scheduler.next();
+        }
+
+        let state = scheduler.state.lock().unwrap();
+        assert_eq!(state.active.len(), MAX_JOBS);
+        drop(state);
+        assert_eq!(scheduler.submit(job("overflow.avif")), SubmitResult::Busy);
+    }
+
+    #[test]
+    fn dds_request_uses_sender_as_the_yazi_subscriber() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let line = concat!(
+            "vimg-gridthumb-request,0,987654321,",
+            r#"{"file":"video,one.mkv","cache":"preview.avif"}"#
+        );
+
+        assert_eq!(
+            submit_dds_message(line, &scheduler).unwrap(),
+            SubmitResult::Queued
+        );
+        let active = scheduler.next();
+        assert_eq!(active.file, PathBuf::from("video,one.mkv"));
+        assert_eq!(scheduler.finish(&active.cache), ["987654321"]);
+    }
+
+    #[test]
+    fn explicit_yazi_id_takes_precedence_over_a_cli_dds_sender() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let line = concat!(
+            "vimg-gridthumb-request,0,111,",
+            r#"{"file":"video.mkv","cache":"preview.avif","yazi_id":"222"}"#
+        );
+
+        assert_eq!(
+            submit_dds_message(line, &scheduler).unwrap(),
+            SubmitResult::Queued
+        );
+        let active = scheduler.next();
+        assert_eq!(scheduler.finish(&active.cache), ["222"]);
     }
 
     #[test]
