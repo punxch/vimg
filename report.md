@@ -1077,3 +1077,249 @@ med 1.265s / P95 1.376s；输出全部 SHA-256 `3f0fa2be…`，跨 capture backe
 - 注意：若部署回 BtbN DLL，进程内编码将因 SVT 版本不同产生非字节一致输出
   （容器/时长正确，仅 bitstream 不同），设置 `VIMG_SUBPROCESS_ENCODER=1`
   可强制一致。
+
+## Yazi DDS 预览服务实装与往返验证（2026-08-01）
+
+此前 `serve.rs` 的请求链路实际为 `gridthumb → vimg send → TCP → serve`，仅完成
+通知使用 `ya pub-to`；调度器也只有一个 worker，`MAX_JOBS=10` 只是队列容量，
+并不满足 AGENTS.md 所述的 DDS 接收和最多同时处理 10 个文件。
+
+本轮改为完整 DDS 链路：
+
+1. `vimg serve` 启动 `ya sub vimg-gridthumb-request` 并逐行读取
+   `kind,receiver,sender,JSON-body`。解析使用 `splitn(4, ',')`，所以 Windows 路径
+   或文件名中的逗号不会截断 JSON；DDS sender 自动成为完成通知的 Yazi ID。
+2. `gridthumb.yazi` 在顶层创建 `ya.sync` 发布桥，通过
+   `ps.pub_to(0, "vimg-gridthumb-request", request)` 直接发送文件路径、cache AVIF
+   路径、源文件 identity 和已探测的媒体描述，不再为每次预览启动 `vimg send`
+   子进程。
+3. 服务完成后通过
+   `ya pub-to <sender> gridthumb-avif-ready --json <payload>` 返回文件与 cache 路径；
+   插件收到后触发 `peek`，命中当前 AVIF/manifest 后执行
+   `ya.image_show(cache_avif)` 和 `ya.preview_widget`。
+4. `vimg send` 保留为兼容/诊断命令，但内部也改为 `ya pub-to`，不再使用固定
+   TCP 端口；`socket2` 直接依赖随之移除。
+5. 服务启动 10 个 worker，调度状态用 `HashSet` 记录所有 active cache；active +
+   queued 总数最多 10。相同 cache 的请求合并并收集所有订阅者；容量满且没有可
+   淘汰的未启动任务时返回 busy，从结构上保证不会同时执行第 11 个文件。
+
+依据 Yazi DDS 官方文档（https://yazi-rs.github.io/docs/dds/）和本机
+Yazi/Ya 26.1.22 实测确认 `ya sub` 协议格式。验证结果：
+
+| 验证项 | 结果 |
+|---|---|
+| `cargo check` | 通过 |
+| `cargo test --features in-process-decode` | **56 passed / 3 ignored / 0 failed** |
+| Lua DDS 契约（发布 request、订阅 ready、触发 peek） | 通过 |
+| release 构建 | `cargo build --release --features in-process-decode` 通过 |
+| 真实进程链路 | 隔离配置加载仓库 `gridthumb.yazi` → `ps.pub_to` → `ya sub` → 直接 `Vcs::run` → `ya pub-to` → 插件 ready 回调成功 |
+| 服务实时状态 | 打印 subscribed、queued、worker processing、done；单任务实测 1.5–1.7s |
+| 输出 | 86,080 bytes；SHA-256 `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2` |
+| cache identity | AVIF 与 `<cache>.3210297211-1744354554.json` manifest 均生成 |
+
+三条真实 DDS 路径（直接 `ya pub-to`、`vimg send` 兼容入口、仓库插件
+`ps.pub_to`）均得到与性能基准逐字节相同的 AVIF。插件层验证使用隔离的
+`YAZI_CONFIG_HOME` 和源视频硬链接，不修改用户现有 Yazi 配置；ready 事件已由
+插件订阅，回调重新触发 `peek`。验证使用的临时 AVIF/manifest/config/硬链接均
+已删除，测试 Yazi/serve/ya 进程已正常停止。
+
+资源说明：单个固定 Preview job 的精确峰值 WS 约 553MB；10 是功能上的并发
+上限而非推荐持续满载值，极端满载可能需要约 5.5GB 以上内存，部署时应结合
+机器资源和 ADR-0001 的单 job 预算继续评估默认并发度。
+
+## Windows 单次运行优化第四轮：剩余瓶颈与下一步（2026-08-01）
+
+本轮只做诊断和候选方案筛选，没有把实验开关留在生产代码中。固定样本所有
+有效 arm 的输出均校验 SHA-256；除明确写出的 0ms recovery arm 外，结果都是
+`3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+当前机器有明显的后台负载波动，因此绝对 wall 不替换上一轮受控 ABBA 的
+1.252s 基准；本轮决策以同一批次交错 arm 和 phase 分解为主。
+
+### 当前关键路径分解
+
+12 次 warm 诊断的中位数为 wall 1.48s、profile total 1.36s、decode 1.15s、
+first_grid 0.97s、receive_wait 1.05s、join 0.033s、encoder_write 0.014s、
+encoder_tail 0.19s。wall 与 profile total 约 0.12s 的差额主要是进程/DLL 启动
+及 profile 边界外工作；对 Yazi 的常驻 `serve` 路径可避免重复启动，对真正的
+一次性 CLI 则不能靠 capture 微优化消除。
+
+一次逐 worker 计时进一步确定最慢 cap7：total 1.128s，其中 open 0.0245s、
+seek 0.0207s、decoder setup 0.0078s、`send_packet` 0.8783s、receive/scale/copy
+0.1534s、other 0.0437s。九个 worker 合计 decoded 566 帧、preroll 254 帧；
+cap7 decoded 98 / preroll 64。**长预滚的软件 H.264 解码是剩余主瓶颈**，
+而重复 open/probe、scale/copy、join、写盘各自只有几十毫秒量级的上限。
+
+SVT 初始化也单独测量了 8 次：`EncoderState::new` 中位数 0.0432s（0.0340–
+0.0511s）。capture worker 已在它之前启动，所以这 43ms 大部分已经与解码重叠；
+把初始化移到 worker 的纯延迟上限很小，延迟到首个 grid 反而可能把它串到
+关键路径上。它更适合作为 RSS 错峰实验，而不是首要提速方案。
+
+### 已完成的窄范围反证
+
+#### SVT `lp`：可用内存换 18–34ms，但不适合作为默认值
+
+每 arm 6 次交错 warm，全部输出逐字节一致；RSS 用 Windows
+`PeakWorkingSetSize` 精确读取（每 arm 2 次）：
+
+| lp | wall p50 | encoder tail p50 | 峰值 WS |
+|---:|---:|---:|---:|
+| 1 | 1.4843s | 0.3410s | 524–536MB |
+| **2（当前）** | **1.3292s** | **0.1635s** | **553–561MB** |
+| 3 | 1.3107s | 0.1320s | 604–619MB |
+| 4 | 1.2954s | 0.1430s | 665–674MB |
+
+`lp=3` 相对当前只省约 18ms，却再增加约 50–65MB；`lp=4` 省约 34ms，增加
+约 110MB。保留 `lp=2`。若将来提供明确的“latency-first/忽略内存预算”模式，
+`lp=4` 可以成为可选项，但不应静默改变默认资源契约。
+
+#### decoder threads：DT3 已处在拐点
+
+只改变长预滚 worker 的线程数，每 arm 6 次交错 warm：
+
+| 长预滚 DT | wall p50 | decode p50 | CPU time p50 | 结论 |
+|---:|---:|---:|---:|---|
+| 2 | 1.4901s | 1.1810s | 14.219s | 慢 |
+| **3（当前）** | **1.3937s** | **1.1105s** | **14.148s** | 采用 |
+| 4 | 1.3872s | 1.1010s | 15.117s | 仅约 6ms，CPU +约 1s |
+| 5 | 1.5858s | 1.2450s | 15.555s | 明显变慢 |
+
+随后又测试短窗口 DT1/DT2 与长窗口 DT3/DT4 的组合。当前 DT2/DT3 的 wall
+p50 1.3617s；DT1/DT3、DT1/DT4、DT2/DT4 分别为 1.4771s、1.4169s、
+1.4554s。DT4 的微弱单臂信号没有复现，短窗口降到 DT1 会产生新的 straggler，
+因此不修改当前选择性 DT3。
+
+#### recovery margin：缩短后的初始信号没有复现
+
+第一组 6 次测试中 50ms 曾比当前 125ms 快约 43ms，故追加每 arm 12 次轮转
+复测：
+
+| `NONREF -> DEFAULT` 余量 | wall p50 | wall P95 | 输出 SHA |
+|---:|---:|---:|---|
+| **125ms（当前）** | **1.3870s** | **1.5062s** | 3f0fa2be… |
+| 75ms | 1.4320s | 1.5149s | 3f0fa2be… |
+| 50ms | 1.3966s | 1.6294s | 3f0fa2be… |
+
+50/75ms 没有稳定收益，50ms 的 P95 反而更差，保留 125ms。0ms arm 虽略快，
+但输出变为 `7a92c5c…`，直接违反权威输出约束。
+
+#### P-core affinity：中位延迟无收益
+
+全 24 logical CPU 与固定 0xFFFF P-core mask 各 8 次交错：wall p50
+1.3118s vs 1.3240s，profile total 1.218s vs 1.220s，decode 均约 1.047–
+1.048s；P-core mask 的 CPU time 从 13.719s 降至 12.672s，但没有降低单次
+中位延迟。硬编码 affinity 不合入；只有 ETW 证明关键线程频繁迁到 E-core 时，
+才值得用 Windows CPU Sets 做 P95/能效实验。
+
+### 下一步优化优先级
+
+详细原理、上游主来源和验收门槛记录在
+[`docs/research/2026-08-01-next-single-run-optimization-options.md`](docs/research/2026-08-01-next-single-run-optimization-options.md)。
+按当前 phase 上限重新排序：
+
+1. **原生 FFmpeg H.264/HEVC decoder + 共享 D3D11VA/NVDEC context 探针。**
+   旧负结果是独立 `h264_cuvid` 路径；原生 decoder 会在 hardware callback 前
+   执行 `skip_frame`，可能同时保留 nonref preroll 跳过与硬解。先只做回调/
+   surface/transfer 计数探针；若 P95 不能改善至少 8%，不集成。
+2. **三级 preroll discard：`BIDIR -> NONREF -> DEFAULT`。** 固定样本的长 GOP
+   含 reference-B，早期 `BIDIR` 理论上可再少解最多约 127 个 preroll frame，
+   是纯 CPU 路径最大的剩余上限；但恢复 reference-B 链风险高，必须用 270 个
+   source PTS、30 个 raw grid hash 和多 codec/GOP corpus 晋级。
+3. **低风险小项：跳过重复 `avformat_find_stream_info`、direct libswscale。**
+   当前关键 worker open+seek 约 45ms，其中可省的重复 stream-info 约 20–25ms
+   上限；receive/scale/copy 总共约 153ms，direct swscale 的实际可省部分预计仅
+   10–40ms。两者都应先加细分计时，再做 Matroska-only/逐帧 hash 探针。
+4. **encoder 初始化/RSS 错峰。** setup 实测只有约 43ms且已与 capture 重叠；
+   只在目标是把 553MB 拉回 512MB 或为 `lp=3` 腾空间时继续，不预期显著降低
+   wall。
+5. **允许新码流时升级 SVT-AV1 4.2.0。** 上游包含短任务相关的 worker 与分配
+   优化，并可测试 `startup-mg-size`；但版本/GOP 会改变 AV1 bitstream，必须建
+   新 cache generation，不能作为当前 byte-identical 默认优化。
+
+结论：现状下继续调线程、affinity、`lp` 或 recovery margin 已进入噪声/内存
+换微秒区。若目标仍是单次再降 0.1s 以上，应优先验证“原生 parser + hwaccel”
+和三级 discard；若不接受高复杂度或新码流，现实可期待的剩余空间约为若干个
+10–40ms 小项，而不是再次获得上一轮 20–30% 的降幅。
+
+## 原型验证：原生 parser + hwaccel 与三级 discard（2026-08-01，RTX 3090 + gyan FFmpeg 8.1.2 shared）
+
+按上一轮结论对两项 P0 候选做独立原型验证。原型层以 `VIMG_PROTO_*` 环境变量
+临时加在 `libav.rs`，验证完成后已从源码还原；脚本与全部运行产物保留在
+`.scratch/proto/`（`sweep.sh`、各 config 的 stdout/日志/dump）。固定样本所有
+输出均做三重 gate：270 个 source PTS、270 张 raw RGB dump 逐字节 hash、
+最终 AVIF SHA-256 `3f0fa2be…`。本机仍有后台负载波动，绝对 wall 只与同批次
+交错测量对比。
+
+### 三级 discard（BIDIR → NONREF → DEFAULT）：否决
+
+按建议做二维 sweep：BIDIR 恢复区 {0.25, 0.375, 0.5}s × 最终 margin
+{0.125, 0.25, 0.5}s，共 9 个 config，全部通过 PTS gate（270/270 一致）但
+**RGB 与 AVIF SHA 全部不一致**。错误 SHA 由较晚的转换点决定（margin 大于
+BIDIR 区时两级转换合并，行为等价于更晚的 BIDIR 区）；把 BIDIR 区放大到
+0.75/1.0/1.5/2.0s 仍然失败。不是恢复区不够，而是
+**`AVDISCARD_BIDIR` 在这条流的稳态 mini-GOP（P、reference-B、B×4）上会永久
+破坏 DPB**：一旦跳过 reference-B，后续 P 帧就对着错误参考重建。
+
+用官方 CLI 独立复现（与原型实现无关）：`ffmpeg -skip_frame bidir` 从 0 帧
+稳态解码 186s，在 183.08s 窗口内输出的 4/4 个 P 帧（pts 4398/4404/4410/
+4424）与完整解码逐帧 md5 不一致；`-threads 1` 同样复现，说明与帧线程无关；
+文件前 2s 干净（起始 GOP 结构不同），所以是“稳态 mini-GOP 含 reference-B”
+本身触发。文档中“BIDIR 只用于早期长 preroll、维护 I/P 链”的假设被这条流
+证伪：跳过 reference-B 的代价是 I/P 链本身损坏。
+
+允许输出改变时（仅作上限数据）：bidir_0.375 与当前两级的同批次交错
+median 1.658s vs 1.793s，约 -7.5%（实测少解约 107/566 帧，理论估计约
+127 帧），但输出不是权威 SHA，不可用。结论：三级 discard 在 FFmpeg
+8.1.2 原生 h264 上对含 reference-B 的样本无条件失败，整条路线关闭。
+
+### 原生 parser + 共享 hwaccel（D3D11VA / CUDA）：功能全通，性能为负，不推广
+
+新探针按研究文档实现：`avcodec_find_decoder(H264)` 原生 decoder + 每 worker
+持有共享 `hw_device_ctx` 的 `av_buffer_ref` + `get_format` 强制硬件格式
+（拒绝静默软件回退），preroll 帧不下载，仅对需要缩放的帧做
+`av_hwframe_transfer_data`，计数探针记录 demux packet、NAL、hardware
+decoded、transfer。**两个后端都完整通过三重 gate**：270 PTS、270 raw RGB、
+AVIF SHA `3f0fa2be…` 全部逐字节一致，且 capture 选择的就是进程内 libav
+backend（无 fallback）。这同时证明 NV12→bicubic RGB 与 yuv420p→bicubic RGB
+的 swscale 输出逐字节相同，以及 GPU 解码像素与软件解码逐字节相同。
+
+**parser-skip 先于硬件的证据**（研究文档的关键假设，已证实）：cap7 在
+discard=none 下 hardware decoded=227，两级 NONREF 下=98，即 129 帧在进入
+NVDEC 前就被原生 parser 跳过；计数与软件路径完全一致（sw none=227、
+sw two=98），且 send 耗时随 decoded 数缩放（none 1.56s vs two 0.88s），
+说明跳过发生在硬件回调之前。transfer 每 worker 仅 33–34 次（offset 后的
+帧），preroll surface 全部留在 GPU。
+
+探针中排除的实现坑（均已解决，记录供后续参考）：(1) hwaccel + 帧线程可
+打开但解码损坏（"Missing reference picture"、"mmco: unref short failure"），
+必须 threads=1；(2) ffmpeg-next 的 `Video::clone` 是 `av_frame_copy` +
+`copy_props`，对硬件帧会复制纹理句柄字节且丢失 `hw_frames_ctx`，必须用
+`av_frame_ref`；(3) D3D11VA 的 `av_hwframe_transfer_data` 要求 dst 已按
+hw frames ctx 的 sw_format 预分配（否则 EINVAL），CUDA 会自己分配；(4)
+D3D11VA surface 高度 16 对齐（1080→1088），dst 按编码尺寸分配即可在传输
+时裁掉 padding。
+
+性能（同批次交错 warm，输出均校验为权威 SHA）：
+
+| 路径 | wall median | 相对当前 | 峰值 WS | 峰值 commit |
+|---|---:|---:|---:|---:|
+| 当前软件（dt 2/3） | 1.711s | — | 563.6MB | 701.4MB |
+| cuda dt1 | 1.784s | +4.2% | 616.4MB | 1520.1MB |
+| d3d11va dt1 | 1.990s | +16.3% | 588.8MB | 785.6MB |
+
+两个硬件后端都达不到“P95 至少快 8%”的推广门槛。原因明确：硬件只加速重建，
+h264 的解析/提交路径（每 worker 约 0.6–0.9s）仍是 CPU 主导且不随后端变快；
+hwaccel 又强制单线程，失去当前 DT2/DT3 的 CPU 并行；每帧 PCIe 下载再增加
+约 0.06–0.13s/worker。CUDA 的 1520MB peak commit 也直接违反 512MB 内存
+契约方向。结论：原生 parser + hwaccel 功能上完全成立（可随时作为独立
+cache generation 的非 byte-identical 轨道），但对当前固定命令没有性能价值，
+默认路径不采用。
+
+### 本轮收敛
+
+两项 P0 均已用原型闭合：三级 discard 因 FFmpeg 的 BIDIR skip 本身损坏
+reference-B 流而不可用；hwaccel 因强制单线程且提交路径仍占 CPU 而比软件
+更慢。剩余可期待的真实空间回到研究文档的 P1 小项（跳过重复 stream-info
+probe 约 20–25ms、direct swscale 约 10–40ms），以及接受新码流的独立轨道
+（SVT 4.2.0 / startup mini-GOP）。若未来换更快的提交路径（如 D3D12VA、
+多 decoder context 分片）或接受非 byte-identical 输出，hwaccel 的探针
+代码与 .scratch/proto 证据可直接复用。
