@@ -7,8 +7,8 @@
 //! - the stream time base is set to the encoder time base (1/fps) before the
 //!   header is written, so the avif (mov) muxer derives the same track
 //!   timescale the CLI produces (20 → ×2 until ≥ 10000 → 10240);
-//! - packets keep the encoder time base and are rescaled by
-//!   `av_interleaved_write_frame`, exactly like the CLI;
+//! - packets keep the encoder time base and are explicitly rescaled to the
+//!   muxer's track time scale (1/10240), matching the CLI's ost rescale;
 //! - RGB → yuv420p10le uses swscale bicubic, the same filter and flags the CLI
 //!   auto-inserts (`auto_scale_0`, flags 0x4), producing tv-range frames;
 //! - libsvtav1 receives identical options (`preset`, `crf`, `svtav1-params
@@ -162,7 +162,6 @@ impl EncoderState {
         let mut options = ffmpeg::Dictionary::new();
         options.set("preset", &preset.to_string());
         options.set("crf", &crf.to_string());
-        // SVT-AV1 lp (Level of Parallelism) 4, same as the subprocess pipeline.
         // SVT-AV1 lp (Level of Parallelism) 2 instead of the subprocess
         // pipeline's 4: lp does not change the bitstream (verified byte-
         // identical) but cuts the in-process encoder's peak working set by

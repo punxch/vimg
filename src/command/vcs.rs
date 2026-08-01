@@ -544,14 +544,13 @@ impl GridEncoder {
     ) -> Result<Self, command::CaptureAttemptError> {
         #[cfg(feature = "in-process-decode")]
         if std::env::var_os("VIMG_SUBPROCESS_ENCODER").is_none()
-            && !is_jpg
-            && !is_webp
-            && vcs.avif_codec == "libsvtav1"
+            && is_in_process_preview_profile(vcs, is_jpg, is_webp)
         {
-            let preset = vcs.avif_preset.unwrap_or(match vcs.args.capture_frames() {
-                1 => 4,
-                _ => 8,
-            });
+            // The in-process encoder is verified byte-identical only for the
+            // fixed Preview profile (3×3, H160, 9 captures, 30 frames, 1.5s,
+            // CRF 30, 20fps, preset 8, no custom filter); any other
+            // configuration falls back to the ffmpeg subprocess.
+            let preset = vcs.avif_preset.unwrap_or(8);
             match command::InProcessAvifEncoder::start(
                 output,
                 grid_w,

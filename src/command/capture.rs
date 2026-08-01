@@ -736,13 +736,25 @@ struct ProbeFields {
     source_time_base: Option<Rational>,
 }
 
+impl ProbeFields {
+    fn complete(&self) -> bool {
+        self.duration_s.is_some()
+            && self.width.is_some()
+            && self.height.is_some()
+            && self.codec.is_some()
+            && self.source_time_base.is_some()
+    }
+}
+
 fn probe_video(video: &std::path::Path) -> anyhow::Result<ProbeFields> {
     // In-process libavformat probing avoids the ~0.1s ffprobe subprocess
     // (Windows process + FFmpeg DLL load) on the single-run critical path.
     // It reads the same container headers ffprobe reads; any failure or
     // missing field falls back to the ffprobe subprocess unchanged.
     #[cfg(feature = "in-process-decode")]
-    if let Ok(fields) = in_process_probe(video) {
+    if let Ok(fields) = in_process_probe(video)
+        && fields.complete()
+    {
         return Ok(fields);
     }
     ffprobe_fields(video)
