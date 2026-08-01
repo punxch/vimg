@@ -29,6 +29,10 @@ shell-escape = "0.1.5"
 
 [features]
 in-process-decode = ["dep:ffmpeg-next"]
+proto-mimalloc = ["dep:mimalloc"]
+
+[target.'cfg(windows)'.dependencies]
+mimalloc = { version = "0.1", optional = true }
 
 [profile.release]
 lto = true

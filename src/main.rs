@@ -2,6 +2,12 @@ mod command;
 mod process;
 mod temporary;
 
+// Prototype bisection (hwaccel-dt branch): mimalloc global allocator to
+// distinguish Windows heap segment caching from a real per-job leak.
+#[cfg(feature = "proto-mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::Parser;
 
 #[derive(Parser)]

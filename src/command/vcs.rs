@@ -192,6 +192,10 @@ impl Vcs {
             eprintln!("capture fallback: {unavailable}; skipping unavailable backend");
         }
         let mut attempt = selected.value;
+        if std::env::var("VIMG_PROTO_SKIP_ENCODE").is_ok_and(|value| value == "1") {
+            // Skip output publication; capture-only mode leaves no temp file.
+            return Ok(());
+        }
         let capture_diagnostics = attempt.capture_completion.diagnostics;
         let capture_backend = capture_diagnostics.backend;
         let stream_timings = attempt.stream_timings;
@@ -679,6 +683,26 @@ fn run_vcs_attempt(
         "Encoding {}",
         sh_escape_filename(&temp_output.path)
     ));
+    // Prototype bisection (hwaccel-dt branch): VIMG_PROTO_SKIP_ENCODE=1 runs
+    // the capture (decode) stage only, consuming frames without creating the
+    // SVT encoder, to attribute per-job working-set retention.
+    if std::env::var("VIMG_PROTO_SKIP_ENCODE").is_ok_and(|value| value == "1") {
+        let mut drained = StreamTimings::default();
+        loop {
+            match stream.recv() {
+                Ok(_) => drained.frames_before_first_grid += 1,
+                Err(_) => break,
+            }
+        }
+        let capture_completion = stream.finish()?;
+        return Ok(VcsAttempt {
+            temp_output,
+            capture_completion,
+            stream_timings: drained,
+            encoder_tail: Duration::ZERO,
+            authority: None,
+        });
+    }
     let mut encoder = GridEncoder::new(
         vcs,
         &temp_output.path,

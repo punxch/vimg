@@ -1409,3 +1409,45 @@ CLI 模式连续 10 次对照（新进程）无此两段式（1.6–2.4s 波动�
 - 结论：服务模式 10 并发满载全部完成约 14s；单任务热路径 ~1.6s；连续
   处理下任务延迟会因进程内累积恶化到 ~3.2s/次，需要单独的泄漏定位
   （每任务后 `PeakWorkingSet` 采样 + SVT deinit 探针）再决定是否修。
+
+## 服务模式每任务 ~75MB committed 泄漏定位（2026-08-02，hwaccel-dt 分支）
+
+承接上一节"WS 每任务 +70MB 常驻"的发现做系统性二分。全部实验在服务模式
+（serve + 串行提交）下用 GetProcessMemoryInfo 的 WorkingSet/PagefileUsage
+（commit）逐任务采样；Windows 堆与 mimalloc 两个全局分配器结果一致。
+
+### 二分矩阵（每任务 commit 增量）
+
+| 配置 | 泄漏 | 排除/锁定 |
+|---|---:|---|
+| n=9 完整任务 | **+75MB** | 基线 |
+| n=9 + SKIP_ENCODE（无 join/SVT/写文件） | +60MB | 排除编码、join、写盘 |
+| n=9 + NO_DECODE（demux-only，无 decoder） | +1MB | **锁定 decoder 侧** |
+| n=9 + DT=1（单线程解码） | +75MB | 排除 frame threading |
+| n=9 + discard=none（无 skip 切换） | +60MB | 排除 skip_frame 状态机 |
+| n=9 + 窗口整体偏移（cap1-9 位置） | +1MB | **锁定窗口位置集合** |
+| n=1/3/6/7/8（cap0-7） | +1MB | 排除 1-8 窗口 |
+| n=1 + 偏移（cap8 位置单独） | +1MB | cap8 单独不泄漏 |
+| n=9 + mi_collect(true) 强制回收 | 不回落 | **真泄漏，非分配器空闲页缓存** |
+
+### 结论
+
+- 每任务真泄漏约 **75MB committed**（10 任务后 ~780MB），两个分配器一致，
+  `mi_collect` 强制回收无效 → 块仍被引用。
+- 泄漏条件精确收窄为：**cap8 窗口（3112s，文件深处）+ 同时与 8 个窗口
+  并发解码**。n≤8、cap8 单独、窗口整体偏移后的 9 并发均不泄漏。与编码、
+  join、demux/seek、线程数、skip 策略、分配器均无关。
+- 机制未最终定位：cap8 单独解码不泄漏但并发时泄漏，指向 FFmpeg h264
+  解码器/AVIO 在特定流位置与并发访问下的进程内资源残留；继续定位需要
+  UMDH/Dr. Memory 级堆追踪，或换 FFmpeg 构建/版本对照。
+
+### 缓解建议（工程层面）
+
+1. **服务模式定期回收**：任务计数达到阈值（如 100）后优雅重启 serve 进程
+   （yazi 插件需处理服务重建），或按 WS 水位重启。
+2. **对照 FFmpeg 构建**：gyan 8.1.2 shared 是否有此泄漏可用其他构建
+   （BtbN、lgpl）验证；若为 FFmpeg 8.1.x 回归则升级可解。
+3. 泄漏量级（75MB/任务）在预览场景（数十任务）内不致命，但长时间驻留
+   服务会持续增长，重启回收是当前最实用的兜底。
+4. 本分支的 `VIMG_PROTO_SKIP_ENCODE / NO_DECODE / DT / DISCARD /
+   IGNORE_START / MI_STATS / CAPTURES` 探针开关保留，供后续堆追踪复用。

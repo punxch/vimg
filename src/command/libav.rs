@@ -485,6 +485,22 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
         .seek(target, ..target)
         .context("libav capture seek failed")?;
     let seek_s = seek_started.elapsed().as_secs_f64();
+    // Prototype bisection: demux-only mode (open + seek + drain ~250 video
+    // packets, never create a decoder) to attribute the per-job leak.
+    if std::env::var("VIMG_PROTO_NO_DECODE").is_ok_and(|value| value == "1") {
+        let mut packets_seen = 0;
+        for (packet_stream, _) in input.packets() {
+            if packet_stream.index() == stream_index {
+                packets_seen += 1;
+                if packets_seen >= 250 {
+                    break;
+                }
+            }
+        }
+        return Err(anyhow::anyhow!(
+            "proto no-decode mode: demuxed {packets_seen} video packets, decoder skipped"
+        ));
+    }
     // The decoder opens lazily on the first video packet after the seek: its
     // pts exposes the preroll length, which selects the frame-thread count.
     // The scaler is created together with the decoder and always lives as

@@ -326,6 +326,9 @@ fn worker(
             |backend| run_vcs(&job.file, &job.cache, job.media.as_ref(), backend),
             || publish_manifest(&job),
         );
+        if std::env::var("VIMG_PROTO_MI_STATS").is_ok_and(|value| value == "1") {
+            report_mi_stats();
+        }
         match completion.outcome {
             ServiceJobOutcome::Published => {
                 notify_yazi(
@@ -500,6 +503,49 @@ fn run_vcs(
     vcs_for_job(video, output, media, capture_backend).run()
 }
 
+/// Prototype bisection: force mimalloc to release idle pages, then report the
+/// process RSS/commit. If commit drops after mi_collect, retention is allocator
+/// idle-page caching; if it stays, blocks are genuinely leaked.
+#[cfg(feature = "proto-mimalloc")]
+fn report_mi_stats() {
+    unsafe extern "C" {
+        fn mi_collect(force: i32);
+        fn mi_process_info(
+            elapsed_msecs: *mut usize,
+            user_msecs: *mut usize,
+            system_msecs: *mut usize,
+            current_rss: *mut usize,
+            peak_rss: *mut usize,
+            current_commit: *mut usize,
+            peak_commit: *mut usize,
+            page_faults: *mut usize,
+        );
+    }
+    unsafe {
+        mi_collect(1);
+        let (mut rss, mut peak, mut commit) = (0usize, 0usize, 0usize);
+        mi_process_info(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut rss,
+            &mut peak,
+            &mut commit,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        eprintln!(
+            "[proto] mi_collect: rss={}MB peak={}MB commit={}MB",
+            rss / 1048576,
+            peak / 1048576,
+            commit / 1048576
+        );
+    }
+}
+
+#[cfg(not(feature = "proto-mimalloc"))]
+fn report_mi_stats() {}
+
 fn vcs_for_job(
     video: &Path,
     output: &Path,
@@ -516,8 +562,15 @@ fn vcs_for_job(
         capture_width: None,
         capture_height: Some(160),
         args: command::Extract {
-            number: 9,
-            ignore_start: Default::default(),
+            number: std::env::var("VIMG_PROTO_CAPTURES")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(9),
+            ignore_start: std::env::var("VIMG_PROTO_IGNORE_START")
+                .ok()
+                .and_then(|value| value.parse::<f32>().ok())
+                .map(command::DurationOrPercent::Seconds)
+                .unwrap_or_default(),
             ignore_end: Default::default(),
             capture_frames: None,
             capture_time: command::HumanDuration { seconds: 1.5 },
