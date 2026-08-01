@@ -342,6 +342,17 @@ impl FrameSchedule {
         self.frame_count
     }
 
+    #[cfg_attr(
+        not(feature = "in-process-decode"),
+        allow(
+            dead_code,
+            reason = "the optional libav backend excludes seek preroll before scheduling"
+        )
+    )]
+    pub(crate) const fn capture_index(&self) -> usize {
+        self.capture_index
+    }
+
     pub(crate) fn push(&mut self, source: SourceFrame) -> anyhow::Result<Vec<ScheduledFrame>> {
         anyhow::ensure!(
             source.duration > 0,

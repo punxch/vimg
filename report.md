@@ -1323,3 +1323,46 @@ probe 约 20–25ms、direct swscale 约 10–40ms），以及接受新码流的
 （SVT 4.2.0 / startup mini-GOP）。若未来换更快的提交路径（如 D3D12VA、
 多 decoder context 分片）或接受非 byte-identical 输出，hwaccel 的探针
 代码与 .scratch/proto 证据可直接复用。
+
+## hwaccel-dt 分支：D3D12VA 与多 decoder context 分片验证（2026-08-02）
+
+承接上一轮"hwaccel 强制单线程"的瓶颈，在 `hwaccel-dt` 分支验证两个候选
+解决方向。原型层与上轮相同的 `VIMG_PROTO_*` 门控（新增 d3d12va 后端与
+`VIMG_PROTO_THREAD_KIND=frame|slice|none` 线程类型控制），三重 gate 不变
+（270 PTS、270 raw RGB、AVIF SHA `3f0fa2be…`）。
+
+### D3D12VA：正确但最慢，且同样不支持帧线程
+
+| 后端 | 单线程 | slice 线程 | 帧线程 |
+|---|---:|---:|---:|
+| cuda | 正确，cap7 send 0.92s | 正确，1.06s（不加速） | **损坏**（Missing reference/mmco） |
+| d3d11va | 正确，cap7 send 1.21s | 正确，1.26s（不加速） | **损坏** |
+| d3d12va | 正确，cap7 send 1.38s | 正确，1.60s（不加速） | **损坏** |
+
+- 三种后端的帧线程全部损坏（与上轮结论一致：hwaccel + `FF_THREAD_FRAME`
+  在 FFmpeg 8.1.2 下打开成功但 DPB 参考链断裂，decoded 只剩 2–4 帧，
+  SHA 均为 `931fce70…`）。
+- slice 线程全部正确（这是新结论：slice threading 不触发损坏），但
+  hwaccel 下 slice 线程不真正并行 MB 解码（MB 重建在 GPU），send 反而
+  增加约 0.1–0.2s 开销。
+- D3D12VA 单线程是三者中最慢的（cap7 send 1.38s vs cuda 0.92s），
+  transfer 也不占优。D3D12VA 出局。
+
+### 多 decoder context 分片：样本 GOP 太长，并行度 ≈ 1
+
+按 IDR 分片的前提是单窗口内存在多个可并行的 GOP。对固定样本 9 个窗口
+逐一检查（ffmpeg `select='eq(pict_type,I)'` 解码计数）：稳态 IDR 间隔约
+**8–12s**（全片 272 个 IDR / 3295s），而单窗口跨度（预滚 2.7s + 窗口
+1.5s + reorder）约 4.2s——绝大多数窗口的预滚+窗口完整落在 **1 个 GOP
+内**，按 IDR 切分只有 1 段，无并行度。唯一例外是 cap4（1640s 附近有
+1640.06/1642.85/1646.27/1647.98 一串 IDR），但其预滚只有 12 帧，本来
+就不需要分片。非 IDR 处切分会破坏 H.264 参考链，不可行。
+
+### 结论
+
+两个候选方向均验证为不可行：D3D12VA 不解决单线程（更慢且帧线程同样
+损坏）；GOP 分片在本样本上无并行度。hwaccel 单线程的 CPU 解析/提交路径
+（cap7 约 0.9s）是 FFmpeg 8.1.2 hwaccel 架构的硬成本，与后端选择无关。
+Windows 固定命令维持软件路径（cap7 1.09s，wall 1.25s 量级），硬件解码
+仅作为未来接受非 byte-identical 输出时的独立轨道候选。原型层代码保留在
+`hwaccel-dt` 分支（libav.rs 的 `VIMG_PROTO_*` 探针），主分支不受影响。
