@@ -16,6 +16,28 @@ def run(arm, renders, peak_mb=450):
 
 
 class AcceptanceTests(unittest.TestCase):
+    def test_load_groups_describe_samples_without_relaxing_absolute_budget(self):
+        runs = [run(arm, [1.0] + [1.1] * 24 + [1.6] * 25) for arm in ['fresh', 'aged']]
+        for result in runs:
+            for job in result['jobs']:
+                job.update(other_pct=20 if job['render'] < 1.3 else 50, cpu=10,
+                           phases={'first_grid': job['render'] - .2, 'encoder_tail': .2})
+        result = bench.summarize(runs, 2, max_p95_seconds=1.3)
+        bins = result['cpu_load']['fresh']['bins']
+        self.assertEqual([group['samples'] for group in bins], [24, 0, 25])
+        self.assertEqual(bins[0]['render']['p95'], 1.1)
+        self.assertEqual(bins[2]['render']['p95'], 1.6)
+        self.assertTrue(result['budget_exceeded'])
+
+    def test_missing_or_invalid_load_observations_remain_explicit(self):
+        runs = [run(arm, [1.2] * 10) for arm in ['fresh', 'aged']]
+        for result in runs:
+            for job, invalid in zip(result['jobs'][1:], [float('nan'), float('inf'), -1, 101]):
+                job['other_pct'] = invalid
+        result = bench.summarize(runs, 1.3)
+        self.assertEqual(result['cpu_load']['fresh']['unclassified_samples'], 9)
+        self.assertTrue(all(group['samples'] == 0 for group in result['cpu_load']['fresh']['bins']))
+
     def test_stable_slow_run_passes_age_gate_but_fails_latency_budget(self):
         runs = [run(arm, [1.4] * 50) for arm in ['fresh', 'aged']]
         result = bench.summarize(runs, 1.3, max_p95_seconds=1.3)

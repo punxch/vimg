@@ -14,6 +14,9 @@ not a proven code bug. Absolute budgets are opt-in; for the preview contract use
 MB uses 1,000,000 bytes; reported MiB uses 1,048,576 bytes. The P95 budget checks
 each process separately after excluding its first render, so a fast process
 cannot hide a slow one. CPU/memory observation and logging add measurement cost.
+The summary also groups warm jobs by observed other-process CPU use: below 30%,
+30% to below 45%, and 45% or higher. These descriptive groups never exclude jobs
+from acceptance; small groups do not establish reliable tail-latency guarantees.
 """
 
 import argparse
@@ -36,6 +39,26 @@ def distribution(values):
     values = sorted(values)
     return dict(median=median(values), p95=values[math.ceil(.95 * len(values)) - 1],
                 minimum=values[0], maximum=values[-1])
+
+
+def summarize_cpu_load(jobs):
+    """Describe observed load; all jobs still participate in the budget checks."""
+    observed = [job for job in jobs if job.get('other_pct') is not None
+                and math.isfinite(job['other_pct']) and 0 <= job['other_pct'] <= 100]
+    bins = []
+    for lower, upper in [(0, 30), (30, 45), (45, None)]:
+        group = [job for job in observed if job['other_pct'] >= lower
+                 and (upper is None or job['other_pct'] < upper)]
+        cpu = [job['cpu'] for job in group if job.get('cpu') is not None]
+        phases = {}
+        for key in ['first_grid', 'receive_wait', 'encoder_tail']:
+            values = [job['phases'][key] for job in group if key in job.get('phases', {})]
+            if values:
+                phases[key] = distribution(values)
+        bins.append(dict(min_other_pct=lower, max_other_pct_exclusive=upper, samples=len(group),
+                         render=distribution([job['render'] for job in group]) if group else None,
+                         cpu=distribution(cpu) if cpu else None, phases=phases))
+    return dict(bins=bins, unclassified_samples=len(jobs) - len(observed))
 
 
 def summarize(runs, max_slowdown, max_p95_seconds=None, max_peak_mb=None):
@@ -67,6 +90,9 @@ def summarize(runs, max_slowdown, max_p95_seconds=None, max_peak_mb=None):
                                        observed=observed, limit=limit))
     return dict(age_comparisons=comparisons, sequences=sequences, process_budgets=budgets,
                 budget_violations=violations, budget_exceeded=bool(violations),
+                cpu_load={arm: summarize_cpu_load([job for run in runs if run['arm'] == arm
+                                                  for job in run['jobs'][1:]])
+                          for arm in ['fresh', 'aged']},
                 warm={arm: distribution([job['render'] for run in runs if run['arm'] == arm
                                          for job in run['jobs'][1:]]) for arm in ['fresh', 'aged']},
                 slowdown_detected=any(row['ratio'] > max_slowdown for row in comparisons + sequences))

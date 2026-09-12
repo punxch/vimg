@@ -78,6 +78,10 @@ and cache reuse. Each process must meet the requested warm P95 and observed peak
 working-set budgets; MB means 1,000,000 bytes. Exit 2 reports a budget violation
 or relative slowdown. Results exclude DDS transport and do not measure a cold
 disk cache. Omitting the absolute budgets checks only relative slowdown.
+The summary groups warm jobs by observed other-process CPU use (below 30%,
+30% to below 45%, and 45% or higher), with sample counts and phase timings.
+These groups help interpret noisy runs; all jobs still count toward acceptance,
+and a small group's P95 is not a reliable latency guarantee.
 
 ## Install
 ### Arch Linux
