@@ -1444,7 +1444,12 @@ mod tests {
         if paced {
             println!("[service-bench] ready");
         }
-        for index in 0..10 {
+        let repetitions = std::env::var("VIMG_BENCH_REPETITIONS")
+            .ok()
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(10);
+        assert!((1..=1000).contains(&repetitions));
+        for index in 0..repetitions {
             if paced {
                 let mut line = String::new();
                 assert!(std::io::stdin().read_line(&mut line).unwrap() > 0);

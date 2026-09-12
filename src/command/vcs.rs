@@ -531,14 +531,49 @@ struct VcsAttemptContext<'a> {
 
 /// Grid encoding sink: the in-process SVT-AV1 encoder when eligible, else the
 /// external ffmpeg subprocess fed with raw RGB over a pipe.
-enum GridEncoder {
+enum GridEncoder<'a> {
+    Pending {
+        vcs: &'a Vcs,
+        output: &'a std::path::Path,
+        width: u32,
+        height: u32,
+    },
     Subprocess(AttemptEncoder),
     #[cfg(feature = "in-process-decode")]
     InProcess(command::InProcessAvifEncoder),
 }
 
-impl GridEncoder {
+impl<'a> GridEncoder<'a> {
     fn new(
+        vcs: &'a Vcs,
+        output: &'a std::path::Path,
+        grid_w: u32,
+        grid_h: u32,
+        is_jpg: bool,
+        is_webp: bool,
+        defer_native: bool,
+    ) -> Result<Self, command::CaptureAttemptError> {
+        #[cfg(test)]
+        let defer_native = defer_native && std::env::var_os("VIMG_BENCH_EAGER_ENCODER").is_none();
+        if cfg!(feature = "in-process-decode")
+            && defer_native
+            && std::env::var_os("VIMG_SUBPROCESS_ENCODER").is_none()
+            && is_in_process_preview_profile(vcs, is_jpg, is_webp)
+        {
+            // Native seek preroll holds full-resolution decoder buffers. Wait
+            // for the first grid before allocating SVT's pools, so those pools
+            // do not overlap the initial peak across all capture points.
+            return Ok(Self::Pending {
+                vcs,
+                output,
+                width: grid_w,
+                height: grid_h,
+            });
+        }
+        Self::start(vcs, output, grid_w, grid_h, is_jpg, is_webp)
+    }
+
+    fn start(
         vcs: &Vcs,
         output: &std::path::Path,
         grid_w: u32,
@@ -575,7 +610,17 @@ impl GridEncoder {
     }
 
     fn write_grid(&mut self, grid: image::RgbImage) -> Result<(), command::CaptureAttemptError> {
+        if let Self::Pending {
+            vcs,
+            output,
+            width,
+            height,
+        } = self
+        {
+            *self = Self::start(vcs, output, *width, *height, false, false)?;
+        }
         match self {
+            Self::Pending { .. } => unreachable!("encoder initialized above"),
             Self::Subprocess(encoder) => encoder
                 .write_grid(&grid)
                 .map_err(command::CaptureAttemptError::fatal),
@@ -588,6 +633,9 @@ impl GridEncoder {
 
     fn finish(&mut self, format: &str) -> Result<Duration, command::CaptureAttemptError> {
         match self {
+            Self::Pending { .. } => Err(command::CaptureAttemptError::fatal(anyhow::anyhow!(
+                "cannot finish an encoder before receiving a grid"
+            ))),
             Self::Subprocess(encoder) => encoder
                 .finish(format)
                 .map_err(command::CaptureAttemptError::fatal),
@@ -703,6 +751,7 @@ fn run_vcs_attempt(
             authority: None,
         });
     }
+    let defer_encoder = backend == command::CaptureBackendPolicy::Libav;
     let mut encoder = GridEncoder::new(
         vcs,
         &temp_output.path,
@@ -710,6 +759,7 @@ fn run_vcs_attempt(
         grid_h,
         context.is_jpg,
         context.is_webp,
+        defer_encoder,
     )?;
     let mut authority = context
         .authority_manifest
@@ -933,6 +983,37 @@ mod tests {
     use clap::Parser;
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     use std::cell::RefCell;
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    fn native_encoder_opens_output_only_when_a_grid_is_ready() {
+        let error_message = |error| match error {
+            command::CaptureAttemptError::Fatal(error) => error,
+            command::CaptureAttemptError::Backend(error) => anyhow::anyhow!("{error}"),
+        };
+        let mut vcs = Vcs::try_parse_from(["vimg", "-c3", "-H160", "-n9", "input.mkv"]).unwrap();
+        vcs.args.capture_frames = Some(30);
+        let output = TempOutputCleanup::new(
+            std::env::temp_dir().join(format!("vimg-deferred-encoder-{}.avif", fastrand::u64(..))),
+        );
+        let mut encoder = GridEncoder::new(&vcs, &output.path, 64, 64, false, false, true)
+            .map_err(error_message)
+            .unwrap();
+        let opened_before_grid = output.path.exists();
+        for index in 0..30 {
+            let grid = image::RgbImage::from_fn(64, 64, |x, y| {
+                image::Rgb([(x + index) as u8, (y + index) as u8, (x + y) as u8])
+            });
+            encoder.write_grid(grid).map_err(error_message).unwrap();
+            assert!(output.path.exists());
+        }
+        encoder.finish("avif").map_err(error_message).unwrap();
+        assert!(fs::metadata(&output.path).unwrap().len() > 0);
+        assert!(
+            !opened_before_grid,
+            "encoder was opened before a grid was ready"
+        );
+    }
 
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     fn preview_auto_vcs() -> Vcs {
