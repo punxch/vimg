@@ -864,18 +864,8 @@ fn receive_frames(
             metrics.preroll_frames += 1;
             continue;
         }
-        let current = PendingDecoded {
-            // Keep the decoder's ref-counted buffer until the next timestamp
-            // establishes its duration. Video::clone copies every YUV plane;
-            // retaining a reference avoids that allocation/copy for CPU frames
-            // and also preserves hardware frame contexts correctly.
-            image: retain_frame(decoded)?,
-            pts,
-            input_frame_index: *input_frame_index,
-            duration: packet_durations.get(&pts).copied(),
-        };
         if let Some(pending) = pending_decoded.take() {
-            let duration = pending.duration.unwrap_or(current.pts - pending.pts);
+            let duration = pending.duration.unwrap_or(pts - pending.pts);
             ensure!(
                 duration > 0,
                 "libav decoder produced non-monotonic source timestamps"
@@ -894,8 +884,40 @@ fn receive_frames(
                 proto,
                 counters,
             )?;
+            if schedule.is_complete() {
+                break;
+            }
         }
-        *pending_decoded = Some(current);
+        let current = PendingDecoded {
+            // Retain the decoder buffer without copying its full YUV planes.
+            // Only frames without a packet duration need the next timestamp
+            // before they can enter the scale and CFR selection pipeline.
+            image: retain_frame(decoded)?,
+            pts,
+            input_frame_index: *input_frame_index,
+            duration: packet_durations.get(&pts).copied(),
+        };
+        if let Some(duration) = current.duration {
+            *last_duration = Some(duration);
+            emit_scheduled_frames(
+                current,
+                duration,
+                scaler,
+                rgb,
+                schedule,
+                source_time_base,
+                sender,
+                previous_rgb,
+                selected,
+                proto,
+                counters,
+            )?;
+            if schedule.is_complete() {
+                break;
+            }
+        } else {
+            *pending_decoded = Some(current);
+        }
     }
     if let Some(error) = receive_error {
         eprintln!(
