@@ -1,5 +1,6 @@
 mod authority;
 mod capture;
+mod cpu_policy;
 #[cfg(feature = "in-process-decode")]
 mod encode;
 mod extract;
@@ -15,6 +16,7 @@ mod videotoolbox;
 
 pub use authority::*;
 pub(crate) use capture::*;
+pub use cpu_policy::ServiceCpuPolicy;
 #[cfg(feature = "in-process-decode")]
 pub(crate) use encode::*;
 pub use extract::*;

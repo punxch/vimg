@@ -44,6 +44,15 @@ publishes `gridthumb-avif-ready` back to the requesting Yazi instance with
 `ya pub-to`. Duplicate cache requests share one job, and no more than 10 jobs
 run at once.
 
+With the native backend on Windows hybrid CPUs, `serve --cpu-policy auto`
+(the default) selects the performance cores to keep idle-service preview
+latency stable. Core types come from Windows; existing process affinity or
+process-default CPU Sets are preserved. Homogeneous CPUs, multiple processor
+groups, other platforms and explicit `--capture-backend ffmpeg` keep OS scheduling. Use
+`vimg serve --cpu-policy all` to keep all allowed cores available, for example
+when comparing throughput for batches. This policy only affects the service;
+standalone `vimg vcs` commands keep OS scheduling.
+
 Copy [`gridthumb.yazi`](gridthumb.yazi) into Yazi's plugin directory and call
 `require("gridthumb"):setup()` from `init.lua`. `vimg send` remains available
 as a command-line DDS publisher for diagnostics and compatibility.

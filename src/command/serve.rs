@@ -25,6 +25,9 @@ pub struct Serve {
     /// Capture implementation fixed for every job in this service process.
     #[arg(long, value_enum, default_value_t = command::DEFAULT_CAPTURE_BACKEND)]
     pub capture_backend: command::CaptureBackendPolicy,
+    /// CPU scheduling for the native Windows preview service.
+    #[arg(long, value_enum, default_value_t = command::ServiceCpuPolicy::Auto)]
+    pub cpu_policy: command::ServiceCpuPolicy,
 }
 
 /// Send a vimg job to the running service.
@@ -245,6 +248,7 @@ fn add_subscriber(state: &mut QueueState, job: &Job) {
 
 impl Serve {
     pub fn run(self) -> anyhow::Result<()> {
+        self.configure_cpu_policy();
         let scheduler = Arc::new(Scheduler {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
@@ -260,6 +264,21 @@ impl Serve {
 
         println!("[serve] Started {MAX_JOBS} workers; waiting for Yazi DDS");
         receive_yazi_requests(scheduler)
+    }
+
+    fn configure_cpu_policy(&self) {
+        if matches!(
+            self.capture_backend,
+            command::CaptureBackendPolicy::Auto | command::CaptureBackendPolicy::Libav
+        ) {
+            match self.cpu_policy.configure() {
+                Ok(Some(cores)) => eprintln!(
+                    "[serve] Using {cores} performance logical CPUs; --cpu-policy all keeps OS scheduling"
+                ),
+                Ok(None) => {}
+                Err(error) => eprintln!("[serve] Keeping OS CPU scheduling: {error}"),
+            }
+        }
     }
 }
 
@@ -1166,6 +1185,77 @@ mod tests {
     }
 
     #[cfg(feature = "in-process-decode")]
+    fn configure_benchmark_cpu_policy() {
+        Serve {
+            capture_backend: command::CaptureBackendPolicy::Libav,
+            cpu_policy: if std::env::var("VIMG_BENCH_CPU_POLICY").as_deref() == Ok("all") {
+                command::ServiceCpuPolicy::All
+            } else {
+                command::ServiceCpuPolicy::Auto
+            },
+        }
+        .configure_cpu_policy();
+    }
+
+    #[test]
+    fn service_cpu_policy_defaults_to_auto_and_accepts_all() {
+        let default = <Serve as clap::Parser>::try_parse_from(["serve"]).unwrap();
+        assert_eq!(default.cpu_policy, command::ServiceCpuPolicy::Auto);
+        let all =
+            <Serve as clap::Parser>::try_parse_from(["serve", "--cpu-policy", "all"]).unwrap();
+        assert_eq!(all.cpu_policy, command::ServiceCpuPolicy::All);
+        assert!(
+            <Serve as clap::Parser>::try_parse_from(["serve", "--cpu-policy", "invalid"]).is_err()
+        );
+    }
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    #[ignore = "measures concurrent native service renders; requires sample/input.mkv"]
+    fn parallel_service_renders() {
+        configure_benchmark_cpu_policy();
+        let video = PathBuf::from("sample/input.mkv");
+        let root = temporary_test_dir("service-parallel-benchmark");
+        let count = std::env::var("VIMG_BENCH_PARALLEL_JOBS")
+            .ok()
+            .map(|value| value.parse::<usize>().unwrap())
+            .unwrap_or(4);
+        assert!((1..=MAX_JOBS).contains(&count));
+        // Match an idle resident service before submitting the whole batch.
+        thread::sleep(Duration::from_secs(10));
+        let barrier = std::sync::Barrier::new(count + 1);
+        let elapsed = thread::scope(|scope| {
+            let mut workers = Vec::new();
+            for index in 0..count {
+                let (barrier, video, root) = (&barrier, &video, &root);
+                workers.push(scope.spawn(move || {
+                    barrier.wait();
+                    let output = root.join(format!("{index}.avif"));
+                    run_vcs(video, &output, None, command::CaptureBackendPolicy::Libav).unwrap();
+                }));
+            }
+            let started = Instant::now();
+            barrier.wait();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            started.elapsed()
+        });
+        let reference = fs::read(root.join("0.avif")).unwrap();
+        for index in 1..count {
+            assert_eq!(
+                fs::read(root.join(format!("{index}.avif"))).unwrap(),
+                reference
+            );
+        }
+        println!(
+            "[service-parallel-bench] jobs={count} render={:.6}s",
+            elapsed.as_secs_f64()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "in-process-decode")]
     #[test]
     #[ignore = "measures ten real preview jobs in one process; requires sample/input.mkv"]
     fn repeated_service_jobs_and_cache_hits() {
@@ -1174,6 +1264,7 @@ mod tests {
             .unwrap_or_else(|| PathBuf::from("sample/input.mkv"));
         let root = temporary_test_dir("service-warm-benchmark");
         let policy = command::CaptureBackendPolicy::Libav;
+        configure_benchmark_cpu_policy();
         let vcs = vcs_for_job(&video, &root.join("unused.avif"), None, policy);
         let capture = command::Capture::plan(&vcs.args, Some(160), None, 4).unwrap();
         let properties = capture.capture_plan().media();
