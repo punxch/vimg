@@ -1190,7 +1190,15 @@ mod tests {
             ready: Condvar::new(),
         };
         let mut reference = None;
+        let paced = std::env::var_os("VIMG_BENCH_PACED").is_some();
+        if paced {
+            println!("[service-bench] ready");
+        }
         for index in 0..10 {
+            if paced {
+                let mut line = String::new();
+                assert!(std::io::stdin().read_line(&mut line).unwrap() > 0);
+            }
             let job = Job {
                 file: video.clone(),
                 cache: root.join(format!("{index}.avif")),
