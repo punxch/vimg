@@ -1,5 +1,114 @@
 # Performance Optimization Report
 
+## 2026-09-12：进一步效率审查
+
+详见 [当前代码效率复核](docs/reviews/2026-09-12-efficiency-review.md)。
+本轮未修改生产代码；Standards/Spec 两轴未发现上轮新增的功能或所有权缺陷。
+补测完整任务 wall 为 1.269–1.396s，主线程 CPU 为 0.844–0.875s；结合
+九路 `try_recv + yield_now`，优先建议验证事件唤醒。CPU 减少量不能直接当作
+wall 改善量。其它候选为重复 probe 复用、grid 所有权传递、标签 coverage
+缓存和服务端缓存复查，均尚未实现或取得性能收益。
+
+现有探针中最慢 cap7 的代表性分解：open 26.8ms、seek 28.8ms、setup 3.2ms、
+send_packet 923.5ms、receive 1.1ms、emit 66.5ms，总计 1.0968s；join 32ms，
+encoder tail 214ms。后续方案应按这些关键路径量级评估，而非重复调整已否决的
+硬解或丢帧策略。原始证据位于 `.scratch/startup/review-cpu.json` 和
+`review-profile-{1,2,3}.log`。
+
+## 2026-09-12：当前源码的启动与热缓存运行优化
+
+保持 `vcs -c3 -H160 -n9 sample/input.mkv --output ...` 的帧选择、尺寸、
+30 帧动画、CRF 和编码参数不变。本轮修改在 `src/command/libav.rs`：
+
+- 用 `av_frame_ref` 保留解码帧，代替 `Video::clone` 对全部 YUV 平面的深拷贝。
+  解码器复用 AVFrame 时，待调度帧仍独立持有有效的 buffer 引用。
+- 缩放阶段直接转移该帧所有权，消除第二次全分辨率深拷贝。硬件帧继续按原路径下载。
+- 每个缩放 filter graph 使用 1 个线程；九个 capture window 已经并行，
+  避免为每个小尺寸缩放器初始化自动大小的线程池。
+
+### 测量口径与版本
+
+PATH 中实际执行的 `D:\Apps\ffmpeg\vimg.exe` 是旧版，不支持 `--profile`。
+它的四次有效运行是 **3.302 / 2.785 / 2.684 / 2.601s**（首次在前）。
+这些数据仅用于确认用户所用版本；下面的优化幅度以**修改前当前源码重新编译**的
+release 为基线，避免把已有功能收益算成本轮优化。
+
+两端均使用 `cargo build --release --features in-process-decode`、相同的
+FFmpeg 8.1.2 shared DLL 和 3,210,297,211 字节的 `sample/input.mkv`。
+基线可执行文件 SHA-256：
+`c83acc09d12db117c9dde6804faf9aee2473713a93061e1a69572eb684ce8544`。
+优化后可执行文件 SHA-256：
+`fe315f8e6a52d7404b861e9c09c13f63c83820494749ea0c7f77387cb84ce2b7`。
+输出放在 `.scratch/startup/`，未覆盖用户已有修改的 `output3.avif`。
+
+每次启动全新 exe，因此计时包含进程启动、DLL 加载以及解码器、缩放器和
+SVT 的重新初始化。交错轮换执行顺序，20 次热缓存运行/版本，首轮另列；
+计时覆盖完整命令退出，SHA 校验在计时结束后进行。P95 使用 nearest-rank。
+**这里的热指系统文件缓存；不是常驻 serve 进程的热任务。没有重启系统或清空
+standby/file cache，因此不把首次观测冒充真正的磁盘冷缓存测试。**
+
+### 最终同批次结果
+
+| 指标 | 修改前源码 | 优化后 | 改善 |
+|---|---:|---:|---:|
+| 首轮观测（系统缓存已热，新进程） | 1.769s | 1.421s | 19.7% |
+| 20 次 wall 中位数 | 1.784s | **1.411s** | **20.9%** |
+| 20 次 wall P95 | 1.936s | **1.633s** | **15.6%** |
+| profile total 中位数 | 1.690s | 1.313s | 22.3% |
+| decode 中位数 | 1.453s | 1.102s | 24.2% |
+| first_grid 中位数 | 1.205s | 0.916s | 24.0% |
+| plan_setup 中位数 | 0.011s | 0.011s | 基本不变 |
+| join 中位数 | 0.040s | 0.032s | — |
+| encoder_tail 中位数 | 0.211s | 0.205s | 基本不变 |
+
+独立的 `PeakWorkingSetSize` 采样（每版本 1 次，非并发运行）：
+峰值 WS **567.5 → 501.2 MiB**，峰值 commit **704.8 → 632.5 MiB**。
+这不是持续服务内存上限或泄漏修复的证明。此批次 wall P95 仍高于 ADR 的
+1.3s 目标，不宣称已达到全部性能契约。
+
+不带 `--profile` 的优化后命令另测 3 次：**1.507 / 1.672 / 1.595s**。
+后台负载导致绝对时间变化，应以同批次交错对照判断收益，而不是只取最快一轮。
+
+消融实验：仅消除两次整帧复制时，8 次/版本交错 warm 中位数
+1.739 → 1.408s；在此基础上限制缩放线程，6 次/版本中位数
+1.407 → 1.290s，P95 1.533 → 1.544s。后一个小样本不能证明尾延迟改善，
+最终合并结果以上方 20 次对照为准。
+
+### 输出与回归验证
+
+- 固定样本、H.264 MP4、HEVC MKV、H.264 VFR MKV 四组输入，强制 libav
+  后端，逐组比较 270 张 RGB、270 个 source PTS 和最终 AVIF；全部一致，
+  共 **1080 帧 RGB + 1080 个时间戳**。
+- 固定样本所有最终对照输出 SHA-256 保持
+  `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+- 新增帧生命周期回归测试：保留帧后，模拟解码器将原 buffer 变为可写、
+  修改像素/PTS 并释放原帧，验证保留帧的像素与时间戳仍正确。
+- `cargo test --features in-process-decode`：**57 passed，0 failed，3 ignored**；
+  新增生命周期测试、已有编码往返、probe 和回退测试均通过。`git diff --check` 通过。
+- 全仓库 `cargo fmt -- --check` 检出了已有格式差异（包括未修改的
+  `capture.rs`、`encode.rs` 及原型代码）；本轮未扩大成全仓库格式整理。
+
+### 复测与运行
+
+可复用的计时脚本为 `scripts/bench-startup.ps1`，原始 CSV、逐次日志、
+两端二进制和四组帧验证结果保留在本机 `.scratch/startup/`。
+
+```powershell
+$env:PATH = 'D:\ffmpeg-dev\libav-deploy;' + $env:PATH
+.\scripts\bench-startup.ps1 `
+  -Baseline .\.scratch\startup\baseline.exe `
+  -Candidate .\target\release\vimg.exe `
+  -OutputDirectory .scratch/startup/recheck -Runs 20
+```
+
+已将匹配的 DLL 放入 `target/release`，可直接使用以下产物：
+
+```powershell
+.\target\release\vimg.exe vcs -c3 -H160 -n9 .\sample\input.mkv --output output3.avif
+```
+
+PATH 中的旧版 exe 未被替换；直接输入 `vimg.exe` 仍会调用旧版。
+
 ## Test Command
 ```
 vimg vcs -c3 -H160 -n9 .\sample\input.mkv --output output.avif

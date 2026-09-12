@@ -816,19 +816,11 @@ fn receive_frames(
             continue;
         }
         let current = PendingDecoded {
-            // ffmpeg-next's Video::clone is av_frame_copy + copy_props, which
-            // mis-copies hardware frames (texture handle bytes, no
-            // hw_frames_ctx); hardware frames need a real av_frame_ref.
-            image: if is_hw {
-                let mut cloned = Video::empty();
-                let result = unsafe {
-                    ffmpeg::ffi::av_frame_ref(cloned.as_mut_ptr(), decoded.as_ptr())
-                };
-                ensure!(result >= 0, "proto hw frame ref failed: {}", result);
-                cloned
-            } else {
-                decoded.clone()
-            },
+            // Keep the decoder's ref-counted buffer until the next timestamp
+            // establishes its duration. Video::clone copies every YUV plane;
+            // retaining a reference avoids that allocation/copy for CPU frames
+            // and also preserves hardware frame contexts correctly.
+            image: retain_frame(decoded)?,
             pts,
             input_frame_index: *input_frame_index,
             duration: packet_durations.get(&pts).copied(),
@@ -872,6 +864,19 @@ struct PendingDecoded {
     duration: Option<i64>,
 }
 
+fn retain_frame(frame: &Video) -> anyhow::Result<Video> {
+    let mut retained = Video::empty();
+    // Both AVFrames are live and distinct, and the destination is empty.
+    // FFmpeg retains ref-counted buffers (or copies non-ref-counted data).
+    let result = unsafe { ffmpeg::ffi::av_frame_ref(retained.as_mut_ptr(), frame.as_ptr()) };
+    ensure!(
+        result >= 0,
+        "retaining decoded frame failed: {}",
+        ffmpeg::Error::from(result)
+    );
+    Ok(retained)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_scheduled_frames(
     current: PendingDecoded,
@@ -913,7 +918,7 @@ fn emit_scheduled_frames(
         counters.transfers += 1;
         cpu
     } else {
-        current.image.clone()
+        current.image
     };
     // Scale the current source frame once. The small RGB is retained as the
     // previous frame for CFR re-selection instead of the full-resolution YUV,
@@ -922,8 +927,8 @@ fn emit_scheduled_frames(
         .get("in")
         .context("libav scale filter has no input")?
         .source()
-        // av_buffersrc_add_frame may take ownership of the supplied frame;
-        // feed a clone and drop the full-resolution reference afterwards.
+        // This frame is no longer needed here; the source may take ownership
+        // of its buffer reference without copying the full-resolution planes.
         .add(&cpu_frame)?;
     scaler
         .get("out")
@@ -1003,6 +1008,9 @@ fn production_scale_filter(
     graph_pix_fmt: &str,
 ) -> anyhow::Result<filter::Graph> {
     let mut graph = filter::Graph::new();
+    // Capture windows already run in parallel. A tiny 160px scale does not
+    // need a machine-sized filter pool for each of the nine workers.
+    unsafe { (*graph.as_mut_ptr()).nb_threads = 1 };
     let args = format!(
         "video_size={}x{}:pix_fmt={}:time_base={}:pixel_aspect=1/1",
         decoder.width(),
@@ -1041,4 +1049,28 @@ fn copy_rgb(frame: &Video) -> anyhow::Result<RgbImage> {
     }
     RgbImage::from_raw(width as u32, height as u32, raw)
         .context("libav capture emitted an invalid RGB frame")
+}
+
+#[cfg(test)]
+mod frame_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn pending_frame_survives_decoder_buffer_reuse() {
+        let mut decoded = Video::new(ffmpeg::format::Pixel::YUV420P, 64, 32);
+        decoded.data_mut(0).fill(73);
+        decoded.set_pts(Some(42));
+        let retained = retain_frame(&decoded).unwrap();
+        assert_eq!(retained.data(0).as_ptr(), decoded.data(0).as_ptr());
+
+        // A decoder reuses its AVFrame while the scheduler still holds the
+        // preceding frame. Make it writable as FFmpeg does for shared buffers.
+        let result = unsafe { ffmpeg::ffi::av_frame_make_writable(decoded.as_mut_ptr()) };
+        assert!(result >= 0);
+        decoded.data_mut(0).fill(99);
+        decoded.set_pts(Some(43));
+        drop(decoded);
+        assert_eq!(retained.pts(), Some(42));
+        assert!(retained.data(0).iter().all(|&value| value == 73));
+    }
 }
