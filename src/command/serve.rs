@@ -1205,7 +1205,20 @@ mod tests {
                 &scheduler,
                 &active,
                 policy,
-                |backend| run_vcs(&active.file, &active.cache, active.media.as_ref(), backend),
+                |backend| {
+                    if std::env::var_os("VIMG_BENCH_PROFILE").is_some() {
+                        let mut vcs = vcs_for_job(
+                            &active.file,
+                            &active.cache,
+                            active.media.as_ref(),
+                            backend,
+                        );
+                        vcs.profile = true;
+                        vcs.run()
+                    } else {
+                        run_vcs(&active.file, &active.cache, active.media.as_ref(), backend)
+                    }
+                },
                 || publish_manifest(&active, policy),
             );
             let render = started.elapsed().as_secs_f64();

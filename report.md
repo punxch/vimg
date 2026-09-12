@@ -1,5 +1,149 @@
 # Performance Optimization Report
 
+## 2026-09-12：继续优化拼图与标签，验证共享探测候选
+
+本轮以前一轮已保存的 jj **`d8ac972d`** 为基线。基线 exe SHA-256：
+`876598fba528d1bcb98407722ad70997c3fcbdf14674bac36a6a053d7d526358`；
+本轮最终 exe：
+`512864cb99e6b87e9822c4dd324293911f6ca7a164435f3f0b2476402a632e2b`。
+release 产物在 `target/release/vimg.exe`。
+
+### 本轮保留的修改
+
+1. **RGB 图块逐行复制。** 当前 Cargo.lock 锁定 image 0.25.8，其
+   `GenericImage::copy_from` 对每个像素执行 get/put，RgbImage 没有覆盖此实现。
+   固定尺寸的 RGB 网格现在验证图块尺寸后，通过安全的 slice 逐行复制。
+   没有增加 unsafe、依赖升级或改变像素格式；最后一行未填满的网格仍保持黑色。
+2. **每个 Capture attempt 复用标签覆盖率。** `MemoryJoiner` 保存网格布局、
+   每个时间标签的背景范围和逐像素透明度，30 帧共用。只缓存绘制数据，不缓存
+   视频像素；背景混合、字形绘制顺序、整数截断和相互重叠的字形保持原样。
+   在等待首组采样帧之前准备标签，准备耗时也计入 profile 的 join 字段。
+3. **按需生成 SourceSelection。** 普通运行不再分配、格式化最终会被丢弃的
+   270 条 source time-base 记录；authority 模式继续完整记录。RGB/PTS 原型
+   dump 的输出独立保留。
+
+### 完整命令：新进程、热文件缓存
+
+执行用户指定的 `vcs -c3 -H160 -n9 sample/input.mkv --output ...`，附加
+`--profile`，使用相同 DLL 和视频。AB/BA 交错，各 20 个计入统计的新进程，
+另各 1 次首轮观测；wall 包含进程/DLL/解码器/编码器初始化。P95 为 nearest-rank。
+
+| 指标 | d8ac972d 基线 | 本轮最终版本 |
+|---|---:|---:|
+| 首轮观测 | 1.545s | 1.519s |
+| wall 中位数 | 1.529s | 1.507s |
+| wall P95 | 1.751s | 1.742s |
+| 拼图 join 中位数（包含标签准备） | 32ms | 21ms |
+| plan setup 中位数 | 11ms | 11ms |
+| decode 中位数 | 1.203s | 1.204s |
+| encoder tail 中位数 | 218ms | 211ms |
+| profile total 中位数 | 1.436s | 1.417s |
+
+拼图阶段本批次减少 **约 34% / 11ms**；完整命令中位数仅减少 **约 1.4%**。
+机器负载在测量中有明显变化，两组 wall 范围分别为 1.361–1.890s、
+1.333–1.830s。不能把这批绝对时间与上一节更低负载时的 1.198s 直接比较，
+也不能将完整命令的全部差值归因于代码。所有 42 次运行的 AVIF 哈希一致。
+
+另各 8 次交错 CPU 采样：主线程中位数两组均为 0.140625s；进程总 CPU
+11.593750 → 11.960938s（约增加 3.2%）。**未观察到整进程 CPU 的可靠下降。**
+本轮保留的是经过输出等价验证、确实减少拼图工作量的局部优化，没有宣称
+获得显著的整体加速或达到 ADR 的 1.3s P95。
+
+没有清空 OS 文件缓存或重启机器，首轮只是首轮观测，不能作为真正的磁盘冷
+缓存收益证据。程序每次全新初始化与下面的常驻服务热任务分开统计。
+
+### 常驻服务热任务：仍有后段变慢，未证明改善
+
+用既有 `repeated_service_jobs_and_cache_hits` 执行两轮 AB/BA 对照，每个
+进程连续生成十个不同 cache path，然后各重复请求一次验证命中。使用真实
+complete_job、VCS、libav/SVT 和 manifest；不含 DDS/ya 传输，不是十任务并发。
+下表的“热任务”指每个进程排除第一个任务后的九个任务。
+
+| 轮次/版本（执行顺序） | 首任务 | 热任务中位数 | 热任务最大值 | 峰值 WS | 峰值 commit |
+|---|---:|---:|---:|---:|---:|
+| 1 / baseline | 1.140s | 1.147s | 1.851s | 591.9 MiB | 653.4 MiB |
+| 1 / candidate | 1.101s | 1.319s | 2.521s | 585.2 MiB | 647.6 MiB |
+| 2 / candidate | 1.216s | 1.370s | 2.141s | 576.8 MiB | 650.1 MiB |
+| 2 / baseline | 1.222s | 1.079s | 1.986s | 585.4 MiB | 653.1 MiB |
+
+四个进程的十任务生成、字节一致性和十次缓存命中断言全部通过。
+候选的两组 cache hit 中位数为 0.798ms、0.985ms。**两版都在后段变慢，
+本批次候选的服务热耗时还更差，不能宣称改善服务吞吐或排除热路径回归。**
+峰值仍超过 ADR 的 512 MiB 预算。局部拼图加速不足以解决整体热任务延迟。
+
+随后增加仅在该忽略测试中使用的 `VIMG_BENCH_PROFILE=1`，输出每个任务的
+现有阶段 profile。独立一轮候选中，第 1–7 个任务 wall 0.999–1.123s，
+第 9/10 个为 1.838/1.839s；相应进程 CPU 仍约 9.17/9.31s，未同步翻倍。
+第 7 → 9 个任务的 decode 0.838 → 1.488s、encoder tail 0.155 → 0.338s，
+join 仍为 15ms。说明后段额外延迟并非由拼图用时增加直接解释，根因尚未确认。
+按任务结束时采样的 WS 也会从约 50MiB 上升到 370MiB 后回落到 75MiB；
+不能继续用“全部都是不可回收泄漏”或“全部已经解决”概括。
+
+还通过测试驱动仅对新建测试子进程分别请求 HighQoS、保留已有计时器精度请求，
+核对返回成功及 ControlMask/StateMask；均未消除变慢，没有修改系统电源计划，
+也没有接入生产代码。这两次跨时段实验不能用于量化策略效果或确定根因。
+[Windows 进程节能策略说明](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setprocessinformation)
+后续若继续追查热延迟，应在受控负载下采集线程等待/调度轨迹，并对候选拆分
+消融；不应以更多解码线程、提高进程优先级或清理全局堆作为未经验证的修复。
+
+这也补充了上一节仅一轮十任务观测的边界：先前 RGB 引用泄漏确已修复，
+但服务后段延迟并未被全面解决。本轮提交是局部拼图优化及诊断支持，
+不是服务性能契约达标结论。
+
+### 标签阶段的独立测量
+
+release 忽略测试 `benchmark_preview_label_cache` 交错执行 8 轮；每轮绘制
+九个时间标签 × 30 张 RGB 网格。计时包含每个任务重新准备标签，排除网格
+分配与复制（它们已包含在上面的实际 join 计时中）。
+
+- 原逐帧布局/光栅化：中位数 **1.843ms**。
+- 预计算后逐帧混合：中位数 **0.451ms**，约减少 75.5%。
+- 九个标签的 coverage Vec 容量合计 **13,824 字节**，只随本次 attempt 存活。
+
+这只是约 1.4ms 的局部收益，不能当成整个拼图或整条命令的 75.5% 加速。
+
+### 共享探测：已测量，未接入默认路径
+
+实验先完整探测一次并深复制 codec 参数，再让九个窗口分别只读容器头，
+独立 seek 和解码。四组输入共 1080 张 RGB、1080 个 PTS 及最终 AVIF 一致。
+各 12 轮交错 wall 中位数 1.234898 → 1.195751s（约减少 3.2%）；另各
+4 次进程 CPU 中位数 9.851563 → 10.078125s，未同步下降。首轮观测
+1.261 → 1.306s。
+
+容器头并不总是包含完整信息，完整探测还会读取和解码部分包，不能仅凭复制
+codec 参数就普遍替代 demuxer 初始化。
+[FFmpeg demuxing 文档](https://ffmpeg.org/doxygen/8.0/group__lavf__decoding.html)
+该原型尚未补齐格式范围、流匹配、源文件变化和头信息不完整的生产回退门槛；
+本轮小幅 wall 趋势不足以支持直接启用。因此恢复现有完整探测路径，将原型
+patch、exe 和日志保存在 `.scratch/startup/phase3/`，未混入最终源码或上述收益。
+
+### 验证及复现
+
+- 原标签绘制实现作为 test-only 像素参考，覆盖横/竖/小尺寸图像、空白/长标签、
+  组合字符、三档背景透明度、连续变化的像素和非零绘制偏移。
+- 网格测试覆盖 0/1/2/3/7 列、缺省标签、空白尾格、不同帧内容、数量/尺寸错误。
+- 四类视频（sample MKV、H.264 MP4、HEVC MKV、H.264 VFR）各 270 张 RGB
+  和 270 个 PTS 与基线相同；四个最终 AVIF 的哈希也分别相同。
+- 另实际运行 baseline/candidate 的 authority record：270 个选择 PTS/time base、
+  30 张编码前 PNG、30 张解码后 PNG 和最终 AVIF 全部一致，确认按需记录未破坏
+  authority 模式。sample AVIF 仍为
+  `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+- 最终 release 测试：67 passed / 0 failed / 5 ignored；标签微基准、连续服务
+  测试另行显式运行。默认 feature 测试：58 passed / 0 failed / 4 ignored。
+
+CLI 复现：为相同 FFmpeg DLL 配置 PATH 后运行
+`scripts/bench-startup.ps1 -Baseline .scratch/startup/phase3/baseline.exe -Candidate .scratch/startup/phase3/candidate.exe -OutputDirectory .scratch/startup/phase3/final-comparison-repeat -Runs 20`。
+标签微基准：`cargo test --release --features in-process-decode benchmark_preview_label_cache -- --ignored --nocapture`。
+原始记录包括 `final-comparison/results.csv`、`candidate-cpu.json`、
+`labels-bench.log`、`verification-final/results.json`、`authority/results.json`；
+热任务证据为 `service-{baseline,candidate}-memory-{0,1}.log`、
+`service-profile.json` 及对应阶段日志；设置 `VIMG_BENCH_PROFILE=1` 后运行
+`cargo test --release --features in-process-decode repeated_service_jobs_and_cache_hits -- --ignored --nocapture`
+可以复现阶段诊断。临时 Windows 策略实验在 `profile_service.py` 的 qos/timer
+模式及对应 `service-profile-{qos,timer}.json` 中。
+共享探测实验使用 `shared-probe.patch`、`shared-probe.exe`、`shared-probe-cpu.json`、
+`prototype-comparison/results.csv`。汇总计算脚本为 `summarize.py`。
+
 ## 2026-09-12：jj 基线保存后的优化实现
 
 开始修改前已用 `jj commit` 保存完整工作区：**`6b4e9a45`**，change

@@ -825,6 +825,17 @@ fn write_stream_frames(
     let started = Instant::now();
     let mut timings = StreamTimings::default();
     let plan = stream.plan();
+    let join_started = profile.then(Instant::now);
+    let joiner = command::MemoryJoiner::new(
+        plan.frame_dimensions(),
+        plan.capture_count(),
+        columns,
+        labels,
+    )
+    .map_err(command::CaptureAttemptError::fatal)?;
+    if let Some(join_started) = join_started {
+        timings.join += join_started.elapsed();
+    }
     let mut pending: BTreeMap<usize, Vec<Option<command::CaptureFrame>>> = BTreeMap::new();
     for expected_frame in 0..plan.capture_frames() {
         while pending
@@ -896,7 +907,8 @@ fn write_stream_frames(
             timings.first_grid = started.elapsed();
         }
         let join_started = profile.then(Instant::now);
-        let grid = command::join_from_memory(&images, columns, labels)
+        let grid = joiner
+            .join(&images)
             .map_err(command::CaptureAttemptError::fatal)?;
         if let Some(join_started) = join_started {
             timings.join += join_started.elapsed();

@@ -568,7 +568,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
     let mut last_duration = None;
     let mut packet_durations = HashMap::new();
     let mut decoder_threads_used = 0;
-    let mut selected = Vec::new();
+    let mut selected = records.as_ref().map(|_| Vec::with_capacity(30));
     let mut metrics = CaptureMetrics::default();
     let mut setup_s = 0.0;
     for (packet_stream, packet) in input.packets() {
@@ -707,10 +707,12 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
     );
     if let Some(records) = records {
         ensure!(
-            !selected.is_empty(),
+            selected
+                .as_ref()
+                .is_some_and(|selected| !selected.is_empty()),
             "libav decoder produced no selected frames"
         );
-        records.lock().unwrap()[capture_index] = Some(selected);
+        records.lock().unwrap()[capture_index] = selected;
     }
     metrics.decode = started.elapsed();
     if proto.probe {
@@ -813,7 +815,7 @@ fn receive_frames(
     pending_decoded: &mut Option<PendingDecoded>,
     last_duration: &mut Option<i64>,
     packet_durations: &HashMap<i64, i64>,
-    selected: &mut Vec<SourceSelection>,
+    selected: &mut Option<Vec<SourceSelection>>,
     metrics: &mut CaptureMetrics,
     proto: &ProtoConfig,
     counters: &mut ProtoCounters,
@@ -928,7 +930,7 @@ fn emit_scheduled_frames(
     source_time_base: crate::command::frame_schedule::Rational,
     sender: &FrameSender,
     previous_rgb: &mut Option<RgbImage>,
-    selected: &mut Vec<SourceSelection>,
+    selected: &mut Option<Vec<SourceSelection>>,
     proto: &ProtoConfig,
     counters: &mut ProtoCounters,
 ) -> anyhow::Result<()> {
@@ -983,14 +985,16 @@ fn emit_scheduled_frames(
             )?
             .clone()
             };
-        selected.push(SourceSelection {
-            source_pts: frame.source_pts,
-            source_time_base: format!(
-                "{}/{}",
-                source_time_base.numerator, source_time_base.denominator
-            ),
-            input_frame_index: frame.input_frame_index,
-        });
+        if let Some(selected) = selected {
+            selected.push(SourceSelection {
+                source_pts: frame.source_pts,
+                source_time_base: format!(
+                    "{}/{}",
+                    source_time_base.numerator, source_time_base.denominator
+                ),
+                input_frame_index: frame.input_frame_index,
+            });
+        }
         if let Some(dump_dir) = &proto.dump_dir {
             let dump_image = if frame.input_frame_index == current.input_frame_index {
                 &current_rgb
