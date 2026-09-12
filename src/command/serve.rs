@@ -22,6 +22,9 @@ const CACHE_PROFILE: &str = "vimg-preview-3x3-h160-n9-f30-crf30-v1";
 /// Run as a service, receiving vimg jobs from Yazi DDS.
 #[derive(clap::Parser, Debug)]
 pub struct Serve {
+    /// Concurrent previews; running and queued jobs together are capped at ten.
+    #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
+    pub jobs: u8,
     /// Capture implementation fixed for every job in this service process.
     #[arg(long, value_enum, default_value_t = command::DEFAULT_CAPTURE_BACKEND)]
     pub capture_backend: command::CaptureBackendPolicy,
@@ -253,7 +256,7 @@ impl Serve {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         });
-        for worker_id in 1..=MAX_JOBS {
+        for worker_id in 1..=usize::from(self.jobs) {
             let worker_scheduler = Arc::clone(&scheduler);
             let capture_backend = self.capture_backend;
             thread::Builder::new()
@@ -262,7 +265,10 @@ impl Serve {
                 .context("Cannot start a vimg service worker")?;
         }
 
-        println!("[serve] Started {MAX_JOBS} workers; waiting for Yazi DDS");
+        println!(
+            "[serve] Started {} workers; capacity {MAX_JOBS} running + queued jobs; waiting for Yazi DDS",
+            self.jobs
+        );
         receive_yazi_requests(scheduler)
     }
 
@@ -886,16 +892,24 @@ mod tests {
             state: Mutex::new(QueueState::default()),
             ready: Condvar::new(),
         };
-        for index in 0..MAX_JOBS {
+        assert_eq!(scheduler.submit(job("active.avif")), SubmitResult::Queued);
+        assert_eq!(scheduler.next().cache, PathBuf::from("active.avif"));
+        for index in 0..MAX_JOBS - 1 {
             assert_eq!(
                 scheduler.submit(job(&format!("{index}.avif"))),
                 SubmitResult::Queued
             );
         }
         assert_eq!(scheduler.submit(job("newest.avif")), SubmitResult::Queued);
-        assert_eq!(scheduler.next().cache, PathBuf::from("newest.avif"));
         let state = scheduler.state.lock().unwrap();
         assert!(!state.jobs.contains(&PathBuf::from("0.avif")));
+        assert_eq!(state.jobs.len(), MAX_JOBS);
+        assert_eq!(state.queued.len(), MAX_JOBS - 1);
+        assert_eq!(state.active.len(), 1);
+        assert!(state.jobs.contains(&PathBuf::from("active.avif")));
+        drop(state);
+        scheduler.finish(Path::new("active.avif"));
+        assert_eq!(scheduler.next().cache, PathBuf::from("newest.avif"));
     }
 
     #[test]
@@ -1185,16 +1199,39 @@ mod tests {
     }
 
     #[cfg(feature = "in-process-decode")]
-    fn configure_benchmark_cpu_policy() {
-        Serve {
-            capture_backend: command::CaptureBackendPolicy::Libav,
-            cpu_policy: if std::env::var("VIMG_BENCH_CPU_POLICY").as_deref() == Ok("all") {
-                command::ServiceCpuPolicy::All
-            } else {
-                command::ServiceCpuPolicy::Auto
-            },
+    fn configure_benchmark_cpu_policy() -> Serve {
+        let cpu_policy = std::env::var("VIMG_BENCH_CPU_POLICY").unwrap_or_else(|_| "auto".into());
+        let mut args = vec![
+            "serve",
+            "--capture-backend",
+            "libav",
+            "--cpu-policy",
+            &cpu_policy,
+        ];
+        let jobs = std::env::var("VIMG_BENCH_BATCH_WORKERS").ok();
+        if let Some(jobs) = &jobs {
+            args.extend(["--jobs", jobs]);
         }
-        .configure_cpu_policy();
+        let service = <Serve as clap::Parser>::try_parse_from(args).unwrap();
+        service.configure_cpu_policy();
+        service
+    }
+
+    #[test]
+    fn service_defaults_to_one_worker_and_bounds_explicit_concurrency() {
+        let default = <Serve as clap::Parser>::try_parse_from(["serve"]).unwrap();
+        assert_eq!(default.jobs, 1);
+        for jobs in 1..=MAX_JOBS {
+            let value = jobs.to_string();
+            for flag in ["--jobs", "-j"] {
+                let service =
+                    <Serve as clap::Parser>::try_parse_from(["serve", flag, &value]).unwrap();
+                assert_eq!(usize::from(service.jobs), jobs);
+            }
+        }
+        for invalid in ["0", "11", "-1", "256", "1.5", "invalid"] {
+            assert!(<Serve as clap::Parser>::try_parse_from(["serve", "--jobs", invalid]).is_err());
+        }
     }
 
     #[test]
@@ -1251,6 +1288,128 @@ mod tests {
         println!(
             "[service-parallel-bench] jobs={count} render={:.6}s",
             elapsed.as_secs_f64()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    #[ignore = "compares bounded service workers on a queued batch; requires sample/input.mkv"]
+    fn queued_service_jobs_and_cache_hits() {
+        use std::sync::{
+            Barrier, OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let service = configure_benchmark_cpu_policy();
+        let video = std::env::var_os("VIMG_BENCH_VIDEO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("sample/input.mkv"));
+        let root = temporary_test_dir("service-queue-benchmark");
+        let count = std::env::var("VIMG_BENCH_BATCH_JOBS")
+            .unwrap_or_else(|_| "10".into())
+            .parse::<usize>()
+            .unwrap();
+        let worker_count = usize::from(service.jobs);
+        assert!((1..=MAX_JOBS).contains(&count));
+        assert!((1..=MAX_JOBS).contains(&worker_count));
+        let policy = command::CaptureBackendPolicy::Libav;
+        let vcs = vcs_for_job(&video, &root.join("unused.avif"), None, policy);
+        let capture = command::Capture::plan(&vcs.args, Some(160), None, 4).unwrap();
+        let properties = capture.capture_plan().media();
+        let media = command::MediaDescriptor {
+            duration_s: Some(properties.duration_s),
+            width: Some(properties.width),
+            height: Some(properties.height),
+            codec: Some(properties.codec.clone()),
+            source_time_base: Some(properties.source_time_base),
+        };
+        let source = source_descriptor(&fs::metadata(&video).unwrap()).unwrap();
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let jobs: Vec<_> = (0..count)
+            .map(|index| Job {
+                file: video.clone(),
+                cache: root.join(format!("{index}.avif")),
+                source: Some(source.clone()),
+                media: Some(media.clone()),
+                yazi_id: None,
+            })
+            .collect();
+        for job in &jobs {
+            assert_eq!(scheduler.submit(job.clone()), SubmitResult::Queued);
+        }
+        // Age the service before submitting any work to its render workers.
+        thread::sleep(Duration::from_secs(10));
+        let claims = AtomicUsize::new(0);
+        let barrier = Barrier::new(worker_count + 1);
+        let started = OnceLock::<Instant>::new();
+        let completed = Mutex::new(Vec::new());
+        thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..worker_count {
+                let (claims, barrier, started, completed, scheduler) =
+                    (&claims, &barrier, &started, &completed, &scheduler);
+                handles.push(scope.spawn(move || {
+                    barrier.wait();
+                    // The fixed batch contains exactly `count` queued jobs;
+                    // claims only stop these test workers after draining it.
+                    while claims.fetch_add(1, Ordering::Relaxed) < count {
+                        let job = scheduler.next();
+                        let job_started = Instant::now();
+                        let result = complete_job(scheduler, &job, policy,
+                            |backend| run_vcs(&job.file, &job.cache, job.media.as_ref(), backend),
+                            || publish_manifest(&job, policy));
+                        assert_eq!(result.outcome, ServiceJobOutcome::Published);
+                        let elapsed = started.get().unwrap().elapsed().as_secs_f64();
+                        let render = job_started.elapsed().as_secs_f64();
+                        completed.lock().unwrap().push((job.cache.clone(), elapsed));
+                        println!("[service-queue-job] cache={} elapsed={elapsed:.6}s render={render:.6}s", job.cache.file_name().unwrap().to_string_lossy());
+                    }
+                }));
+            }
+            started.set(Instant::now()).unwrap();
+            barrier.wait();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+        let completed = completed.into_inner().unwrap();
+        assert_eq!(completed.len(), count);
+        let first = completed
+            .iter()
+            .map(|(_, elapsed)| *elapsed)
+            .fold(f64::INFINITY, f64::min);
+        let total = completed
+            .iter()
+            .map(|(_, elapsed)| *elapsed)
+            .fold(0.0, f64::max);
+        let latest = completed
+            .iter()
+            .find(|(cache, _)| cache == &jobs.last().unwrap().cache)
+            .unwrap()
+            .1;
+        let reference = std::env::var_os("VIMG_BENCH_REFERENCE_AVIF")
+            .map(|path| fs::read(path).unwrap())
+            .unwrap_or_else(|| fs::read(&jobs[0].cache).unwrap());
+        for job in jobs {
+            assert_eq!(fs::read(&job.cache).unwrap(), reference);
+            assert_eq!(scheduler.submit(job), SubmitResult::Queued);
+            let active = scheduler.next();
+            let result = complete_job(
+                &scheduler,
+                &active,
+                policy,
+                |_| panic!("cached batch job rendered again"),
+                || panic!("cached batch job republished"),
+            );
+            assert_eq!(result.outcome, ServiceJobOutcome::Reused);
+        }
+        assert!(scheduler.state.lock().unwrap().jobs.is_empty());
+        println!(
+            "[service-queue-bench] jobs={count} workers={worker_count} first={first:.6}s latest={latest:.6}s total={total:.6}s"
         );
         fs::remove_dir_all(root).unwrap();
     }

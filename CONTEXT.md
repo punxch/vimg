@@ -41,11 +41,11 @@ Optional source-video duration, dimensions, and modification identity carried wi
 _Avoid_: ffprobe output, video metadata blob
 
 **Service capacity**:
-The configured limit of one executing capture job and up to nine queued capture jobs while the local service remains stable.
+The default limit of one executing capture job and up to nine queued capture jobs. `serve --jobs` can allow one through ten executing capture jobs; executing and queued capture jobs together remain capped at ten. The interactive resource budget applies to the default capacity.
 _Avoid_: thread count, ffmpeg count
 
 **Admission limit**:
-The service-capacity boundary after which a new capture job receives `busy` instead of being queued.
+The ten-job service-capacity boundary. A newer capture job replaces the oldest unstarted capture job at this boundary; it receives `busy` only when every admitted capture job is already executing.
 _Avoid_: backpressure, overload
 
 **Latest-preview queue**:

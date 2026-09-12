@@ -41,8 +41,13 @@ The plugin publishes `vimg-gridthumb-request` messages through Yazi DDS. The
 service receives them with `ya sub`, runs the equivalent of
 `vimg vcs -c3 -H160 -n9 <video> --output <file-cache>.avif` in-process, and
 publishes `gridthumb-avif-ready` back to the requesting Yazi instance with
-`ya pub-to`. Duplicate cache requests share one job, and no more than 10 jobs
-run at once.
+`ya pub-to`. Duplicate cache requests share one job. By default, one preview
+runs while up to nine wait; the newest queued preview runs next. At capacity,
+a new request replaces the oldest queued job, preserving jobs already running.
+Use `vimg serve --jobs 4` (or `-j4`) to increase concurrent previews when batch
+throughput matters more than first-preview latency and memory use. `--jobs`
+accepts 1 through 10; running and queued jobs together remain capped at ten.
+If all ten are already running, a new distinct request receives `busy`.
 
 With the native backend on Windows hybrid CPUs, `serve --cpu-policy auto`
 (the default) selects the performance cores to keep idle-service preview
