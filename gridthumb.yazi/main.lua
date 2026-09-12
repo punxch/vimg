@@ -47,6 +47,7 @@ local function media_descriptor(url, meta)
 		-- FFmpeg chooses its default video stream. A time base is only safe to
 		-- reuse without probing when there is exactly one non-cover video stream.
 		if video_stream_count == 1 then
+			descriptor.codec = video_stream.codec_name
 			local numerator, denominator = (video_stream.time_base or ""):match("^(%d+)/(%d+)$")
 			numerator, denominator = tonumber(numerator), tonumber(denominator)
 			if numerator and denominator and numerator > 0 and denominator > 0
@@ -120,7 +121,7 @@ function M:preload(job)
 		return true
 	end
 
-	local meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_type,width,height,time_base:stream_disposition=attached_pic")
+	local meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_name,codec_type,width,height,time_base:stream_disposition=attached_pic")
 	if not meta then
 		return true, err
 	elseif not meta.format.duration then
@@ -196,6 +197,9 @@ function M:generate_avif(job, cache)
 	if source.width and source.height then
 		request.width = source.width
 		request.height = source.height
+	end
+	if source.codec then
+		request.codec = source.codec
 	end
 	if source.source_time_base_numerator and source.source_time_base_denominator then
 		request.source_time_base_numerator = source.source_time_base_numerator

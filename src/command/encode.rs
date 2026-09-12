@@ -54,11 +54,11 @@ impl InProcessAvifEncoder {
         })
     }
 
-    pub(crate) fn write_grid(&self, grid: &RgbImage) -> anyhow::Result<()> {
+    pub(crate) fn write_grid(&self, grid: RgbImage) -> anyhow::Result<()> {
         self.sender
             .as_ref()
             .context("in-process AVIF encoder has already been closed")?
-            .send(grid.clone())
+            .send(grid)
             .context("in-process AVIF encoder stopped")
     }
 
@@ -90,6 +90,8 @@ struct EncoderState {
     time_base: ffmpeg::Rational,
     width: u32,
     height: u32,
+    rgb: Video,
+    yuv: Video,
 }
 
 // The swscale context is a raw pointer and not auto-Send; every member is
@@ -106,8 +108,8 @@ impl EncoderState {
         preset: u8,
     ) -> anyhow::Result<Self> {
         ffmpeg::init().context("initializing software libav")?;
-        let codec =
-            ffmpeg::encoder::find_by_name("libsvtav1").context("libsvtav1 encoder is unavailable")?;
+        let codec = ffmpeg::encoder::find_by_name("libsvtav1")
+            .context("libsvtav1 encoder is unavailable")?;
         let mut output = ffmpeg::format::output_as(path, "avif")
             .with_context(|| format!("opening AVIF output {}", path.display()))?;
         // The CLI sets GLOBAL_HEADER whenever the muxer requests it (mov/avif
@@ -193,6 +195,8 @@ impl EncoderState {
             time_base,
             width,
             height,
+            rgb: Video::new(ffmpeg::format::Pixel::RGB24, width, height),
+            yuv: Video::new(ffmpeg::format::Pixel::YUV420P10LE, width, height),
         })
     }
 
@@ -223,7 +227,9 @@ impl EncoderState {
                 .write_interleaved(&mut self.output)
                 .context("writing AVIF packet")?;
         }
-        self.output.write_trailer().context("writing AVIF trailer")?;
+        self.output
+            .write_trailer()
+            .context("writing AVIF trailer")?;
         Ok(())
     }
 
@@ -236,23 +242,29 @@ impl EncoderState {
             self.width,
             self.height
         );
-        let mut rgb = Video::new(ffmpeg::format::Pixel::RGB24, self.width, self.height);
         let row = self.width as usize * 3;
-        let stride = rgb.stride(0);
+        let stride = self.rgb.stride(0);
         let raw = grid.as_raw();
         for y in 0..self.height as usize {
-            rgb.data_mut(0)[y * stride..y * stride + row]
+            self.rgb.data_mut(0)[y * stride..y * stride + row]
                 .copy_from_slice(&raw[y * row..(y + 1) * row]);
         }
-        let mut yuv = Video::new(ffmpeg::format::Pixel::YUV420P10LE, self.width, self.height);
+        // The encoder may retain a reference after send_frame. FFmpeg copies
+        // only when that buffer is still shared; otherwise reuse its storage.
+        let result = unsafe { ffmpeg::ffi::av_frame_make_writable(self.yuv.as_mut_ptr()) };
+        ensure!(
+            result >= 0,
+            "making encoder frame writable: {}",
+            ffmpeg::Error::from(result)
+        );
         // The CLI's auto_scale_0 emits tv-range frames into libsvtav1.
-        yuv.set_color_range(ffmpeg::color::Range::MPEG);
-        self.converter.run(&rgb, &mut yuv)?;
-        yuv.set_pts(Some(pts));
+        self.yuv.set_color_range(ffmpeg::color::Range::MPEG);
+        self.converter.run(&self.rgb, &mut self.yuv)?;
+        self.yuv.set_pts(Some(pts));
         // One tick per frame in the encoder time base, like the CLI filter
         // chain emits; the encoder propagates it to the packet duration.
-        unsafe { (*yuv.as_mut_ptr()).duration = 1 };
-        self.encoder.send_frame(&yuv)?;
+        unsafe { (*self.yuv.as_mut_ptr()).duration = 1 };
+        self.encoder.send_frame(&self.yuv)?;
         Ok(())
     }
 }
@@ -294,7 +306,7 @@ mod tests {
         let path = temp_output("roundtrip");
         let mut encoder = InProcessAvifEncoder::start(&path, 64, 64, 20.0, 30, 8).unwrap();
         for frame in 0..30 {
-            encoder.write_grid(&grid(frame)).unwrap();
+            encoder.write_grid(grid(frame)).unwrap();
         }
         encoder.finish().unwrap();
 

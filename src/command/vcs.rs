@@ -574,10 +574,10 @@ impl GridEncoder {
         Ok(Self::Subprocess(AttemptEncoder::new(child)))
     }
 
-    fn write_grid(&mut self, grid: &image::RgbImage) -> Result<(), command::CaptureAttemptError> {
+    fn write_grid(&mut self, grid: image::RgbImage) -> Result<(), command::CaptureAttemptError> {
         match self {
             Self::Subprocess(encoder) => encoder
-                .write_grid(grid)
+                .write_grid(&grid)
                 .map_err(command::CaptureAttemptError::fatal),
             #[cfg(feature = "in-process-decode")]
             Self::InProcess(encoder) => encoder
@@ -907,7 +907,7 @@ fn write_stream_frames(
                 .map_err(command::CaptureAttemptError::fatal)?;
         }
         let write_started = profile.then(Instant::now);
-        encoder.write_grid(&grid)?;
+        encoder.write_grid(grid)?;
         if let Some(write_started) = write_started {
             timings.encoder_write += write_started.elapsed();
         }

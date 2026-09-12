@@ -16,7 +16,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, SyncSender, sync_channel},
     },
@@ -183,7 +183,9 @@ fn pix_fmt_name(format: ffmpeg::ffi::AVPixelFormat) -> String {
         if name.is_null() {
             return format!("pixfmt:{}", format as i32);
         }
-        std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+        std::ffi::CStr::from_ptr(name)
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -193,7 +195,9 @@ fn device_type_name(kind: ffmpeg::ffi::AVHWDeviceType) -> String {
         if name.is_null() {
             "unknown".to_owned()
         } else {
-            std::ffi::CStr::from_ptr(name).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(name)
+                .to_string_lossy()
+                .into_owned()
         }
     }
 }
@@ -264,6 +268,7 @@ pub(super) fn start(
     let mut workers = Vec::with_capacity(plan.capture_count());
     let cancelled = Arc::new(AtomicBool::new(false));
     let records = authority.then(|| Arc::new(Mutex::new(vec![None; plan.capture_count()])));
+    let ready = Arc::new(FrameReady::default());
     for (window, schedule) in plan
         .windows()
         .iter()
@@ -271,6 +276,10 @@ pub(super) fn start(
         .zip(plan.schedules().iter().cloned())
     {
         let (sender, receiver) = sync_channel(2);
+        let sender = FrameSender {
+            sender: Some(sender),
+            ready: Arc::clone(&ready),
+        };
         receivers.push(receiver);
         let video = plan.video().to_owned();
         let dimensions = plan.frame_dimensions();
@@ -304,6 +313,7 @@ pub(super) fn start(
         workers,
         records,
         cancelled,
+        ready,
     }))
 }
 
@@ -318,11 +328,53 @@ struct LibavCaptureAttempt {
     workers: Vec<JoinHandle<anyhow::Result<CaptureMetrics>>>,
     records: Option<AuthorityRecords>,
     cancelled: Arc<AtomicBool>,
+    ready: Arc<FrameReady>,
+}
+
+#[derive(Default)]
+struct FrameReady {
+    scan: Mutex<()>,
+    changed: Condvar,
+}
+
+impl FrameReady {
+    fn notify(&self) {
+        // Serialize notification with scan -> wait. Enqueueing never holds
+        // this lock: a full bounded channel must not block the consumer.
+        let _scan = self.scan.lock().unwrap();
+        self.changed.notify_one();
+    }
+}
+
+struct FrameSender {
+    sender: Option<SyncSender<anyhow::Result<CaptureFrame>>>,
+    ready: Arc<FrameReady>,
+}
+
+impl FrameSender {
+    fn send(
+        &self,
+        frame: anyhow::Result<CaptureFrame>,
+    ) -> Result<(), std::sync::mpsc::SendError<anyhow::Result<CaptureFrame>>> {
+        let result = self.sender.as_ref().unwrap().send(frame);
+        self.ready.notify();
+        result
+    }
+}
+
+impl Drop for FrameSender {
+    fn drop(&mut self) {
+        // Disconnect first, then wake the reader, including on worker panic.
+        // Otherwise it could observe an empty connected channel and sleep forever.
+        self.sender.take();
+        self.ready.notify();
+    }
 }
 
 impl CaptureAttempt for LibavCaptureAttempt {
     fn recv(&self) -> anyhow::Result<CaptureFrame> {
         let mut next = self.next.lock().unwrap();
+        let mut scan = self.ready.scan.lock().unwrap();
         loop {
             let mut any_connected = false;
             {
@@ -348,9 +400,10 @@ impl CaptureAttempt for LibavCaptureAttempt {
                     "libav capture stream ended before all frames were produced"
                 ));
             }
-            // Some channels are empty (workers gated on the concurrency
-            // semaphore or still decoding). Yield and retry.
-            std::thread::yield_now();
+            // Holding scan through the predicate check prevents lost wakeups.
+            // Keep the existing ready-channel order instead of blocking on a
+            // particular slow capture and backing up all the other workers.
+            scan = self.ready.changed.wait(scan).unwrap();
         }
     }
 
@@ -425,7 +478,7 @@ struct DecodeRequest<'a> {
     start_s: f32,
     dimensions: (u32, u32),
     schedule: crate::command::frame_schedule::FrameSchedule,
-    sender: &'a SyncSender<anyhow::Result<CaptureFrame>>,
+    sender: &'a FrameSender,
     records: Option<AuthorityRecords>,
     cancelled: &'a AtomicBool,
     proto: ProtoConfig,
@@ -550,13 +603,8 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
                 .unwrap_or(threads);
             decoder_threads_used = threads;
             let setup_started = Instant::now();
-            let mut opened = open_proto_decoder(
-                &parameters,
-                codec_id,
-                threads,
-                &proto,
-                hw_device.as_ref(),
-            )?;
+            let mut opened =
+                open_proto_decoder(&parameters, codec_id, threads, &proto, hw_device.as_ref())?;
             opened.skip_frame(Discard::NonReference);
             let graph_pix_fmt = if proto.hwaccel.is_some() {
                 proto_sw_format(&opened).unwrap_or_else(|| "nv12".to_owned())
@@ -568,18 +616,13 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
                     .name()
                     .to_owned()
             };
-            let opened_scaler = production_scale_filter(
-                &opened,
-                dimensions,
-                time_base,
-                &graph_pix_fmt,
-            )?;
+            let opened_scaler =
+                production_scale_filter(&opened, dimensions, time_base, &graph_pix_fmt)?;
             setup_s = setup_started.elapsed().as_secs_f64();
             decode_pipeline = Some((opened, opened_scaler));
         }
-        let (active_decoder, active_scaler) = decode_pipeline
-            .as_mut()
-            .expect("decoder opened above");
+        let (active_decoder, active_scaler) =
+            decode_pipeline.as_mut().expect("decoder opened above");
         if let Some(pts) = packet.dts().or_else(|| packet.pts()) {
             let seconds = pts as f64 * f64::from(time_base);
             if seconds >= f64::from(start_s) - NONREF_RECOVERY_MARGIN_S {
@@ -673,10 +716,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
     if proto.probe {
         eprintln!(
             "[proto] cap={capture_index} start_s={start_s:.3} hw={} dt={} open={open_s:.4} seek={seek_s:.4} setup={setup_s:.4} send={:.4} receive={:.4} emit={:.4} total={:.4} packets={} decoded={} preroll={} hw_decoded={} transfers={}",
-            proto
-                .hwaccel
-                .map(ProtoHw::label)
-                .unwrap_or("sw"),
+            proto.hwaccel.map(ProtoHw::label).unwrap_or("sw"),
             decoder_threads_used,
             counters.send_s,
             counters.receive_s,
@@ -721,21 +761,22 @@ fn open_proto_decoder(
             }
         }
     }
-    let attempt = |kind: threading::Type, count: usize| -> Result<ffmpeg::decoder::Video, ffmpeg::Error> {
-        let mut context = ffmpeg::codec::context::Context::from_parameters(parameters.clone())?;
-        if kind != threading::Type::None {
-            context.set_threading(threading::Config { kind, count });
-        }
-        if let (Some(device), Some(hw)) = (hw_device, proto.hwaccel) {
-            unsafe {
-                let context_ptr = context.as_mut_ptr();
-                (*context_ptr).hw_device_ctx = ffmpeg::ffi::av_buffer_ref(device.0);
-                PROTO_HW_FORMAT.with(|cell| cell.set(hw.pixel_format()));
-                (*context_ptr).get_format = Some(proto_get_format);
+    let attempt =
+        |kind: threading::Type, count: usize| -> Result<ffmpeg::decoder::Video, ffmpeg::Error> {
+            let mut context = ffmpeg::codec::context::Context::from_parameters(parameters.clone())?;
+            if kind != threading::Type::None {
+                context.set_threading(threading::Config { kind, count });
             }
-        }
-        Ok(context.decoder().open_as(codec)?.video()?)
-    };
+            if let (Some(device), Some(hw)) = (hw_device, proto.hwaccel) {
+                unsafe {
+                    let context_ptr = context.as_mut_ptr();
+                    (*context_ptr).hw_device_ctx = ffmpeg::ffi::av_buffer_ref(device.0);
+                    PROTO_HW_FORMAT.with(|cell| cell.set(hw.pixel_format()));
+                    (*context_ptr).get_format = Some(proto_get_format);
+                }
+            }
+            Ok(context.decoder().open_as(codec)?.video()?)
+        };
     // Prototype knob: VIMG_PROTO_THREAD_KIND=frame|slice|none overrides the
     // frame-threading default (slice threading + hwaccel compatibility check).
     let thread_kind = std::env::var("VIMG_PROTO_THREAD_KIND").ok();
@@ -747,9 +788,7 @@ fn open_proto_decoder(
     match attempt(kind, count) {
         Ok(video) => Ok(video),
         Err(error) if hw_device.is_some() => {
-            eprintln!(
-                "[proto] frame-threaded hw open failed ({error}); retrying single-threaded"
-            );
+            eprintln!("[proto] frame-threaded hw open failed ({error}); retrying single-threaded");
             attempt(threading::Type::None, 0).map_err(|error| {
                 anyhow::anyhow!("libav capture is unavailable: hw decoder open failed: {error}")
             })
@@ -768,7 +807,7 @@ fn receive_frames(
     rgb: &mut Video,
     schedule: &mut crate::command::frame_schedule::FrameSchedule,
     source_time_base: crate::command::frame_schedule::Rational,
-    sender: &SyncSender<anyhow::Result<CaptureFrame>>,
+    sender: &FrameSender,
     input_frame_index: &mut i64,
     previous_rgb: &mut Option<RgbImage>,
     pending_decoded: &mut Option<PendingDecoded>,
@@ -849,11 +888,13 @@ fn receive_frames(
         *pending_decoded = Some(current);
     }
     if let Some(error) = receive_error {
-        eprintln!("[proto]   cap={} receive_frame error: {error}", schedule.capture_index());
+        eprintln!(
+            "[proto]   cap={} receive_frame error: {error}",
+            schedule.capture_index()
+        );
     }
     // receive_s excludes the emit work measured inside emit_scheduled_frames.
-    counters.receive_s +=
-        receive_started.elapsed().as_secs_f64() - (counters.emit_s - emit_before);
+    counters.receive_s += receive_started.elapsed().as_secs_f64() - (counters.emit_s - emit_before);
     Ok(())
 }
 
@@ -885,7 +926,7 @@ fn emit_scheduled_frames(
     rgb: &mut Video,
     schedule: &mut crate::command::frame_schedule::FrameSchedule,
     source_time_base: crate::command::frame_schedule::Rational,
-    sender: &SyncSender<anyhow::Result<CaptureFrame>>,
+    sender: &FrameSender,
     previous_rgb: &mut Option<RgbImage>,
     selected: &mut Vec<SourceSelection>,
     proto: &ProtoConfig,
@@ -905,8 +946,8 @@ fn emit_scheduled_frames(
     let cpu_frame = if is_hw {
         // D3D11VA's transfer requires a destination pre-allocated in the hw
         // frames context sw_format (e.g. NV12); CUDA would allocate it itself.
-        let mut cpu = hw_sw_frame(&current.image)
-            .context("proto hw frame has no hw frames context")?;
+        let mut cpu =
+            hw_sw_frame(&current.image).context("proto hw frame has no hw frames context")?;
         let result = unsafe {
             ffmpeg::ffi::av_hwframe_transfer_data(cpu.as_mut_ptr(), current.image.as_ptr(), 0)
         };
@@ -930,21 +971,18 @@ fn emit_scheduled_frames(
         // This frame is no longer needed here; the source may take ownership
         // of its buffer reference without copying the full-resolution planes.
         .add(&cpu_frame)?;
-    scaler
-        .get("out")
-        .context("libav scale filter has no output")?
-        .sink()
-        .frame(rgb)?;
+    receive_scaled_frame(scaler, rgb)?;
     let current_rgb = copy_rgb(rgb)?;
     for frame in scheduled {
-        let image = if frame.input_frame_index == current.input_frame_index {
-            current_rgb.clone()
-        } else {
-            previous_rgb.as_ref().context(
+        let image =
+            if frame.input_frame_index == current.input_frame_index {
+                current_rgb.clone()
+            } else {
+                previous_rgb.as_ref().context(
                 "libav frame schedule selected a previous source frame that was not retained",
             )?
             .clone()
-        };
+            };
         selected.push(SourceSelection {
             source_pts: frame.source_pts,
             source_time_base: format!(
@@ -973,6 +1011,18 @@ fn emit_scheduled_frames(
     }
     *previous_rgb = Some(current_rgb);
     counters.emit_s += emit_started.elapsed().as_secs_f64();
+    Ok(())
+}
+
+fn receive_scaled_frame(scaler: &mut filter::Graph, rgb: &mut Video) -> anyhow::Result<()> {
+    let mut output = scaler
+        .get("out")
+        .context("libav scale filter has no output")?;
+    // buffersink moves a new reference into this AVFrame without unref'ing
+    // its previous contents. The previous RGB pixels have already been copied
+    // to RgbImage; release the old buffer before reusing the frame container.
+    unsafe { ffmpeg::ffi::av_frame_unref(rgb.as_mut_ptr()) };
+    output.sink().frame(rgb)?;
     Ok(())
 }
 
@@ -1072,5 +1122,162 @@ mod frame_lifetime_tests {
         drop(decoded);
         assert_eq!(retained.pts(), Some(42));
         assert!(retained.data(0).iter().all(|&value| value == 73));
+    }
+
+    #[test]
+    fn replacing_scaled_output_releases_the_previous_buffer() {
+        ffmpeg::init().unwrap();
+        let mut graph = filter::Graph::new();
+        unsafe { (*graph.as_mut_ptr()).nb_threads = 1 };
+        graph
+            .add(
+                &filter::find("buffer").unwrap(),
+                "in",
+                "video_size=64x32:pix_fmt=rgb24:time_base=1/20:pixel_aspect=1/1",
+            )
+            .unwrap();
+        graph
+            .add(&filter::find("buffersink").unwrap(), "out", "")
+            .unwrap();
+        graph
+            .output("in", 0)
+            .unwrap()
+            .input("out", 0)
+            .unwrap()
+            .parse("null")
+            .unwrap();
+        graph.validate().unwrap();
+        let mut rgb = Video::new(ffmpeg::format::Pixel::RGB24, 64, 32);
+        rgb.data_mut(0).fill(11);
+        let previous = retain_frame(&rgb).unwrap();
+        let previous_buffer = unsafe { (*previous.as_ptr()).buf[0] };
+        assert_eq!(
+            unsafe { ffmpeg::ffi::av_buffer_get_ref_count(previous_buffer) },
+            2
+        );
+        let mut next = Video::new(ffmpeg::format::Pixel::RGB24, 64, 32);
+        next.data_mut(0).fill(42);
+        graph.get("in").unwrap().source().add(&next).unwrap();
+        receive_scaled_frame(&mut graph, &mut rgb).unwrap();
+        assert_eq!(
+            unsafe { ffmpeg::ffi::av_buffer_get_ref_count(previous_buffer) },
+            1
+        );
+        assert_eq!(previous.data(0)[0], 11);
+        assert_eq!(rgb.data(0)[0], 42);
+    }
+
+    fn test_stream(count: usize) -> (Vec<FrameSender>, LibavCaptureAttempt) {
+        let ready = Arc::new(FrameReady::default());
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..count {
+            let (sender, receiver) = sync_channel(2);
+            senders.push(FrameSender {
+                sender: Some(sender),
+                ready: Arc::clone(&ready),
+            });
+            receivers.push(receiver);
+        }
+        (
+            senders,
+            LibavCaptureAttempt {
+                receivers: Mutex::new(receivers),
+                next: Mutex::new(0),
+                capture_count: count,
+                workers: Vec::new(),
+                records: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                ready,
+            },
+        )
+    }
+
+    #[test]
+    fn ready_stream_wakes_for_data_and_disconnect_without_polling() {
+        let (senders, stream) = test_stream(2);
+        let (done_tx, done_rx) = sync_channel(1);
+        let reader = thread::spawn(move || {
+            for _ in 0..60 {
+                stream.recv().unwrap();
+            }
+            assert!(stream.recv().is_err());
+            done_tx.send(()).unwrap();
+        });
+        let writers: Vec<_> = senders
+            .into_iter()
+            .enumerate()
+            .map(|(index, sender)| {
+                thread::spawn(move || {
+                    for animation_index in 0..30 {
+                        sender
+                            .send(Ok(CaptureFrame {
+                                capture_index: index,
+                                animation_index,
+                                image: RgbImage::new(1, 1),
+                            }))
+                            .unwrap();
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        reader.join().unwrap();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn ready_stream_wakes_on_worker_error_and_panic() {
+        let (mut senders, stream) = test_stream(1);
+        let sender = senders.pop().unwrap();
+        let (done_tx, done_rx) = sync_channel(1);
+        let reader = thread::spawn(move || {
+            assert!(
+                stream
+                    .recv()
+                    .err()
+                    .unwrap()
+                    .to_string()
+                    .contains("injected")
+            );
+            assert!(stream.recv().is_err());
+            done_tx.send(()).unwrap();
+        });
+        let writer = thread::spawn(move || {
+            let _sender = sender;
+            _sender
+                .send(Err(anyhow::anyhow!("injected error")))
+                .unwrap();
+            panic!("injected worker panic");
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        reader.join().unwrap();
+        assert!(writer.join().is_err());
+    }
+
+    #[test]
+    fn cancelling_ready_stream_releases_a_full_channel() {
+        let (mut senders, mut stream) = test_stream(1);
+        let sender = senders.pop().unwrap();
+        let (full_tx, full_rx) = sync_channel(1);
+        stream.workers.push(thread::spawn(move || {
+            for _ in 0..2 {
+                sender.send(Err(anyhow::anyhow!("queued"))).unwrap();
+            }
+            full_tx.send(()).unwrap();
+            assert!(sender.send(Err(anyhow::anyhow!("blocked"))).is_err());
+            Ok(CaptureMetrics::default())
+        }));
+        full_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(stream);
     }
 }

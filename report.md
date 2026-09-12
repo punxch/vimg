@@ -1,5 +1,130 @@
 # Performance Optimization Report
 
+## 2026-09-12：jj 基线保存后的优化实现
+
+开始修改前已用 `jj commit` 保存完整工作区：**`6b4e9a45`**，change
+`pnymmsut`，描述 `perf: retain capture frames and reduce preview scale startup overhead`。
+本节 CLI/CPU 的基线是该状态的 release exe
+`fe315f8e6a52d7404b861e9c09c13f63c83820494749ea0c7f77387cb84ce2b7`。
+最终 exe SHA-256 为
+`876598fba528d1bcb98407722ad70997c3fcbdf14674bac36a6a053d7d526358`。
+
+### 保留的修改
+
+1. **事件唤醒替代忙轮询。** 保留九路容量为 2 的队列与原来的就绪扫描顺序；
+   空队列时使用 Condvar 等待。通知与扫描到等待的转换共用锁，避免丢失唤醒；
+   入队时不持有该锁，避免满队列死锁。发送者先断开队列再通知，覆盖正常退出、
+   错误和 panic，消费者取消时仍可释放阻塞的发送者。
+2. **网格所有权与编码缓冲复用。** `write_grid` 直接接收生成的 `RgbImage`，
+   不再整图 clone；复用 RGB/YUV AVFrame，写 YUV 前调用
+   `av_frame_make_writable`，保护编码器可能仍持有的引用。
+3. **DDS 元数据链路补齐 codec。** 插件提取 `codec_name`，仅在视频流不歧义时
+   发送 codec/time base；`vimg send --codec` 和服务 JSON 解析保持该字段。
+   完整描述符可以跳过计划阶段的再次 probe，旧客户端或不完整描述符仍会探测。
+4. **服务端缓存复查。** 任务出队后核对 source path、size、纳秒 mtime、
+   AVIF header、output size/mtime、profile、backend policy 及 manifest；
+   匹配则直接通知全部等待者。旧 manifest、变化/损坏的输出或源文件走生成路径。
+   原型开关运行禁用服务端缓存复用，并在 manifest 中标记，避免掩盖诊断或被
+   正常服务复用。插件既有缓存读取协议保持兼容。
+5. **修复缩放输出帧的引用泄漏。** 连续任务测量暴露热运行退化后，检查本地
+   ffmpeg-next 的 Sink wrapper，发现它直接调用 buffersink；该 API 会将新
+   frame 引用移入目标，并不会清理目标旧内容。现在每次接收缩放输出前先
+   `av_frame_unref(rgb)`。之前的像素已经复制为独立 RgbImage，释放安全。
+   [FFmpeg buffersink 实现](https://ffmpeg.org/doxygen/8.0/buffersink_8c_source.html)
+
+第 5 项是本轮实现及连续任务验证时补查到的既有问题。它修正了历史报告中
+“解码器/特定窗口并发残留”的不完整归因：至少缩放输出 AVFrame 的旧引用没有
+释放是明确的调用方泄漏。回归测试验证输出帧替换后旧 buffer 引用数由 2 降到 1，
+剩余的 1 是测试主动保留的观察引用。
+
+### 单次 CLI 与 CPU
+
+相同 FFmpeg DLL、sample/input.mkv、固定参数、输出哈希门槛；最终版本各
+20 次新进程热文件缓存运行，交错顺序，P95 使用 nearest-rank。
+
+| 指标 | jj 保存的基线 | 最终版本 |
+|---|---:|---:|
+| 首轮观测 | 1.151s | 1.425s |
+| wall 中位数 | 1.239s | 1.198s |
+| wall P95 | 1.457s | 1.575s |
+| profile total 中位数 | 1.141s | 1.107s |
+| decode 中位数 | 0.959s | 0.925s |
+| encoder tail 中位数 | 0.168s | 0.164s |
+| 单次峰值 WS（独立各 1 次） | 503.3 MiB | 497.7 MiB |
+
+**单次 wall 中位数约降低 3.4%，P95 本批次反而增加约 8.1%；不能宣称尾延迟
+或冷启动已改善。** 本机绝对延迟有波动，且未清空系统缓存，首轮不是受控的
+磁盘冷缓存。所有进程/DLL/解码器/SVT 初始化仍包含在完整命令计时中。
+
+另用 Windows GetThreadTimes/GetProcessTimes 各四次交错采样：
+
+| CPU 中位数 | 基线 | 最终版本 | 降低 |
+|---|---:|---:|---:|
+| 主线程 | 0.796875s | 0.132813s | **83.3%** |
+| 整个进程 | 11.023438s | 10.500000s | 4.7% |
+
+CPU 时间不等于 wall；本轮最稳定的单次任务收益是减少空转占用。
+事件唤醒单独消融的 10 次/版本中位数约 1.22 → 1.21s，亦未显示明显的 wall
+改善。修复引用泄漏之前的组合版本 20 次对照为 1.156 → 1.147s，P95
+1.271 → 1.286s；这些中间测量不替代最终结果。
+
+### 同一进程连续任务与重复请求
+
+新增可显式运行的 release 集成测试 `repeated_service_jobs_and_cache_hits`：
+一个进程内，连续生成十个不同 cache path 的相同视频预览；每个完成后再提交
+同一请求，断言命中且不能再次调用 capture/publish。十个 AVIF 必须逐字节相同。
+使用真实的服务调度、complete_job、libav/SVT 和 manifest 代码，**不包含 DDS
+网络传输和 `ya pub-to` 的耗时，也不是十任务并发吞吐测试**。
+
+以下对照专门隔离最后的 buffersink 引用修复。修复前版本已经包含事件唤醒、
+编码缓冲复用与服务缓存，二者各连续运行十个任务；峰值由 Windows
+PeakWorkingSetSize/PeakPagefileUsage 读取：
+
+| 指标 | 引用修复前 | 引用修复后 |
+|---|---:|---:|
+| 十任务峰值 WS | 934.9 MiB | **582.1 MiB** |
+| 十任务峰值 commit | 1037.7 MiB | **652.7 MiB** |
+| 第 1 个任务 | 1.117s | 1.232s |
+| 第 8 个任务 | 1.391s | 1.215s |
+| 第 9 个任务 | 1.913s | 1.167s |
+| 第 10 个任务 | 2.166s | **1.282s** |
+
+修复后十次生成的范围为 **1.135–1.312s**；十次缓存复用为
+**0.475–0.850ms，中位数 0.660ms**。本次十任务不再出现后段持续升到 2s
+的形态，但这不等于任意长时间服务的内存上限证明。峰值 WS 仍高于 ADR 的
+512 MiB 预算，未宣称全部性能契约已达成。
+
+### 验证与复现
+
+- 最终 release 测试：**65 passed / 0 failed / 4 ignored**；连续十任务测试
+  另外显式运行通过。测试覆盖唤醒、断开、发送者 panic、满队列取消、旧 RGB
+  buffer 释放、YUV 编码往返、完整 DDS 描述符免 probe、缓存失效及等待者通知。
+- 默认 feature 配置 **56 passed / 0 failed / 3 ignored**。顺带修复既有
+  preview 测试辅助函数缺少 `in-process-decode` 门控的问题。
+- `lua scripts/test-gridthumb-metadata.lua` 验证 preload → DDS payload 链路，
+  覆盖单视频、多视频歧义和封面图；`luac -p gridthumb.yazi/main.lua` 通过。
+- 固定样本、H.264 MP4、HEVC MKV、H.264 VFR MKV 共 **1080 张 RGB、1080 个
+  PTS 和四个 AVIF** 均与 jj 基线一致。固定样本 SHA-256 仍为
+  `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+- `git diff --check` 通过。原始 CSV/日志/采样器/二进制保留在
+  `.scratch/startup/phase2/`，最终数据为 `stable-comparison/results.csv`、
+  `stable-cpu.json`、`verification-stable/results.json`、
+  `service-before-memory.log`、`service-stable-memory.log`。
+
+```powershell
+$env:PKG_CONFIG_PATH = 'D:\ffmpeg-dev\ffmpeg-8.1.2-full_build-shared\lib\pkgconfig'
+$env:PATH = 'D:\ffmpeg-dev\libav-deploy;' + $env:PATH
+cargo test --release --features in-process-decode repeated_service_jobs_and_cache_hits -- --ignored --nocapture
+.\scripts\bench-startup.ps1 -Baseline .\.scratch\startup\phase2\baseline.exe -Candidate .\target\release\vimg.exe -OutputDirectory .scratch/startup/phase2/recheck -Runs 20
+.\target\release\vimg.exe vcs -c3 -H160 -n9 .\sample\input.mkv --output output3.avif
+```
+
+本轮没有直接删除九个 worker 的 stream-info probe：它们需要独立且完整的
+codec 参数、像素格式与 seek 状态。本次减少的是 DDS 完整描述符下的 plan
+probe；跨 worker 的 header/codec 参数共享仍需单独实现和验证。亦未改变
+并发任务上限、帧数、CRF、preset 或硬解策略。PATH 中的旧版 exe 未被替换，
+新版及匹配 DLL 位于 `target/release`。
+
 ## 2026-09-12：进一步效率审查
 
 详见 [当前代码效率复核](docs/reviews/2026-09-12-efficiency-review.md)。

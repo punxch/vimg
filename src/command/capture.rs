@@ -1542,8 +1542,10 @@ mod tests {
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+    #[cfg(feature = "in-process-decode")]
     use std::path::PathBuf;
 
+    #[cfg(feature = "in-process-decode")]
     fn preview_avif() -> PathBuf {
         // Reuse the in-process encoder to build a tiny real AVIF (1.5s, 64x64,
         // 20fps, 30 frames) that the probe can read, with no external fixtures.
@@ -1558,7 +1560,7 @@ mod probe_tests {
                 let v = ((x + y + frame * 3) % 256) as u8;
                 image::Rgb([v, v.wrapping_mul(2), v.wrapping_mul(3)])
             });
-            encoder.write_grid(&grid).unwrap();
+            encoder.write_grid(grid).unwrap();
         }
         encoder.finish().unwrap();
         path

@@ -3,7 +3,7 @@ use anyhow::{Context, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     sync::{Arc, Condvar, Mutex},
@@ -15,6 +15,9 @@ const REQUEST_EVENT: &str = "vimg-gridthumb-request";
 const READY_EVENT: &str = "gridthumb-avif-ready";
 const FAILED_EVENT: &str = "gridthumb-avif-failed";
 const MAX_JOBS: usize = 10;
+// Bump when the fixed preview's output contract changes. Legacy manifests
+// remain readable by the plugin, but are not sufficient for server reuse.
+const CACHE_PROFILE: &str = "vimg-preview-3x3-h160-n9-f30-crf30-v1";
 
 /// Run as a service, receiving vimg jobs from Yazi DDS.
 #[derive(clap::Parser, Debug)]
@@ -49,6 +52,9 @@ pub struct Send {
     /// Source video height captured by the preview client.
     #[arg(long)]
     pub height: Option<u32>,
+    /// Codec name of the selected video stream, captured by the preview client.
+    #[arg(long)]
+    pub codec: Option<String>,
     /// Numerator of the selected video stream's time base, captured by the preview client.
     #[arg(long)]
     pub source_time_base_numerator: Option<i32>,
@@ -109,6 +115,11 @@ impl Job {
             .map(|(numerator, denominator)| {
                 command::frame_schedule::Rational::new(numerator, denominator)
             });
+        let codec = value
+            .get("codec")
+            .and_then(serde_json::Value::as_str)
+            .filter(|codec| !codec.is_empty())
+            .map(str::to_owned);
         Some(Self {
             file: PathBuf::from(value.get("file")?.as_str()?),
             cache: PathBuf::from(value.get("cache")?.as_str()?),
@@ -118,12 +129,13 @@ impl Job {
             media: (duration_s.is_some()
                 || width.is_some()
                 || height.is_some()
-                || source_time_base.is_some())
+                || source_time_base.is_some()
+                || codec.is_some())
             .then_some(command::MediaDescriptor {
                 duration_s,
                 width,
                 height,
-                codec: None,
+                codec,
                 source_time_base,
             }),
             yazi_id: value
@@ -324,13 +336,16 @@ fn worker(
             &job,
             capture_backend,
             |backend| run_vcs(&job.file, &job.cache, job.media.as_ref(), backend),
-            || publish_manifest(&job),
+            || publish_manifest(&job, capture_backend),
         );
         if std::env::var("VIMG_PROTO_MI_STATS").is_ok_and(|value| value == "1") {
             report_mi_stats();
         }
         match completion.outcome {
-            ServiceJobOutcome::Published => {
+            ServiceJobOutcome::Published | ServiceJobOutcome::Reused => {
+                if completion.outcome == ServiceJobOutcome::Reused {
+                    println!("[serve:{worker_id}] Cache hit: {}", job.file_name());
+                }
                 notify_yazi(
                     &job.file,
                     &job.cache,
@@ -363,6 +378,7 @@ struct ServiceCompletion {
 #[derive(Debug, Eq, PartialEq)]
 enum ServiceJobOutcome {
     Published,
+    Reused,
     Failed(String),
 }
 
@@ -373,6 +389,12 @@ fn complete_job(
     run_capture: impl FnOnce(command::CaptureBackendPolicy) -> anyhow::Result<()>,
     publish: impl FnOnce() -> anyhow::Result<()>,
 ) -> ServiceCompletion {
+    if cache_is_current(job, capture_backend) {
+        return ServiceCompletion {
+            outcome: ServiceJobOutcome::Reused,
+            subscribers: scheduler.finish(&job.cache),
+        };
+    }
     let outcome = match run_capture(capture_backend) {
         Ok(()) => match publish() {
             Ok(()) => ServiceJobOutcome::Published,
@@ -392,8 +414,7 @@ fn complete_job(
     }
 }
 
-fn source_descriptor(video: &Path) -> anyhow::Result<SourceDescriptor> {
-    let metadata = fs::metadata(video)?;
+fn source_descriptor(metadata: &fs::Metadata) -> anyhow::Result<SourceDescriptor> {
     let modified_s = metadata
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
@@ -414,15 +435,72 @@ fn manifest_path(cache: &Path, source: &SourceDescriptor) -> PathBuf {
     ))
 }
 
-fn publish_manifest(job: &Job) -> anyhow::Result<()> {
-    let source = match &job.source {
-        Some(source) => source.clone(),
-        None => source_descriptor(&job.file)?,
+fn current_manifest(
+    job: &Job,
+    backend: command::CaptureBackendPolicy,
+) -> anyhow::Result<(SourceDescriptor, serde_json::Value)> {
+    let source_metadata = fs::metadata(&job.file)?;
+    ensure!(source_metadata.is_file(), "preview source is not a file");
+    let source = source_descriptor(&source_metadata)?;
+    ensure!(
+        job.source
+            .as_ref()
+            .is_none_or(|requested| requested == &source),
+        "preview source changed since the request"
+    );
+    let mut output = fs::File::open(&job.cache)?;
+    let output_metadata = output.metadata()?;
+    ensure!(output_metadata.is_file(), "preview output is not a file");
+    let mut header = [0; 12];
+    output.read_exact(&mut header)?;
+    ensure!(
+        &header[4..8] == b"ftyp" && matches!(&header[8..12], b"avif" | b"avis"),
+        "preview output has no AVIF header"
+    );
+    let modified_ns = |metadata: &fs::Metadata| -> anyhow::Result<String> {
+        Ok(metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_string())
     };
     let manifest = serde_json::json!({
         "source_size": source.size,
         "source_modified_s": source.modified_s,
+        "source_modified_ns": modified_ns(&source_metadata)?,
+        "source_path": fs::canonicalize(&job.file)?.to_string_lossy(),
+        "output_size": output_metadata.len(),
+        "output_modified_ns": modified_ns(&output_metadata)?,
+        "profile": CACHE_PROFILE,
+        "backend_policy": backend.name(),
+        "prototype_run": prototype_run(),
     });
+    Ok((source, manifest))
+}
+
+fn cache_is_current(job: &Job, backend: command::CaptureBackendPolicy) -> bool {
+    // Diagnostic knobs can change the capture profile or intentionally omit
+    // work. Neither consume cached results nor promote them to normal runs.
+    if prototype_run() {
+        return false;
+    }
+    let check = || -> anyhow::Result<bool> {
+        let (source, expected) = current_manifest(job, backend)?;
+        let bytes = fs::read(manifest_path(&job.cache, &source))?;
+        let stored: serde_json::Value = serde_json::from_slice(&bytes)?;
+        Ok(stored == expected)
+    };
+    // Missing, legacy, changed or invalid artifacts take the generation path.
+    check().unwrap_or(false)
+}
+
+fn prototype_run() -> bool {
+    std::env::vars_os().any(|(name, _)| name.to_string_lossy().starts_with("VIMG_PROTO_"))
+}
+
+fn publish_manifest(job: &Job, backend: command::CaptureBackendPolicy) -> anyhow::Result<()> {
+    let (source, manifest) = current_manifest(job, backend)?;
     let manifest_path = manifest_path(&job.cache, &source);
     let parent = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let temporary = parent.join(format!(".{}.tmp", fastrand::u64(..)));
@@ -480,6 +558,7 @@ impl Send {
             "duration_s": self.duration_s,
             "width": self.width,
             "height": self.height,
+            "codec": self.codec,
             "source_time_base_numerator": self.source_time_base_numerator,
             "source_time_base_denominator": self.source_time_base_denominator,
         })
@@ -595,6 +674,7 @@ mod tests {
     use std::cell::Cell;
     #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
     use std::cell::RefCell;
+    use std::io::Write;
 
     fn job(cache: &str) -> Job {
         Job {
@@ -902,6 +982,118 @@ mod tests {
     }
 
     #[test]
+    fn complete_dds_descriptor_plans_without_reopening_the_video() {
+        let job = Job::from_json(
+            r#"{"file":"missing-probe-test.mkv","cache":"preview.avif","duration_s":12.5,"width":1920,"height":1080,"codec":"h264","source_time_base_numerator":1,"source_time_base_denominator":1000}"#,
+        ).unwrap();
+        let vcs = vcs_for_job(
+            &job.file,
+            &job.cache,
+            job.media.as_ref(),
+            command::CaptureBackendPolicy::Auto,
+        );
+        let capture = command::Capture::plan(&vcs.args, Some(160), None, 4).unwrap();
+        assert_eq!(capture.capture_plan().media().codec, "h264");
+        let mut partial = vcs.args;
+        partial.media.as_mut().unwrap().codec = None;
+        assert!(command::Capture::plan(&partial, Some(160), None, 4).is_err());
+    }
+
+    fn cached_test_job(root: &Path) -> Job {
+        let mut job = job("unused");
+        job.file = root.join("video.mkv");
+        job.cache = root.join("preview.avif");
+        fs::write(&job.file, b"source").unwrap();
+        // A header fixture for testing manifest reuse, not decoding.
+        fs::write(&job.cache, b"\0\0\0\x18ftypavif\0\0\0\0avifmif1").unwrap();
+        job
+    }
+
+    #[test]
+    fn completed_cache_skips_generation_and_notifies_all_waiters() {
+        let root = temporary_test_dir("cache-hit");
+        let mut job = cached_test_job(&root);
+        let policy = command::CaptureBackendPolicy::Auto;
+        publish_manifest(&job, policy).unwrap();
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        job.yazi_id = Some("first".to_owned());
+        scheduler.submit(job.clone());
+        job.yazi_id = Some("second".to_owned());
+        scheduler.submit(job);
+        let active = scheduler.next();
+        let mut completion = complete_job(
+            &scheduler,
+            &active,
+            policy,
+            |_| panic!("cache hit must not run capture"),
+            || panic!("cache hit must not republish"),
+        );
+        assert_eq!(completion.outcome, ServiceJobOutcome::Reused);
+        completion.subscribers.sort();
+        assert_eq!(completion.subscribers, ["first", "second"]);
+        assert!(scheduler.state.lock().unwrap().jobs.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_requires_matching_profile_source_and_unchanged_output() {
+        let root = temporary_test_dir("cache-invalid");
+        let job = cached_test_job(&root);
+        let policy = command::CaptureBackendPolicy::Auto;
+        let (source, _) = current_manifest(&job, policy).unwrap();
+        let manifest = manifest_path(&job.cache, &source);
+        assert!(!cache_is_current(&job, policy));
+        fs::write(&manifest, b"{\"source_size\":6,\"source_modified_s\":0}").unwrap();
+        assert!(!cache_is_current(&job, policy));
+        publish_manifest(&job, policy).unwrap();
+        assert!(cache_is_current(&job, policy));
+        assert!(!cache_is_current(
+            &job,
+            command::CaptureBackendPolicy::Ffmpeg
+        ));
+        let mut stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest).unwrap()).unwrap();
+        stored["profile"] = "obsolete".into();
+        fs::write(&manifest, stored.to_string()).unwrap();
+        assert!(!cache_is_current(&job, policy));
+        publish_manifest(&job, policy).unwrap();
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&job.cache)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(!cache_is_current(&job, policy));
+        publish_manifest(&job, policy).unwrap();
+        fs::write(&job.cache, b"damaged output").unwrap();
+        assert!(!cache_is_current(&job, policy));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cache_rejects_source_changes_within_the_same_second() {
+        let root = temporary_test_dir("cache-source-stamp");
+        let job = cached_test_job(&root);
+        let source = fs::OpenOptions::new().write(true).open(&job.file).unwrap();
+        let timestamp = std::time::UNIX_EPOCH + Duration::new(1_700_000_000, 100_000);
+        source
+            .set_times(fs::FileTimes::new().set_modified(timestamp))
+            .unwrap();
+        let policy = command::CaptureBackendPolicy::Auto;
+        publish_manifest(&job, policy).unwrap();
+        assert!(cache_is_current(&job, policy));
+        source
+            .set_times(fs::FileTimes::new().set_modified(timestamp + Duration::from_millis(1)))
+            .unwrap();
+        assert!(!cache_is_current(&job, policy));
+        drop(source);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn service_startup_policy_is_propagated_to_each_vcs_job() {
         let vcs = vcs_for_job(
             Path::new("video.mkv"),
@@ -970,6 +1162,74 @@ mod tests {
 
         assert!(error.to_string().starts_with("Video file not found:"));
         assert!(!output.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "in-process-decode")]
+    #[test]
+    #[ignore = "measures ten real preview jobs in one process; requires sample/input.mkv"]
+    fn repeated_service_jobs_and_cache_hits() {
+        let video = std::env::var_os("VIMG_BENCH_VIDEO")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("sample/input.mkv"));
+        let root = temporary_test_dir("service-warm-benchmark");
+        let policy = command::CaptureBackendPolicy::Libav;
+        let vcs = vcs_for_job(&video, &root.join("unused.avif"), None, policy);
+        let capture = command::Capture::plan(&vcs.args, Some(160), None, 4).unwrap();
+        let properties = capture.capture_plan().media();
+        let media = command::MediaDescriptor {
+            duration_s: Some(properties.duration_s),
+            width: Some(properties.width),
+            height: Some(properties.height),
+            codec: Some(properties.codec.clone()),
+            source_time_base: Some(properties.source_time_base),
+        };
+        let source = source_descriptor(&fs::metadata(&video).unwrap()).unwrap();
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let mut reference = None;
+        for index in 0..10 {
+            let job = Job {
+                file: video.clone(),
+                cache: root.join(format!("{index}.avif")),
+                source: Some(source.clone()),
+                media: Some(media.clone()),
+                yazi_id: None,
+            };
+            scheduler.submit(job.clone());
+            let active = scheduler.next();
+            let started = Instant::now();
+            let result = complete_job(
+                &scheduler,
+                &active,
+                policy,
+                |backend| run_vcs(&active.file, &active.cache, active.media.as_ref(), backend),
+                || publish_manifest(&active, policy),
+            );
+            let render = started.elapsed().as_secs_f64();
+            assert_eq!(result.outcome, ServiceJobOutcome::Published);
+            let bytes = fs::read(&active.cache).unwrap();
+            if let Some(reference) = &reference {
+                assert_eq!(&bytes, reference);
+            } else {
+                reference = Some(bytes);
+            }
+            scheduler.submit(job);
+            let active = scheduler.next();
+            let started = Instant::now();
+            let result = complete_job(
+                &scheduler,
+                &active,
+                policy,
+                |_| panic!("repeat request rendered again"),
+                || panic!("repeat request republished"),
+            );
+            let cached = started.elapsed().as_secs_f64();
+            assert_eq!(result.outcome, ServiceJobOutcome::Reused);
+            println!("[service-bench] job={index} render={render:.6}s cached={cached:.6}s");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
