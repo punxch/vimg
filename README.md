@@ -62,6 +62,23 @@ Copy [`gridthumb.yazi`](gridthumb.yazi) into Yazi's plugin directory and call
 `require("gridthumb"):setup()` from `init.lua`. `vimg send` remains available
 as a command-line DDS publisher for diagnostics and compatibility.
 
+### Measure resident previews on Windows
+
+Build release tests with `cargo test --release --features in-process-decode --no-run`,
+then pass the resulting test executable to the benchmark:
+
+```powershell
+python scripts/bench-service.py --test-exe target/release/deps/vimg-<hash>.exe --dll-dir D:/ffmpeg-dev/libav-deploy --output-dir .scratch/service-budget --jobs-per-process 50 --max-p95-seconds 1.3 --max-peak-mb 512
+```
+
+Use your libav DLL directory and a new output directory for each run. The script
+compares immediate jobs with jobs started after ten seconds of process idle time,
+records phase timings and CPU/memory observations, and verifies repeated output
+and cache reuse. Each process must meet the requested warm P95 and observed peak
+working-set budgets; MB means 1,000,000 bytes. Exit 2 reports a budget violation
+or relative slowdown. Results exclude DDS transport and do not measure a cold
+disk cache. Omitting the absolute budgets checks only relative slowdown.
+
 ## Install
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/vimg).

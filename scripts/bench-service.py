@@ -6,10 +6,14 @@ Then supply the test executable (not target/release/vimg.exe):
   python scripts/bench-service.py --test-exe target/release/deps/vimg-<hash>.exe \
       --dll-dir D:/ffmpeg-dev/libav-deploy --output-dir .scratch/service-age
 
-Each process generates ten previews and checks ten cache hits. Alternates whole
+Each process generates --jobs-per-process previews and checks their cache hits. Alternates whole
 fresh/aged processes in AB/BA order; no cache purge or DDS notification timing.
-Exit 2 means a measured slowdown exceeds --max-slowdown, not a proven code bug.
-Exit 0 does not imply the separate 1.3-second P95 performance target was met.
+Exit 2 means a measured slowdown or requested absolute budget was exceeded,
+not a proven code bug. Absolute budgets are opt-in; for the preview contract use
+--jobs-per-process 50 --max-p95-seconds 1.3 --max-peak-mb 512.
+MB uses 1,000,000 bytes; reported MiB uses 1,048,576 bytes. The P95 budget checks
+each process separately after excluding its first render, so a fast process
+cannot hide a slow one. CPU/memory observation and logging add measurement cost.
 """
 
 import argparse
@@ -34,7 +38,7 @@ def distribution(values):
                 minimum=values[0], maximum=values[-1])
 
 
-def summarize(runs, max_slowdown):
+def summarize(runs, max_slowdown, max_p95_seconds=None, max_peak_mb=None):
     """Compare first-three medians by round and last/first within each process."""
     comparisons = []
     for round_index in sorted({run['round'] for run in runs}):
@@ -48,7 +52,21 @@ def summarize(runs, max_slowdown):
         last = median(job['render'] for job in run['jobs'][-3:])
         sequences.append(dict(round=run['round'], arm=run['arm'], first=first,
                               last=last, ratio=last / first))
-    return dict(age_comparisons=comparisons, sequences=sequences,
+    budgets = []
+    violations = []
+    for run in runs:
+        warm = distribution([job['render'] for job in run['jobs'][1:]])
+        memories = [job['memory']['peak_ws_mib'] for job in run['jobs'] if job.get('memory')]
+        peak_mb = max(memories) * 1048576 / 1000000 if memories else None
+        budgets.append(dict(round=run['round'], arm=run['arm'], warm_samples=len(run['jobs']) - 1,
+                            warm=warm, peak_ws_mb=peak_mb))
+        for metric, observed, limit in [('warm_p95_seconds', warm['p95'], max_p95_seconds),
+                                        ('peak_ws_mb', peak_mb, max_peak_mb)]:
+            if limit is not None and (observed is None or observed > limit):
+                violations.append(dict(round=run['round'], arm=run['arm'], metric=metric,
+                                       observed=observed, limit=limit))
+    return dict(age_comparisons=comparisons, sequences=sequences, process_budgets=budgets,
+                budget_violations=violations, budget_exceeded=bool(violations),
                 warm={arm: distribution([job['render'] for run in runs if run['arm'] == arm
                                          for job in run['jobs'][1:]]) for arm in ['fresh', 'aged']},
                 slowdown_detected=any(row['ratio'] > max_slowdown for row in comparisons + sequences))
@@ -94,8 +112,10 @@ class WindowsCounters:
 
 
 def measure(args, round_index, arm, counters):
+    repetitions = getattr(args, 'jobs_per_process', 10)
     env = {key: value for key, value in os.environ.items() if not key.startswith('VIMG_')}
     env.update(VIMG_BENCH_PACED='1', VIMG_BENCH_PROFILE='1', VIMG_BENCH_VIDEO=str(args.video))
+    env['VIMG_BENCH_REPETITIONS'] = str(repetitions)
     if args.dll_dir:
         env['PATH'] = str(args.dll_dir) + os.pathsep + env.get('PATH', '')
     log_path = args.output_dir / f'{round_index}-{arm}.log'
@@ -134,7 +154,7 @@ def measure(args, round_index, arm, counters):
             delay = args.idle_seconds if arm == 'aged' else 0
             print(f'round={round_index} {arm}: ready; idle={delay}s', flush=True)
             time.sleep(delay)
-            for index in range(10):
+            for index in range(repetitions):
                 before = counters.snapshot(process)
                 process.stdin.write('run\n')
                 process.stdin.flush()
@@ -191,6 +211,12 @@ def main():
     parser.add_argument('--rounds', type=int, default=2)
     parser.add_argument('--idle-seconds', type=float, default=10)
     parser.add_argument('--max-slowdown', type=float, default=1.3)
+    parser.add_argument('--jobs-per-process', type=int, default=10,
+                        help='renders per process, 4..1000; use at least 50 to assess P95')
+    parser.add_argument('--max-p95-seconds', type=float,
+                        help='optional per-process warm P95 budget, excluding its first render')
+    parser.add_argument('--max-peak-mb', type=float,
+                        help='optional per-process peak working-set budget in decimal MB')
     args = parser.parse_args()
     if os.name != 'nt':
         parser.error('Windows CPU/memory counters are required')
@@ -200,6 +226,12 @@ def main():
         parser.error('--idle-seconds must be between 0 and 3600')
     if not math.isfinite(args.max_slowdown) or args.max_slowdown <= 1:
         parser.error('--max-slowdown must be greater than 1')
+    if not 4 <= args.jobs_per_process <= 1000:
+        parser.error('--jobs-per-process must be between 4 and 1000')
+    for name in ['max_p95_seconds', 'max_peak_mb']:
+        value = getattr(args, name)
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error(f'--{name.replace("_", "-")} must be finite and greater than 0')
     args.repo = Path(__file__).resolve().parents[1]
     for field in ['test_exe', 'video']:
         path = getattr(args, field).resolve(strict=True)
@@ -217,6 +249,8 @@ def main():
                     video=str(args.video), video_size=args.video.stat().st_size,
                     video_mtime_ns=args.video.stat().st_mtime_ns, rounds=args.rounds,
                     idle_seconds=args.idle_seconds, max_slowdown=args.max_slowdown,
+                    jobs_per_process=args.jobs_per_process,
+                    max_p95_seconds=args.max_p95_seconds, max_peak_mb=args.max_peak_mb,
                     logical_processors=os.cpu_count(),
                     active_power_scheme=subprocess.check_output(['powercfg', '/getactivescheme']).decode(errors='replace'))
     (args.output_dir / 'environment.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
@@ -225,10 +259,10 @@ def main():
     for round_index in range(args.rounds):
         for arm in (['fresh', 'aged'] if round_index % 2 == 0 else ['aged', 'fresh']):
             runs.append(measure(args, round_index, arm, counters))
-    summary = summarize(runs, args.max_slowdown)
+    summary = summarize(runs, args.max_slowdown, args.max_p95_seconds, args.max_peak_mb)
     (args.output_dir / 'summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(json.dumps(summary, indent=2))
-    return 2 if summary['slowdown_detected'] else 0
+    return 2 if summary['slowdown_detected'] or summary['budget_exceeded'] else 0
 
 
 if __name__ == '__main__':

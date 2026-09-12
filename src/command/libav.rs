@@ -238,13 +238,13 @@ fn hw_sw_frame(hw_frame: &Video) -> Option<Video> {
 }
 
 const DECODER_THREADS: usize = 2;
-/// Reserve a third frame thread for long seek prerolls. Shorter windows keep
+/// Allow four frame threads for long seek prerolls. Shorter windows keep
 /// two threads to reduce decoder buffers and competition with slow workers.
 /// This only selects decoder parallelism; the seek and frame-selection rules
 /// are unchanged. The threshold is measured with the fixed Preview profile;
 /// see report.md for CLI/service timings and the remaining memory limits.
-const PREROLL_DT3_THRESHOLD_S: f64 = 6.0;
-const DECODER_THREADS_LONG_PREROLL: usize = 3;
+const LONG_PREROLL_THRESHOLD_S: f64 = 6.0;
+const DECODER_THREADS_LONG_PREROLL: usize = 4;
 type AuthorityRecords = Arc<Mutex<Vec<Option<Vec<SourceSelection>>>>>;
 
 pub(super) fn start(
@@ -591,7 +591,7 @@ fn decode_capture(request: DecodeRequest<'_>) -> anyhow::Result<CaptureMetrics> 
                 .pts()
                 .map(|pts| (f64::from(start_s) - pts as f64 * f64::from(time_base)).max(0.0))
                 .unwrap_or(0.0);
-            let threshold = PREROLL_DT3_THRESHOLD_S;
+            let threshold = LONG_PREROLL_THRESHOLD_S;
             // Ignored service benchmarks compare policies in one test binary.
             #[cfg(test)]
             let threshold = std::env::var("VIMG_BENCH_DT3_THRESHOLD")
