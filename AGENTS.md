@@ -1,7 +1,5 @@
-## Version control
-
-Use Git to manage this repository. Use `git status`, `git add`, `git commit`, and
-`git push` for version-control work.
+## 版本控制：
+本仓库使用 Git 管理版本。使用 `git status` 和 `git diff` 检查更改，再用 `git add`、`git commit` 和 `git push` 暂存、提交并推送更改。不再初始化或使用 jj。
 
 ## 已完成：
 需要优化执行效率，以下面的命令为测试方法。记录当前的耗时，并对比优化后的耗时，优化结果输出记录到report.md
