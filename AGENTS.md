@@ -1,3 +1,8 @@
+## Version control
+
+Use Git to manage this repository. Use `git status`, `git add`, `git commit`, and
+`git push` for version-control work.
+
 ## 已完成：
 需要优化执行效率，以下面的命令为测试方法。记录当前的耗时，并对比优化后的耗时，优化结果输出记录到report.md
 run shell:
