@@ -49,6 +49,18 @@ throughput matters more than first-preview latency and memory use. `--jobs`
 accepts 1 through 10; running and queued jobs together remain capped at ten.
 If all ten are already running, a new distinct request receives `busy`.
 
+The plugin marks requests with `latest: true`. Each Yazi instance then keeps
+one current preview interest: switching previews removes its previous interest,
+and a queued job with no remaining requester is removed. Hovering another file
+or switching tabs also sends `vimg-gridthumb-cancel` with the previous `cache`,
+including when the new file already has a cache or needs no video preview.
+Running jobs finish and populate their caches. Shared requests from other
+instances and ordinary requests without `latest` remain intact; `vimg send`
+keeps its batch behavior. Interactive interest and cancellation use the DDS
+sender ID, and cancellation only matches that sender's current cache.
+When a result is ready, the plugin forces a preview refresh for the hovered
+file while preserving its current preview position.
+
 With the native backend on Windows hybrid CPUs, `serve --cpu-policy auto`
 (the default) selects the performance cores to keep idle-service preview
 latency stable. Core types come from Windows; existing process affinity or

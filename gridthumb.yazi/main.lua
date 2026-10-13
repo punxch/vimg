@@ -1,6 +1,22 @@
 local M = {}
 local media_descriptors = {}
-local publish_avif_request = ya.sync(function(_, request)
+local function cancel_stale_preview(state)
+	local hovered = cx.active.current.hovered
+	if state.preview and (not hovered or state.preview.file ~= tostring(hovered.url)) then
+		ps.pub_to(0, "vimg-gridthumb-cancel", { cache = state.preview.cache })
+		state.preview = nil
+	end
+end
+
+local publish_avif_request = ya.sync(function(state, request)
+	cancel_stale_preview(state)
+	local hovered = cx.active.current.hovered
+	-- An async preload may finish after the user has moved to another file.
+	if not hovered or request.file ~= tostring(hovered.url) then
+		return
+	end
+	state.preview = { file = request.file, cache = request.cache }
+	request.latest = true
 	ps.pub_to(0, "vimg-gridthumb-request", request)
 end)
 
@@ -61,11 +77,15 @@ local function media_descriptor(url, meta)
 end
 
 function M:setup()
+	ps.sub("hover", function() cancel_stale_preview(self) end)
+	ps.sub("tab", function() cancel_stale_preview(self) end)
 	ps.sub_remote("gridthumb-avif-ready", function(body)
 		local hovered = cx.active.current.hovered
 		if hovered and body and body.file == tostring(hovered.url) then
 			ya.dbg("[gridthumb] avif ready:", tostring(body.cache))
-			ya.emit("peek", { 0, only_if = hovered.url })
+			-- The source file is unchanged, but its animated cache is now ready.
+			-- Force a new peek without resetting the current preview position.
+			ya.emit("peek", { only_if = hovered.url, force = true })
 		end
 	end)
 end

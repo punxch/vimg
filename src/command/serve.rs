@@ -12,6 +12,7 @@ use std::{
 };
 
 const REQUEST_EVENT: &str = "vimg-gridthumb-request";
+const CANCEL_EVENT: &str = "vimg-gridthumb-cancel";
 const READY_EVENT: &str = "gridthumb-avif-ready";
 const FAILED_EVENT: &str = "gridthumb-avif-failed";
 const MAX_JOBS: usize = 10;
@@ -85,8 +86,13 @@ struct Job {
 }
 
 impl Job {
+    #[cfg(test)]
     fn from_json(line: &str) -> Option<Self> {
         let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        Self::from_value(&value)
+    }
+
+    fn from_value(value: &serde_json::Value) -> Option<Self> {
         let source_size = value.get("source_size").and_then(serde_json::Value::as_u64);
         let source_modified_s = value
             .get("source_modified_s")
@@ -162,7 +168,10 @@ impl Job {
 #[derive(Default)]
 struct QueueState {
     jobs: HashSet<PathBuf>,
+    // Legacy/batch requests remain subscribed until completion. Interactive
+    // clients opt into one replaceable preview interest per Yazi instance.
     subscribers: HashMap<PathBuf, HashSet<String>>,
+    previews: HashMap<String, PathBuf>,
     queued: VecDeque<Job>,
     active: HashSet<PathBuf>,
 }
@@ -177,6 +186,7 @@ enum SubmitResult {
     Queued,
     Shared,
     Busy,
+    Cancelled,
 }
 
 impl SubmitResult {
@@ -185,15 +195,42 @@ impl SubmitResult {
             Self::Queued => "queued",
             Self::Shared => "shared",
             Self::Busy => "busy",
+            Self::Cancelled => "cancelled",
         }
     }
 }
 
 impl Scheduler {
     fn submit(&self, job: Job) -> SubmitResult {
+        self.submit_inner(job, false)
+    }
+
+    fn submit_inner(&self, job: Job, latest: bool) -> SubmitResult {
         let mut state = self.state.lock().unwrap();
+        if latest {
+            if let Some(id) = &job.yazi_id {
+                if state
+                    .previews
+                    .get(id)
+                    .is_some_and(|cache| cache != &job.cache)
+                {
+                    let previous = state.previews.remove(id).unwrap();
+                    remove_orphaned_preview(&mut state, &previous);
+                }
+            }
+        }
         if state.jobs.contains(&job.cache) {
-            add_subscriber(&mut state, &job);
+            add_subscriber(&mut state, &job, latest);
+            if latest {
+                if let Some(index) = state
+                    .queued
+                    .iter()
+                    .position(|queued| queued.cache == job.cache)
+                {
+                    let queued = state.queued.remove(index).unwrap();
+                    state.queued.push_back(queued);
+                }
+            }
             return SubmitResult::Shared;
         }
 
@@ -202,16 +239,30 @@ impl Scheduler {
             if let Some(evicted) = state.queued.pop_front() {
                 state.jobs.remove(&evicted.cache);
                 state.subscribers.remove(&evicted.cache);
+                state.previews.retain(|_, cache| cache != &evicted.cache);
             } else {
                 return SubmitResult::Busy;
             }
         }
 
-        add_subscriber(&mut state, &job);
+        add_subscriber(&mut state, &job, latest);
         state.jobs.insert(job.cache.clone());
         state.queued.push_back(job);
         self.ready.notify_one();
         SubmitResult::Queued
+    }
+
+    fn cancel_preview(&self, id: &str, cache: &Path) {
+        let mut state = self.state.lock().unwrap();
+        // A delayed cancellation for an older preview cannot cancel its successor.
+        if state
+            .previews
+            .get(id)
+            .is_some_and(|current| current == cache)
+        {
+            state.previews.remove(id);
+            remove_orphaned_preview(&mut state, cache);
+        }
     }
 
     fn next(&self) -> Job {
@@ -230,22 +281,45 @@ impl Scheduler {
         let mut state = self.state.lock().unwrap();
         state.jobs.remove(cache);
         state.active.remove(cache);
-        state
-            .subscribers
-            .remove(cache)
-            .unwrap_or_default()
-            .into_iter()
-            .collect()
+        let mut subscribers = state.subscribers.remove(cache).unwrap_or_default();
+        state.previews.retain(|id, current| {
+            if current == cache {
+                subscribers.insert(id.clone());
+                false
+            } else {
+                true
+            }
+        });
+        subscribers.into_iter().collect()
     }
 }
 
-fn add_subscriber(state: &mut QueueState, job: &Job) {
+fn remove_orphaned_preview(state: &mut QueueState, cache: &Path) {
+    if state.subscribers.contains_key(cache)
+        || state.previews.values().any(|current| current == cache)
+    {
+        return;
+    }
+    if let Some(index) = state.queued.iter().position(|job| job.cache == cache) {
+        state.queued.remove(index);
+        state.jobs.remove(cache);
+    }
+}
+
+fn add_subscriber(state: &mut QueueState, job: &Job, latest: bool) {
     if let Some(yazi_id) = &job.yazi_id {
-        state
-            .subscribers
-            .entry(job.cache.clone())
-            .or_default()
-            .insert(yazi_id.clone());
+        if latest {
+            state.previews.insert(yazi_id.clone(), job.cache.clone());
+        } else {
+            state
+                .subscribers
+                .entry(job.cache.clone())
+                .or_default()
+                .insert(yazi_id.clone());
+        }
+    } else {
+        // An anonymous batch job is still requested work, not an orphan.
+        state.subscribers.entry(job.cache.clone()).or_default();
     }
 }
 
@@ -291,7 +365,7 @@ impl Serve {
 fn receive_yazi_requests(scheduler: Arc<Scheduler>) -> anyhow::Result<()> {
     loop {
         let mut child = ProcessCommand::new("ya")
-            .args(["sub", REQUEST_EVENT])
+            .args(["sub", &format!("{REQUEST_EVENT},{CANCEL_EVENT}")])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -332,15 +406,42 @@ fn submit_request(line: &str, scheduler: &Scheduler) -> Result<SubmitResult, ()>
 fn submit_dds_message(line: &str, scheduler: &Scheduler) -> anyhow::Result<SubmitResult> {
     let mut fields = line.splitn(4, ',');
     let kind = fields.next().context("missing event kind")?;
-    ensure!(kind == REQUEST_EVENT, "unexpected event kind {kind}");
+    ensure!(
+        matches!(kind, REQUEST_EVENT | CANCEL_EVENT),
+        "unexpected event kind {kind}"
+    );
     let _receiver = fields.next().context("missing receiver")?;
     let sender = fields.next().context("missing sender")?;
     let body = fields.next().context("missing JSON body")?;
-    let mut job = Job::from_json(body).context("invalid JSON body")?;
+    let value: serde_json::Value = serde_json::from_str(body).context("invalid JSON body")?;
+    if kind == CANCEL_EVENT {
+        ensure!(
+            sender != "0" && !sender.is_empty(),
+            "cancellation requires a sender"
+        );
+        let cache = value
+            .get("cache")
+            .and_then(serde_json::Value::as_str)
+            .context("missing cache")?;
+        scheduler.cancel_preview(sender, Path::new(cache));
+        return Ok(SubmitResult::Cancelled);
+    }
+    let mut job = Job::from_value(&value).context("invalid job fields")?;
     if job.yazi_id.is_none() && sender != "0" {
         job.yazi_id = Some(sender.to_owned());
     }
-    Ok(scheduler.submit(job))
+    if value.get("latest").and_then(serde_json::Value::as_bool) == Some(true) {
+        // Interactive interest belongs to the DDS sender, not a forwarded
+        // notification target. CLI/batch clients retain the legacy behavior.
+        ensure!(
+            sender != "0" && !sender.is_empty(),
+            "latest preview requires a sender"
+        );
+        job.yazi_id = Some(sender.to_owned());
+        Ok(scheduler.submit_inner(job, true))
+    } else {
+        Ok(scheduler.submit(job))
+    }
 }
 
 fn worker(
@@ -721,6 +822,87 @@ mod tests {
         assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Queued);
         assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Shared);
         assert_eq!(scheduler.next().cache, PathBuf::from("preview.avif"));
+    }
+
+    #[test]
+    fn latest_preview_drops_only_orphaned_queued_jobs() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let send = |cache: &str, sender: &str, latest: bool| {
+            submit_dds_message(
+                &format!(
+                    "{REQUEST_EVENT},0,{sender},{}",
+                    serde_json::json!({"file":"video.mkv","cache":cache,"latest":latest})
+                ),
+                &scheduler,
+            )
+            .unwrap()
+        };
+        send("active.avif", "1", true);
+        scheduler.next();
+        send("shared.avif", "1", true);
+        send("shared.avif", "2", true);
+        send("orphan.avif", "1", true);
+        send("batch.avif", "1", false);
+        send("selected.avif", "1", true);
+        let state = scheduler.state.lock().unwrap();
+        assert!(!state.jobs.contains(Path::new("orphan.avif")));
+        assert!(state.jobs.contains(Path::new("active.avif")));
+        assert!(state.jobs.contains(Path::new("shared.avif")));
+        assert!(state.jobs.contains(Path::new("batch.avif")));
+        assert_eq!(state.jobs.len(), 4);
+        drop(state);
+        assert!(scheduler.finish(Path::new("active.avif")).is_empty());
+        assert_eq!(scheduler.next().cache, Path::new("selected.avif"));
+        assert_eq!(scheduler.finish(Path::new("selected.avif")), ["1"]);
+        assert_eq!(scheduler.next().cache, Path::new("batch.avif"));
+        assert_eq!(scheduler.finish(Path::new("batch.avif")), ["1"]);
+        assert_eq!(scheduler.next().cache, Path::new("shared.avif"));
+        assert_eq!(scheduler.finish(Path::new("shared.avif")), ["2"]);
+    }
+
+    #[test]
+    fn cancel_preview_is_scoped_to_sender_and_cache() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        for sender in ["1", "2"] {
+            submit_dds_message(
+                &format!(
+                    "{REQUEST_EVENT},0,{sender},{}",
+                    serde_json::json!({"file":"video.mkv","cache":"shared.avif","latest":true})
+                ),
+                &scheduler,
+            )
+            .unwrap();
+        }
+        let cancel = |sender: &str, cache: &str| {
+            submit_dds_message(
+                &format!(
+                    "vimg-gridthumb-cancel,0,{sender},{}",
+                    serde_json::json!({"cache":cache})
+                ),
+                &scheduler,
+            )
+            .unwrap();
+        };
+        cancel("1", "old.avif");
+        cancel("2", "shared.avif");
+        assert!(
+            scheduler
+                .state
+                .lock()
+                .unwrap()
+                .jobs
+                .contains(Path::new("shared.avif"))
+        );
+        cancel("1", "shared.avif");
+        let state = scheduler.state.lock().unwrap();
+        assert!(state.jobs.is_empty());
+        assert!(state.queued.is_empty());
     }
 
     #[test]
@@ -1513,5 +1695,78 @@ mod tests {
         let path = std::env::temp_dir().join(format!("vimg-{label}-{}", fastrand::u64(..)));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn cancelling_interactive_interest_preserves_anonymous_and_named_batch_requests() {
+        for subscriber in [None, Some("batch-client".to_owned())] {
+            let scheduler = Scheduler {
+                state: Mutex::new(QueueState::default()),
+                ready: Condvar::new(),
+            };
+            let mut batch = job("shared.avif");
+            batch.yazi_id = subscriber.clone();
+            scheduler.submit(batch);
+            let mut preview = job("shared.avif");
+            preview.yazi_id = Some("preview-client".to_owned());
+            scheduler.submit_inner(preview, true);
+            scheduler.cancel_preview("preview-client", Path::new("shared.avif"));
+            assert_eq!(scheduler.next().cache, Path::new("shared.avif"));
+            assert_eq!(
+                scheduler.finish(Path::new("shared.avif")),
+                subscriber.into_iter().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn reselecting_a_shared_preview_prioritizes_it_and_eviction_releases_interest() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let mut oldest = job("oldest.avif");
+        oldest.yazi_id = Some("preview-client".to_owned());
+        scheduler.submit_inner(oldest.clone(), true);
+        for index in 1..MAX_JOBS {
+            scheduler.submit(job(&format!("batch-{index}.avif")));
+        }
+        scheduler.submit(job("replacement.avif"));
+        assert!(scheduler.state.lock().unwrap().previews.is_empty());
+        scheduler.submit_inner(oldest.clone(), true);
+        scheduler.submit(job("newer-batch.avif"));
+        assert_eq!(scheduler.submit_inner(oldest, true), SubmitResult::Shared);
+        assert_eq!(scheduler.next().cache, Path::new("oldest.avif"));
+        assert_eq!(
+            scheduler.finish(Path::new("oldest.avif")),
+            ["preview-client"]
+        );
+        assert!(scheduler.state.lock().unwrap().previews.is_empty());
+    }
+
+    #[test]
+    fn interactive_protocol_uses_dds_sender_and_rejects_anonymous_changes() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let body =
+            r#"{"file":"video.mkv","cache":"preview.avif","latest":true,"yazi_id":"different"}"#;
+        assert!(submit_dds_message(&format!("{REQUEST_EVENT},0,0,{body}"), &scheduler).is_err());
+        submit_dds_message(&format!("{REQUEST_EVENT},0,123,{body}"), &scheduler).unwrap();
+        assert!(
+            submit_dds_message(
+                "vimg-gridthumb-cancel,0,0,{\"cache\":\"preview.avif\"}",
+                &scheduler
+            )
+            .is_err()
+        );
+        submit_dds_message(
+            "vimg-gridthumb-cancel,0,456,{\"cache\":\"preview.avif\",\"yazi_id\":\"123\"}",
+            &scheduler,
+        )
+        .unwrap();
+        assert_eq!(scheduler.next().cache, Path::new("preview.avif"));
+        assert_eq!(scheduler.finish(Path::new("preview.avif")), ["123"]);
     }
 }
