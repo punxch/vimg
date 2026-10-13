@@ -63,6 +63,45 @@ pub(super) fn open_input(
 }
 
 #[cfg(feature = "in-process-decode")]
+pub(super) fn open_input_observed(
+    video: &std::path::Path,
+    timing: &mut super::preview::PreviewTimings,
+) -> anyhow::Result<ffmpeg_next::format::context::Input> {
+    use ffmpeg_next as ffmpeg;
+    ffmpeg::init().context("initializing software libav")?;
+    timing.mark("libav_init");
+    let path = std::ffi::CString::new(video.to_str().context("non-UTF-8 preview path")?)?;
+    let mut options = ffmpeg::Dictionary::new();
+    options.set("scan_all_pmts", "1");
+    // Mirror input_with_dictionary, splitting its two native calls solely for
+    // opt-in diagnostics. Own the opened context before probing so errors drop it.
+    let mut input = unsafe {
+        let mut raw = std::ptr::null_mut();
+        let mut raw_options = options.disown();
+        let status = ffmpeg::ffi::avformat_open_input(
+            &mut raw,
+            path.as_ptr(),
+            std::ptr::null_mut(),
+            &mut raw_options,
+        );
+        drop(ffmpeg::Dictionary::own(raw_options));
+        if status < 0 {
+            return Err(ffmpeg::Error::from(status).into());
+        }
+        ffmpeg::format::context::Input::wrap(raw)
+    };
+    timing.mark("open_header");
+    // The live Input owns this pointer and will close it on success or error.
+    let status =
+        unsafe { ffmpeg::ffi::avformat_find_stream_info(input.as_mut_ptr(), std::ptr::null_mut()) };
+    timing.mark("stream_info");
+    if status < 0 {
+        return Err(ffmpeg::Error::from(status).into());
+    }
+    Ok(input)
+}
+
+#[cfg(feature = "in-process-decode")]
 pub(super) fn metadata_from_input(
     input: &ffmpeg_next::format::context::Input,
 ) -> anyhow::Result<Value> {

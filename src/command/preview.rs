@@ -16,6 +16,55 @@ pub struct Preview {
     pub max_height: u32,
     #[arg(long, default_value_t = 75, value_parser = clap::value_parser!(u8).range(0..=100))]
     pub quality: u8,
+    /// Print native stage timings as JSON on stderr (stdout remains metadata).
+    #[arg(long)]
+    pub timings: bool,
+}
+
+#[cfg(feature = "in-process-decode")]
+pub(super) struct PreviewTimings {
+    clock: Option<(std::time::Instant, std::time::Instant)>,
+    stages: Vec<(&'static str, f64)>,
+    packets: usize,
+}
+
+#[cfg(feature = "in-process-decode")]
+impl PreviewTimings {
+    fn new(enabled: bool) -> Self {
+        Self {
+            clock: enabled.then(|| {
+                let now = std::time::Instant::now();
+                (now, now)
+            }),
+            stages: Vec::new(),
+            packets: 0,
+        }
+    }
+
+    pub(super) fn mark(&mut self, phase: &'static str) {
+        if let Some((_, previous)) = &mut self.clock {
+            let now = std::time::Instant::now();
+            self.stages
+                .push((phase, now.duration_since(*previous).as_secs_f64() * 1000.0));
+            *previous = now;
+        }
+    }
+}
+
+#[cfg(feature = "in-process-decode")]
+impl Drop for PreviewTimings {
+    fn drop(&mut self) {
+        if let Some((start, _)) = self.clock {
+            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "vimg-preview-timing {}",
+                json!({
+                    "total_ms": total_ms, "stages_ms": self.stages,
+                    "packets": self.packets, "pid": std::process::id(),
+                })
+            );
+        }
+    }
 }
 
 impl Preview {
@@ -37,7 +86,12 @@ impl Preview {
     #[cfg(feature = "in-process-decode")]
     fn prepare(&self) -> anyhow::Result<Value> {
         use anyhow::ensure;
-        let mut input = super::probe::open_input(&self.video)?;
+        let mut timing = PreviewTimings::new(self.timings);
+        let mut input = if self.timings {
+            super::probe::open_input_observed(&self.video, &mut timing)?
+        } else {
+            super::probe::open_input(&self.video)?
+        };
         let mut metadata = super::probe::metadata_from_input(&input)?;
         metadata["native_preview"] = json!(true);
         metadata["native_probe"] = json!(true);
@@ -60,9 +114,12 @@ impl Preview {
         // Use precisely the same duration rounding as the Lua/ffprobe path.
         let duration: f64 = metadata["format"]["duration"].as_str().unwrap().parse()?;
         let seconds = (duration * percent as f64 / 100.0).floor();
-        match native::jpeg(&mut input, seconds, self) {
+        timing.mark("metadata");
+        match native::jpeg(&mut input, seconds, self, &mut timing) {
             Ok(jpeg) => {
+                timing.mark("decoder_release");
                 native::publish(&self.output, &jpeg)?;
+                timing.mark("publish");
                 metadata["preview_written"] = json!(true);
             }
             Err(error) => {
@@ -71,13 +128,15 @@ impl Preview {
                 metadata["preview_fallback"] = json!(error.to_string());
             }
         }
+        drop(input);
+        timing.mark("input_release");
         Ok(metadata)
     }
 }
 
 #[cfg(feature = "in-process-decode")]
 mod native {
-    use super::Preview;
+    use super::{Preview, PreviewTimings};
     use anyhow::{Context, ensure};
     use ffmpeg_next::{self as ffmpeg, codec, filter, format, frame::Video, media::Type};
     use std::{io::Write, path::Path};
@@ -86,6 +145,7 @@ mod native {
         input: &mut format::context::Input,
         seconds: f64,
         options: &Preview,
+        timing: &mut PreviewTimings,
     ) -> anyhow::Result<Vec<u8>> {
         // FFmpeg applies extra timestamp correction to discontinuous inputs
         // (for example MPEG-TS). Keep its seek/trim behavior on that path.
@@ -138,6 +198,7 @@ mod native {
         let mut decoder = context.decoder().video()?;
         decoder.skip_frame(codec::discard::Discard::NonKey);
         drop(videos);
+        timing.mark("decoder_init");
         // FFmpeg input-side -ss is relative to the container's start time.
         let origin = unsafe { (*input.as_ptr()).start_time };
         let origin = if origin == ffmpeg::ffi::AV_NOPTS_VALUE {
@@ -150,6 +211,7 @@ mod native {
             .checked_add(origin)
             .context("seek timestamp overflow")?;
         input.seek(target, ..target)?;
+        timing.mark("seek");
         for mut stream in input.streams_mut() {
             if stream.index() != index {
                 // The stream remains owned by input throughout this update.
@@ -172,6 +234,7 @@ mod native {
             let mut packet = ffmpeg::Packet::empty();
             match packet.read(input) {
                 Ok(()) => {
+                    timing.packets += 1;
                     if packet.stream() != index {
                         continue;
                     }
@@ -179,12 +242,12 @@ mod native {
                 }
                 Err(ffmpeg::Error::Eof) => {
                     decoder.send_eof()?;
-                    return receive(&mut decoder, target_pts, options)?
+                    return receive(&mut decoder, target_pts, options, timing)?
                         .context("no keyframe after preview position");
                 }
                 Err(error) => return Err(error.into()),
             }
-            if let Some(jpeg) = receive(&mut decoder, target_pts, options)? {
+            if let Some(jpeg) = receive(&mut decoder, target_pts, options, timing)? {
                 return Ok(jpeg);
             }
         }
@@ -194,6 +257,7 @@ mod native {
         decoder: &mut ffmpeg::decoder::Video,
         target: i64,
         options: &Preview,
+        timing: &mut PreviewTimings,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let mut frame = Video::empty();
         loop {
@@ -226,11 +290,16 @@ mod native {
                 ),
                 "pixel format uses FFmpeg"
             );
-            return Ok(Some(encode(&frame, options)?));
+            timing.mark("read_decode");
+            return Ok(Some(encode(&frame, options, timing)?));
         }
     }
 
-    fn encode(frame: &Video, options: &Preview) -> anyhow::Result<Vec<u8>> {
+    fn encode(
+        frame: &Video,
+        options: &Preview,
+        timing: &mut PreviewTimings,
+    ) -> anyhow::Result<Vec<u8>> {
         let mut graph = filter::Graph::new();
         // The graph is owned locally; one filter worker matches the plugin.
         unsafe { (*graph.as_mut_ptr()).nb_threads = 1 };
@@ -273,9 +342,11 @@ mod native {
             options.max_width, options.max_height
         ))?;
         graph.validate()?;
+        timing.mark("filter_setup");
         graph.get("in").unwrap().source().add(frame)?;
         let mut scaled = Video::empty();
         graph.get("out").unwrap().sink().frame(&mut scaled)?;
+        timing.mark("scale");
         // Degenerate output dimensions can make the scaled SAR invalid for
         // the encoder (for example 1x1 at 16:9). FFmpeg's CLI rewrites those
         // image headers; leave that case to the compatibility path.
@@ -313,10 +384,12 @@ mod native {
         }
         scaled.set_pts(Some(0));
         let mut encoder = encoder.open()?;
+        timing.mark("jpeg_setup");
         encoder.send_frame(&scaled)?;
         encoder.send_eof()?;
         let mut packet = ffmpeg::Packet::empty();
         encoder.receive_packet(&mut packet)?;
+        timing.mark("jpeg_encode");
         Ok(packet.data().context("empty JPEG packet")?.to_vec())
     }
 

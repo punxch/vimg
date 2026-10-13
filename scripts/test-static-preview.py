@@ -46,6 +46,7 @@ def main():
     parser.add_argument("--max-width", default=600, type=int)
     parser.add_argument("--max-height", default=900, type=int)
     parser.add_argument("--quality", default=75, type=int)
+    parser.add_argument("--timings", action="store_true", help="Also check opt-in timing diagnostics on stderr")
     parser.add_argument("videos", nargs="+", type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -61,8 +62,26 @@ def main():
             command = [args.vimg, "preview", "--output", str(candidate), "--skip", str(skip),
                        "--max-width", str(args.max_width), "--max-height", str(args.max_height),
                        "--quality", str(args.quality), "--", str(video)]
-            actual = json.loads(subprocess.check_output(command))
+            if args.timings:
+                command.insert(2, "--timings")
+            completed = subprocess.run(command, capture_output=True, check=True)
+            actual = json.loads(completed.stdout)
             assert actual.get("native_preview") is True, "This check requires an in-process-decode build"
+            timing = None
+            timing_lines = [line.removeprefix("vimg-preview-timing ")
+                            for line in completed.stderr.decode(errors="replace").splitlines()
+                            if line.startswith("vimg-preview-timing ")]
+            if args.timings:
+                assert len(timing_lines) == 1, completed.stderr
+                timing = json.loads(timing_lines[0])
+                assert timing["total_ms"] >= sum(value for _, value in timing["stages_ms"])
+                if actual["preview_written"]:
+                    phases = dict(timing["stages_ms"])
+                    assert all(name in phases for name in ["open_header", "stream_info", "seek",
+                               "read_decode", "filter_setup", "scale", "jpeg_encode", "publish", "input_release"])
+                    assert timing["packets"] > 0
+            else:
+                assert not timing_lines, "Default preview must not emit timing diagnostics"
             assert probe_check.preview_fields(actual) == probe_check.preview_fields(expected), (video, actual)
             if not actual["preview_written"]:
                 assert not candidate.exists(), "Fallback must not publish a partial image"
@@ -70,14 +89,14 @@ def main():
                 assert fallback_run.returncode == original_run.returncode
             if not baseline.exists():
                 assert not candidate.exists(), (video, "native path produced a frame when baseline has none")
-                rows.append(dict(file=str(video), skip=skip, metadata=actual, no_image=True,
+                rows.append(dict(file=str(video), skip=skip, metadata=actual, timing=timing, no_image=True,
                                  baseline_exit=original_run.returncode, baseline_stderr=original_run.stderr.decode(errors="replace")))
                 (args.output_dir / "results.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
                 print(f"{video.name} skip={skip}: matching no-image fallback", flush=True)
                 continue
             assert original_run.returncode == 0
             original, new = image_hashes(baseline), image_hashes(candidate)
-            row = dict(file=str(video), skip=skip, metadata=actual, baseline=original, candidate=new)
+            row = dict(file=str(video), skip=skip, metadata=actual, timing=timing, baseline=original, candidate=new)
             rows.append(row)
             (args.output_dir / "results.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
             assert original == new, row

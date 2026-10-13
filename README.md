@@ -53,6 +53,14 @@ JSON response with `preview_written: false` requires fallback, or an upper-bound
 seek refresh when `preview_upper_bound` is present. Images are encoded in memory
 and published by renaming a completed file in the cache directory.
 
+Add `--timings` to diagnose native preview latency. One `vimg-preview-timing`
+JSON line on stderr reports milliseconds for opening, stream discovery, seeking,
+reading/decoding, scaling, JPEG encoding and publishing; stdout keeps the same
+metadata protocol. `total_ms` covers native preparation and input cleanup, not
+process startup or response serialization. Failed or unsupported inputs may
+report only the stages reached. Timings are disabled by default and are only
+available in builds with `in-process-decode`.
+
 Existing static images skip extraction. Their metadata, and installations too old
 for `preview`, use `vimg probe <video>` or ffprobe. Standard builds report the
 missing native capability without starting ffprobe inside `preview`. The plugin
