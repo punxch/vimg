@@ -47,6 +47,11 @@ H.264/HEVC stream in Matroska or MP4/MOV without autorotation. Cover art, ambigu
 stream selection, discontinuous timestamps and unsupported formats retain the
 FFmpeg path and reuse the already-probed metadata.
 
+For a confirmed H.264 IDR packet at or after the requested preview position, the
+native path drains the decoder's buffered frames, avoiding extra GOP reads just to
+release the selected frame. AVC framing and the resulting frame are checked;
+recovery-point pictures and HEVC keep normal decoder draining.
+
 `vimg preview --output <cache> --skip 0 --max-width 600 --max-height 900 --quality 75 <video>`
 prints metadata plus `native_preview` and `preview_written` flags. A successful
 JSON response with `preview_written: false` requires fallback, or an upper-bound
@@ -60,6 +65,8 @@ metadata protocol. `total_ms` covers native preparation and input cleanup, not
 process startup or response serialization. Failed or unsupported inputs may
 report only the stages reached. Timings are disabled by default and are only
 available in builds with `in-process-decode`.
+The counters include `packets`, `key_packets` and `early_drain`; `selected_pts`
+is the selected frame's timestamp in the video stream's time-base units.
 
 Existing static images skip extraction. Their metadata, and installations too old
 for `preview`, use `vimg probe <video>` or ffprobe. Standard builds report the

@@ -26,6 +26,9 @@ pub(super) struct PreviewTimings {
     clock: Option<(std::time::Instant, std::time::Instant)>,
     stages: Vec<(&'static str, f64)>,
     packets: usize,
+    key_packets: usize,
+    early_drain: bool,
+    selected_pts: Option<i64>,
 }
 
 #[cfg(feature = "in-process-decode")]
@@ -38,6 +41,9 @@ impl PreviewTimings {
             }),
             stages: Vec::new(),
             packets: 0,
+            key_packets: 0,
+            early_drain: false,
+            selected_pts: None,
         }
     }
 
@@ -61,6 +67,8 @@ impl Drop for PreviewTimings {
                 json!({
                     "total_ms": total_ms, "stages_ms": self.stages,
                     "packets": self.packets, "pid": std::process::id(),
+                    "key_packets": self.key_packets, "early_drain": self.early_drain,
+                    "selected_pts": self.selected_pts,
                 })
             );
         }
@@ -138,7 +146,9 @@ impl Preview {
 mod native {
     use super::{Preview, PreviewTimings};
     use anyhow::{Context, ensure};
-    use ffmpeg_next::{self as ffmpeg, codec, filter, format, frame::Video, media::Type};
+    use ffmpeg_next::{
+        self as ffmpeg, codec, codec::packet::Ref as _, filter, format, frame::Video, media::Type,
+    };
     use std::{io::Write, path::Path};
 
     pub(super) fn jpeg(
@@ -190,6 +200,19 @@ mod native {
         );
         let index = stream.index();
         let time_base = stream.time_base();
+        // Only length-prefixed H.264 IDRs are eligible for early draining.
+        // Keep HEVC, recovery-point/open GOP and unknown framing on the normal path.
+        let mut nal_length_size = if parameters.id() == codec::Id::H264 {
+            // The parameters and extradata are borrowed from the live input stream.
+            let raw = unsafe { &*parameters.as_ptr() };
+            if raw.extradata_size >= 7 && !raw.extradata.is_null() {
+                avc_length_size(unsafe { std::slice::from_raw_parts(raw.extradata, 7) })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let mut context = codec::context::Context::from_parameters(parameters)?;
         context.set_threading(codec::threading::Config {
             kind: codec::threading::Type::Frame,
@@ -238,16 +261,53 @@ mod native {
                     if packet.stream() != index {
                         continue;
                     }
+                    timing.key_packets += usize::from(packet.is_key());
+                    if packet
+                        .side_data()
+                        .any(|side| side.kind() == codec::packet::side_data::Type::NewExtraData)
+                    {
+                        // A new AVC configuration may change the NAL length size.
+                        nal_length_size = None;
+                    }
+                    let drain_pts = if packet.is_key()
+                        && packet.pts().is_some_and(|pts| pts >= target_pts)
+                    {
+                        // Consider only the first key packet at/after the target.
+                        // Do not drain past an earlier recovery-point picture.
+                        nal_length_size.take().and_then(|size| {
+                            (unsafe { (*packet.as_ptr()).flags == ffmpeg::ffi::AV_PKT_FLAG_KEY }
+                                && packet.data().is_some_and(|data| avc_idr(data, size)))
+                            .then(|| packet.pts().unwrap())
+                        })
+                    } else {
+                        None
+                    };
                     decoder.send_packet(&packet)?;
+                    if let Some(pts) = drain_pts {
+                        // Consume any immediately available output before sending
+                        // EOF; send_eof may otherwise return EAGAIN.
+                        if let Some(jpeg) =
+                            receive(&mut decoder, target_pts, options, timing, None)?
+                        {
+                            return Ok(jpeg);
+                        }
+                        // A complete IDR is independent of later pictures. Draining
+                        // releases the reorder queue instead of reading more GOPs
+                        // solely to make the decoder return this one preview frame.
+                        decoder.send_eof()?;
+                        timing.early_drain = true;
+                        return receive(&mut decoder, target_pts, options, timing, Some(pts))?
+                            .context("no keyframe after early drain");
+                    }
                 }
                 Err(ffmpeg::Error::Eof) => {
                     decoder.send_eof()?;
-                    return receive(&mut decoder, target_pts, options, timing)?
+                    return receive(&mut decoder, target_pts, options, timing, None)?
                         .context("no keyframe after preview position");
                 }
                 Err(error) => return Err(error.into()),
             }
-            if let Some(jpeg) = receive(&mut decoder, target_pts, options, timing)? {
+            if let Some(jpeg) = receive(&mut decoder, target_pts, options, timing, None)? {
                 return Ok(jpeg);
             }
         }
@@ -258,6 +318,7 @@ mod native {
         target: i64,
         options: &Preview,
         timing: &mut PreviewTimings,
+        expected_idr_pts: Option<i64>,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let mut frame = Video::empty();
         loop {
@@ -276,6 +337,12 @@ mod native {
             if pts < target {
                 continue;
             }
+            if let Some(expected) = expected_idr_pts {
+                ensure!(
+                    frame.is_key() && pts == expected && !frame.is_corrupt(),
+                    "early-drained frame requires FFmpeg validation"
+                );
+            }
             ensure!(!frame.is_interlaced(), "interlaced frame uses FFmpeg");
             ensure!(
                 frame
@@ -290,8 +357,137 @@ mod native {
                 ),
                 "pixel format uses FFmpeg"
             );
+            timing.selected_pts = Some(pts);
             timing.mark("read_decode");
             return Ok(Some(encode(&frame, options, timing)?));
+        }
+    }
+
+    fn avc_length_size(extra: &[u8]) -> Option<usize> {
+        if extra.len() < 7 || extra[0] != 1 || extra[4] & 0xfc != 0xfc {
+            return None;
+        }
+        match (extra[4] & 3) + 1 {
+            size @ (1 | 2 | 4) => Some(usize::from(size)),
+            _ => None,
+        }
+    }
+
+    // Validate every NAL boundary, not just the first slice. The demuxer supplies
+    // a complete AVC access unit; allow IDR slices plus ordinary parameter/SEI
+    // data, but reject mixed VCL, extensions, unknown types and malformed framing.
+    fn avc_idr(mut data: &[u8], length_size: usize) -> bool {
+        if !matches!(length_size, 1 | 2 | 4) {
+            return false;
+        }
+        let mut idr = false;
+        while !data.is_empty() {
+            let Some(length) = data.get(..length_size) else {
+                return false;
+            };
+            let size = length
+                .iter()
+                .fold(0usize, |n, &b| (n << 8) | usize::from(b));
+            data = &data[length_size..];
+            let Some(nal) = data.get(..size).filter(|nal| !nal.is_empty()) else {
+                return false;
+            };
+            if nal[0] & 0x80 != 0 {
+                return false;
+            }
+            match nal[0] & 0x1f {
+                5 if nal[0] & 0x60 != 0 && nal.len() > 1 => idr = true,
+                6..=9 | 12 => {}
+                _ => return false,
+            }
+            data = &data[size..];
+        }
+        idr
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{avc_idr, avc_length_size};
+
+        fn packet(size: usize, nals: &[&[u8]]) -> Vec<u8> {
+            let mut packet = Vec::new();
+            for nal in nals {
+                packet.extend_from_slice(&(nal.len() as u32).to_be_bytes()[4 - size..]);
+                packet.extend_from_slice(nal);
+            }
+            packet
+        }
+
+        #[test]
+        fn avc_configuration_requires_known_length_framing() {
+            for size in [1, 2, 4] {
+                assert_eq!(
+                    avc_length_size(&[1, 100, 0, 40, 0xfc | (size - 1), 0xe1, 0]),
+                    Some(usize::from(size))
+                );
+            }
+            for extra in [
+                &[][..],
+                &[1, 100, 0, 40],
+                &[0, 0, 0, 1, 0x67, 0, 0],
+                &[1, 100, 0, 40, 0xfe, 0, 0],
+                &[1, 100, 0, 40, 3, 0, 0],
+            ] {
+                assert_eq!(avc_length_size(extra), None);
+            }
+        }
+
+        #[test]
+        fn complete_multislice_idr_allows_parameter_and_sei_nals() {
+            for size in [1, 2, 4] {
+                assert!(avc_idr(
+                    &packet(
+                        size,
+                        &[
+                            &[0x09, 0xf0],
+                            &[0x67, 1],
+                            &[0x68, 1],
+                            &[0x06, 1],
+                            &[0x65, 1],
+                            &[0x65, 2],
+                            &[0x0c, 0x80]
+                        ]
+                    ),
+                    size
+                ));
+            }
+        }
+
+        #[test]
+        fn recovery_points_mixed_slices_and_extensions_do_not_drain() {
+            for nals in [
+                vec![&[0x06, 1][..], &[0x41, 1]],
+                vec![&[0x65, 1][..], &[0x41, 1]],
+                vec![&[0x65, 1][..], &[0x74, 1]],
+                vec![&[0x65, 1][..], &[0x0b, 1]],
+                vec![&[0x05, 1][..]],
+                vec![&[0xe5, 1][..]],
+                vec![&[0x67, 1][..]],
+            ] {
+                assert!(!avc_idr(&packet(4, &nals), 4));
+            }
+        }
+
+        #[test]
+        fn incomplete_or_malformed_access_units_do_not_drain() {
+            let complete = packet(4, &[&[0x65, 1], &[0x65, 2]]);
+            for n in [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11] {
+                assert!(!avc_idr(&complete[..n], 4), "truncated at {n}");
+            }
+            for data in [
+                &[0, 0, 0, 0][..],
+                &[255, 255, 255, 255, 0x65],
+                &[0, 0, 0, 1, 0x65],
+            ] {
+                assert!(!avc_idr(data, 4));
+            }
+            assert!(!avc_idr(&complete, 0));
+            assert!(!avc_idr(&complete, 3));
         }
     }
 

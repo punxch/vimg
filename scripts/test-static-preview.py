@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--max-height", default=900, type=int)
     parser.add_argument("--quality", default=75, type=int)
     parser.add_argument("--timings", action="store_true", help="Also check opt-in timing diagnostics on stderr")
+    parser.add_argument("--skip", action="append", type=int, help="Preview offset to check; repeat for multiple offsets (default: 0 and 45)")
     parser.add_argument("videos", nargs="+", type=Path)
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
@@ -55,7 +56,7 @@ def main():
         video = video.resolve()
         expected = json.loads(subprocess.check_output(["ffprobe", "-v", "quiet", "-show_entries",
                               probe_check.ENTRIES, "-of", "json=c=1", str(video)]))
-        for skip in (0, 45):
+        for skip in args.skip if args.skip is not None else (0, 45):
             baseline = args.output_dir / f"{index}-{skip}-baseline.jpg"
             candidate = args.output_dir / f"{index}-{skip}-candidate.jpg"
             original_run = subprocess.run(ffmpeg_args(video, baseline, expected, skip, args.max_width, args.max_height, args.quality), capture_output=True)
