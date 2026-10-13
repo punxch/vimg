@@ -167,9 +167,10 @@ function M:preload(job)
 	if not (cha and cha.len > 0) then
 		-- A single keyframe does not amortize hardware-device initialization.
 		-- Keep decoding on the CPU; animated grids use the service's backend.
+		-- Bound filter and JPEG worker startup for this single-frame command.
 		-- stylua: ignore
 		local cmd = Command("ffmpeg"):arg({
-			"-v", "quiet", "-threads", 1,
+			"-v", "quiet", "-threads", 1, "-filter_threads", 1,
 			"-skip_frame", "nokey",
 			"-an", "-sn", "-dn",
 		})
@@ -184,7 +185,7 @@ function M:preload(job)
 
 		-- stylua: ignore
 		local status, err = cmd:arg({
-			"-vframes", 1,
+			"-vframes", 1, "-threads:v", 1,
 			"-q:v", 31 - math.floor(rt.preview.image_quality * 0.3),
 			"-vf", string.format("scale='min(%d,iw)':'min(%d,ih)':force_original_aspect_ratio=decrease:flags=fast_bilinear", rt.preview.max_width, rt.preview.max_height),
 			"-f", "image2",
