@@ -1,5 +1,118 @@
 # Performance Optimization Report
 
+## 2026-10-13：用轻量原生探测减少静态预览的元数据等待
+
+基线为 Git `19f3bb2`。新增 `vimg probe <video>`，原生构建通过 libavformat
+返回预览所需的 JSON；插件优先调用该命令。最终真实 Yazi 对照中，重复
+空图像缓存预览的元数据等待中位数 **138.4→98.4ms（−28.9%）**，整段静态
+预览准备 **424.4→399.4ms（−5.9%）**。新进程首轮仍有额外启动延迟，
+本轮没有证明首次进程调用或真正磁盘冷启动得到稳定改善。
+
+### 定位与实现
+
+先比较原始参数、单线程、只输出视频流、关闭流信息探测和缩短分析窗口，
+每项 8 次，正反顺序交替。原始探测中位数 119.9ms；其余分别为
+118.0、112.5、112.3、113.6ms，单线程加视频选择为 117.7ms。
+仅执行 Scoop PATH 中的 `ffprobe -version` 已需 102.2ms；直接执行其实际
+EXE 的同项测量为 74.3ms。由此判断，本机进程启动及程序加载占主要成本，
+不是 JSON 字段太多。没有采用缩短分析窗口或跳过 `find_stream_info`。
+
+新命令使用项目已有的可选 `ffmpeg-next` 依赖，仍执行完整
+`avformat_find_stream_info`，并与 ffprobe 一样启用 MPEG-TS 的
+`scan_all_pmts`。遍历全部视频流，保留封面 disposition；时长按 ffprobe
+的六位小数字符串输出，不先转为 f32。原生探测缺少必要字段或失败时，
+以及未启用 `in-process-decode` 时，使用 ffprobe 回退。
+实现参考 [FFmpeg 8.1.2 ffprobe 源码](https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/fftools/ffprobe.c)
+的输入探测流程；本机静态 ffprobe EXE 约 242MB，vimg EXE 约 8MB，后者
+另需共享库。文件大小只是实现差异，不单独作为耗时下降的因果证明。
+
+插件只在预览元数据路径使用新命令，spot 信息展示沿用原路径。新命令仍是
+一个子进程，并非消除了所有进程启动；需同时更新原生版 EXE 和插件才能
+取得本轮收益。旧版/缺失的 vimg、无效 JSON 或缺少时长等情况保留原 ffprobe
+回退。`native_probe` 能力字段和 `ya.sync` 状态使标准构建、旧版及缺失助手
+在后续 peek 中被跳过；单个坏文件的执行错误不会禁用其他文件的原生探测。
+
+### 最终版本真实 Yazi 对照
+
+Yazi/Ya 26.1.22、FFmpeg/链接 libav 8.1.2，同一 `sample/input.mkv`。
+旧→新→新→旧四个独立 Yazi 进程，每个首次 1 次、后续 10 次；44 次全部
+保留。每次切走并删除该次测试的静态图缓存，动画服务在计时期间关闭。
+相同环境、600×900 尺寸上限、质量 75、图像延迟 30ms，禁用预加载。
+使用生产插件的埋点副本，在 Yazi 内以 `ya.time()` 测量。构建和性能测量
+分开进行，没有主动施加 CPU 负载。系统 CPU 仍有背景波动。
+
+| 指标 | 基线 | 最终版本 |
+|---|---:|---:|
+| 重复空缓存预览：元数据中位数，各 20 次 | 138.4ms | 98.4ms（−28.9%） |
+| 上述元数据样本 P95 | 155.0ms | 109.3ms |
+| 重复空缓存预览：peek→静态显示调用中位数 | 424.4ms | 399.4ms（−5.9%） |
+| 上述整段样本 P95 | 454.1ms | 406.9ms |
+| 重复预览：单帧提取中位数 | 281.9ms | 294.1ms |
+| 重复预览期间系统 CPU 中位数，含测试自身 | 30.14% | 33.94% |
+| 新进程首次元数据，两次原始值 | 165.5 / 143.3ms | 195.0 / 103.1ms |
+| 新进程首次静态预览，两次原始值 | 453.4 / 440.1ms | 493.6 / 404.8ms |
+| 包含首次、各 22 次的静态预览中位数 | 425.5ms | 400.0ms |
+| 包含首次的最大静态预览耗时 | 458.0ms | 493.6ms |
+
+P95 使用 nearest-rank。新版组单帧提取稍慢且 CPU 占用更高，故没有把
+元数据节省的约 40ms 全部计为整段收益。首次观测中，新版一次比基线慢；
+原型的首次独立命令还曾为 835ms，而重复中位数为 87.5ms。尚未精确归因
+这类首用额外耗时，不把它当作错误样本剔除。首次样本量各只有 2 次，
+不足以保证冷启动尾延迟。先前未加能力缓存的中间版本还测得
+139.3→89.4ms、429.9→387.6ms，保留为诊断记录，不替代最终版本数据。
+
+所有预览都重新启动元数据助手和静态 FFmpeg；“重复”只是 Yazi 进程及
+操作系统缓存已热，不是图像或元数据缓存命中。本轮未重启机器或清空页
+缓存，不包含 Yazi 应用启动。终端缺少 chafa，计时截至 `ya.image_show`
+调用及图像文件校验，没有测量屏幕像素实际绘制完成时间。
+
+### 回退成本与正确性
+
+标准构建的直接命令对照曾测得 ffprobe 140.5ms、经 vimg 转调 191.1ms，
+因此加入能力缓存。最终真实 Yazi 标准构建测试中，11 次预览仅尝试一次
+助手；后续 10 次探测中位数 141.6ms、静态准备 425.1ms，直接走 ffprobe。
+但首次能力判断仍有成本：该次探测 391.7ms、静态准备 680.4ms。
+标准构建仅保证兼容，不声称首次性能获益；缺少原生能力的状态持续到
+Yazi 重启，更新 EXE 后应重启 Yazi。
+
+- 原生和标准构建各对照 18 个素材，时长、全部视频流顺序、codec、尺寸、
+  时间基、封面标志与 ffprobe 一致。涵盖 H.264、HEVC、VFR、多视频流、
+  音频先行、长 GOP、MPEG-TS、非零起始时间、不同帧率、色彩范围、非方形
+  像素、隔行、短片和封面。移除 PATH 中的 ffprobe 后，18 个原生探测仍
+  成功；最终原生 EXE 再次通过 18 项对照及能力字段检查。无效路径返回
+  失败状态，stdout 不发布部分 JSON。
+- 新旧元数据分别驱动实际静态取帧命令，11 个素材 × 两个 skip，22 对
+  JPEG 字节和解码 RGB 哈希一致。最终 44 次 Yazi 静态图均匹配上一轮的
+  10,749 字节 JPEG：
+  `ac3d666b3f640b22310630d58879a7807740ceb62467da7b120de3291d4e469d`。
+- 三个 Lua 回归脚本通过，包含原生成功、旧版/缺失助手、坏 JSON、缺失
+  时长/流、会话内能力缓存、单个文件失败不禁用原生能力，以及既有的
+  元数据传递、取消和 ready 刷新行为。
+- 原生 release 测试 78 通过/7 忽略；无默认 feature 测试 68 通过/4 忽略。
+  能力标记补充后重新构建两种最终 EXE，并完成真实 Yazi 能力缓存与原生
+  链路验证。保留既有 `unused_mut`/feature-off `dead_code` 警告。
+- 最终真实 Yazi+服务烟测：静态准备 325.3ms，请求→ready 1.088s，
+  ready→动画调用 32.9ms（含 30ms 配置延迟），再次访问缓存 30.8ms；只
+  请求/执行一次动画生成，切换取消正常，AVIF 匹配既有 golden
+  `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+- 原命令 `vimg vcs -c3 -H160 -n9 sample/input.mkv --output <cache>.avif`
+  在加能力字段前的基线/新版 ABBA 验证为 1.392/1.224/1.172/1.193s，
+  四个输出均匹配 golden。未改动画实现，不据这四次波动宣称 CLI 加速。
+
+最终原生 EXE SHA-256：
+`eac5c5c5b8d6d60e29f1bac17050a19b2eda07804bb8f57601372730898a3302`。
+可复用的元数据一致性检查为
+`python scripts/test-preview-probe.py --vimg target/release/vimg.exe <video>...`，
+需按本机配置 libav DLL 搜索路径。Lua 检查为 `scripts/test-gridthumb-probe.lua`、
+`scripts/test-gridthumb-metadata.lua`、`scripts/test-gridthumb-requests.lua`。
+原始数据、构建副本及复现脚本在忽略目录 `.scratch/startup/phase16/`：
+`diagnostic.json`、`native-diagnostic.json`、`final-*/result.json` 和事件日志、
+`final-analysis.json`、`final-corpus-metadata.json`、`feature-off-metadata.json`、
+`corpus/results.json`、`fallback/`、`final-smoke/`、`cli-checks.json`。
+正式比较对应 `final-0` 到 `final-3`，早期 `abba-*` 为中间版本。测试使用
+隔离配置/缓存和临时 PATH，未覆盖用户安装；测试 Yazi 与服务均已退出。
+
+
 ## 2026-10-13：缩短首次静态预览的单帧提取耗时
 
 基线为 Git `9699aad`。本轮仅修改 `gridthumb.yazi` 的静态单帧命令：

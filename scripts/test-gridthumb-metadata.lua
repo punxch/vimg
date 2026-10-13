@@ -1,6 +1,7 @@
 -- Run with: lua scripts/test-gridthumb-metadata.lua
 -- Exercise preload -> descriptor -> DDS payload with local Yazi stubs.
 local sent, meta
+Command = function() return { arg = function(self) return self end, output = function() return nil end } end
 local state = {}
 cx = { active = { current = { hovered = { url = "video.mkv" } } } }
 Url = function(value) return value end

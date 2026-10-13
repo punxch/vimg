@@ -1,5 +1,11 @@
 local M = {}
 local media_descriptors = {}
+local vimg_probe_available = ya.sync(function(state, available)
+	if available ~= nil then
+		state.vimg_probe_available = available
+	end
+	return state.vimg_probe_available ~= false
+end)
 local function cancel_stale_preview(state)
 	local hovered = cx.active.current.hovered
 	if state.preview and (not hovered or state.preview.file ~= tostring(hovered.url)) then
@@ -141,7 +147,7 @@ function M:preload(job)
 		return true
 	end
 
-	local meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_name,codec_type,width,height,time_base:stream_disposition=attached_pic")
+	local meta, err = self.list_preview_meta(job.file.url)
 	if not meta then
 		return true, err
 	elseif not meta.format.duration then
@@ -271,6 +277,30 @@ function M:spot_base(job)
 		end
 	end
 	return rows
+end
+
+function M.list_preview_meta(url)
+	-- The native build probes with libav in a much smaller process. Older or
+	-- unavailable vimg installations retain the original ffprobe path.
+	local output
+	if vimg_probe_available() then
+		output = Command("vimg"):arg({ "probe", "--", tostring(url) }):output()
+		if not output or output.status.code == 2 then
+			vimg_probe_available(false)
+		end
+	end
+	if output and output.status.success then
+		local meta = ya.json_decode(output.stdout)
+		if type(meta) == "table" and type(meta.format) == "table"
+			and tonumber(meta.format.duration) and tonumber(meta.format.duration) > 0
+			and type(meta.streams) == "table" and #meta.streams > 0 then
+			if meta.native_probe == false then
+				vimg_probe_available(false)
+			end
+			return meta
+		end
+	end
+	return M.list_meta(url, "format=duration:stream=codec_name,codec_type,width,height,time_base:stream_disposition=attached_pic")
 end
 
 function M.list_meta(url, entries)

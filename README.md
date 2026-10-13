@@ -40,6 +40,13 @@ vimg serve --capture-backend auto
 On a cache miss, the plugin first shows a static keyframe, then requests the
 animated grid. Static extraction uses one software decoding thread to avoid
 hardware-device startup for a single frame; the service uses its selected backend.
+Preview metadata comes from `vimg probe <video>`. Builds with `in-process-decode`
+use libav directly, avoiding the larger ffprobe process while retaining full stream
+discovery and cover art. Other builds or native probe failures use ffprobe. The
+plugin also falls back to ffprobe when vimg is missing or too old for `probe`.
+It remembers missing native capability for the Yazi session, so later previews
+call ffprobe directly instead of repeatedly starting an unavailable helper.
+Update both the executable and plugin to use the faster metadata path.
 
 The plugin publishes `vimg-gridthumb-request` messages through Yazi DDS. The
 service receives them with `ya sub`, runs the equivalent of

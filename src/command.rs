@@ -9,6 +9,7 @@ mod join;
 #[cfg(feature = "in-process-decode")]
 mod libav;
 mod print_completions;
+mod probe;
 mod serve;
 mod vcs;
 #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
@@ -22,6 +23,7 @@ pub(crate) use encode::*;
 pub use extract::*;
 pub use join::*;
 pub use print_completions::*;
+pub use probe::*;
 pub use serve::*;
 pub use vcs::*;
 
