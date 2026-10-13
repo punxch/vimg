@@ -1,5 +1,11 @@
 local M = {}
 local media_descriptors = {}
+local vimg_preview_available = ya.sync(function(state, available)
+	if available ~= nil then
+		state.vimg_preview_available = available
+	end
+	return state.vimg_preview_available ~= false
+end)
 local vimg_probe_available = ya.sync(function(state, available)
 	if available ~= nil then
 		state.vimg_probe_available = available
@@ -147,7 +153,14 @@ function M:preload(job)
 		return true
 	end
 
-	local meta, err = self.list_preview_meta(job.file.url)
+	local cha = fs.cha(cache)
+	local meta, err
+	if not (cha and cha.len > 0) then
+		meta = self.prepare_preview(job, cache)
+	end
+	if not meta then
+		meta, err = self.list_preview_meta(job.file.url)
+	end
 	if not meta then
 		return true, err
 	elseif not meta.format.duration then
@@ -302,6 +315,45 @@ function M.list_preview_meta(url)
 		end
 	end
 	return M.list_meta(url, "format=duration:stream=codec_name,codec_type,width,height,time_base:stream_disposition=attached_pic")
+end
+
+function M.prepare_preview(job, cache)
+	if not vimg_preview_available() then
+		return
+	end
+	local output = Command("vimg"):arg({
+		"preview", "--output", tostring(cache), "--skip", tostring(job.skip),
+		"--max-width", tostring(rt.preview.max_width), "--max-height", tostring(rt.preview.max_height),
+		"--quality", tostring(rt.preview.image_quality), "--", tostring(job.file.url),
+	}):output()
+	if not output then
+		vimg_preview_available(false)
+		vimg_probe_available(false)
+		return
+	elseif output.status.code == 2 then
+		-- Old vimg may still support the separate probe command.
+		vimg_preview_available(false)
+		return
+	elseif not output.status.success then
+		return
+	end
+	local meta = ya.json_decode(output.stdout)
+	if type(meta) ~= "table" then
+		return
+	elseif meta.native_preview == false then
+		vimg_preview_available(false)
+		if meta.native_probe == false then
+			vimg_probe_available(false)
+		end
+		return
+	end
+	-- A native per-file fallback can still reuse its complete metadata. The
+	-- usual cache check below decides whether FFmpeg must extract the image.
+	if type(meta.format) == "table" and tonumber(meta.format.duration)
+		and tonumber(meta.format.duration) > 0
+		and type(meta.streams) == "table" and #meta.streams > 0 then
+		return meta
+	end
 end
 
 function M.list_meta(url, entries)

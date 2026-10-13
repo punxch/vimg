@@ -45,15 +45,30 @@ impl Probe {
 
 #[cfg(feature = "in-process-decode")]
 fn native_metadata(video: &std::path::Path) -> anyhow::Result<Value> {
-    use ffmpeg_next::{self as ffmpeg, format::stream::Disposition, media::Type};
-    use serde_json::json;
+    metadata_from_input(&open_input(video)?)
+}
+
+#[cfg(feature = "in-process-decode")]
+pub(super) fn open_input(
+    video: &std::path::Path,
+) -> anyhow::Result<ffmpeg_next::format::context::Input> {
+    use ffmpeg_next as ffmpeg;
 
     ffmpeg::init().context("initializing software libav")?;
     // Match ffprobe's MPEG-TS program discovery. input_with_dictionary still
     // performs avformat_find_stream_info; do not shorten probing heuristics.
     let mut options = ffmpeg::Dictionary::new();
     options.set("scan_all_pmts", "1");
-    let input = ffmpeg::format::input_with_dictionary(video, options)?;
+    Ok(ffmpeg::format::input_with_dictionary(video, options)?)
+}
+
+#[cfg(feature = "in-process-decode")]
+pub(super) fn metadata_from_input(
+    input: &ffmpeg_next::format::context::Input,
+) -> anyhow::Result<Value> {
+    use ffmpeg_next::{self as ffmpeg, format::stream::Disposition, media::Type};
+    use serde_json::json;
+
     ensure!(input.duration() > 0, "missing video duration");
     let mut streams = Vec::new();
     for stream in input.streams() {

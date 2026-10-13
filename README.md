@@ -40,13 +40,25 @@ vimg serve --capture-backend auto
 On a cache miss, the plugin first shows a static keyframe, then requests the
 animated grid. Static extraction uses one software decoding thread to avoid
 hardware-device startup for a single frame; the service uses its selected backend.
-Preview metadata comes from `vimg probe <video>`. Builds with `in-process-decode`
-use libav directly, avoiding the larger ffprobe process while retaining full stream
-discovery and cover art. Other builds or native probe failures use ffprobe. The
-plugin also falls back to ffprobe when vimg is missing or too old for `probe`.
-It remembers missing native capability for the Yazi session, so later previews
-call ffprobe directly instead of repeatedly starting an unavailable helper.
-Update both the executable and plugin to use the faster metadata path.
+On an empty static cache, builds with `in-process-decode` use `vimg preview` to
+probe, seek, scale and encode JPEG in one process, with one input open and full
+stream discovery. The native path covers a single progressive 8-bit YUV420
+H.264/HEVC stream in Matroska or MP4/MOV without autorotation. Cover art, ambiguous
+stream selection, discontinuous timestamps and unsupported formats retain the
+FFmpeg path and reuse the already-probed metadata.
+
+`vimg preview --output <cache> --skip 0 --max-width 600 --max-height 900 --quality 75 <video>`
+prints metadata plus `native_preview` and `preview_written` flags. A successful
+JSON response with `preview_written: false` requires fallback, or an upper-bound
+seek refresh when `preview_upper_bound` is present. Images are encoded in memory
+and published by renaming a completed file in the cache directory.
+
+Existing static images skip extraction. Their metadata, and installations too old
+for `preview`, use `vimg probe <video>` or ffprobe. Standard builds report the
+missing native capability without starting ffprobe inside `preview`. The plugin
+caches unavailable capabilities for the Yazi session; per-file failures do not
+disable other files. Update both the executable and plugin, then restart Yazi to
+use the combined path.
 
 The plugin publishes `vimg-gridthumb-request` messages through Yazi DDS. The
 service receives them with `ya sub`, runs the equivalent of

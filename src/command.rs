@@ -8,6 +8,7 @@ mod frame_schedule;
 mod join;
 #[cfg(feature = "in-process-decode")]
 mod libav;
+mod preview;
 mod print_completions;
 mod probe;
 mod serve;
@@ -22,6 +23,7 @@ pub use cpu_policy::ServiceCpuPolicy;
 pub(crate) use encode::*;
 pub use extract::*;
 pub use join::*;
+pub use preview::*;
 pub use print_completions::*;
 pub use probe::*;
 pub use serve::*;

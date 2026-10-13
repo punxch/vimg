@@ -20,6 +20,7 @@ enum Command {
     Serve(command::Serve),
     Send(command::Send),
     Probe(command::Probe),
+    Preview(command::Preview),
     PrintCompletions(command::PrintCompletions),
 }
 
@@ -52,6 +53,7 @@ fn run(cmd: Command) -> anyhow::Result<()> {
         Command::Serve(c) => c.run()?,
         Command::Send(c) => c.run()?,
         Command::Probe(c) => c.run()?,
+        Command::Preview(c) => c.run()?,
         Command::PrintCompletions(c) => c.run(),
     }
 
