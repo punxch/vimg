@@ -37,6 +37,10 @@ Run the long-lived preview service used by `gridthumb.yazi`:
 vimg serve --capture-backend auto
 ```
 
+On a cache miss, the plugin first shows a static keyframe, then requests the
+animated grid. Static extraction uses one software decoding thread to avoid
+hardware-device startup for a single frame; the service uses its selected backend.
+
 The plugin publishes `vimg-gridthumb-request` messages through Yazi DDS. The
 service receives them with `ya sub`, runs the equivalent of
 `vimg vcs -c3 -H160 -n9 <video> --output <file-cache>.avif` in-process, and

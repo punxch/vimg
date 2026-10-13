@@ -159,9 +159,11 @@ function M:preload(job)
 	-- method 1: ffmpeg single-frame cache (skip if exists)
 	local cha = fs.cha(cache)
 	if not (cha and cha.len > 0) then
+		-- A single keyframe does not amortize hardware-device initialization.
+		-- Keep decoding on the CPU; animated grids use the service's backend.
 		-- stylua: ignore
 		local cmd = Command("ffmpeg"):arg({
-			"-v", "quiet", "-threads", 1, "-hwaccel", "auto",
+			"-v", "quiet", "-threads", 1,
 			"-skip_frame", "nokey",
 			"-an", "-sn", "-dn",
 		})
