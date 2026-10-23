@@ -178,6 +178,16 @@ def main():
                     totals.append(stages)
                 summary[arm]["stages_ms"] = {name: statistics.median(s.get(name, 0) for s in totals)
                                               for name in sorted(set().union(*totals))}
+                summary[arm]["stage_distributions_ms"] = {
+                    name: distribution([s.get(name, 0) for s in totals])
+                    for name in sorted(set().union(*totals))
+                }
+                summary[arm]["native_total_ms"] = distribution([r["timing"]["total_ms"] for r in selected])
+                # Includes process creation/loading, CLI work, output and exit.
+                # Use the native span, not the sum of individual stage marks.
+                summary[arm]["outside_native_ms"] = distribution([
+                    r["elapsed_ms"] - r["timing"]["total_ms"] for r in selected
+                ])
                 summary[arm]["packets"] = [r["timing"]["packets"] for r in selected]
         return summary
 

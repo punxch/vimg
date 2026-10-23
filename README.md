@@ -210,6 +210,12 @@ keeps every measurement and its acceptance status. `--max-blocks` and
 `--idle-timeout` bound retries and idle waits. Set these limits before a run;
 compare each complete group of measurements separately.
 
+With `--timings`, both summaries also include `stage_distributions_ms` (median,
+P95, minimum and maximum per stage), `native_total_ms`, and `outside_native_ms`.
+The existing `stages_ms` medians remain available. The outside-native remainder
+is wall time minus the reported native span; it includes process creation,
+loading, CLI work, output and exit, so it must not be labeled DLL loading time.
+
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/vimg).
 

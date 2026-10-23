@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import statistics
 import sys
 from unittest.mock import patch
 
@@ -39,7 +40,7 @@ def main():
         command = ["bench-static-preview.py", "--baseline", str(args.vimg.resolve()),
                    "--candidate", str(args.vimg.resolve()), "--video", str(args.video.resolve()),
                    "--output-dir", str(output), "--runs", "4", "--max-system-cpu", "12",
-                   "--max-blocks", str(max_blocks)]
+                   "--max-blocks", str(max_blocks), "--timings"]
         log = io.StringIO()
         error = None
         with patch.object(sys, "argv", command), patch.object(bench, "system_cpu", side_effect=counters()), \
@@ -62,6 +63,24 @@ def main():
             for arm in ["baseline", "candidate"]:
                 assert result["summary"][arm]["n"] == 4
                 assert result["all_samples_summary"][arm]["n"] == 6
+            # Exercise the real diagnostic JSON through the same busy-block
+            # retry path. Stage tails and the outside-native remainder must
+            # use the same population as wall time, without changing old fields.
+            for field, accepted_only in [("summary", True), ("all_samples_summary", False)]:
+                for arm in ["baseline", "candidate"]:
+                    selected = [r for r in measured if r["arm"] == arm and (not accepted_only or r["accepted"])]
+                    actual = result[field][arm]
+                    native = [r["timing"]["total_ms"] for r in selected]
+                    outside = [r["elapsed_ms"] - r["timing"]["total_ms"] for r in selected]
+                    assert actual["native_total_ms"]["median"] == statistics.median(native)
+                    assert actual["native_total_ms"]["p95"] == max(native)  # 4/6 samples: nearest-rank P95.
+                    assert actual["outside_native_ms"]["median"] == statistics.median(outside)
+                    assert actual["outside_native_ms"]["minimum"] == min(outside)
+                    assert min(outside) >= 0
+                    decode = [sum(v for n, v in r["timing"]["stages_ms"] if n == "read_decode") for r in selected]
+                    assert min(decode) > 0
+                    assert actual["stage_distributions_ms"]["read_decode"]["p95"] == max(decode)
+                    assert actual["stage_distributions_ms"]["read_decode"]["median"] == actual["stages_ms"]["read_decode"]
         else:
             assert error and "Not enough quiet blocks" in str(error)
             assert not (output / "results.json").exists(), "Incomplete run must not publish a success summary"
@@ -85,7 +104,7 @@ def main():
             pass
         else:
             raise AssertionError("Idle wait must be bounded under sustained CPU load")
-    print("Whole-block retries, retained samples, retry limit and idle timeout passed")
+    print("Whole-block retries, phase distributions, retained samples, retry limit and idle timeout passed")
 
 
 if __name__ == "__main__":
