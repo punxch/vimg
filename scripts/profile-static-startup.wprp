@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Start/stop from an elevated shell using -filemode and a dedicated
+     -instancename. Launch previews normally. Include the launching process
+     when attributing CreateProcess costs; some work precedes the child thread.
+     Profiled latency is diagnostic, not untraced performance acceptance.
+     File mode preserves early startup events during long CPU-idle waits. -->
+<WindowsPerformanceRecorder Version="1.0">
+  <Profiles>
+    <SystemCollector Id="StartupCollector" Name="Static Preview Startup">
+      <BufferSize Value="256"/><Buffers Value="512"/>
+    </SystemCollector>
+    <SystemProvider Id="StartupProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread"/><Keyword Value="Loader"/><Keyword Value="SampledProfile"/>
+        <Keyword Value="CSwitch"/><Keyword Value="ReadyThread"/><Keyword Value="HardFaults"/>
+        <Keyword Value="DiskIO"/><Keyword Value="DiskIOInit"/><Keyword Value="Filename"/>
+      </Keywords>
+      <Stacks>
+        <Stack Value="SampledProfile"/><Stack Value="CSwitch"/><Stack Value="ReadyThread"/>
+        <Stack Value="HardFault"/><Stack Value="ProcessCreate"/><Stack Value="ThreadCreate"/>
+      </Stacks>
+    </SystemProvider>
+    <Profile Id="VimgStartup.Verbose.File" Name="VimgStartup"
+             Description="Preview CPU, scheduling, image loading and disk attribution"
+             LoggingMode="File" DetailLevel="Verbose">
+      <Collectors><SystemCollectorId Value="StartupCollector"><SystemProviderId Value="StartupProvider"/></SystemCollectorId></Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

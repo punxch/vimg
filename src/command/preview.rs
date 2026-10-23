@@ -2,6 +2,8 @@ use serde_json::{Value, json};
 use std::{io::Write, path::PathBuf};
 
 #[cfg(feature = "in-process-decode")]
+mod cues;
+#[cfg(feature = "in-process-decode")]
 mod hevc;
 
 /// Try a native static preview; print metadata and preview_written for fallback.
@@ -44,6 +46,8 @@ pub(super) struct PreviewTimings {
     first_key_pts: Option<i64>,
     first_key_bytes: usize,
     selected_packet_bytes: usize,
+    cue_index_entries: usize,
+    cue_index_points: usize,
 }
 
 #[cfg(feature = "in-process-decode")]
@@ -71,6 +75,8 @@ impl PreviewTimings {
             first_key_pts: None,
             first_key_bytes: 0,
             selected_packet_bytes: 0,
+            cue_index_entries: 0,
+            cue_index_points: 0,
         }
     }
 
@@ -106,6 +112,8 @@ impl Drop for PreviewTimings {
                     "first_key_pts": self.first_key_pts,
                     "first_key_bytes": self.first_key_bytes,
                     "selected_packet_bytes": self.selected_packet_bytes,
+                    "cue_index_entries": self.cue_index_entries,
+                    "cue_index_points": self.cue_index_points,
                 })
             );
         }
@@ -263,6 +271,13 @@ mod native {
             )
         };
         timing.target_pts = Some(target_pts);
+        if input.nb_streams() >= 8 {
+            if let Some(index) = super::cues::prime(input, index)? {
+                timing.cue_index_entries = index.entries;
+                timing.cue_index_points = index.points;
+            }
+            timing.mark("cue_index");
+        }
         if let Ok(jpeg) = attempt(input, index, target, Some(target_pts), options, timing) {
             return Ok(jpeg);
         }

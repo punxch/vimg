@@ -38,6 +38,11 @@ mimalloc = { version = "0.1", optional = true }
 lto = true
 strip = true
 
+# Compact executable for latency-sensitive, fresh-process preview calls.
+[profile.preview]
+inherits = "release"
+opt-level = "s"
+
 [lints.rust]
 unused_crate_dependencies = "deny"
 

@@ -54,6 +54,11 @@ fails, it creates a fresh decoder and tries the preceding indexed keyframe once.
 Static previews may therefore select a different frame, including an earlier frame
 near EOF; preview bounds, JPEG quality and autorotation behavior are preserved.
 
+For large, subtitle-rich Matroska indexes, a bounded Cues reader installs the
+complete video index after full stream discovery. This avoids allocating the
+subtitle indexes for a single image. Unsupported layouts or inconsistent indexes
+retain FFmpeg's normal parser and seek behavior.
+
 Confirmed H.264 IDR and single-layer HEVC IDR/BLA/CRA access units can drain the
 decoder immediately, avoiding extra GOP reads to release the preview frame.
 NAL boundaries, picture structure and decoded output are checked. Unknown framing,
@@ -84,6 +89,8 @@ available in builds with `in-process-decode`.
 The counters include `packets`, `key_packets`, `pre_target_packets` and
 `early_drain`. `target_pts` and `selected_pts` use the video stream's time base;
 `seek_mode` and `attempts` describe the final seek path and total attempts.
+`cue_index_entries` and `cue_index_points` report installed video entries and
+inspected CuePoints when the large-index fast path is used.
 `drain_kind` identifies early H.264 IDR or HEVC IDR/BLA/CRA draining, otherwise null.
 `decoder_threads` and `skip_loop_filter` report the last opened decoder's policy.
 Stage names can repeat after a retry; sum repeated stages when aggregating timings.
@@ -162,9 +169,13 @@ package a small `avfilter` alongside the existing codec/container libraries:
 
 ```powershell
 $env:PKG_CONFIG_PATH='D:/ffmpeg-dev/ffmpeg-8.1.2-full_build-shared/lib/pkgconfig'
-cargo build --release --features in-process-decode
-python -B -X utf8 scripts/build-preview-runtime.py --exe target/release/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --output-dir target/preview-runtime
+cargo build --profile preview --features in-process-decode
+python -B -X utf8 scripts/build-preview-runtime.py --exe target/preview/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --output-dir target/preview-runtime
 ```
+
+The Cargo `preview` profile inherits release settings and optimizes Rust code
+for a smaller executable and fresh-process startup. All subcommands remain
+available. The standard `cargo build --release` profile is also supported.
 
 This Windows x64 script requires Python 3.12+, Git Bash, MinGW GCC/make and NASM;
 use `--bash`, `--mingw-bin` and `--nasm` to override the tool paths. It verifies the
@@ -185,6 +196,7 @@ Validate preview behavior and compare warm, fresh-process release latency with:
 
 ```powershell
 python -B -X utf8 scripts/test-preview-fast.py --vimg target/preview-runtime/vimg.exe --fixtures .scratch/startup/preview-fixtures --output-dir .scratch/startup/preview-check
+python -B -X utf8 scripts/test-preview-cues.py --vimg target/preview-runtime/vimg.exe --fixtures .scratch/startup/cue-fixtures --output-dir .scratch/startup/cue-check
 python -B -X utf8 scripts/bench-static-preview.py --baseline <old-vimg.exe> --candidate target/preview-runtime/vimg.exe --video sample/input.mkv --output-dir .scratch/startup/preview-bench
 python -B -X utf8 scripts/test-preview-decode.py --baseline <old-vimg.exe> --candidate target/preview-runtime/vimg.exe --fixtures .scratch/startup/decode-fixtures --output-dir .scratch/startup/decode-check sample/input.mkv
 ```

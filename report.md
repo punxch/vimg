@@ -1,5 +1,193 @@
 # Performance Optimization Report
 
+## 2026-10-24：定位启动链路与首次 seek，精简视频索引读取和 EXE
+
+**本轮组合版本将 H.264 主素材首次静态预览的独立热态中位数从 80.62ms 降至 65.69ms（−18.52%），
+真实磁盘冷态从 102.34ms 降至 82.68ms（−19.21%）。** 视频索引优化进入原生预览路径；
+组合结果使用新增的 Cargo `preview` 构建配置。普通 `release` 构建仍可用，只有索引优化，不能套用组合耗时。
+本轮没有改变选帧、JPEG 质量、预览尺寸、方向处理、stdout 或 Yazi 协议。
+
+### 调用栈及定位证据
+
+本轮基线源码为 Git `141d7eb`，冻结基线包 `target/preview-runtime-phase27-guarded/vimg.exe`，
+SHA-256 `01a6f8bcf635c9e8bdb6e09657b619d1bba14b3021b2f817fc190bf3727c11ad`。
+环境沿用 Windows / i9-12900K、FFmpeg 8.1.2，主素材 `sample/input.mkv`。
+先用 `.scratch/startup/phase28/repro.py` 重现首次 seek 开销，3 次合格样本中位数 **10.260ms**，
+超过预设的 8ms 优化目标，脚本报红。修复后最终反馈循环把新增 `cue_index` 一起计入，
+索引准备加首次 seek 中位数 **2.177ms**，通过目标，避免把成本移入新阶段后误报收益。
+
+使用新增的 `scripts/profile-static-startup.wprp`，采集 CPU 栈、进程/线程创建、映像加载、
+CSwitch、ReadyThread、hard fault 和磁盘事件。WPR 控制器提升权限，被测 vimg 保持普通令牌；
+把启动它的 Python 进程也纳入栈分析，因为一部分 CreateProcess 工作早于子进程首个线程。
+正式诊断使用 file mode：16 个新进程事件完整，其中 11 个满足运行期间系统 CPU≤12%，无丢事件。
+诊断版只增加 main 入口/退出和阶段起始时间标记，未用于性能验收，标记没有保留在生产源码。
+
+- **首次 seek：主要是通用 EBML 解析和字幕 Cues 分配。** 11 次合格调用的 seek 区间有 105 个 CPU 样本。
+  典型栈为 `avformat_seek_file → av_seek_frame → avformat+0xe1020 → +0xdda10 →
+  +0xdccb0（递归 EBML 路径）→ av_fast_realloc → _aligned_realloc / RtlAllocateHeap`。
+  原 DLL 无内部 PDB；RVA 与同版 `matroskadec.c` 的解析/扩容调用关系相符，不声称源码行级精确归因。
+  主素材有 **55 条流（1 视频、2 音频、52 字幕）**，Cues 负载 **849946 字节、31708 个 CuePoint**，
+  其中只有 **669 条视频索引**。FFmpeg 延迟到首次 seek 才解析并构造全部轨道的索引。
+- **启动链路：显著成本发生在子进程首线程之前。** 热态诊断的 `CreateProcess` 调用至 main 中位数为 **42.170ms**；
+  调用至 ProcessStart 为 **1.626ms**，ProcessStart 至首个 ThreadStart 为 **25.068ms**。
+  首线程创建后至 main 的运行、等待、就绪时间中位数分别为 **12.172 / 2.090 / 0.468ms**。
+  父进程最常见的一组创建进程调用栈包含 **192 个样本**，路径经过 `CreateProcessW → NtCreateUserProcess → sysdiag.sys`；
+  另有包含该驱动及文件读取/缓存拷贝的栈。读取本机驱动版本信息确认它属于火绒，版本 **6.0.0.3**。
+  因此不能把进入 main 前的全部时间都解释为 DLL 加载。上述计数是栈样本，不能直接换算为毫秒或全部启动时间占比。
+- **冷态归因：读盘等待增加。** 另采集 4 个清缓存后的诊断进程，其中 3 个低负载合格，均无丢事件。
+  合格调用进入 main 前为 **59.72–64.77ms**；首线程运行约 **12.35–12.74ms**，等待 **11.90–15.34ms**。
+  这些只有 3 个合格样本且开启完整采样，只用于定位，最终冷态验收另行采集。
+
+最初 memory-mode 长跟踪虽然 `EventsLost=0`，24 个进程中仍有 14 个早期 ProcessStart 已被环形缓冲覆盖。
+这些不完整进程被排除；改用 file mode 后重新采满，避免把“零丢事件”误当成“历史事件完整”。
+API/实现依据：[Microsoft SystemProvider](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/systemprovider)、
+[FFmpeg 8.1.2 Matroska demuxer](https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavformat/matroskadec.c)。
+
+### 采用的实现与边界
+
+1. `preview/cues.rs` 只在 Matroska、至少 8 条流、原生 H.264/HEVC 单视频预览、已有视频索引仅 1–2 条时尝试。
+   在完整 stream discovery 之后复用已有 AVIO，扫描有界文件头，通过 SeekHead 读取 **64KiB–4MiB** Cues；
+   仅对至少 2048 个 CuePoint、CuePoint 数至少为视频索引数 4 倍的文件启用，最多安装 65536 条视频索引。
+   嵌套元素使用切片解析，保留完整视频索引，省去字幕索引的逐项分配；没有额外打开输入文件。
+2. 对长度、整数溢出、重复字段、单一视频轨道、时间尺度、递增时间戳、位置范围及顺序做检查，
+   并与 FFmpeg 已探测的视频索引逐项交叉验证。恢复原 AVIO 位置及错误状态后才安装索引；
+   完整安装成功后设置 `AVFMT_FLAG_IGNIDX`，绕过延迟 Cues 解析。未知布局或不一致索引沿用普通 FFmpeg 路径；
+   AVIO 恢复失败终止本次原生尝试，使用既有元数据回退。保留前向选择、相邻帧前探、后向重试和损坏输出检查。
+3. 新增可选 Cargo `preview` profile，继承 release 的 LTO/strip，仅把 Rust `opt-level` 改为 `s`。
+   EXE 从 **8408576 字节降至 5620224 字节（−33.16%）**，仍包含所有命令和格式支持。
+   同逻辑单项对照显示原生阶段之外的中位数 **48.820→39.919ms**，与减少创建进程时读取/处理 EXE 的工作相符。
+   这是本机调用栈与对照实验支持的推断，不保证所有安全软件/硬件上有同样幅度。
+   Os 也有代价：Cues 加 seek 从 **1.242→2.232ms**，但端到端仍稳定改善。
+4. `--timings` 新增 `cue_index` 阶段及 `cue_index_entries` / `cue_index_points` 计数；stdout 和 CLI 参数保持兼容。
+   所有 **7 个运行 DLL 与基线逐字节相同**，安全配置、电源、优先级和亲和性保持原状。
+
+仅索引优化的热态确认中，初始索引加 seek **9.413→1.212ms**，释放输入 **1.435→0.257ms**。
+不要只引用新 `seek` 的约 0.03ms：必须加回 `cue_index`。
+
+### 冻结构建与单项贡献
+
+最终包：`target/preview-runtime-phase28-final/vimg.exe`，SHA-256
+`3ee3eabe0539a06805fc1c9ec7a313696fdbc4364bb746cef80e6d93f1bc2b99`，经过打包脚本版本、导出和文件哈希校验。
+仅 Cues 的 O3 实验包为 `phase28-cues`，SHA-256
+`2259c8a57f5a1a1554381b6846f5a830e4b5c2c543c0b854293787a94adc2a4e`；
+同逻辑 Os 实验包为 `phase28-size`，SHA-256
+`a4d602b255242e093a26bbf5f453ef406eeea9a91355a1442014aebc26ff98ed`。
+后者通过环境覆盖构建参数探索；最终包改用仓库内命名 profile 并独立确认，统计没有混用二进制。
+
+| 单项热态对照 | 基线/候选次数 | 中位数 基线→候选（ms） | P95 基线→候选（ms） | 中位数变化 |
+| --- | --- | --- | --- | --- |
+| 原基线→仅视频 Cues 索引，均 O3 | 12/12 | 80.58→71.20 | 114.83→77.89 | -11.64% |
+| 已有索引优化，O3→Os | 12/12 | 73.91→65.61 | 79.71→77.47 | -11.24% |
+
+两组是各自交错对照，不能把不同批次的绝对值首尾拼接，或把两项百分比直接相加。
+单项贡献用热态隔离；真实磁盘冷态对比的是最终组合包，没有单独宣称每项的冷态收益。
+
+### 最终低负载冷热验收
+
+命令为 `vimg preview --output <独立文件>.jpg --max-width 600 --max-height 900 --quality 75 -- sample/input.mkv`。
+热态每臂预热两次、每次新进程；正式独立热态关闭 timings。采用四次 ABBA/BAAB 整组对照，
+运行前连续四个 250ms 窗口系统 CPU≤**4%**，调用期间≤**12%**，一项超限则保留整组并补测。
+系统 CPU 包含被测进程。冷态每次 RAMMap `-Es` / `-Et` 后再次等待相同低负载窗口，使用 file-mode 轻量磁盘 ETW；
+验收期间没有并行编译、图像测试或编码任务。冷态及紧接热态分别按各自 CPU 判定。
+
+| 最终构建 / 每臂有效次数 | 基线/候选次数 | 中位数 基线→候选（ms） | P95 基线→候选（ms） | 中位数变化 |
+| --- | --- | --- | --- | --- |
+| H.264 独立热态，无 timings | 12/12 | 80.62→65.69 | 82.08→67.37 | -18.52% |
+| H.264 真实磁盘冷态，有 timings | 8/8 | 102.34→82.68 | 183.12→103.27 | -19.21% |
+| 冷态后紧接热态，仅辅助诊断 | 6/6 | 77.43→65.08 | 95.09→67.54 | -15.95% |
+| HEVC 自然素材，热态，有 timings | 12/12 | 54.76→48.55 | 57.45→51.07 | -11.34% |
+
+最终独立热态完成 8 组，6 组合格；最终冷态 4 组全部合格，收齐每臂 8 次。
+紧接热态只有每臂 6 次合格，仅作为辅助观察，热态验收采用独立的每臂 12 次。
+P95 使用最近秩；样本少时等于最大值。冷态基线的 **183.12ms** 长尾系统 CPU 为 **5.90%**，
+prepare 为 **43.15ms**，主要延长在 prepare 之外，完整保留，没有按墙钟时间剔除。
+按整组进行 10000 次探索性 bootstrap（seed=28），中位数变化 95% 区间：最终独立热态 **[-20.26%, -17.99%]**; 最终磁盘冷态 **[-20.98%, -14.12%]**。
+小样本区间仅辅助判断本次收益稳定性，不代表所有机器或素材的总体区间。
+
+| 最终冷态阶段中位数（ms） | 基线 | 候选 |
+| --- | --- | --- |
+| 打开文件头 | 2.737 | 2.582 |
+| 完整流信息探测 | 7.516 | 7.150 |
+| 读包/解码 | 11.366 | 11.147 |
+| 释放输入 | 1.563 | 0.261 |
+| 索引准备加初始 seek（逐次相加后取中位数） | 10.387 | 2.758 |
+| prepare 总区间 | 39.710 | 29.397 |
+| 端到端减 prepare | 63.740 | 53.426 |
+
+各阶段分别取中位数，不能逐行相加重建端到端中位数。`elapsed - prepare` 包含进程创建/等待、
+DLL/CRT、CLI、输出和退出等成本，不能全部归因于驱动或 DLL。
+
+| 最终有效样本 | 进程 CPU 中位数（ms） | 系统 CPU 中位数（%） |
+| --- | --- | --- |
+| 独立热态 | 46.88→46.88 | 6.92→6.37 |
+| 磁盘冷态 | 54.69→54.69 | 7.32→7.29 |
+
+GetProcessTimes 有 15.625ms 量化，而且不包含父进程执行的创建进程工作；本轮不声称进程 CPU 中位数得到改善。
+主素材新旧两版读包数均为 **2**，选中 PTS **173924（173.924s）**，解码输入包 **123116 字节**，
+输出 **600×338**。全部主素材样本 JPEG SHA-256 均为
+`5a8763e5650dd928a42126a922bd815843d971e640b18456cc2bb07468631f44`，肉眼检查无明显损坏。
+
+### 真实读盘与保留的数据
+
+最终 16 条冷态跟踪及首批中断前的 11 条跟踪全部通过 ETW 检查：无丢事件、被测进程创建事件完整，
+每次冷态输入/EXE/DLL 的 DiskIORead 均大于零，紧接热态均为零；清缓存到启动之间没有这三类对象提前读盘。
+最终合格冷态实际读取量中位数如下，MiB 为 2^20 字节；统计传输量，可能包含重复读取。
+
+| 实际读取对象 | 基线（MiB） | 候选（MiB） |
+| --- | --- | --- |
+| 输入文件 | 1.516 | 1.516 |
+| EXE | 10.736 | 8.076 |
+| DLL | 18.740 | 18.485 |
+
+输入读取量未变，说明这次 Cues 优化主要减少解析、分配和释放。EXE 实际读盘减少约 **2.66MiB**；
+DLL 哈希/体积没有变化，其读取页差异不能当作依赖裁剪。hard fault 中位数为 **20→28.5**，数量不能替代耗时或字节数。
+
+| 组别 | 每臂全量次数 基线/候选 | 全量中位数（ms） | 合格/完成组数 |
+| --- | --- | --- | --- |
+| 索引确认 | 22/22 | 81.80→70.92 | 6/11 |
+| 体积单项 | 16/16 | 73.98→65.85 | 6/8 |
+| 最终独立热态 | 16/16 | 80.69→65.62 | 6/8 |
+| 最终磁盘冷态 | 8/8 | 102.34→82.68 | 4/4 |
+| 冷后热态 | 8/8 | 78.99→65.08 | 3/4 |
+| HEVC 热态 | 14/14 | 54.76→48.89 | 6/7 |
+
+初次索引探索使用运行前 CPU≤8%，40 组仅 2 组合格（每臂 4 次），未达到验收门槛；全量 80 次/每臂保留。
+其中一次计数器计算出 104.55%，作为无效读数未进入合格组。之后把运行前门槛收紧为 4%，
+重新收集单项和最终对照，期间门槛仍为 12%。不以那批不足样本推断稳定收益。
+首批冷态在 2 组完成后，控制器遇到请求文件临时占用而中断；2 组完整数据及第 3 组已完成的 3 次调用均保留，
+该批每臂只有 4 次合格冷态，不作为最终验收。加入仅针对请求文件读取的临时占用重试后，新目录完整重测了每臂 8 次；
+生产程序在两批之间没有改动。所有提升权限的测量控制器均已退出。
+
+### 功能验证与复现
+
+- 原生 Rust 测试 **98 通过 / 7 忽略**，默认构建 **68 通过 / 4 忽略**；包括 6 项新的 Cues 解析边界测试。
+- 新增真实媒体索引用例 **9 项**：大索引 3 个位置、稀疏视频 Cues、未知 Segment 长度、错误首索引位置、
+  重复视频时间戳、缺失 Cues SeekHead、少量有效 CuePoint。新旧 JPEG 和元数据逐项一致，输出均严格解码成功。
+- 既有前探保护、24 个快速预览/损坏用例、18 个 HEVC 对照、探测协议、4 个 Lua 脚本和 **17 个插件协议检查**通过。
+  缓存失败保护和回退路径继续生效；新解析器未触发的 HEVC 素材另做了上表的性能对照。
+- 原始 `vimg vcs -c3 -H160 -n9 sample/input.mkv --output <独立文件>.avif` 通过，
+  输出 **30 帧、852×480、20fps、time_base=1/10240、PTS 0..14848 / 步长512**，严格解码成功；
+  SHA-256 与基线相同：`3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+  本轮验证 VCS 功能和输出一致，没有据此宣称 VCS 编码吞吐提升。
+
+推荐构建方式已更新至 README（不覆盖全局安装；输出目录须为新目录）：
+
+```powershell
+$env:PKG_CONFIG_PATH='D:/ffmpeg-dev/ffmpeg-8.1.2-full_build-shared/lib/pkgconfig'
+cargo build --profile preview --features in-process-decode
+python -B -X utf8 scripts/build-preview-runtime.py --exe target/preview/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --output-dir target/preview-runtime-next
+python -B -X utf8 scripts/test-preview-cues.py --vimg target/preview-runtime-next/vimg.exe --fixtures .scratch/startup/cue-fixtures-next --output-dir .scratch/startup/cue-check-next
+```
+
+调用栈配置可用 `wpr -start scripts/profile-static-startup.wprp!VimgStartup -filemode -instancename VimgStartupManual`，
+在普通权限进程中运行预览，再用 `wpr -stop <输出>.etl -skipPdbGen -instancename VimgStartupManual` 停止该会话。
+分析时同时关联父进程和子进程；完整 CPU/调度采样仅用于归因，端到端验收另测。
+
+本地原始数据及脚本在 `.scratch/startup/phase28/`：`profile-file/`、`repro.py`、`final-feedback.py`、
+`warm-cues/`、`warm-cues-confirm/`、`warm-size/`、`warm-final/`、`cold-final/`、`cold-confirm/`、
+`warm-hevc-final/`、`validation-final/`、`summary.json`。新旧运行包在 `target/preview-runtime-phase28-*`。
+实验二进制、ETL、临时素材不入 Git；现有 `.serena/project.yml` 修改未纳入本轮提交。
+
 ## 2026-10-24：CPU 调用栈定位 H.264 CABAC 开销，并采用有界关键帧前探
 
 **本轮将首次静态预览的大部分解码开销定位到 CABAC/残差解析，并通过选择更小的邻近 IDR 减少工作量。**
