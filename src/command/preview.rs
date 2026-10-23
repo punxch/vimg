@@ -39,6 +39,11 @@ pub(super) struct PreviewTimings {
     drain_kind: Option<&'static str>,
     decoder_threads: usize,
     skip_loop_filter: bool,
+    lookahead_packets: usize,
+    lookahead_selected: bool,
+    first_key_pts: Option<i64>,
+    first_key_bytes: usize,
+    selected_packet_bytes: usize,
 }
 
 #[cfg(feature = "in-process-decode")]
@@ -61,6 +66,11 @@ impl PreviewTimings {
             drain_kind: None,
             decoder_threads: 0,
             skip_loop_filter: false,
+            lookahead_packets: 0,
+            lookahead_selected: false,
+            first_key_pts: None,
+            first_key_bytes: 0,
+            selected_packet_bytes: 0,
         }
     }
 
@@ -91,6 +101,11 @@ impl Drop for PreviewTimings {
                     "drain_kind": self.drain_kind,
                     "decoder_threads": self.decoder_threads,
                     "skip_loop_filter": self.skip_loop_filter,
+                    "lookahead_packets": self.lookahead_packets,
+                    "lookahead_selected": self.lookahead_selected,
+                    "first_key_pts": self.first_key_pts,
+                    "first_key_bytes": self.first_key_bytes,
+                    "selected_packet_bytes": self.selected_packet_bytes,
                 })
             );
         }
@@ -265,6 +280,9 @@ mod native {
         timing.attempts += 1;
         timing.early_drain = false;
         timing.drain_kind = None;
+        timing.lookahead_selected = false;
+        timing.first_key_pts = None;
+        timing.first_key_bytes = 0;
         timing.seek_mode = if minimum_pts.is_some() {
             "forward"
         } else {
@@ -345,14 +363,33 @@ mod native {
                         continue;
                     }
                     timing.key_packets += usize::from(packet.is_key());
-                    let (before_target, drain) =
+                    let packet_framing = framing;
+                    let (before_target, mut drain) =
                         packet_policy(&packet, minimum_pts, codec_id, &mut framing);
+                    if let Some((pts, kind)) = drain {
+                        timing.first_key_pts = Some(pts);
+                        timing.first_key_bytes = packet.size();
+                        if minimum_pts.is_some() && kind == "h264_idr" {
+                            if let Some(next) = smaller_indexed_idr(
+                                input,
+                                index,
+                                &packet,
+                                packet_framing.unwrap(),
+                                timing,
+                            ) {
+                                drain = Some((next.pts().unwrap(), kind));
+                                packet = next;
+                                timing.lookahead_selected = true;
+                            }
+                        }
+                    }
                     decoder.skip_frame(if before_target {
                         timing.pre_target_packets += 1;
                         codec::discard::Discard::All
                     } else {
                         codec::discard::Discard::NonKey
                     });
+                    timing.selected_packet_bytes = packet.size();
                     decoder.send_packet(&packet)?;
                     if let Some((pts, kind)) = drain {
                         // Consume any immediately available output before sending
@@ -383,6 +420,90 @@ mod native {
                 return Ok(jpeg);
             }
         }
+    }
+
+    /// CABAC work dominates large H.264 IDRs. Inspect at most one neighboring
+    /// indexed keyframe before decoding, keeping the original packet alive for
+    /// every declined/failed lookup. Only complete IDRs may take this path: both
+    /// choices drain immediately, so moving the demux cursor cannot lose a
+    /// packet needed to finish the original picture.
+    fn smaller_indexed_idr(
+        input: &mut format::context::Input,
+        index: usize,
+        original: &ffmpeg::Packet,
+        length_size: usize,
+        timing: &mut PreviewTimings,
+    ) -> Option<ffmpeg::Packet> {
+        if original.size() < 256 * 1024 {
+            return None;
+        }
+        // An in-band SPS/PPS update may be required by the next IDR. Never
+        // discard that update along with the picture we would otherwise skip.
+        if avc_idr_parameters(original.data()?, length_size)? {
+            return None;
+        }
+        let pts = original.pts()?;
+        let stream = input.stream(index)?;
+        let time_base = stream.time_base();
+        if time_base.numerator() <= 0 || time_base.denominator() <= 0 {
+            return None;
+        }
+        // Bound the extra offset to five seconds, regardless of sparse Cues.
+        let window = unsafe {
+            ffmpeg::ffi::av_rescale_q_rnd(
+                5,
+                ffmpeg::ffi::AVRational { num: 1, den: 1 },
+                time_base.into(),
+                ffmpeg::ffi::AVRounding::AV_ROUND_DOWN,
+            )
+        };
+        let limit = pts.checked_add(window)?;
+        let wanted = pts.checked_add(1)?;
+        let timestamp = unsafe {
+            let entry = ffmpeg::ffi::avformat_index_get_entry_from_timestamp(
+                stream.as_ptr() as *mut _,
+                wanted,
+                0,
+            );
+            if entry.is_null() {
+                return None;
+            }
+            // Index pointers are invalidated by a seek/read; copy before either.
+            (*entry).timestamp
+        };
+        if timestamp < wanted || timestamp > limit {
+            return None;
+        }
+        timing.mark("read_packet");
+        let next = (|| {
+            let result = unsafe {
+                ffmpeg::ffi::av_seek_frame(input.as_mut_ptr(), index as i32, timestamp, 0)
+            };
+            if result < 0 {
+                return None;
+            }
+            let mut packet = ffmpeg::Packet::empty();
+            packet.read(input).ok()?;
+            timing.packets += 1;
+            timing.lookahead_packets += 1;
+            timing.key_packets += usize::from(packet.stream() == index && packet.is_key());
+            let next_pts = packet.pts()?;
+            if packet.stream() != index
+                || next_pts <= pts
+                || next_pts > limit
+                || packet.size() > original.size() / 2
+                || unsafe { (*packet.as_ptr()).flags != ffmpeg::ffi::AV_PKT_FLAG_KEY }
+                || packet
+                    .side_data()
+                    .any(|s| s.kind() == codec::packet::side_data::Type::NewExtraData)
+                || !avc_idr(packet.data()?, length_size)
+            {
+                return None;
+            }
+            Some(packet)
+        })();
+        timing.mark("keyframe_lookahead");
+        next
     }
 
     fn packet_policy(
@@ -491,33 +612,36 @@ mod native {
     // Validate every NAL boundary, not just the first slice. The demuxer supplies
     // a complete AVC access unit; allow IDR slices plus ordinary parameter/SEI
     // data, but reject mixed VCL, extensions, unknown types and malformed framing.
-    fn avc_idr(mut data: &[u8], length_size: usize) -> bool {
+    fn avc_idr(data: &[u8], length_size: usize) -> bool {
+        avc_idr_parameters(data, length_size).is_some()
+    }
+
+    // Some(true) means a valid IDR access unit also carries parameter sets.
+    fn avc_idr_parameters(mut data: &[u8], length_size: usize) -> Option<bool> {
         if !matches!(length_size, 1 | 2 | 4) {
-            return false;
+            return None;
         }
         let mut idr = false;
+        let mut parameters = false;
         while !data.is_empty() {
-            let Some(length) = data.get(..length_size) else {
-                return false;
-            };
+            let length = data.get(..length_size)?;
             let size = length
                 .iter()
                 .fold(0usize, |n, &b| (n << 8) | usize::from(b));
             data = &data[length_size..];
-            let Some(nal) = data.get(..size).filter(|nal| !nal.is_empty()) else {
-                return false;
-            };
+            let nal = data.get(..size).filter(|nal| !nal.is_empty())?;
             if nal[0] & 0x80 != 0 {
-                return false;
+                return None;
             }
             match nal[0] & 0x1f {
                 5 if nal[0] & 0x60 != 0 && nal.len() > 1 => idr = true,
-                6..=9 | 12 => {}
-                _ => return false,
+                7 | 8 => parameters = true,
+                6 | 9 | 12 => {}
+                _ => return None,
             }
             data = &data[size..];
         }
-        idr
+        idr.then_some(parameters)
     }
 
     fn hevc_length_size(extra: &[u8]) -> Option<usize> {

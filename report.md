@@ -1,5 +1,204 @@
 # Performance Optimization Report
 
+## 2026-10-24：CPU 调用栈定位 H.264 CABAC 开销，并采用有界关键帧前探
+
+**本轮将首次静态预览的大部分解码开销定位到 CABAC/残差解析，并通过选择更小的邻近 IDR 减少工作量。**
+最终策略已经过独立低负载冷热确认；具体结果见下表。H.264 保持单线程和环路滤波，
+JPEG 尺寸、质量、方向处理及 stdout/Yazi 协议沿用原行为。选帧变化是此次收益的来源，不能解释成相同图像的解码器加速。
+
+### CPU 调用栈证据
+
+基线源码为 Git `4f59b91`；其生产路径与 `bb4e1d0` 相同，冻结包仍为
+`target/preview-runtime-phase24-wpp/vimg.exe`（SHA-256 `1f9955090a7423dbdd979ca08ba11c622ade932d20806b6fa52ef79196423d47`）。
+Windows / i9-12900K、FFmpeg 8.1.2，主素材为 `sample/input.mkv`。
+以下 RVA 对应 `avcodec-62.dll` 的 SHA-256：
+`34f5b1baac01c4be3edf464309c79db05ffbd4a9c905c94b4a4651cd15370296`。
+先用上轮细分探针复测三次低负载调用，`packet_send` 中位数 **29.777ms**，读包约 **0.31ms**；
+以 27ms 为改进目标的诊断脚本报红，重现本轮要调查的瓶颈。
+
+使用 WPR 的 `ProcessThread`、`Loader`、`SampledProfile` 及 `SampledProfile` 栈，
+分别采集旧路径和初版前探路径各 40 个普通权限新进程；满足 CPU 门槛的分别为 37、33 个。
+两条 CPU 跟踪都没有丢事件。按 PID 和模块地址关联栈，进一步只统计 **直接由 vimg 调用**的
+`avcodec_send_packet`，排除 `avformat_find_stream_info` 内部的解码调用。
+这些是 CPU 归因数据，不用于端到端性能验收。
+
+| 原 DLL 内函数 / RVA | 基线直接 send_packet 栈的叶样本 | 占 1069 个直接调用样本的比例 |
+| --- | ---: | ---: |
+| `decode_cabac_residual_nondc_internal` / `0x36d510` | 565 | 52.85% |
+| `get_cabac` / `0x36b580` | 221 | 20.67% |
+| `decode_significance_x86` / `0x36c9f0` | 131 | 12.25% |
+| `ff_h264_decode_mb_cabac` / `0x36eac0` | 26 | 2.43% |
+| `get_cabac_noinline` / `0x36b4e0` | 15 | 1.40% |
+| DC 残差解析 / `0x36cf30` | 7 | 0.65% |
+| 上述 CABAC/残差路径合计 | 965 | **90.27%** |
+
+典型栈为 `avcodec_send_packet → … → decode_slice → ff_h264_decode_mb_cabac →
+decode_cabac_residual_nondc_internal → get_cabac`。原库没有内部符号/PDB，函数映射通过同版源码的
+带符号构建、调用关系和反汇编核对完成；例如两个 160 字节 CABAC 函数与符号版仅有表地址的四字节位移不同。
+这支持函数级归因，不提供源码行级的精确百分比。符号库仅用于离线分析：其精简构建缺少完整 avformat
+所需的辅助导出，尝试运行完整 CLI 超时，没有产生可用测量；没有把该库用于验收或默认运行包。
+
+前探路径的直接调用样本降为 345 个（33 个进程），归一化约 **28.89→10.45 个样本/预览**。
+样本数不是精确毫秒。主素材原关键帧只有一个 IDR slice，主要瓶颈是必须串行解析的大量编码残差，
+因此本轮没有继续增加线程、放宽错误检查或重试收益不稳的 H.264 去滤波开关。
+
+### 采用的策略及边界
+
+- 仅在向前尝试中，对通过既有 IDR NAL 校验且至少 **256KiB** 的 H.264 关键帧前探。
+  原帧携带 SPS/PPS 时保留原帧，避免略过后续帧需要的参数更新；新增回归先在未加保护的版本上报红，再验证修复。
+- 只查紧邻的后续索引关键帧，额外时间偏移不超过 **5 秒**，最多额外 seek 一次、读取一个包。
+  不扫描整个 GOP；没有合适索引、候选不可读、时间戳异常、携带新 extradata 或不满足 IDR 校验时使用原包。
+- 只有候选包不超过原包的一半大小才采用。两种选择都沿用既有解码、损坏检查和提前排空路径。
+  候选实际解码失败时重建解码器，执行既有后向尝试；仍失败时保留元数据供插件回退，失败不覆盖旧缓存。
+- `--timings` 增加首次关键帧 PTS/包大小、前探读包数、是否采用候选、送入解码器的包大小，
+  以及触发时的 `read_packet` / `keyframe_lookahead` 阶段；stdout 元数据格式不变。
+
+主素材目标 PTS 仍为 164000：原帧 **169.378s / 457932 字节**，现选帧 **173.924s / 123116 字节**，
+额外偏移 **4.546s**，压缩包减少 **73.11%**。总读包数 **1→2**，实际重建图像仍为一张。
+画面从片头字样变为人物镜头，检查无明显损坏，输出均为 600×338；JPEG/RGB 差异按允许的选帧变化记录。
+JPEG SHA-256（每臂所有样本一致）：
+
+- 基线：`ac3d666b3f640b22310630d58879a7807740ceb62467da7b120de3291d4e469d`。
+- 最终候选：`5a8763e5650dd928a42126a922bd815843d971e640b18456cc2bb07468631f44`。
+
+### 最终二进制与低负载验收
+
+最终包为 `target/preview-runtime-phase27-guarded/vimg.exe`，SHA-256
+`01a6f8bcf635c9e8bdb6e09657b619d1bba14b3021b2f817fc190bf3727c11ad`。
+它包含 SPS/PPS 保守处理。初版包 `phase27-final` 的 SHA-256 为
+`9e48cb70d1a40080f69bfe1c9048a0e7ec68a039db4892b2686a37a0bde9cd2d`；初版与最终包的数据分开列示，不混合统计。
+所有默认运行 DLL 与基线逐字节一致，没有使用符号库或上一轮精简 swscale 实验库。
+
+测量前连续四个 250ms 窗口系统 CPU≤8%，调用期间系统 CPU≤12%；系统 CPU 包含被测进程。
+采用四次 ABBA/BAAB 整组判定，有一次超限则保留全组并补测，不按墙钟长短删除慢样本。
+热态先预热，每次新进程、独立输出；最终独立热态不带 `--timings`。
+冷态每次用 RAMMap `-Es` / `-Et` 清缓存，再等待相同低负载窗口，并用 ETW 验证实际读盘。
+最终确认期间不并行运行构建、图像测试或编码任务。没有改变全局电源、优先级、亲和性，也没有停止用户程序。
+
+| 组别 / 每臂有效次数 | 中位数 基线→候选（ms） | P95 基线→候选（ms） | 中位数变化 |
+| --- | ---: | ---: | ---: |
+| 最终独立热态，无 timings，各 12 | 97.65→80.94 | 102.26→88.55 | -17.11% |
+| 最终磁盘冷态，有 timings，各 8 | 113.94→95.22 | 116.94→100.19 | -16.42% |
+| 最终冷态后紧接热态，有 timings，各 4 | 97.44→78.39 | 100.31→79.91 | -19.56% |
+
+最终独立热态完成 11 组，其中 6 组达标；最终冷态完成 6 组，其中 4 组达标。
+紧接热态按自身 CPU 读数判定，共 2 组达标，不借用冷态判定。
+这 4 次/每臂紧接热态仅用于辅助诊断，未达到独立热态的样本门槛；热态验收采用上表独立的 12 次/每臂。
+
+P95 采用最近秩定义；样本数较小时等于最大值，应结合完整样本而不是单独解读。
+探索性整组 bootstrap（seed=27、10000 次，不拆散四次组）结果如下；区间用于辅助判断稳定性，
+不把小样本置信区间当作对所有机器/素材的保证。
+
+最终独立热态中位数变化 95% 区间 **[-21.09%, -15.02%]**；最终冷态中位数变化 95% 区间 **[-17.18%, -13.95%]**。
+
+| 最终冷态阶段中位数（ms） | 基线 | 候选 |
+| --- | ---: | ---: |
+| 打开文件头 | 1.829 | 2.747 |
+| 完整流信息探测 | 5.718 | 7.076 |
+| 初始 seek | 9.601 | 9.960 |
+| 读包/解码阶段 | 30.003 | 11.184 |
+| 缩放 | 0.492 | 0.464 |
+| JPEG 编码 | 0.643 | 0.538 |
+| 候选新增：首次读包 | — | 0.707 |
+| 候选新增：前探 seek/读包 | — | 0.326 |
+| prepare 总区间 | 53.257 | 37.679 |
+| 端到端减 prepare | 60.342 | 57.319 |
+
+基线 read_decode 包含首次读包；候选将首次读包与前探单独计时，因此比较整个取帧工作时必须把这两项算回去。
+
+前探增加了一次读取，却减少了最昂贵的解码输入；本轮没有证明进入 `main` 前的启动成本得到同等幅度改善。
+阶段分别取中位数，不能将各行相加还原端到端中位数。`elapsed_ms - total_ms` 仍包含创建/等待、
+DLL/CRT、CLI、输出和退出等开销，不能全部归因于 DLL 加载。
+
+### 冷态读盘证据与所有样本
+
+本轮初版 48 条、最终版 24 条冷态 ETW 跟踪全部无丢事件。每次冷态输入/EXE/运行库的 DiskIORead 均大于零，
+紧接热态三类读盘均为零；清缓存至启动之间没有目标输入、EXE、运行库的提前读盘。
+最终有效冷态读取量中位数如下，MiB 按 2^20 字节计算；这是实际传输量，不是唯一文件页的大小。
+
+| 读取对象 | 基线（MiB） | 候选（MiB） |
+| --- | ---: | ---: |
+| 输入 | 1.344 | 1.516 |
+| EXE | 11.101 | 10.736 |
+| DLL | 19.834 | 18.505 |
+
+输入额外读取约 176KiB；库哈希/体积未变，DLL 实际读取页的变化不能称为依赖裁剪。
+hard fault 中位数为 6→31。
+
+高负载轮次完整保留，最终全量中位数与有效样本计数如下。
+
+| 最终组别 | 每臂全部次数 | 全量中位数 基线→候选（ms） | 有效次数/每臂 |
+| --- | ---: | ---: | ---: |
+| 独立热态 | 22 | 98.18→81.71 | 12 |
+| 磁盘冷态 | 12 | 114.25→96.53 | 8 |
+| 冷态后热态 | 12 | 96.94→78.64 | 4 |
+
+进程 CPU 使用 GetProcessTimes，存在 15.625ms 量化；hard fault 数量不是耗时或读取字节的替代指标。
+
+| 最终有效样本 | 进程 CPU 中位数 基线→候选（ms） | 系统 CPU 中位数 基线→候选（%） |
+| --- | ---: | ---: |
+| 独立热态 | 78.12→46.88 | 8.31→7.04 |
+| 磁盘冷态 | 70.31→46.88 | 7.21→6.41 |
+
+### 探索结果及副素材检查
+
+下表使用添加 SPS/PPS 保护之前的 `phase27-final` 包；最终验收结果在上表单列。
+
+| 组别 / 每臂有效次数 | 中位数 基线→候选（ms） | P95 基线→候选（ms） | 中位数变化 |
+| --- | ---: | ---: | ---: |
+| 主素材阶段热态，各 24 | 101.52→83.06 | 127.61→96.52 | -18.18% |
+| 主素材无 timings 确认，各 12 | 100.44→82.72 | 108.95→104.11 | -17.64% |
+| 主素材磁盘冷态，各 8 | 116.23→94.59 | 122.93→107.96 | -18.61% |
+| 大包但候选体积接近，各 12 | 224.12→226.07 | 233.02→235.96 | +0.87% |
+| HEVC 自然素材初测，各 12 | 55.85→55.58 | 63.79→86.07 | -0.48% |
+| HEVC 补测，各 24 | 57.32→56.19 | 65.36→68.84 | -1.98% |
+| 主素材 skip=45，各 12 | 83.33→81.97 | 113.15→90.57 | -1.63% |
+
+拒选副素材为连续大体积关键帧，额外读取未换来更小候选；其中位数增加约 0.9%，
+整组区间覆盖零，记录这一有界探测开销，不宣称所有文件都提速。
+HEVC 初测出现 86.07ms 和 74.43ms 的低负载长尾，原生阶段分别仅 9.24ms、9.18ms，
+增加主要位于原生 prepare 区间之外，且前探读包数为零。
+补测到每臂 24 个有效样本后，中位数 57.32→56.19ms，区间 [−3.77%, +0.76%]；
+P95 65.36→68.84ms，仍稍高，但原先约 22ms 的尾差未稳定复现。两轮都保留，不据此声称改善了 HEVC 尾延迟。
+本轮副素材的性能对照为热态；真实磁盘冷态验收针对 H.264 主素材。
+
+### 验证与复现
+
+- 最终 native 测试 **92 passed / 7 ignored**；默认构建测试 **68 passed / 4 ignored**。
+- 新增 `scripts/test-preview-lookahead.py`：8 个真实媒体用例，覆盖 MKV/MP4 小候选、体积接近的拒选、
+  超过时间上限、结尾回退、候选 NAL 截断、候选解码错误、原帧内带 SPS/PPS。每张 JPEG 严格解码，检查尺寸和元数据。
+- 既有静态预览主素材 2 个比较、快速 seek/HEVC/配置变化 24 个用例、HEVC WPP/非 WPP/多 slice/1080p/4K 18 个同帧比较通过。
+  HEVC 18 个比较像素相同。4 个 Yazi Lua 测试与 17 个原生协议检查通过，包括旧缓存保留、路径参数和无 ffprobe/ffmpeg 子进程。
+- 原始 `vimg vcs -c3 -H160 -n9 .\sample\input.mkv --output …avif` 通过：30 帧、852×480、20fps、
+  时间基 1/10240，PTS 0…14848 步长 512，每帧 duration=512；严格完整解码通过。
+  文件 SHA-256 仍为 `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+
+构建与测试命令（输出目录必须是新目录）：
+
+```powershell
+$env:PKG_CONFIG_PATH='D:/ffmpeg-dev/ffmpeg-8.1.2-full_build-shared/lib/pkgconfig'
+cargo build --release --features in-process-decode
+python scripts/build-preview-runtime.py --exe target/release/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --filter-dll target/preview-runtime-repro/avfilter-11.dll --output-dir target/preview-runtime-new
+python scripts/test-preview-lookahead.py --vimg target/preview-runtime-new/vimg.exe --fixtures .scratch/lookahead-fixtures-new --output-dir .scratch/lookahead-validation-new
+python scripts/bench-static-preview.py --baseline target/preview-runtime-phase24-wpp/vimg.exe --candidate target/preview-runtime-new/vimg.exe --video sample/input.mkv --output-dir .scratch/lookahead-bench-new --runs 12 --max-system-cpu 12 --idle-system-cpu 8
+```
+
+新增 `scripts/profile-static-preview.wprp`，已通过 WPR profile 解析。
+在管理员终端启动/结束其专用会话，在普通终端运行被采样命令：
+
+```powershell
+wpr -start .\scripts\profile-static-preview.wprp!VimgPreviewCpu -instancename VimgPreviewCpu
+# 在普通终端重复运行 preview，按 PID 查看调用栈；采样耗时不用于无跟踪验收。
+wpr -stop .scratch\preview-cpu-new.etl -skipPdbGen -instancename VimgPreviewCpu
+```
+
+WPR 配置依据 [Microsoft SystemProvider 文档](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/2-system-and-event-provider-definitions)，
+栈解析使用 [Microsoft TraceEvent 的 CallStack 示例](https://github.com/microsoft/perfview/blob/main/src/TraceEvent/Samples/41_TraceLogMonitor.cs)。
+本机原始数据、所有超限组、ETL、地址映射与诊断脚本在 `.scratch/startup/phase27/`，汇总为 `summary.json`；
+关键目录为 `cpu-profile/{production,lookahead}`、`warm-final`、`cold-final`、`validation-final`。
+冷态控制器沿用前轮方法，只管理自身 WPR 会话和缓存清理，vimg 始终使用普通令牌。
+实验包、符号构建、ETL 和临时素材均不入库，`.serena/project.yml` 原修改不纳入提交。
+
 ## 2026-10-24：补齐低负载 H.264 阶段诊断与三项优化实验
 
 **本轮完成了上轮未收齐的低负载阶段诊断，但没有发现足够稳定的新优化收益。**

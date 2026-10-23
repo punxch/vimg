@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Start/stop WPR in an elevated shell; launch measured previews normally.
+     CPU-sampled runs are for attribution, not untraced latency acceptance. -->
+<WindowsPerformanceRecorder Version="1.0">
+  <Profiles>
+    <SystemCollector Id="PreviewCpuCollector" Name="Static Preview CPU">
+      <BufferSize Value="256"/><Buffers Value="256"/>
+    </SystemCollector>
+    <SystemProvider Id="PreviewCpuProvider">
+      <Keywords>
+        <Keyword Value="ProcessThread"/><Keyword Value="Loader"/>
+        <Keyword Value="SampledProfile"/>
+      </Keywords>
+      <Stacks><Stack Value="SampledProfile"/></Stacks>
+    </SystemProvider>
+    <Profile Id="VimgPreviewCpu.Verbose.Memory" Name="VimgPreviewCpu"
+             Description="Static preview sampled CPU stacks" LoggingMode="Memory" DetailLevel="Verbose">
+      <Collectors><SystemCollectorId Value="PreviewCpuCollector"><SystemProviderId Value="PreviewCpuProvider"/></SystemCollectorId></Collectors>
+    </Profile>
+    <Profile Id="VimgPreviewCpu.Verbose.File" Name="VimgPreviewCpu"
+             Description="Static preview sampled CPU stacks" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors><SystemCollectorId Value="PreviewCpuCollector"><SystemProviderId Value="PreviewCpuProvider"/></SystemCollectorId></Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>
