@@ -1178,7 +1178,9 @@ mod frame_lifetime_tests {
             .unwrap()
             .input("out", 0)
             .unwrap()
-            .parse("null")
+            // Exercise buffer replacement with a pass-through format filter
+            // that is also present in the minimal production runtime.
+            .parse("format=rgb24")
             .unwrap();
         graph.validate().unwrap();
         let mut rgb = Video::new(ffmpeg::format::Pixel::RGB24, 64, 32);

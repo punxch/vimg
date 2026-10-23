@@ -29,6 +29,11 @@ pub(super) struct PreviewTimings {
     key_packets: usize,
     early_drain: bool,
     selected_pts: Option<i64>,
+    target_pts: Option<i64>,
+    seek_mode: &'static str,
+    attempts: usize,
+    pre_target_packets: usize,
+    drain_kind: Option<&'static str>,
 }
 
 #[cfg(feature = "in-process-decode")]
@@ -44,6 +49,11 @@ impl PreviewTimings {
             key_packets: 0,
             early_drain: false,
             selected_pts: None,
+            target_pts: None,
+            seek_mode: "none",
+            attempts: 0,
+            pre_target_packets: 0,
+            drain_kind: None,
         }
     }
 
@@ -69,6 +79,9 @@ impl Drop for PreviewTimings {
                     "packets": self.packets, "pid": std::process::id(),
                     "key_packets": self.key_packets, "early_drain": self.early_drain,
                     "selected_pts": self.selected_pts,
+                    "target_pts": self.target_pts, "seek_mode": self.seek_mode,
+                    "attempts": self.attempts, "pre_target_packets": self.pre_target_packets,
+                    "drain_kind": self.drain_kind,
                 })
             );
         }
@@ -200,28 +213,7 @@ mod native {
         );
         let index = stream.index();
         let time_base = stream.time_base();
-        // Only length-prefixed H.264 IDRs are eligible for early draining.
-        // Keep HEVC, recovery-point/open GOP and unknown framing on the normal path.
-        let mut nal_length_size = if parameters.id() == codec::Id::H264 {
-            // The parameters and extradata are borrowed from the live input stream.
-            let raw = unsafe { &*parameters.as_ptr() };
-            if raw.extradata_size >= 7 && !raw.extradata.is_null() {
-                avc_length_size(unsafe { std::slice::from_raw_parts(raw.extradata, 7) })
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let mut context = codec::context::Context::from_parameters(parameters)?;
-        context.set_threading(codec::threading::Config {
-            kind: codec::threading::Type::Frame,
-            count: 1,
-        });
-        let mut decoder = context.decoder().video()?;
-        decoder.skip_frame(codec::discard::Discard::NonKey);
         drop(videos);
-        timing.mark("decoder_init");
         // FFmpeg input-side -ss is relative to the container's start time.
         let origin = unsafe { (*input.as_ptr()).start_time };
         let origin = if origin == ffmpeg::ffi::AV_NOPTS_VALUE {
@@ -233,14 +225,8 @@ mod native {
         let target = target
             .checked_add(origin)
             .context("seek timestamp overflow")?;
-        input.seek(target, ..target)?;
-        timing.mark("seek");
-        for mut stream in input.streams_mut() {
-            if stream.index() != index {
-                // The stream remains owned by input throughout this update.
-                unsafe { (*stream.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL };
-            }
-        }
+        // Static previews favor a nearby indexed keyframe over an exact image.
+        // Keep the same open/probed input for one bounded backward retry.
         let target_pts = unsafe {
             ffmpeg::ffi::av_rescale_q_rnd(
                 target,
@@ -252,6 +238,74 @@ mod native {
                 ffmpeg::ffi::AVRounding::AV_ROUND_UP,
             )
         };
+        timing.target_pts = Some(target_pts);
+        if let Ok(jpeg) = attempt(input, index, target, Some(target_pts), options, timing) {
+            return Ok(jpeg);
+        }
+        attempt(input, index, target, None, options, timing)
+    }
+
+    fn attempt(
+        input: &mut format::context::Input,
+        index: usize,
+        target: i64,
+        minimum_pts: Option<i64>,
+        options: &Preview,
+        timing: &mut PreviewTimings,
+    ) -> anyhow::Result<Vec<u8>> {
+        timing.attempts += 1;
+        timing.early_drain = false;
+        timing.drain_kind = None;
+        timing.seek_mode = if minimum_pts.is_some() {
+            "forward"
+        } else {
+            "backward"
+        };
+        if minimum_pts.is_some() {
+            input.seek(target, target..)?;
+        } else {
+            input.seek(target, ..target)?;
+        }
+        timing.mark("seek");
+        for mut stream in input.streams_mut() {
+            if stream.index() != index {
+                // The stream remains owned by input throughout this update.
+                unsafe { (*stream.as_mut_ptr()).discard = ffmpeg::ffi::AVDiscard::AVDISCARD_ALL };
+            }
+        }
+        // A fresh decoder also resets EOF, reference pictures and changed codec
+        // configuration after an unsuccessful forward attempt.
+        let parameters = input
+            .stream(index)
+            .context("missing preview stream")?
+            .parameters();
+        let codec_id = parameters.id();
+        let raw = unsafe { &*parameters.as_ptr() };
+        let mut framing = if raw.extradata_size > 0 && !raw.extradata.is_null() {
+            let extra =
+                unsafe { std::slice::from_raw_parts(raw.extradata, raw.extradata_size as usize) };
+            match codec_id {
+                codec::Id::H264 => avc_length_size(extra),
+                codec::Id::HEVC => hevc_length_size(extra),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut context = codec::context::Context::from_parameters(parameters)?;
+        context.set_threading(codec::threading::Config {
+            kind: codec::threading::Type::Frame,
+            count: 1,
+        });
+        let mut decoder = context.decoder();
+        decoder.check(
+            codec::decoder::Check::BISTREAM
+                | codec::decoder::Check::BUFFER
+                | codec::decoder::Check::EXPLODE,
+        );
+        let mut decoder = decoder.video()?;
+        decoder.skip_frame(codec::discard::Discard::NonKey);
+        timing.mark("decoder_init");
         loop {
             // Drop/unref each packet before reading the next one.
             let mut packet = ffmpeg::Packet::empty();
@@ -262,63 +316,91 @@ mod native {
                         continue;
                     }
                     timing.key_packets += usize::from(packet.is_key());
-                    if packet
-                        .side_data()
-                        .any(|side| side.kind() == codec::packet::side_data::Type::NewExtraData)
-                    {
-                        // A new AVC configuration may change the NAL length size.
-                        nal_length_size = None;
-                    }
-                    let drain_pts = if packet.is_key()
-                        && packet.pts().is_some_and(|pts| pts >= target_pts)
-                    {
-                        // Consider only the first key packet at/after the target.
-                        // Do not drain past an earlier recovery-point picture.
-                        nal_length_size.take().and_then(|size| {
-                            (unsafe { (*packet.as_ptr()).flags == ffmpeg::ffi::AV_PKT_FLAG_KEY }
-                                && packet.data().is_some_and(|data| avc_idr(data, size)))
-                            .then(|| packet.pts().unwrap())
-                        })
+                    let (before_target, drain) =
+                        packet_policy(&packet, minimum_pts, codec_id, &mut framing);
+                    decoder.skip_frame(if before_target {
+                        timing.pre_target_packets += 1;
+                        codec::discard::Discard::All
                     } else {
-                        None
-                    };
+                        codec::discard::Discard::NonKey
+                    });
                     decoder.send_packet(&packet)?;
-                    if let Some(pts) = drain_pts {
+                    if let Some((pts, kind)) = drain {
                         // Consume any immediately available output before sending
                         // EOF; send_eof may otherwise return EAGAIN.
                         if let Some(jpeg) =
-                            receive(&mut decoder, target_pts, options, timing, None)?
+                            receive(&mut decoder, minimum_pts, options, timing, None)?
                         {
                             return Ok(jpeg);
                         }
-                        // A complete IDR is independent of later pictures. Draining
+                        // A complete random-access picture needs no later pictures. Draining
                         // releases the reorder queue instead of reading more GOPs
                         // solely to make the decoder return this one preview frame.
                         decoder.send_eof()?;
                         timing.early_drain = true;
-                        return receive(&mut decoder, target_pts, options, timing, Some(pts))?
+                        timing.drain_kind = Some(kind);
+                        return receive(&mut decoder, minimum_pts, options, timing, Some(pts))?
                             .context("no keyframe after early drain");
                     }
                 }
                 Err(ffmpeg::Error::Eof) => {
                     decoder.send_eof()?;
-                    return receive(&mut decoder, target_pts, options, timing, None)?
+                    return receive(&mut decoder, minimum_pts, options, timing, None)?
                         .context("no keyframe after preview position");
                 }
                 Err(error) => return Err(error.into()),
             }
-            if let Some(jpeg) = receive(&mut decoder, target_pts, options, timing, None)? {
+            if let Some(jpeg) = receive(&mut decoder, minimum_pts, options, timing, None)? {
                 return Ok(jpeg);
             }
         }
     }
 
+    fn packet_policy(
+        packet: &ffmpeg::Packet,
+        minimum_pts: Option<i64>,
+        codec_id: codec::Id,
+        framing: &mut Option<usize>,
+    ) -> (bool, Option<(i64, &'static str)>) {
+        if packet
+            .side_data()
+            .any(|side| side.kind() == codec::packet::side_data::Type::NewExtraData)
+        {
+            // Decoder configuration can change the NAL framing. Never drain
+            // against the old configuration, even on a pre-target packet.
+            *framing = None;
+        }
+        // Unknown timestamps never authorize dropping picture reconstruction.
+        let before_target = minimum_pts
+            .zip(packet.pts())
+            .is_some_and(|(target, pts)| pts < target);
+        let drain = if packet.is_key() && !before_target && packet.pts().is_some() {
+            // Consider only the first eligible key packet; recovery/unknown
+            // pictures retain normal decoder behavior throughout this attempt.
+            framing.take().and_then(|size| {
+                if unsafe { (*packet.as_ptr()).flags != ffmpeg::ffi::AV_PKT_FLAG_KEY } {
+                    return None;
+                }
+                let data = packet.data()?;
+                let kind = match codec_id {
+                    codec::Id::H264 if avc_idr(data, size) => Some("h264_idr"),
+                    codec::Id::HEVC => hevc_irap(data, size),
+                    _ => None,
+                }?;
+                Some((packet.pts().unwrap(), kind))
+            })
+        } else {
+            None
+        };
+        (before_target, drain)
+    }
+
     fn receive(
         decoder: &mut ffmpeg::decoder::Video,
-        target: i64,
+        minimum_pts: Option<i64>,
         options: &Preview,
         timing: &mut PreviewTimings,
-        expected_idr_pts: Option<i64>,
+        expected_key_pts: Option<i64>,
     ) -> anyhow::Result<Option<Vec<u8>>> {
         let mut frame = Video::empty();
         loop {
@@ -334,12 +416,16 @@ mod native {
                 .timestamp()
                 .or_else(|| frame.pts())
                 .context("frame has no timestamp")?;
-            if pts < target {
+            if minimum_pts.is_some_and(|target| pts < target) {
                 continue;
             }
-            if let Some(expected) = expected_idr_pts {
+            ensure!(
+                frame.is_key() && !frame.is_corrupt(),
+                "invalid preview keyframe uses FFmpeg"
+            );
+            if let Some(expected) = expected_key_pts {
                 ensure!(
-                    frame.is_key() && pts == expected && !frame.is_corrupt(),
+                    pts == expected,
                     "early-drained frame requires FFmpeg validation"
                 );
             }
@@ -405,9 +491,61 @@ mod native {
         idr
     }
 
+    fn hevc_length_size(extra: &[u8]) -> Option<usize> {
+        // hvcC has a 23-byte fixed header; Annex B and incomplete records must
+        // not be mistaken for length-prefixed access units.
+        if extra.len() < 23 || extra[0] != 1 {
+            return None;
+        }
+        match (extra[21] & 3) + 1 {
+            size @ (1 | 2 | 4) => Some(usize::from(size)),
+            _ => None,
+        }
+    }
+
+    fn hevc_irap(mut data: &[u8], length_size: usize) -> Option<&'static str> {
+        if !matches!(length_size, 1 | 2 | 4) {
+            return None;
+        }
+        let mut picture_type = None;
+        while !data.is_empty() {
+            let length = data.get(..length_size)?;
+            let size = length
+                .iter()
+                .fold(0usize, |n, &b| (n << 8) | usize::from(b));
+            data = &data[length_size..];
+            let nal = data.get(..size).filter(|nal| nal.len() >= 3)?;
+            // forbidden_zero_bit, nuh_layer_id and temporal_id_plus1. Only
+            // single-layer, temporal-layer-zero random-access pictures qualify.
+            if nal[0] & 0x81 != 0 || nal[1] != 1 {
+                return None;
+            }
+            let kind = (nal[0] >> 1) & 0x3f;
+            match kind {
+                16..=21 => {
+                    let first_slice = nal[2] & 0x80 != 0;
+                    match picture_type {
+                        None if first_slice => picture_type = Some(kind),
+                        Some(previous) if previous == kind && !first_slice => {}
+                        _ => return None, // no mixed pictures or missing first slice
+                    }
+                }
+                32..=35 | 38..=40 => {} // VPS/SPS/PPS/AUD/filler/prefix and suffix SEI
+                _ => return None,
+            }
+            data = &data[size..];
+        }
+        match picture_type? {
+            16..=18 => Some("hevc_bla"),
+            19..=20 => Some("hevc_idr"),
+            21 => Some("hevc_cra"),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{avc_idr, avc_length_size};
+        use super::{avc_idr, avc_length_size, hevc_irap, hevc_length_size, packet_policy};
 
         fn packet(size: usize, nals: &[&[u8]]) -> Vec<u8> {
             let mut packet = Vec::new();
@@ -488,6 +626,152 @@ mod native {
             }
             assert!(!avc_idr(&complete, 0));
             assert!(!avc_idr(&complete, 3));
+        }
+
+        #[test]
+        fn hevc_configuration_requires_a_complete_length_header() {
+            let mut extra = [0; 23];
+            extra[0] = 1;
+            for size in [1, 2, 4] {
+                extra[21] = size - 1;
+                assert_eq!(hevc_length_size(&extra), Some(usize::from(size)));
+            }
+            assert_eq!(hevc_length_size(&extra[..22]), None);
+            extra[21] = 2;
+            assert_eq!(hevc_length_size(&extra), None);
+            extra[0] = 0;
+            assert_eq!(hevc_length_size(&extra), None);
+        }
+
+        #[test]
+        fn hevc_idr_bla_cra_and_multiple_slices_can_drain() {
+            for size in [1, 2, 4] {
+                for kind in 16..=21 {
+                    let data = packet(
+                        size,
+                        &[
+                            &[64, 1, 0x80],
+                            &[66, 1, 0x80],
+                            &[68, 1, 0x80],
+                            &[70, 1, 0x80],
+                            &[78, 1, 0x80],
+                            &[kind << 1, 1, 0x80],
+                            &[kind << 1, 1, 0x40],
+                            &[80, 1, 0x80],
+                        ],
+                    );
+                    assert_eq!(
+                        hevc_irap(&data, size),
+                        Some(match kind {
+                            16..=18 => "hevc_bla",
+                            19..=20 => "hevc_idr",
+                            _ => "hevc_cra",
+                        })
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn hevc_rejects_mixed_pictures_layers_and_invalid_headers() {
+            for nals in [
+                vec![&[38, 1, 0x80][..], &[42, 1, 0x40]], // IDR then CRA slice
+                vec![&[38, 1, 0x80][..], &[2, 1, 0x40]],  // non-IRAP VCL
+                vec![&[38, 1, 0x80][..], &[38, 1, 0x80]], // two pictures
+                vec![&[38, 1, 0x40][..]],                 // missing first slice
+                vec![&[39, 1, 0x80][..]],                 // other layer
+                vec![&[38, 9, 0x80][..]],                 // other layer
+                vec![&[38, 0, 0x80][..]],                 // invalid temporal id
+                vec![&[38, 2, 0x80][..]],                 // other temporal layer
+                vec![&[166, 1, 0x80][..]],                // forbidden bit
+                vec![&[64, 1, 0x80][..]],                 // parameters only
+                vec![&[38, 1, 0x80][..], &[72, 1, 0x80]], // end of sequence
+            ] {
+                assert_eq!(hevc_irap(&packet(4, &nals), 4), None, "{nals:?}");
+            }
+        }
+
+        #[test]
+        fn hevc_rejects_truncated_nals_and_bad_length_prefixes() {
+            let complete = packet(4, &[&[38, 1, 0x80]]);
+            for n in 0..complete.len() {
+                assert_eq!(hevc_irap(&complete[..n], 4), None);
+            }
+            for data in [
+                &[0, 0, 0, 0][..],
+                &[255, 255, 255, 255],
+                &[0, 0, 0, 2, 38, 1],
+            ] {
+                assert_eq!(hevc_irap(data, 4), None);
+            }
+            assert_eq!(hevc_irap(&complete, 0), None);
+            assert_eq!(hevc_irap(&complete, 3), None);
+        }
+
+        #[test]
+        fn unknown_and_negative_timestamps_preserve_decoder_input_policy() {
+            use ffmpeg_next::{Packet, codec};
+            let mut key = Packet::copy(&packet(4, &[&[0x65, 1]]));
+            key.set_flags(codec::packet::Flags::KEY);
+            let mut framing = Some(4);
+            assert_eq!(
+                packet_policy(&key, Some(10), codec::Id::H264, &mut framing),
+                (false, None)
+            );
+            assert_eq!(framing, Some(4));
+            key.set_pts(Some(-1));
+            assert_eq!(
+                packet_policy(&key, Some(10), codec::Id::H264, &mut framing),
+                (true, None)
+            );
+            // Backward retry explicitly allows the preceding keyframe.
+            assert_eq!(
+                packet_policy(&key, None, codec::Id::H264, &mut framing),
+                (false, Some((-1, "h264_idr")))
+            );
+        }
+
+        #[test]
+        fn corrupt_key_packet_cannot_authorize_early_draining() {
+            use ffmpeg_next::{Packet, codec};
+            let mut key = Packet::copy(&packet(4, &[&[0x65, 1]]));
+            key.set_pts(Some(10));
+            key.set_flags(codec::packet::Flags::KEY | codec::packet::Flags::CORRUPT);
+            let mut framing = Some(4);
+            assert_eq!(
+                packet_policy(&key, Some(10), codec::Id::H264, &mut framing),
+                (false, None)
+            );
+            assert_eq!(framing, None);
+        }
+
+        #[test]
+        fn a_configuration_change_disables_draining_for_the_attempt() {
+            use ffmpeg_next::{Packet, codec, codec::packet::Mut as _};
+            let mut changed = Packet::copy(&packet(4, &[&[0x65, 1]]));
+            changed.set_pts(Some(0));
+            changed.set_flags(codec::packet::Flags::KEY);
+            let side = unsafe {
+                ffmpeg_next::ffi::av_packet_new_side_data(
+                    changed.as_mut_ptr(),
+                    ffmpeg_next::ffi::AVPacketSideDataType::AV_PKT_DATA_NEW_EXTRADATA,
+                    1,
+                )
+            };
+            assert!(!side.is_null());
+            unsafe { *side = 1 };
+            let mut framing = Some(4);
+            assert_eq!(
+                packet_policy(&changed, Some(10), codec::Id::H264, &mut framing),
+                (true, None)
+            );
+            let mut next = Packet::copy(&packet(4, &[&[0x65, 1]]));
+            next.set_pts(Some(10));
+            next.set_flags(codec::packet::Flags::KEY);
+            assert_eq!(
+                packet_policy(&next, Some(10), codec::Id::H264, &mut framing),
+                (false, None)
+            );
         }
     }
 

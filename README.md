@@ -47,10 +47,18 @@ H.264/HEVC stream in Matroska or MP4/MOV without autorotation. Cover art, ambigu
 stream selection, discontinuous timestamps and unsupported formats retain the
 FFmpeg path and reuse the already-probed metadata.
 
-For a confirmed H.264 IDR packet at or after the requested preview position, the
-native path drains the decoder's buffered frames, avoiding extra GOP reads just to
-release the selected frame. AVC framing and the resulting frame are checked;
-recovery-point pictures and HEVC keep normal decoder draining.
+The native path first seeks to an indexed keyframe at or after the requested
+position. It still sends earlier packets to the decoder for parameter processing,
+while suppressing picture reconstruction when their PTS is known. If that attempt
+fails, it creates a fresh decoder and tries the preceding indexed keyframe once.
+Static previews may therefore select a different frame, including an earlier frame
+near EOF; preview bounds, JPEG quality and autorotation behavior are preserved.
+
+Confirmed H.264 IDR and single-layer HEVC IDR/BLA/CRA access units can drain the
+decoder immediately, avoiding extra GOP reads to release the preview frame.
+NAL boundaries, picture structure and decoded output are checked. Unknown framing,
+configuration changes and recovery-point H.264 pictures keep normal draining;
+invalid or unsupported output retains the metadata-based FFmpeg fallback.
 
 `vimg preview --output <cache> --skip 0 --max-width 600 --max-height 900 --quality 75 <video>`
 prints metadata plus `native_preview` and `preview_written` flags. A successful
@@ -65,8 +73,11 @@ metadata protocol. `total_ms` covers native preparation and input cleanup, not
 process startup or response serialization. Failed or unsupported inputs may
 report only the stages reached. Timings are disabled by default and are only
 available in builds with `in-process-decode`.
-The counters include `packets`, `key_packets` and `early_drain`; `selected_pts`
-is the selected frame's timestamp in the video stream's time-base units.
+The counters include `packets`, `key_packets`, `pre_target_packets` and
+`early_drain`. `target_pts` and `selected_pts` use the video stream's time base;
+`seek_mode` and `attempts` describe the final seek path and total attempts.
+`drain_kind` identifies early H.264 IDR or HEVC IDR/BLA/CRA draining, otherwise null.
+Stage names can repeat after a retry; sum repeated stages when aggregating timings.
 
 Existing static images skip extraction. Their metadata, and installations too old
 for `preview`, use `vimg probe <video>` or ffprobe. Standard builds report the
@@ -134,6 +145,49 @@ These groups help interpret noisy runs; all jobs still count toward acceptance,
 and a small group's P95 is not a reliable latency guarantee.
 
 ## Install
+
+### Minimal native Windows runtime
+
+Build the executable with FFmpeg 8.1.2 development libraries, then build and
+package a small `avfilter` alongside the existing codec/container libraries:
+
+```powershell
+$env:PKG_CONFIG_PATH='D:/ffmpeg-dev/ffmpeg-8.1.2-full_build-shared/lib/pkgconfig'
+cargo build --release --features in-process-decode
+python -B -X utf8 scripts/build-preview-runtime.py --exe target/release/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --output-dir target/preview-runtime
+```
+
+This Windows x64 script requires Python 3.12+, Git Bash, MinGW GCC/make and NASM;
+use `--bash`, `--mingw-bin` and `--nasm` to override the tool paths. It verifies the
+pinned source SHA-256 and runtime library versions, disables linker timestamps,
+records build inputs and file hashes in `manifest.json`, and keeps the source/build cache in
+`target/preview-ffmpeg`. The output directory must be new. To package a previously
+built minimal DLL independently, add `--filter-dll <path/to/avfilter-11.dll>`;
+the same library-version and filter-set checks still apply. An `INCOMPLETE` marker
+indicates a failed package check. Nothing is installed globally.
+
+Only `avfilter` is replaced. It retains `buffer`, `buffersink`, `scale`, `format`
+and the always-built audio buffer endpoints; all supplied codec, container and
+other runtime DLLs are copied unchanged, including the SVT-AV1 capability.
+Run `target/preview-runtime/vimg.exe` to use the adjacent DLLs. Build provenance
+and performance measurements are recorded in [report.md](report.md).
+
+Validate preview behavior and compare warm, fresh-process release latency with:
+
+```powershell
+python -B -X utf8 scripts/test-preview-fast.py --vimg target/preview-runtime/vimg.exe --fixtures .scratch/startup/preview-fixtures --output-dir .scratch/startup/preview-check
+python -B -X utf8 scripts/bench-static-preview.py --baseline <old-vimg.exe> --candidate target/preview-runtime/vimg.exe --video sample/input.mkv --output-dir .scratch/startup/preview-bench
+```
+
+Put FFmpeg/ffprobe on PATH for image checks and full runtime DLLs on PATH for the
+baseline. Each benchmark arm receives two warmups and twelve measured calls in
+ABBA/BAAB order, with new output files. Add `--timings` for a separate diagnostic
+run. This benchmark does not purge the Windows file cache; the RAMMap/ETW cold
+measurement procedure and evidence are described in the report. Static tests
+record JPEG/RGB differences and require complete decoding, dimensions, metadata
+and fallback behavior; `test-static-preview.py --exact` optionally checks the old
+image for diagnostics. VCS frame/timeline checks remain unchanged.
+
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/vimg).
 

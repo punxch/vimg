@@ -1,5 +1,372 @@
 # Performance Optimization Report
 
+## 2026-10-23：首次静态预览四项优化落地与冷/热验收
+
+本轮以 Git `2bdff6c` 的原生 release 为基线，采用用户确认的新验收口径：
+保持预览尺寸约束、JPEG 质量参数、方向和元数据；允许选帧与像素变化。
+快速策略默认启用，失败仍复用已探测元数据走原插件 FFmpeg 回退。
+最终独立运行包位于 `target/preview-runtime-repro/`，没有覆盖全局安装。
+
+### 最终结果
+
+主素材为 `sample/input.mkv`，参数为
+`preview --skip 0 --max-width 600 --max-height 900 --quality 75`。
+两端均以实际名称 `vimg.exe` 启动新进程，每次使用独立 JPEG 输出；
+墙钟包含进程创建、原生探测/解码/缩放/编码/发布、stdout/stderr 读取和进程退出。
+下表默认模式不启用 `--timings`。
+
+| 状态 | 每版本样本 | 基线中位数 / P95 | 最终中位数 / P95 | 中位数改善 |
+| --- | ---: | ---: | ---: | ---: |
+| Windows 文件缓存冷态 | 8 | 165.9 / 187.3ms | 115.1 / 147.7ms | 30.6% |
+| 独立预热后的热态 | 12 | 142.8 / 158.9ms | 99.3 / 128.5ms | 30.4% |
+| 每次冷测后立即热测 | 8 | 141.2 / 159.9ms | 98.7 / 116.7ms | 30.1% |
+
+冷热中位数均超过至少改善 10% 的目标。P95 使用 nearest-rank；
+8/12 个样本时它就是本组最大值，不将其解释成长期延迟保证。
+测试机器为 Windows、Intel Core i9-12900K；没有修改系统电源/调度策略。
+这里的冷态是清理 Windows 文件缓存后的实际读盘，不等同于断电启动或清空 SSD 内部缓存。
+测量覆盖直接 CLI 首次静态预览，插件协议另测，不包含 Yazi DDS 传输或屏幕显示耗时。
+
+### 实现与保护
+
+- **减少前置解码**：目标之前且 PTS 已知的包仍发送给解码器处理参数，
+  使用 `AVDISCARD_ALL` 抑制图像重建；其他包恢复 `AVDISCARD_NONKEY`。
+  缺失 PTS 使用保守解码，不授权跳过重建或提前排空。
+- **快速定位**：优先 `input.seek(target, target..)` 前向索引定位。
+  失败或没有有效输出时，在同一个已探测 input 上创建新解码器，执行一次
+  `input.seek(target, ..target)`，允许返回目标之前的索引关键帧。
+  第二次仍失败才返回原有回退协议，不重复探测。
+- **HEVC 排空**：在既有 H.264 IDR 校验之外，增加 hvcC 长度前缀、全部 NAL
+  边界、单层/temporal-layer-zero、首 slice 和同一 IRAP 图像类型检查，
+  覆盖 IDR/BLA/CRA。截断、混合图像、多层、未知结构和配置变化不授权提前排空。
+  正常解码仍可处理不满足快速路径的结构；损坏/非关键帧不发布，排空结果
+  的时间戳必须匹配候选包。解码启用 bitstream/buffer/explode 错误检查。
+- **启动依赖**：固定官方 FFmpeg 8.1.2，仅重建 avfilter，保留 `buffer`、
+  `buffersink`、`scale`、`format` 和构建系统总会带入的 `abuffer`/`abuffersink`。
+  其余 DLL 全部原样复制，avcodec、avformat、avutil、swscale 校验版本及 SHA-256。
+  SVT-AV1、编码器和封装能力不裁剪。avfilter 从 **124,344,320 字节缩至
+  281,932 字节（118.58MiB→275.32KiB）**。
+
+CLI/stdout 协议及插件调用不变。仅 `--timings` 增加 `target_pts`、
+`seek_mode`、`attempts`、`pre_target_packets`、`drain_kind`；时间戳使用视频流 time base。
+重试后的同名阶段应累加，计数覆盖两次尝试。主素材目标 PTS 164000，
+仍选 PTS 169378；最终只需读取 1 包，旧版为 199 包。
+
+### 热态分项归因
+
+每种模式先各预热 2 次，再按 ABBA/BAAB 各测 12 次，release、新进程、新输出。
+默认耗时与诊断阶段计时分开运行；不同组的绝对时间不能拼接相减。
+A=旧版，B=仅减少前置重建的原型，C=再加前向定位/重试及解码校验，D=再加 HEVC 排空，
+E=再加精简 DLL。B 仅用于同素材拆分收益，不作为交付版本。
+D 的正式版本还把包策略提取成函数以直接测试缺失 PTS 和配置变化。
+
+| 变更 / 素材 | 首轮中位数 基线/候选 | 复测中位数 基线/候选 | 复测 P95 基线/候选 | 复测系统 CPU 基线/候选 |
+| --- | ---: | ---: | ---: | ---: |
+| A→B 前置解码 / 主素材 | 160.7 / 131.9ms | 144.8 / 119.5ms | 156.9 / 148.5ms | 7.7% / 12.6% |
+| B→C 快速定位 / 主素材 | 121.7 / 115.8ms | 118.3 / 110.0ms | 125.3 / 137.3ms | 9.0% / 8.7% |
+| C→D HEVC 开关 / H.264 主素材 | 110.4 / 117.8ms | 107.9 / 114.9ms | 155.3 / 127.3ms | 10.0% / 11.8% |
+| C→D HEVC 排空 / 1080p | 78.4 / 64.2ms | 78.6 / 64.5ms | 91.4 / 80.5ms | 14.5% / 16.0% |
+| C→D HEVC 排空 / 4K | 123.5 / 82.7ms | 未重复 | 首轮 139.7 / 90.3ms | 首轮 10.1% / 14.5% |
+| D→E 精简 DLL / 主素材 | 108.9 / 105.0ms | 109.5 / 104.4ms | 127.1 / 117.9ms | 14.7% / 11.8% |
+| A→E 组合 / 主素材 | 140.4 / 100.2ms | 151.7 / 108.5ms | 169.1 / 127.6ms | 19.4% / 18.4% |
+
+首轮及补测全部保留，没有剔除高负载样本。系统 CPU≥45% 的默认测量样本为：
+首轮 decode 3 次、HEVC 1080p 1 次；诊断测量首轮 decode 8 次、seek 1 次，
+补测 decode 9 次、combined 1 次。已分别补测；第三次 decode 诊断及最终组合
+默认/诊断组均无此类高负载样本。所有 cold/cold-final 样本也均低于 45%。
+
+H.264 控制组初测出现数毫秒增加，不能作为 HEVC 的收益。
+进一步以只差 HEVC 分支的原型各测 24 次，得到
+
+**123.3→121.3ms**，P95 139.9→136.5ms，方向与前两轮相反；
+包策略函数提取的独立对照为 106.4→104.8ms。未观察到稳定的 H.264 回退，
+也不为 HEVC 改动声明 H.264 收益。HEVC 1080p 的两轮热态结果稳定，4K 收益更大。
+
+| 诊断对照 | read_decode 中位数 | 读包数 |
+| --- | ---: | ---: |
+| 前置解码（第三轮） | 65.5→40.7ms | [199]→[199] |
+| 快速定位（复测） | 41.1→30.7ms | [199]→[1] |
+| HEVC 1080p（复测） | 17.5→6.3ms | [94]→[1] |
+| HEVC 4K | 59.3→21.3ms | [46]→[1] |
+| 最终组合 | 65.7→30.6ms | [199]→[1] |
+
+### 冷态分项与实际读盘
+
+先完成五组各 8 次/版本的冷测（共 80 个独立 ETW 会话），随后对确定性
+链接的最终运行包再做 8 次/版本（16 个会话）。每个冷进程结束后立即启动
+同版本热进程。A/B 排序同样交错；冷/热输出各自独立。
+
+| 冷态变更 / 素材 | 基线中位数 / P95 | 候选中位数 / P95 | 改善 | 系统 CPU 基线/候选 |
+| --- | ---: | ---: | ---: | ---: |
+| 前置解码 / 主素材 | 163.2 / 182.4ms | 147.0 / 171.7ms | 9.9% | 13.7% / 15.9% |
+| 快速定位 / 主素材 | 142.6 / 161.1ms | 124.6 / 144.8ms | 12.6% | 16.6% / 13.6% |
+| HEVC 排空 / 1080p | 98.7 / 132.1ms | 83.9 / 102.2ms | 15.1% | 10.8% / 9.8% |
+| 精简 DLL / 主素材 | 130.7 / 145.5ms | 121.2 / 137.3ms | 7.3% | 23.9% / 12.6% |
+| 首轮组合 / 主素材 | 169.8 / 173.4ms | 119.5 / 150.8ms | 29.6% | 14.5% / 13.6% |
+
+| 分项冷态磁盘读取中位数 | 素材（基线→候选） | libav DLL（基线→候选） |
+| --- | ---: | ---: |
+| decode | 17.203→17.203MiB | 30.803→30.742MiB |
+| seek | 17.203→1.344MiB | 31.019→30.879MiB |
+| hevc | 3.157→1.657MiB | 31.194→31.194MiB |
+| dll | 1.344→1.344MiB | 31.450→19.834MiB |
+| combined | 17.203→1.344MiB | 31.456→19.834MiB |
+
+控制器仅以管理员令牌启停本次专用 WPR 会话和调用 RAMMap `-Es`、`-Et`；
+被测 vimg 使用普通用户令牌。会话名为 `VimgColdPhase23` 和
+`VimgColdPhase23Final`，均已停止，两个控制器均已退出。
+全部 96 条 ETW 日志 `EventsLost=0`；每一次冷测都观察到素材、EXE 和 libav
+DLL 的 DiskIORead，紧接的热测在这三类路径上全部为 0 字节。
+读取量按文件路径和进程墙钟区间统计，包含系统代为发起的读取/预读；
+没有把进程逻辑读取字节数当作磁盘读取。
+
+最终组 RAMMap 完成到启动间隔为 3.47–23.71ms；standby 从 GiB/MiB 级
+清到 0.207–0.246MiB，每次清理命令退出码均为 0。结果如下：
+
+| 最终组冷态资源中位数 | 基线 | 最终包 |
+| --- | ---: | ---: |
+| 系统 CPU | 13.2% | 11.1% |
+| vimg 进程 CPU 时间 | 125.0ms | 78.1ms |
+| 进程硬缺页 | 40.0 | 18.5 |
+| 素材读盘 | 17.203MiB | 1.395MiB |
+| EXE 读盘 | 11.250MiB | 11.445MiB |
+| libav 读盘 | 30.773MiB | 19.497MiB |
+
+进程 CPU 时间来自 GetProcessTimes，受 Windows 计时粒度限制。最终冷态样本（按执行顺序，ms）：
+
+- baseline：165.6、169.8、187.3、163.2、163.4、176.1、160.2、166.2。
+
+- candidate：147.7、138.6、116.0、114.2、117.9、113.5、110.6、112.8。
+
+### 功能验收与选帧变化
+
+- 既有 139 组预览/回退对照，加新增 24 组，共 163 组通过：141 次原生输出，
+  22 次保留回退协议（其中 1 次双方都无图）。实际输出使用 FFmpeg 严格解码为
+  RGB 并验证数据长度、尺寸、方向及元数据。JPEG/RGB 哈希差异只记录；
+  `--exact` 可额外启用历史图像对照。
+- 22 组输出与原 FFmpeg 图像不同：包括稀疏 Cues、部分开放 GOP、动态分辨率，
+  以及原路径在结尾没有后续关键帧而新路径可回到前一关键帧的情况。
+  稀疏 Cues 删除 10 秒索引后，目标 2 秒会选 20 秒帧，符合新规则。
+  主素材全部已测位置仍与原图一致。
+- 新增 HEVC IDR/BLA/CRA、长 GOP、1080p/4K、损坏输入与动态配置素材。
+  BLA 为 CRA 素材修改相容的 NAL 类型并重算容器 CRC 的确定性合成用例；
+  不能替代所有真实多层/复杂 HEVC 的覆盖。未知结构保持正常解码/回退。
+  4K 和动态分辨率输出另做了目视检查，无明显损坏。
+- Rust 原生测试 **89 passed / 7 ignored**，默认构建 **68 passed / 4 ignored**。
+  新测试覆盖 NAL 截断、混合图像、多 slice、多层、异常/缺失 PTS、损坏标记，
+  以及真实 AVPacket 的 NEW_EXTRADATA 侧数据禁用提前排空。
+- 17 项协议检查通过：无外部 ffmpeg/ffprobe 仍可原生预览、上界响应、参数错误、
+  同源输出拒绝、坏文件、发布失败和旧缓存保护。4 组 Lua 插件测试通过，
+  覆盖元数据复用、能力缓存、刷新、取消和陈旧结果处理。
+- 最终确定性 DLL 再次通过全部 89 项原生单测和 24 个新增图像用例。
+  精简库初测曾因测试专用 `null` 滤镜被裁掉而失败；测试改为生产库已有的
+  透传 `format=rgb24`，保留原帧缓冲引用计数/释放断言，不为测试增加运行库依赖。
+  动态分辨率素材另用显式测试选项验证当前帧尺寸边界与显示比例；固定分辨率
+  素材仍要求与原 FFmpeg 的尺寸相同。
+
+原始 VCS 命令也已验证：
+
+```powershell
+vimg.exe vcs -c3 -H160 -n9 .\sample\input.mkv --output <unique>.avif
+```
+
+基线与最终包先各预热一次，再交错各测 4 次，中位数 **981.9→982.7ms**，
+没有声明 VCS 加速。默认无原生 feature 的 release 也完成同一命令和 capability
+响应检查（单次 1815.4ms，仅作功能检查）。所有输出 SHA-256 均为
+`3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+AVIF 动画流 `v:1` 为 30 帧、852×480、20fps、time base 1/10240，PTS 为
+0、512、…、14848，帧 duration 全部一致；全动画严格解码通过。
+初次检查误选 `v:0` 的主静态图得到 1 帧，改为明确检查动画流后通过。
+
+### 构建与复现
+
+```powershell
+$env:PKG_CONFIG_PATH='D:/ffmpeg-dev/ffmpeg-8.1.2-full_build-shared/lib/pkgconfig'
+cargo build --release --features in-process-decode
+python -B -X utf8 scripts/build-preview-runtime.py --exe target/release/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --output-dir target/preview-runtime --build-root target/preview-ffmpeg-clean
+```
+
+输出目录必须不存在；旧实验目录不会被覆盖。需要 Python 3.12+、Git Bash、
+MinGW GCC/make、NASM，可用参数覆盖路径。实际工具链为 GCC 15.2.0，
+编译器/NASM 版本及配置参数记录在 manifest；固定工具链重建，跨工具链哈希
+不作相同承诺。`--filter-dll` 可独立打包已构建的 DLL，仍做 ABI/滤镜检查。
+未通过检查的包保留 `INCOMPLETE`，不能被标为成功。
+
+脚本固定 [FFmpeg 8.1.2 官方源码](https://ffmpeg.org/releases/ffmpeg-8.1.2.tar.xz)，
+SHA-256 `464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c`。
+配置使用 `--disable-everything --disable-autodetect --enable-shared --disable-static`，
+仅启用所需滤镜/依赖，不构建 FFmpeg 命令行程序；`-static-libgcc` 避免增加编译器
+运行时 DLL，`--no-insert-timestamp` 消除 PE 构建时间戳。
+最终 avfilter 两次独立重新链接的 SHA-256 完全相同：
+
+`29fe462b228ce8e1c6f3293bc243a2ecb4e59d96440fe00987946b3046e38f31`。
+
+保留库版本为 avcodec 62.28.102、avformat 62.12.102、avutil 60.26.102、
+swscale 9.5.102；新 avfilter 11.14.102。版本/滤镜集合用独立子进程加载检查，
+避免 Windows 复用已加载 DLL 而检错运行包。四个保留核心库的 SHA-256 不变。
+
+主要二进制身份（均只留本地，不入 Git）：
+
+| 版本 | SHA-256 |
+| --- | --- |
+| 基线 2bdff6c | `9597000837733f9e828339cbe610776720e596cd711541fb08a4886ec66d990e` |
+| 仅减少前置解码 | `055eab31a5746b9d0f0748cf71820425526ccb59e5197dd55af0e52a476d61f8` |
+| 快速定位、无 HEVC 排空 | `f44175f4a67908b9ee07b149a67677196ba0de63d79cb5f3d4f49d815d9bc42a` |
+| 最终原生 EXE | `2fa1e409ff996056c1dfa17f37615a6b55cd4e1d4976c011c9a9ffffc4c3ca7b` |
+
+复现热测与新增素材验证：
+
+```powershell
+python -B -X utf8 scripts/bench-static-preview.py --baseline <baseline/vimg.exe> --candidate target/preview-runtime-repro/vimg.exe --video sample/input.mkv --output-dir <new-result-dir>
+python -B -X utf8 scripts/test-preview-fast.py --vimg target/preview-runtime-repro/vimg.exe --fixtures <fixture-dir> --output-dir <new-test-dir>
+```
+
+性能/验证证据位于 `.scratch/startup/phase23/`：`warm-*`、`repeat-warm-*`、
+`third-decode-timings`、`control-*` 保存每次耗时/系统 CPU/进程 CPU/哈希/阶段计数；
+`cold/` 与 `cold-final/` 保存受限管理员控制器、WPR profile、普通权限测量器、
+RAMMap 结果、96 份 ETL、逐事件 JSON 和 `analysis.json`。冷测运行前通过
+`Start-Process ... -Verb RunAs -WindowStyle Hidden` 启动对应 `admin.py`，
+普通权限运行 `matrix.py`，完成后 `analyze.py` 校验读盘及无丢失事件；
+分析器沿用 `phase19/analyzer`。每次复现使用新目录及独立 ETW 会话名。
+`verified-*`、`boundary-*`、`final-fast`、`repro-fast`、`protocol-results.json`、
+`vcs-verified/results.json` 保存功能结果。独立构建源和日志位于
+`target/preview-ffmpeg-repro/`，最终包 manifest 记录所有文件的大小及哈希。
+
+四项优化均有对应收益证据并通过功能验收，进入本地独立运行包；没有修改
+全局 FFmpeg/vimg 或 Yazi 安装。实验二进制、临时素材、ETL、构建产物均不入库。
+提交仅包含实现、测试、构建/测量脚本、README 和本报告；保留并排除现有
+`.serena/project.yml` 修改。
+
+## 2026-10-23：进一步性能调查——先减少目标之前的解码
+
+基线为 `2bdff6c`，本轮围绕首次静态预览开展测量和可撤销原型实验，
+没有把实验逻辑合入正式代码。`src/command/preview.rs` 已恢复原始字节，
+`target/release/vimg.exe` 已恢复本轮基线；实验保存在 `.scratch/startup/phase22/`。
+当前原生 release 的 SHA-256 为
+`9597000837733f9e828339cbe610776720e596cd711541fb08a4886ec66d990e`。
+
+### 结论和建议顺序
+
+1. **优先减少目标之前的图像重建。** 保留原 seek、顺序读包及参数处理，
+   目标之前暂时使用 `AVDISCARD_ALL`，到目标附近恢复 `AVDISCARD_NONKEY`。
+   release 原型在较低后台负载的交错复测中，首次预览热态中位数
+   **149.3→125.8ms（−15.8%，减少 23.5ms）**；读包仍为 199 个，
+   读包与解码阶段 **65.4→40.9ms**。收益主要来自省去前一个关键帧的重建。
+   正式实现应先限定到能验证完整 IDR 的 H.264 路径；缺失/异常 PTS、
+   开放 GOP、配置变化、交错图像及无法确认安全性的输入应重走原路径。
+   当前原型按包 PTS 切换 discard，尚未实现这些上线保护，不能把有限素材
+   对照通过当作对所有视频的正确性证明。
+2. **再调查启动侧和 libav 构建裁剪，尤其面向磁盘冷启动。** 当前
+   `--version` 的 12 次热态中位数也有 55.4ms；预览内部计时之外约 57ms。
+   PE 导入表确认 EXE 直接依赖 avcodec、avformat、avfilter、swscale、avutil。
+   本机 avcodec/avfilter DLL 文件约 92.9/118.6MiB；上一轮 ETW 已观察到
+   冷态 libav 实际磁盘读取中位数约 27.6MiB。可对照构建仅保留所需能力的
+   libav，或评估独立精简静态预览助手。DLL 文件大小不是启动时实际读盘量，
+   57ms 也包含进程创建、参数解析、输出和退出，不能全部归因为 DLL。
+   裁剪必须兼顾现有 Capture 后端需要的滤镜/编解码器。
+3. **HEVC 提前排空作为后续方向。** 当前提前排空只覆盖 H.264；既有
+   HEVC 素材仍可能读 94/195 个包才返回所选帧。但现有 HEVC 测试素材很小，
+   先前读包/解码仅约 2–3ms，不能据此推断真实 4K HEVC 的收益。
+   应先收集有代表性的长 GOP HEVC，再区分 IDR、CRA、leading pictures
+   等情况验证，不直接复用 H.264 的判断。
+4. **不采用无条件向后 seek，也不优先缩短探测。** 向后 seek 已有可复现
+   的选帧错误；当前完整流信息探测仅约 6ms，缩放与 JPEG 编码合计约 1–2ms，
+   均小于前置解码及进程启动开销。
+
+### 基线及原型方法
+
+基线反馈命令：
+
+```powershell
+python -B -X utf8 .scratch/startup/phase22/profile.py baseline target/release/vimg.exe
+```
+
+每次启动新 CLI 进程、输出到新 JPEG 文件；主素材 `sample/input.mkv`，
+参数保持 `preview --skip 0 --max-width 600 --max-height 900 --quality 75`。
+首次诊断为 2 次预热加 8 次测量：墙钟 150.4ms，native prepare 89.7ms，
+stream_info 5.9ms，seek 9.7ms，read_decode 64.7ms；全部选中 PTS 169378，
+读包 199 个，与既有 JPEG golden 相同。
+
+随后逐项改变一个变量：
+
+- `forward-prototype.rs`：仅把 `input.seek(target, ..target)` 改为
+  `input.seek(target, target..)`。主素材只读 1 个包、仍选中同一 JPEG，
+  但兼容性反例使其不能作为通用替换。
+- `discard-prototype.rs`：保持原 seek，在发送每个包前，根据包 PTS 是否
+  小于目标切换 `All/NonKey`。包仍送入解码器，不直接丢弃整个包。
+  FFmpeg 8.1.2 的 [H.264 NAL 处理](https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/h264dec.c)
+  和 [slice 跳过逻辑](https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavcodec/h264_slice.c)
+  支持这一候选方向，但其他编解码器及动态状态不能仅靠类推确认。
+
+开发构建仅用于筛选、计数和图像对照；下面正式耗时比较均使用 release。
+原型 release SHA-256 为
+`055eab31a5746b9d0f0748cf71820425526ccb59e5197dd55af0e52a476d61f8`。
+
+### Release 热态交错比较
+
+每轮、每种计时模式先各预热 2 次，再按 ABBA/BAAB 顺序各测 12 次。
+默认模式不启用 `--timings`；阶段计时另测，不能跨轮拼接成同一次测量。
+计时从启动子进程前到 stdout/stderr 读取及进程退出完成；系统 CPU 含测试自身。
+
+| 轮次 / 指标 | 基线 | 减少前置解码原型 |
+| --- | ---: | ---: |
+| 第一轮，默认 CLI 中位数 | 199.1ms | 160.2ms（−19.5%） |
+| 第一轮，默认 CLI 范围 | 169.7–278.9ms | 143.8–237.0ms |
+| 第一轮，默认模式系统 CPU 中位数 | 63.25% | 56.26% |
+| 复测，默认 CLI 中位数 | 149.3ms | 125.8ms（−15.8%） |
+| 复测，默认 CLI 范围 | 145.2–157.6ms | 120.7–149.2ms |
+| 复测，默认模式系统 CPU 中位数 | 22.99% | 24.40% |
+| 复测，启用阶段计时的 CLI 中位数 | 149.1ms | 124.3ms |
+| 复测，native prepare 中位数 | 91.4ms | 66.9ms |
+| 复测，read_decode 中位数 | 65.4ms | 40.9ms |
+| 复测，stream_info 中位数 | 6.3ms | 6.1ms |
+| 复测，seek 中位数 | 9.9ms | 9.7ms |
+| 复测，prepare 之外耗时中位数 | 57.6ms | 57.2ms |
+
+第一轮后台负载明显偏高，全部数据保留；复测前 5 个两秒 CPU 窗口为
+20.1%–31.5%。两轮结果均支持减少前置解码有收益，不能用不同负载轮次
+的绝对耗时直接比较。两轮共 112 张输出（含预热、默认/诊断模式、两版本）
+全部匹配既有主素材 JPEG SHA-256：
+`ac3d666b3f640b22310630d58879a7807740ceb62467da7b120de3291d4e469d`。
+
+这些是 **OS 文件缓存热态、新 CLI 进程的首次预览**，不含 Yazi DDS 或显示。
+本轮没有清理 Windows 文件缓存，也没有重做 ETW 磁盘冷态测量。
+减少 CPU 工作可能帮助冷态，但没有据此声称具体的冷启动改善幅度；
+读包数没有下降，不能声称减少了素材磁盘读取。
+
+### 向后 seek 的反例及正确性验证
+
+既有 139 组对照中，向后 seek 原型的 114 个原生输出仍与 golden 相同，
+但开放 GOP MP4 在 skip=79、80 时从原生成功变成了 seek 失败后回退。
+进一步构造稀疏 Cues 素材：复制既有 24 秒 closed-long.mkv，把 10 秒
+CuePoint 改为同尺寸 Void 并重算 Cues CRC32；视频包、文件长度及其他
+偏移不变，剩余索引时间为 0、20 秒，实际关键帧仍为 0、10、20 秒。
+
+目标为 1 秒时：
+
+- FFmpeg 和当前正式代码选中 10 秒帧；
+- 向后 seek 原型只读 1 包，错误选中 20 秒帧，JPEG 与 RGB 哈希均不同；
+- 减少前置解码原型仍选中 10 秒帧，与 FFmpeg 的 JPEG/RGB 完全一致。
+
+这与 [Matroska seek 使用 Cues 索引条目定位](https://github.com/FFmpeg/FFmpeg/blob/n8.1.2/libavformat/matroskadec.c)
+的实现相符。找到“一个有效 IDR”不足以证明它就是应选的第一个关键帧；
+只检查最终帧非损坏和 PTS 大于目标，无法发现这个错误。
+
+减少前置解码的 release 原型复用了上一轮已由 FFmpeg 验证的 139 组 golden：
+116 个原生 JPEG 字节一致，已记录的原生 PTS 均一致；23 组回退的元数据和
+能力状态不变，本轮未重复执行这些回退的 FFmpeg 图片生成。
+另对新增稀疏索引案例直接运行 FFmpeg/JPEG/RGB 对照，通过。
+这是可行性验证，不替代正式实现后的异常配置、时间戳、回退和磁盘冷态测试。
+
+### 本地证据
+
+`.scratch/startup/phase22/` 内保留：
+`profile.py` / `baseline.json`、`paired.py` / `paired.json` / `paired-repeat.json`、
+`compare.py` / `discard-release-compare.json`、`sparse_cues.py` / `sparse-cues.mkv`、
+`sparse-forward/results.json`（预期失败反例）、`sparse-current/results.json`、
+`sparse-discard-release/results.json`、`imports.json`、`version-timing.json`，
+以及两个实验源码和独立二进制。实验目录已被既有 scratch 规则忽略。
+
 ## 2026-10-14：提前取出已到达的 H.264 IDR，减少额外 GOP 读取
 
 基线为 `2569fdb`。在确认目标 H.264 IDR 已送入解码器后，提前排空其
