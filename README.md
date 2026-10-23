@@ -202,6 +202,14 @@ and complete JPEG decoding, and records RGB error/PSNR for visual inspection.
 Its optional fixtures cover WPP, disabled WPP, multiple slices and small frames;
 fixture hashes are checked before reuse.
 
+On Windows, add `--max-system-cpu 12 --idle-system-cpu 8` to the warm benchmark
+to wait for one second of low CPU load before each measured call. A busy call
+causes its entire four-call ABBA/BAAB block to be retained and repeated. The JSON
+contains both the accepted-block `summary` and `all_samples_summary`; `rows.json`
+keeps every measurement and its acceptance status. `--max-blocks` and
+`--idle-timeout` bound retries and idle waits. Set these limits before a run;
+compare each complete group of measurements separately.
+
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/vimg).
 

@@ -1,5 +1,102 @@
 # Performance Optimization Report
 
+## 2026-10-24：H.264 冷启动 4.2% 差值复核与 CPU 负载控制
+
+**未确认稳定的 H.264 代码回退，因此没有修改解码策略或回滚 HEVC 优化。**
+同一组二进制复测，低负载冷态中位数仅差 +0.15%，热态 +0.48%。
+本轮改进测量工具，加入负载门槛、整组补测和失败上限。上轮 +4.2% 的历史记录保留；
+不能将本轮复核写成“代码修复后加速 4.2%”。
+
+### 主要对照与结论
+
+基线仍为 `db471de` 的 `.scratch/startup/phase24/baseline/vimg.exe`，候选仍为 `bb4e1d0` 的
+`target/preview-runtime-phase24-wpp/vimg.exe`。两端 EXE SHA-256 与上轮记录一致，所有相邻 DLL 逐个校验相同。
+没有重新构建、换库、修改优先级/亲和性/电源计划或停止用户应用。机器仍为 Windows / i9-12900K。
+命令为 `preview --skip 0 --max-width 600 --max-height 900 --quality 75`，每次启动新进程、使用独立输出，主要对照不启用 timings。
+
+门槛在测量前固定：启动前连续四个 250ms 窗口的系统 CPU 均≤8%，测量期间系统 CPU≤12%。
+系统 CPU 包含被测进程，不代表全机零负载。任一次超限，整组四次 ABBA/BAAB 均保留但不计入低负载汇总，补测整组；
+没有按耗时快慢选点。冷态沿用 RAMMap `-Es` / `-Et`，以普通令牌启动；紧接热态另按完整组判定。
+
+| 状态 / 样本数 | 中位数 基线→候选（ms） | P95 基线→候选（ms） | 中位数变化（正数为变慢） |
+| --- | ---: | ---: | ---: |
+| 上轮冷态，各 8 次 | 119.08→124.12 | 147.32→143.14 | +4.23% |
+| 本轮低负载冷态，各 16 次 | 116.12→116.29 | 155.43→124.91 | +0.15% |
+| 本轮全部冷态，各 50 次 | 116.68→116.85 | 149.50→128.62 | +0.15% |
+| 本轮低负载热态，各 24 次 | 100.78→101.26 | 109.90→111.31 | +0.48% |
+| 本轮全部热态，各 60 次 | 100.92→101.93 | 113.12→117.77 | +1.00% |
+| 紧接冷测的低负载热态，各 12 次 | 100.20→101.17 | 108.15→119.14 | +0.97% |
+
+热态共 30 个对照组，12 组合格；冷态共 25 组，8 组合格。全部超限组和慢轮次保留。
+包括超限组的全部 50 次/版本冷测也仅差约 0.15%，不是通过去掉超限组才得到接近的结果。
+低负载基线仍有一次约 155ms 的冷启动，按既定条件保留；16 次的 nearest-rank P95 恰好为最大值。
+
+按完整组重采样 10,000 次（固定种子 25），中位数相对差的探索性 95% 区间为：
+上轮冷态 -7.11%～+10.02%，本轮低负载冷态 -3.45%～+2.53%，
+热态 -0.56%～+2.61%。区间包含零；它们描述当次小样本，不保证其他环境或长期 P95。
+
+### 对原差值的归因
+
+旧记录每版本仅 8 次，难以可靠区分约 5ms 的差值和运行波动。加载状态也有可观察变化：
+
+| 进程硬缺页中位数 | 基线 | 候选 |
+| --- | ---: | ---: |
+| 上轮 | 6.0 | 71.0 |
+| 本轮低负载冷态 | 6.5 | 7.0 |
+
+候选 EXE/DLL 字节未变，硬缺页却从 71 降到 7，这不是本轮修改解码代码的结果。
+硬缺页表示需要从磁盘取回内存页，见 [Microsoft Hard Faults 说明](https://learn.microsoft.com/en-us/previous-versions/windows/desktop/xperf/hard-faults)。
+**据此推断，原差值更符合冷加载状态差异和小样本波动，而非稳定的 H.264 解码回退。**
+CPU 不是已证明的唯一原因；负载、采样数量和运行历史同时影响观察结果，现有证据不能把原约 5ms
+精确拆分为 CPU 争用、预读和缺页等待，也不能归因到某个具体 Windows 服务。
+
+代码核对：H.264 不进入 HEVC PPS/WPP 检查，仍使用 1 个 Frame 线程并保留环路滤波。
+采集到的候选阶段记录均为 `decoder_threads=1`、`skip_loop_filter=false`；两端读包数均为 1，选帧时间戳和 JPEG 哈希一致。
+
+### 冷态证据与补充诊断限制
+
+主要冷测的 100 个 ETW 会话均无丢失事件，每次都实际读取素材、EXE 和运行库，紧接热态这些路径的读取均为零。
+按执行窗口和具体路径统计，包含系统代发读取，不以逻辑读取量代替磁盘读取。低负载冷态读取量中位数：
+
+| 路径 | 基线 MiB | 候选 MiB |
+| --- | ---: | ---: |
+| 素材 | 1.344 | 1.344 |
+| EXE | 11.391 | 11.108 |
+| 运行库 | 19.834 | 20.200 |
+
+仍是 Windows 文件缓存冷态，未清理 SSD 控制器缓存或 Windows 预取文件。
+另外两组带 timings 的补充诊断，因后续持续负载波动，在无活动追踪的边界安全停止：
+
+- `stages` 保留 71 次冷/紧接热态试验：17 个完整组仅 1 个低负载冷态组合格（每版本 2 次），另有 3 次未完成组样本。
+- `settled` 在清缓存后增加相同的低负载等待，保留 15 次试验：3 个完整组均未合格，另有 3 次未完成组样本。
+
+两组未达到预定的每版本 8 次，**不作为性能验收或修复依据**。这 86 个已完成启动的 ETW 会话均无丢失事件、均实际读到目标文件；
+`settled` 的等待期间没有目标路径读取，未观察到等待阶段重新预热这些文件。所有原始记录和中断尾部保留。
+完整组（含超限组）的 read_decode 中位数分别为 30.70→30.83ms、30.62→30.67ms，decoder_init 为
+0.121→0.116ms、0.109→0.111ms，仅作线索，不能据此声称已用低负载阶段测量排除所有细小回退。
+所有控制器及专用 ETW 会话均已停止；主动停止后测量器报告控制器退出，不是 vimg 功能失败，也未标记为成功完成。
+
+### 测量工具改动与验证
+
+`scripts/bench-static-preview.py` 新增可选 `--max-system-cpu`、`--idle-system-cpu`、`--idle-timeout`、`--max-blocks`。
+默认仍采用原有预热和 ABBA/BAAB 次数。启用门槛后同时输出低负载 `summary` 和保留超限组的 `all_samples_summary`；
+`run.json` 固定记录参数与 EXE 哈希，`rows.json` 保留逐次数据与整组判定。等待超时或重试耗尽会失败，不发布伪成功汇总。
+
+新增 `scripts/test-preview-benchmark.py` 使用真实 vimg/JPEG 流程并注入 CPU 计数，验证单次超限会使整组保留并补测、
+两端样本平衡、重试耗尽不生成成功汇总、持续高负载等待有上限。这些逻辑测试不纳入性能表。
+默认与启用门槛的真实 CLI 各 4 次/版本通过，非法参数在创建输出目录前拒绝；所有实际预览完整解码、图像哈希一致。
+原生源码和运行包未修改，未重新构建。本轮不为 H.264 声称加速。
+
+```powershell
+python -B -X utf8 scripts/bench-static-preview.py --baseline .scratch/startup/phase24/baseline/vimg.exe --candidate target/preview-runtime-phase24-wpp/vimg.exe --video sample/input.mkv --output-dir <new-directory> --runs 24 --max-system-cpu 12 --idle-system-cpu 8
+python -B -X utf8 scripts/test-preview-benchmark.py --vimg target/preview-runtime-phase24-wpp/vimg.exe --video sample/input.mkv --output-dir <new-test-directory>
+```
+
+完整证据在 `.scratch/startup/phase25/`：`warm-original`、`original` 是已完成的主要对照；`stages`、`settled` 是未达到样本目标的补充诊断。
+`prepare.py` 创建新目录和会话，启动对应 `admin.py` 后以普通令牌运行 `measure.py --cold`，结束后由 `analyze.py` 验证读盘。
+`summary.json` / `summarize.py` 保存区间及归因统计；`benchmark-tests`、`benchmark-default`、`benchmark-gated`、`validation.json` 保存工具验证。
+提交测量脚本、测试、README 和本报告；实验二进制/素材/ETL 不入库，`.serena/project.yml` 的用户改动不纳入提交。
+
 ## 2026-10-24：静态预览环路滤波与 HEVC slice 线程对照
 
 本轮基线为 Git `db471de` 的原生 release，继续使用相同的精简 FFmpeg 8.1.2 DLL。
