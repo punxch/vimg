@@ -1,5 +1,138 @@
 # Performance Optimization Report
 
+## 2026-10-24：静态预览环路滤波与 HEVC slice 线程对照
+
+本轮基线为 Git `db471de` 的原生 release，继续使用相同的精简 FFmpeg 8.1.2 DLL。
+测试了关闭环路滤波、HEVC 2/4 个 slice 线程，以及两者组合。最终只默认启用
+**已探测画面面积≥2,073,600 像素且所有 hvcC PPS 都明确启用 WPP、未启用 tiles 的 HEVC 组合策略**。
+H.264、小图、无 WPP、未知配置保留原滤波和单线程；这些输入未证明有稳定的端到端收益。
+本轮不修改 VCS 解码、JPEG 质量/尺寸参数、选帧规则、stdout 元数据或插件协议。
+
+### 最终版本：新进程冷热耗时
+
+测试机仍为 Windows / i9-12900K。参数为 `preview --skip 0 --max-width 600 --max-height 900 --quality 75`。
+两端均用实际名称 `vimg.exe` 和独立输出文件。热态先各预热两次，再按 ABBA/BAAB 交替每臂测 24 次；
+冷态各 8 次，每次 RAMMap 清理后启动普通权限进程，并立即追加一次热态调用。
+下表为最终运行包的默认模式（没有 `--timings`），单位 ms；P95 使用 nearest-rank。
+
+| 素材 | 热态中位数 基线→最终 | 热态 P95 基线→最终 | 冷态中位数 基线→最终 | 冷态 P95 基线→最终 | 冷/热中位数改善 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 主素材 H.264 1080p | 110.0→109.2 | 124.2→123.7 | 119.1→124.1 | 147.3→143.1 | -4.2% / 0.7% |
+| HEVC 1080p / WPP | 59.7→57.4 | 70.6→65.3 | 82.0→75.9 | 107.8→84.2 | 7.4% / 3.9% |
+| HEVC 4K / WPP | 76.4→64.4 | 90.2→71.8 | 92.4→88.3 | 117.0→100.2 | 4.4% / 15.8% |
+| 真实画面 HEVC 4K / WPP（1080p 放大） | 76.8→66.7 | 96.1→75.1 | 91.4→77.1 | 104.8→80.1 | 15.7% / 13.2% |
+
+H.264 最终策略和图像保持原样，但本轮冷态仍为 119.1→124.1ms（慢约 4.2%），
+未达到主素材加速目标。保留该结果，不将 HEVC 的改善外推到 H.264。8 次冷测的 P95 等于本组最大值，
+不能解释成长期延迟保证；不同批次中位数不拼接相减。真实画面取自现有主素材 1500 秒位置，
+4K 用例由 1080p 放大后编码，用于内容复杂度对照，不冒充原生 4K 摄影素材。
+
+| 最终运行包资源（基线→最终） | 热态进程 CPU ms | 冷态进程 CPU ms | 热态系统 CPU % | 冷态系统 CPU % | 冷态素材 / EXE / DLL MiB（最终） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 主素材 H.264 1080p | 78.1→78.1 | 78.1→78.1 | 20.0→21.7 | 9.8→10.7 | 1.395 / 11.108 / 19.507 |
+| HEVC 1080p / WPP | 31.2→31.2 | 31.2→31.2 | 11.4→10.7 | 17.1→15.5 | 0.313 / 11.101 / 18.618 |
+| HEVC 4K / WPP | 46.9→54.7 | 46.9→70.3 | 10.4→13.0 | 15.7→29.3 | 0.627 / 11.108 / 18.866 |
+| 真实画面 HEVC 4K / WPP（1080p 放大） | 46.9→31.2 | 46.9→39.1 | 19.8→21.6 | 10.3→10.0 | 0.065 / 11.126 / 18.866 |
+
+进程 CPU 使用 GetProcessTimes，受 Windows 计时粒度限制；系统 CPU 包含本进程。
+主素材和 HEVC 1080p/4K 在 skip=0 的阶段诊断中，取帧循环仍只读 1 个包，收益来自单帧处理。
+
+### 单项、线程数及组合的消融结果
+
+所有实验臂使用同一个原型 EXE、同一套 DLL，仅切换两个临时实验开关。原型不进入默认运行包。
+先各测 12 次热态，再各测 24 次复测；下表采用 24 次复测和对应各 8 次冷态对照。
+
+| 素材 / 改动 | 热态中位数 基线→候选 | 热态 P95 基线→候选 | 冷态中位数 基线→候选 | 冷态 P95 基线→候选 |
+| --- | ---: | ---: | ---: | ---: |
+| H.264 / 仅关闭滤波 | 103.7→102.4 | 118.2→115.5 | 125.5→119.9 | 181.4→138.4 |
+| HEVC 1080p / 仅关闭滤波 | 62.8→61.9 | 75.9→82.2 | 73.6→74.1 | 85.9→85.2 |
+| HEVC 1080p / 仅 4 slice 线程 | 62.0→60.2 | 73.9→72.8 | 83.0→77.3 | 96.9→93.6 |
+| HEVC 1080p / 组合 | 59.3→57.5 | 69.8→80.2 | 75.9→70.4 | 105.6→76.5 |
+| HEVC 4K / 仅关闭滤波 | 77.6→73.8 | 90.1→89.2 | 93.7→89.6 | 123.9→95.2 |
+| HEVC 4K / 仅 4 slice 线程 | 95.6→81.0 | 129.1→115.5 | 89.5→81.9 | 96.8→110.1 |
+| HEVC 4K / 组合 | 82.3→68.3 | 90.4→84.9 | 89.6→83.9 | 102.6→96.0 |
+
+另有 2 线程和 4 线程的独立对照。阶段诊断中，4K HEVC 的 read_decode 为
+22.5→14.5ms（2 线程）、22.9→11.4ms（4 线程）；4 线程初始化约 0.9ms。
+1080p 对应约 6.4→4.3/3.8ms。320×180 的解码没有并行收益，却增加约 0.5–0.7ms 初始化，故排除小图。
+无 WPP 的真实画面没有获得 slice 解码加速，4 线程整进程初测退化约 8.5%，故必须检查 PPS。
+只读 hvcC parallelismType 不足够：FFmpeg 在未指定 min_spatial_segmentation_idc 时会将该字段设为 0，
+即使 PPS 启用了 WPP。本实现用有边界检查的 RBSP/Exp-Golomb 读取 PPS 前缀，未知结构保持单线程。
+参考固定本地 FFmpeg 8.1.2 的 `libavformat/hevc.c` 和 `libavcodec/hevc/hevcdec.c`，
+以及 [FFmpeg PPS / parallelismType 源码说明](https://www.ffmpeg.org/doxygen/trunk/hevc_8c_source.html)。
+
+在已经使用 4 个 slice 线程的相同原型上，再加关闭滤波，各 48 次 ABBA 对照：
+1080p 56.4→56.1ms、4K 68.0→65.5ms、真实画面 1080p 57.0→56.6ms、真实画面 4K 63.4→62.4ms。
+因此大尺寸 WPP HEVC 保留组合策略；没有把不同组的差值相加当作组合收益。
+
+### 没有进入默认策略的实验与负结果
+
+- H.264 关闭滤波虽然单帧解码约 30.8→29.6ms，64 次热态也有 103.6→102.1ms 的小幅改善，
+  但含该改动的中间运行包各 16 次冷态为 116.0→122.1ms；第一轮同 EXE 冷态却为 125.5→119.9ms。
+  冷态方向未稳定复现，不能把热态约 1–2ms 的收益推广到冷启动，最终恢复原 H.264 策略。
+  中间包的硬缺页中位数 6.5→57.0，不能据此将全部变化归因为解码开关。该轮原始结果完整保留。
+- 320×180 单独关闭滤波仅省不到 0.1ms 解码，墙钟结果不稳定，最终保留滤波。
+- 无 WPP 的 1080p 单独关闭滤波整进程复测约为 +1.9%、+0.2%、−3.8%，不足以进入默认策略。
+  最终恢复原策略后，无 WPP 热态为 57.5→58.2ms，320×180 为 51.3→50.9ms；均不声明加速。
+- 中间包同时包含 H.264/无 WPP 关闭滤波的所有测量均保留在 `warm-final-*`、`warm-accepted`、
+  `warm-hevc-only`、`cold-final`；最终数据只取 `warm-wpp` 和 `cold-accepted`。
+
+### 冷态证据与负载处理
+
+总计 256 个 ETW 会话：单项/组合 112 个，中间包 80 个，最终包 64 个。
+每个会话均 `EventsLost=0`；每次冷态都读到素材、EXE 和 libav DLL，紧接热态这些路径均为 0 字节。
+WPR 读取按路径与进程墙钟窗口归类，包含系统代发的读取/预读，不把进程逻辑读取量当成磁盘读取。
+RAMMap `-Es`/`-Et` 均成功，控制器只用管理员令牌清缓存和管理本次专用会话，被测程序为普通令牌。
+这是 Windows 文件缓存冷态，不等同于断电或 SSD 控制器缓存清空；所有控制器和会话均已停止。
+
+最终清缓存到启动间隔 3.49–24.96ms；
+清理后 standby 0.207–0.344MiB。
+全部高负载样本保留，没有为了结果好看而删点。初筛及真实画面对照出现高负载轮次，已追加复测；
+最终默认热态系统 CPU≥45% 样本 2 个，
+最终冷/紧接热态同阈值样本 0 个。所有轮次的逐次 CPU、耗时和图像哈希均保留。
+
+最终热态的两个高负载样本均位于真实画面 4K 组，仍完整保留在主表。该组随后独立追加每臂 24 次 ABBA/BAAB：中位数 74.6→61.2ms，P95 100.1→71.8ms，中位数改善 17.9%；CPU≥45% 样本 0 个。追加结果保存在 `warm-wpp-natural-repeat`，不替换或合并原批次。
+
+### 功能、图像和兼容性验证
+
+- 原生 Rust 测试 92 passed / 7 ignored；标准构建 68 passed / 4 ignored。新增测试覆盖 WPP/tiles、
+  多 PPS、截断长度、错误 NAL 头、多层 PPS、emulation-prevention 和过长/截断 Exp-Golomb。
+- 既有 46 组静态预览/回退和 24 组快速 seek/IRAP 用例通过；元数据、方向、尺寸、完整 JPEG 解码、
+  损坏输入不覆盖旧缓存的要求保持。17 项协议检查和 4 组 Lua 插件测试通过。
+- 新增 33 组与基线同帧对照：选中 PTS、seek 路径/次数、元数据和尺寸一致；真实画面、WPP、
+  无 WPP、多 slice、320×180 和 1920×1078 门槛下输入均覆盖，实际线程数符合限制。
+  18 组 RGB 有差异；变化图像 PSNR 最低 41.95dB，
+  RGB 单通道平均绝对误差最大 0.515/255。这些数值只记录，未将像素相同当成通用验收条件。
+  对真实画面、4K 图像及差异较大的测试图作目视检查，没有发现明显损坏。H.264、无 WPP 和门槛下用例图像保持基线。
+- 原始 `vimg.exe vcs -c3 -H160 -n9 .\sample\input.mkv --output <unique>.avif` 通过，
+  AVIF 动画流 `v:1` 仍为 30 帧、852×480、20fps、time base 1/10240、PTS 0..14848 步长 512。
+  严格解码通过，输出 SHA-256 仍为 `3f0fa2be39601e3b083287ddd0f66d603ff593b3dde82d12efae99954f3be4f2`。
+  本轮没有修改 VCS 或声明其加速。
+
+### 构建、复现与提交范围
+
+```powershell
+$env:PKG_CONFIG_PATH='D:/ffmpeg-dev/ffmpeg-8.1.2-full_build-shared/lib/pkgconfig'
+cargo build --release --features in-process-decode
+python -B -X utf8 scripts/build-preview-runtime.py --exe target/release/vimg.exe --runtime-dir D:/ffmpeg-dev/libav-deploy --output-dir target/preview-runtime-phase24-wpp --filter-dll target/preview-runtime-repro/avfilter-11.dll
+python -B -X utf8 scripts/test-preview-decode.py --baseline <baseline/vimg.exe> --candidate target/preview-runtime-phase24-wpp/vimg.exe --fixtures <new-fixture-dir> --output-dir <new-check-dir> sample/input.mkv
+python -B -X utf8 scripts/bench-static-preview.py --baseline <baseline/vimg.exe> --candidate target/preview-runtime-phase24-wpp/vimg.exe --video <video> --output-dir <new-bench-dir> --runs 24
+```
+
+运行包位于 `target/preview-runtime-phase24-wpp/`，没有覆盖全局安装。DLL 全部与上一轮原样一致，
+本轮只重编译 vimg；`--timings` 增加 `decoder_threads` 和 `skip_loop_filter`，默认 stdout 协议不变。
+最终 EXE SHA-256：`1f9955090a7423dbdd979ca08ba11c622ade932d20806b6fa52ef79196423d47`。
+基线 EXE SHA-256：`2fa1e409ff996056c1dfa17f37615a6b55cd4e1d4976c011c9a9ffffc4c3ca7b`。
+
+完整证据在 `.scratch/startup/phase24/`：`warm-first`、`warm-repeat`、`warm-diagnostic`、
+`warm-natural`、`warm-loop-on-slice` 保存消融；`cold`、`cold-final`、`cold-accepted` 保存
+受限控制器、WPR 配置、普通令牌测量器、每次缓存清理状态、ETL、逐事件 JSON 及分析结果。
+复测时先启动对应 `admin.py`，再以普通令牌运行 `matrix.py`，测量结束后运行 `analyze.py`；
+必须使用新目录和专用会话名。`prototype.patch` 与 `bench.py` 记录临时开关及实验构建逻辑，
+这些开关已从正式源码移除。`quality-wpp`、`test-fixtures`、`fast-wpp`、`static-wpp`、
+`wpp-validation` 保存最终包的图像、协议与 VCS 证据；生成素材的命令和哈希位于各自 manifest。
+提交包含实现、测试脚本、README 和本报告；实验二进制、ETL、素材不入库，`.serena/project.yml` 保留并排除。
+
 ## 2026-10-23：首次静态预览四项优化落地与冷/热验收
 
 本轮以 Git `2bdff6c` 的原生 release 为基线，采用用户确认的新验收口径：

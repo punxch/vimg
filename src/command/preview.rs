@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 use std::{io::Write, path::PathBuf};
 
+#[cfg(feature = "in-process-decode")]
+mod hevc;
+
 /// Try a native static preview; print metadata and preview_written for fallback.
 #[derive(clap::Parser, Debug)]
 pub struct Preview {
@@ -34,6 +37,8 @@ pub(super) struct PreviewTimings {
     attempts: usize,
     pre_target_packets: usize,
     drain_kind: Option<&'static str>,
+    decoder_threads: usize,
+    skip_loop_filter: bool,
 }
 
 #[cfg(feature = "in-process-decode")]
@@ -54,6 +59,8 @@ impl PreviewTimings {
             attempts: 0,
             pre_target_packets: 0,
             drain_kind: None,
+            decoder_threads: 0,
+            skip_loop_filter: false,
         }
     }
 
@@ -82,6 +89,8 @@ impl Drop for PreviewTimings {
                     "target_pts": self.target_pts, "seek_mode": self.seek_mode,
                     "attempts": self.attempts, "pre_target_packets": self.pre_target_packets,
                     "drain_kind": self.drain_kind,
+                    "decoder_threads": self.decoder_threads,
+                    "skip_loop_filter": self.skip_loop_filter,
                 })
             );
         }
@@ -281,23 +290,41 @@ mod native {
             .parameters();
         let codec_id = parameters.id();
         let raw = unsafe { &*parameters.as_ptr() };
-        let mut framing = if raw.extradata_size > 0 && !raw.extradata.is_null() {
-            let extra =
-                unsafe { std::slice::from_raw_parts(raw.extradata, raw.extradata_size as usize) };
-            match codec_id {
-                codec::Id::H264 => avc_length_size(extra),
-                codec::Id::HEVC => hevc_length_size(extra),
-                _ => None,
-            }
+        let extra = if raw.extradata_size > 0 && !raw.extradata.is_null() {
+            // The stream owns this configuration until its parameters are copied below.
+            unsafe { std::slice::from_raw_parts(raw.extradata, raw.extradata_size as usize) }
         } else {
-            None
+            &[]
         };
+        let mut framing = match codec_id {
+            codec::Id::H264 => avc_length_size(extra),
+            codec::Id::HEVC => hevc_length_size(extra),
+            _ => None,
+        };
+        // Small previews do not recover even the pool setup cost. H.264 loop
+        // filtering changes also lacked a stable cold-start benefit.
+        let large_hevc = codec_id == codec::Id::HEVC
+            && raw.width > 0
+            && raw.height > 0
+            && i64::from(raw.width) * i64::from(raw.height) >= 1920 * 1080;
+        let fast_decode = large_hevc && super::hevc::has_wavefront(extra);
+        let threads = if fast_decode { 4 } else { 1 };
         let mut context = codec::context::Context::from_parameters(parameters)?;
         context.set_threading(codec::threading::Config {
-            kind: codec::threading::Type::Frame,
-            count: 1,
+            kind: if threads > 1 {
+                codec::threading::Type::Slice
+            } else {
+                codec::threading::Type::Frame
+            },
+            count: threads,
         });
         let mut decoder = context.decoder();
+        // A disposable still-image decoder does not need filtered reference
+        // pictures for later playback. Keep reconstruction/error checks intact;
+        // only HEVC deblocking and SAO are skipped before downscaling the image.
+        if fast_decode {
+            decoder.skip_loop_filter(codec::discard::Discard::All);
+        }
         decoder.check(
             codec::decoder::Check::BISTREAM
                 | codec::decoder::Check::BUFFER
@@ -305,6 +332,8 @@ mod native {
         );
         let mut decoder = decoder.video()?;
         decoder.skip_frame(codec::discard::Discard::NonKey);
+        timing.decoder_threads = decoder.threading().count;
+        timing.skip_loop_filter = fast_decode;
         timing.mark("decoder_init");
         loop {
             // Drop/unref each packet before reading the next one.

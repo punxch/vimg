@@ -60,6 +60,14 @@ NAL boundaries, picture structure and decoded output are checked. Unknown framin
 configuration changes and recovery-point H.264 pictures keep normal draining;
 invalid or unsupported output retains the metadata-based FFmpeg fallback.
 
+HEVC source frames with at least 2,073,600 pixels (1080p area) use four slice
+threads and skip loop filtering (deblocking and SAO) when every hvcC PPS enables
+WPP without tiles. Pixels can differ while size and JPEG quality settings stay
+the same. H.264, smaller frames, streams without WPP and unknown configurations
+retain filtering and one decoder thread: those cases did not show stable latency
+gains from the experimental options. These settings apply only to static
+previews; VCS decoding retains its own policy.
+
 `vimg preview --output <cache> --skip 0 --max-width 600 --max-height 900 --quality 75 <video>`
 prints metadata plus `native_preview` and `preview_written` flags. A successful
 JSON response with `preview_written: false` requires fallback, or an upper-bound
@@ -77,6 +85,7 @@ The counters include `packets`, `key_packets`, `pre_target_packets` and
 `early_drain`. `target_pts` and `selected_pts` use the video stream's time base;
 `seek_mode` and `attempts` describe the final seek path and total attempts.
 `drain_kind` identifies early H.264 IDR or HEVC IDR/BLA/CRA draining, otherwise null.
+`decoder_threads` and `skip_loop_filter` report the last opened decoder's policy.
 Stage names can repeat after a retry; sum repeated stages when aggregating timings.
 
 Existing static images skip extraction. Their metadata, and installations too old
@@ -177,6 +186,7 @@ Validate preview behavior and compare warm, fresh-process release latency with:
 ```powershell
 python -B -X utf8 scripts/test-preview-fast.py --vimg target/preview-runtime/vimg.exe --fixtures .scratch/startup/preview-fixtures --output-dir .scratch/startup/preview-check
 python -B -X utf8 scripts/bench-static-preview.py --baseline <old-vimg.exe> --candidate target/preview-runtime/vimg.exe --video sample/input.mkv --output-dir .scratch/startup/preview-bench
+python -B -X utf8 scripts/test-preview-decode.py --baseline <old-vimg.exe> --candidate target/preview-runtime/vimg.exe --fixtures .scratch/startup/decode-fixtures --output-dir .scratch/startup/decode-check sample/input.mkv
 ```
 
 Put FFmpeg/ffprobe on PATH for image checks and full runtime DLLs on PATH for the
@@ -187,6 +197,10 @@ measurement procedure and evidence are described in the report. Static tests
 record JPEG/RGB differences and require complete decoding, dimensions, metadata
 and fallback behavior; `test-static-preview.py --exact` optionally checks the old
 image for diagnostics. VCS frame/timeline checks remain unchanged.
+The decoder comparison checks selected timestamps, actual thread counts, dimensions
+and complete JPEG decoding, and records RGB error/PSNR for visual inspection.
+Its optional fixtures cover WPP, disabled WPP, multiple slices and small frames;
+fixture hashes are checked before reuse.
 
 ### Arch Linux
 Available in the [AUR](https://aur.archlinux.org/packages/vimg).
