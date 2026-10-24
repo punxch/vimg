@@ -2,8 +2,10 @@ use serde_json::{Value, json};
 use std::{io::Write, path::PathBuf};
 
 #[cfg(feature = "in-process-decode")]
+#[path = "preview/cues.rs"]
 mod cues;
 #[cfg(feature = "in-process-decode")]
+#[path = "preview/hevc.rs"]
 mod hevc;
 
 /// Try a native static preview; print metadata and preview_written for fallback.

@@ -11,6 +11,11 @@ readme = "README.md"
 # Don't bloat package with example images
 exclude = ["**.avif", ".github"]
 
+[workspace]
+members = ["preview-cli"]
+default-members = ["."]
+resolver = "3"
+
 [dependencies]
 anyhow = "1.0.69"
 clap = { version = "4.1.8", features = ["derive", "env", "wrap_help"] }

@@ -192,6 +192,39 @@ other runtime DLLs are copied unchanged, including the SVT-AV1 capability.
 Run `target/preview-runtime/vimg.exe` to use the adjacent DLLs. Build provenance
 and performance measurements are recorded in [report.md](report.md).
 
+For faster static previews, build the optional `vimg-preview` helper. It compiles
+the same preview/probe implementation with fewer Rust dependencies. Its private
+runtime contains H.264/HEVC/MJPEG decoders, a JPEG encoder, Matroska/MOV demuxers,
+and the preview filters. Keep this runtime in its own directory: VCS and the
+service need the full `vimg` package and its original codec/container libraries.
+
+```powershell
+cargo build --locked --profile preview -p vimg-preview
+python -B -X utf8 scripts/build-static-preview-runtime.py --exe target/preview/vimg-preview.exe --source-archive target/preview-ffmpeg/ffmpeg-8.1.2.tar.xz --output-dir target/static-preview-runtime
+```
+
+The source archive is cached by the full runtime build above. The helper script
+verifies its checksum, builds in `target/static-preview-ffmpeg`, validates the
+library versions and component sets, and records toolchain and artifact hashes.
+It uses the same Windows build tools and a new output directory. No global
+installation is changed. To compare only the EXE change, place the helper in a
+separate directory alongside copies of the full runtime's DLLs.
+
+Select the helper explicitly in Yazi's `init.lua` using its absolute path:
+
+```lua
+require("gridthumb"):setup({
+    preview_helper = "D:/Repo/Rust/vimg/target/static-preview-runtime/vimg-preview.exe",
+})
+```
+
+The plugin calls the helper directly for Matroska/MOV-family extensions; other
+extensions use `vimg preview`. Missing, old or feature-disabled helpers fall
+back to the full command and are skipped for the rest of the session. Per-file
+failures retain the existing metadata and FFmpeg fallback path. `vimg` and
+FFmpeg remain on PATH for these fallbacks and animated previews. Without this
+option, the plugin continues to use `vimg` for every preview.
+
 Validate preview behavior and compare warm, fresh-process release latency with:
 
 ```powershell

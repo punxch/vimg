@@ -4,8 +4,13 @@ local vimg_preview_available = ya.sync(function(state, available)
 	if available ~= nil then
 		state.vimg_preview_available = available
 	end
-	return state.vimg_preview_available ~= false
+	return state.vimg_preview_available ~= false, state.preview_helper
 end)
+local set_preview_helper = ya.sync(function(state, helper)
+	state.preview_helper = helper
+end)
+local helper_extensions = { mkv = true, webm = true, mp4 = true, mov = true,
+	m4v = true, m4a = true, ["3gp"] = true, ["3g2"] = true, mj2 = true }
 local vimg_probe_available = ya.sync(function(state, available)
 	if available ~= nil then
 		state.vimg_probe_available = available
@@ -88,7 +93,8 @@ local function media_descriptor(url, meta)
 	return descriptor
 end
 
-function M:setup()
+function M:setup(options)
+	self.preview_helper = options and options.preview_helper or nil
 	ps.sub("hover", function() cancel_stale_preview(self) end)
 	ps.sub("tab", function() cancel_stale_preview(self) end)
 	ps.sub_remote("gridthumb-avif-ready", function(body)
@@ -318,14 +324,34 @@ function M.list_preview_meta(url)
 end
 
 function M.prepare_preview(job, cache)
-	if not vimg_preview_available() then
+	local available, helper = vimg_preview_available()
+	if not available then
 		return
 	end
-	local output = Command("vimg"):arg({
+	-- The private helper runtime supports the Matroska and MOV families. Keep
+	-- other extensions on the full command to avoid an extra failed process.
+	local extension = tostring(job.file.url):match("%.([^./\\]+)$")
+	if not (extension and helper_extensions[extension:lower()]) then
+		helper = nil
+	end
+	local args = {
 		"preview", "--output", tostring(cache), "--skip", tostring(job.skip),
 		"--max-width", tostring(rt.preview.max_width), "--max-height", tostring(rt.preview.max_height),
 		"--quality", tostring(rt.preview.image_quality), "--", tostring(job.file.url),
-	}):output()
+	}
+	local output = Command(helper or "vimg"):arg(args):output()
+	local meta
+	if helper then
+		if output and output.status.success then
+			meta = ya.json_decode(output.stdout)
+		end
+		if not output or output.status.code == 2
+			or (type(meta) == "table" and meta.native_preview == false) then
+			-- A missing/old helper must not disable the full vimg capabilities.
+			set_preview_helper(nil)
+			output, meta = Command("vimg"):arg(args):output(), nil
+		end
+	end
 	if not output then
 		vimg_preview_available(false)
 		vimg_probe_available(false)
@@ -337,7 +363,7 @@ function M.prepare_preview(job, cache)
 	elseif not output.status.success then
 		return
 	end
-	local meta = ya.json_decode(output.stdout)
+	meta = meta or ya.json_decode(output.stdout)
 	if type(meta) ~= "table" then
 		return
 	elseif meta.native_preview == false then
