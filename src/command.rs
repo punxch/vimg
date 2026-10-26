@@ -12,6 +12,7 @@ mod preview;
 mod print_completions;
 mod probe;
 mod serve;
+mod service_instance;
 mod vcs;
 #[cfg(all(target_os = "macos", feature = "in-process-decode"))]
 mod videotoolbox;

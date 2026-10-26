@@ -24,7 +24,7 @@ ps = {
     sub_remote = function(event, callback) remote_events[event] = callback end,
 }
 plugin = dofile(arg[1] or "gridthumb.yazi/main.lua")
-plugin:setup()
+plugin:setup { auto_start = false }
 local function request(file, cache)
     plugin:generate_avif({ file = { url = file } }, cache)
 end

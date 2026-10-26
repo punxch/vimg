@@ -15,6 +15,8 @@ const REQUEST_EVENT: &str = "vimg-gridthumb-request";
 const CANCEL_EVENT: &str = "vimg-gridthumb-cancel";
 const READY_EVENT: &str = "gridthumb-avif-ready";
 const FAILED_EVENT: &str = "gridthumb-avif-failed";
+const PING_EVENT: &str = "vimg-gridthumb-ping";
+const SERVICE_READY_EVENT: &str = "gridthumb-service-ready";
 const MAX_JOBS: usize = 10;
 // Bump when the fixed preview's output contract changes. Legacy manifests
 // remain readable by the plugin, but are not sufficient for server reuse.
@@ -23,6 +25,9 @@ const CACHE_PROFILE: &str = "vimg-preview-3x3-h160-n9-f30-crf30-v1";
 /// Run as a service, receiving vimg jobs from Yazi DDS.
 #[derive(clap::Parser, Debug)]
 pub struct Serve {
+    /// Yazi CLI executable, matching the version of the running Yazi.
+    #[arg(long, default_value = "ya")]
+    pub ya: PathBuf,
     /// Concurrent previews; running and queued jobs together are capped at ten.
     #[arg(short, long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=10))]
     pub jobs: u8,
@@ -83,6 +88,7 @@ struct Job {
     source: Option<SourceDescriptor>,
     media: Option<command::MediaDescriptor>,
     yazi_id: Option<String>,
+    refresh: bool,
 }
 
 impl Job {
@@ -154,6 +160,7 @@ impl Job {
                 .get("yazi_id")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned),
+            refresh: value.get("refresh").and_then(serde_json::Value::as_bool) == Some(true),
         })
     }
 
@@ -174,6 +181,8 @@ struct QueueState {
     previews: HashMap<String, PathBuf>,
     queued: VecDeque<Job>,
     active: HashSet<PathBuf>,
+    // A refresh arriving during capture must run after that capture finishes.
+    refreshes: HashMap<PathBuf, Job>,
 }
 
 struct Scheduler {
@@ -221,6 +230,14 @@ impl Scheduler {
         }
         if state.jobs.contains(&job.cache) {
             add_subscriber(&mut state, &job, latest);
+            if job.refresh {
+                if state.active.contains(&job.cache) {
+                    state.refreshes.insert(job.cache.clone(), job.clone());
+                } else if let Some(queued) = state.queued.iter_mut().find(|j| j.cache == job.cache)
+                {
+                    *queued = job.clone();
+                }
+            }
             if latest {
                 if let Some(index) = state
                     .queued
@@ -279,6 +296,12 @@ impl Scheduler {
 
     fn finish(&self, cache: &Path) -> Vec<String> {
         let mut state = self.state.lock().unwrap();
+        if let Some(refresh) = state.refreshes.remove(cache) {
+            state.active.remove(cache);
+            state.queued.push_back(refresh);
+            self.ready.notify_one();
+            return Vec::new();
+        }
         state.jobs.remove(cache);
         state.active.remove(cache);
         let mut subscribers = state.subscribers.remove(cache).unwrap_or_default();
@@ -304,6 +327,7 @@ fn remove_orphaned_preview(state: &mut QueueState, cache: &Path) {
         state.queued.remove(index);
         state.jobs.remove(cache);
     }
+    state.refreshes.remove(cache);
 }
 
 fn add_subscriber(state: &mut QueueState, job: &Job, latest: bool) {
@@ -325,6 +349,12 @@ fn add_subscriber(state: &mut QueueState, job: &Job, latest: bool) {
 
 impl Serve {
     pub fn run(self) -> anyhow::Result<()> {
+        let Some(_instance) = super::service_instance::acquire()
+            .context("Cannot acquire the vimg preview service instance lock")?
+        else {
+            println!("[serve] A vimg preview service is already running; exiting");
+            return Ok(());
+        };
         self.configure_cpu_policy();
         let scheduler = Arc::new(Scheduler {
             state: Mutex::new(QueueState::default()),
@@ -333,9 +363,10 @@ impl Serve {
         for worker_id in 1..=usize::from(self.jobs) {
             let worker_scheduler = Arc::clone(&scheduler);
             let capture_backend = self.capture_backend;
+            let ya = self.ya.clone();
             thread::Builder::new()
                 .name(format!("vimg-worker-{worker_id}"))
-                .spawn(move || worker(worker_id, worker_scheduler, capture_backend))
+                .spawn(move || worker(worker_id, worker_scheduler, capture_backend, ya))
                 .context("Cannot start a vimg service worker")?;
         }
 
@@ -343,7 +374,7 @@ impl Serve {
             "[serve] Started {} workers; capacity {MAX_JOBS} running + queued jobs; waiting for Yazi DDS",
             self.jobs
         );
-        receive_yazi_requests(scheduler)
+        receive_yazi_requests(scheduler, &self.ya)
     }
 
     fn configure_cpu_policy(&self) {
@@ -362,10 +393,13 @@ impl Serve {
     }
 }
 
-fn receive_yazi_requests(scheduler: Arc<Scheduler>) -> anyhow::Result<()> {
+fn receive_yazi_requests(scheduler: Arc<Scheduler>, ya: &Path) -> anyhow::Result<()> {
     loop {
-        let mut child = ProcessCommand::new("ya")
-            .args(["sub", &format!("{REQUEST_EVENT},{CANCEL_EVENT}")])
+        let mut child = ProcessCommand::new(ya)
+            .args([
+                "sub",
+                &format!("{REQUEST_EVENT},{CANCEL_EVENT},{PING_EVENT}"),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
@@ -378,6 +412,14 @@ fn receive_yazi_requests(scheduler: Arc<Scheduler>) -> anyhow::Result<()> {
 
         for line in BufReader::new(stdout).lines() {
             match line {
+                Ok(line) if line.split(',').next() == Some(PING_EVENT) => {
+                    let response = service_response(&line).and_then(|(receiver, body)| {
+                        publish_yazi_event(ya, receiver, SERVICE_READY_EVENT, &body)
+                    });
+                    if let Err(error) = response {
+                        eprintln!("[serve] Cannot answer service probe: {error}");
+                    }
+                }
                 Ok(line) => match submit_dds_message(&line, &scheduler) {
                     Ok(result) => println!("[serve] DDS request: {}", result.protocol()),
                     Err(error) => eprintln!("[serve] Invalid DDS request: {error}"),
@@ -395,6 +437,26 @@ fn receive_yazi_requests(scheduler: Arc<Scheduler>) -> anyhow::Result<()> {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn service_response(line: &str) -> anyhow::Result<(&str, String)> {
+    let mut fields = line.splitn(4, ',');
+    ensure!(fields.next() == Some(PING_EVENT), "unexpected probe event");
+    let _receiver = fields.next().context("missing receiver")?;
+    let sender = fields.next().context("missing sender")?;
+    ensure!(
+        sender.parse::<u64>().is_ok_and(|id| id != 0),
+        "probe requires a sender"
+    );
+    let body: serde_json::Value = serde_json::from_str(fields.next().context("missing body")?)?;
+    let token = body
+        .get("token")
+        .and_then(serde_json::Value::as_u64)
+        .context("missing probe token")?;
+    Ok((
+        sender,
+        serde_json::json!({ "token": token, "pid": std::process::id() }).to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -448,6 +510,7 @@ fn worker(
     worker_id: usize,
     scheduler: Arc<Scheduler>,
     capture_backend: command::CaptureBackendPolicy,
+    ya: PathBuf,
 ) {
     loop {
         let job = scheduler.next();
@@ -473,6 +536,7 @@ fn worker(
                     println!("[serve:{worker_id}] Cache hit: {}", job.file_name());
                 }
                 notify_yazi(
+                    &ya,
                     &job.file,
                     &job.cache,
                     &completion.subscribers,
@@ -486,6 +550,7 @@ fn worker(
                 );
             }
             ServiceJobOutcome::Failed(reason) => notify_yazi(
+                &ya,
                 &job.file,
                 &job.cache,
                 &completion.subscribers,
@@ -515,7 +580,7 @@ fn complete_job(
     run_capture: impl FnOnce(command::CaptureBackendPolicy) -> anyhow::Result<()>,
     publish: impl FnOnce() -> anyhow::Result<()>,
 ) -> ServiceCompletion {
-    if cache_is_current(job, capture_backend) {
+    if !job.refresh && cache_is_current(job, capture_backend) {
         return ServiceCompletion {
             outcome: ServiceJobOutcome::Reused,
             subscribers: scheduler.finish(&job.cache),
@@ -643,6 +708,7 @@ fn publish_manifest(job: &Job, backend: command::CaptureBackendPolicy) -> anyhow
 }
 
 fn notify_yazi(
+    ya: &Path,
     video: &Path,
     cache: &Path,
     subscribers: &[String],
@@ -662,15 +728,19 @@ fn notify_yazi(
     };
     let payload = payload.to_string();
     for yazi_id in subscribers {
-        match ProcessCommand::new("ya")
-            .args(["pub-to", yazi_id, event, "--json", &payload])
-            .status()
-        {
-            Ok(status) if status.success() => {}
-            Ok(status) => eprintln!("[serve] Yazi notification exited with {status}"),
-            Err(error) => eprintln!("[serve] Cannot notify Yazi: {error}"),
+        if let Err(error) = publish_yazi_event(ya, yazi_id, event, &payload) {
+            eprintln!("[serve] Cannot notify Yazi: {error}");
         }
     }
+}
+
+fn publish_yazi_event(ya: &Path, receiver: &str, event: &str, payload: &str) -> anyhow::Result<()> {
+    let status = ProcessCommand::new(ya)
+        .args(["pub-to", receiver, event, "--json", payload])
+        .status()
+        .context("Cannot publish through `ya`")?;
+    ensure!(status.success(), "Yazi notification exited with {status}");
+    Ok(())
 }
 
 impl Send {
@@ -809,6 +879,7 @@ mod tests {
             source: None,
             media: None,
             yazi_id: None,
+            refresh: false,
         }
     }
 
@@ -822,6 +893,26 @@ mod tests {
         assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Queued);
         assert_eq!(scheduler.submit(job("preview.avif")), SubmitResult::Shared);
         assert_eq!(scheduler.next().cache, PathBuf::from("preview.avif"));
+    }
+
+    #[test]
+    fn service_probe_replies_to_the_dds_sender_with_the_same_token() {
+        let (receiver, body) =
+            service_response("vimg-gridthumb-ping,0,123,{\"token\":7,\"yazi_id\":\"456\"}")
+                .unwrap();
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(receiver, "123");
+        assert_eq!(body["token"], 7);
+        assert_eq!(body["pid"], std::process::id());
+        for invalid in [
+            "vimg-gridthumb-ping,0,0,{\"token\":7}",
+            "vimg-gridthumb-ping,0,123,{}",
+            "vimg-gridthumb-ping,0,123,{\"token\":\"7\"}",
+            "vimg-gridthumb-ping,0,123,invalid",
+            "vimg-gridthumb-request,0,123,{\"token\":7}",
+        ] {
+            assert!(service_response(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -1254,6 +1345,98 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_a_queued_cache_bypasses_reuse() {
+        let root = temporary_test_dir("cache-refresh");
+        let mut job = cached_test_job(&root);
+        let policy = command::CaptureBackendPolicy::Auto;
+        publish_manifest(&job, policy).unwrap();
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        scheduler.submit(job.clone());
+        job.refresh = true;
+        assert_eq!(scheduler.submit(job), SubmitResult::Shared);
+        let active = scheduler.next();
+        assert!(active.refresh);
+        let captured = Cell::new(false);
+        let completion = complete_job(
+            &scheduler,
+            &active,
+            policy,
+            |_| {
+                captured.set(true);
+                Ok(())
+            },
+            || Ok(()),
+        );
+        assert!(
+            captured.get(),
+            "refresh must render even with a valid cache"
+        );
+        assert_eq!(completion.outcome, ServiceJobOutcome::Published);
+        assert!(scheduler.state.lock().unwrap().jobs.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_refreshes_coalesce_and_notify_only_after_the_fresh_capture() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let send = |refresh| {
+            submit_dds_message(
+                &format!(
+                    "{REQUEST_EVENT},0,123,{}",
+                    serde_json::json!({
+                        "file": "video.mkv", "cache": "preview.avif", "latest": true,
+                        "refresh": refresh,
+                    })
+                ),
+                &scheduler,
+            )
+            .unwrap()
+        };
+        assert_eq!(send(false), SubmitResult::Queued);
+        let active = scheduler.next();
+        for _ in 0..3 {
+            assert_eq!(send(true), SubmitResult::Shared);
+        }
+        assert!(scheduler.finish(&active.cache).is_empty());
+        {
+            let state = scheduler.state.lock().unwrap();
+            assert_eq!(state.jobs.len(), 1);
+            assert_eq!(state.queued.len(), 1);
+            assert!(state.refreshes.is_empty());
+        }
+        let fresh = scheduler.next();
+        assert!(fresh.refresh);
+        assert_eq!(scheduler.finish(&fresh.cache), ["123"]);
+        assert!(scheduler.state.lock().unwrap().jobs.is_empty());
+    }
+
+    #[test]
+    fn abandoned_active_refresh_does_not_queue_an_orphan() {
+        let scheduler = Scheduler {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        };
+        let mut job = job("preview.avif");
+        job.yazi_id = Some("123".into());
+        scheduler.submit_inner(job.clone(), true);
+        let active = scheduler.next();
+        job.refresh = true;
+        scheduler.submit_inner(job, true);
+        scheduler.cancel_preview("123", &active.cache);
+        assert!(scheduler.finish(&active.cache).is_empty());
+        let state = scheduler.state.lock().unwrap();
+        assert!(state.jobs.is_empty());
+        assert!(state.queued.is_empty());
+        assert!(state.refreshes.is_empty());
+    }
+
+    #[test]
     fn cache_requires_matching_profile_source_and_unchanged_output() {
         let root = temporary_test_dir("cache-invalid");
         let job = cached_test_job(&root);
@@ -1403,6 +1586,11 @@ mod tests {
     fn service_defaults_to_one_worker_and_bounds_explicit_concurrency() {
         let default = <Serve as clap::Parser>::try_parse_from(["serve"]).unwrap();
         assert_eq!(default.jobs, 1);
+        assert_eq!(default.ya, PathBuf::from("ya"));
+        let configured =
+            <Serve as clap::Parser>::try_parse_from(["serve", "--ya", "D:/Yazi tools/ya.exe"])
+                .unwrap();
+        assert_eq!(configured.ya, PathBuf::from("D:/Yazi tools/ya.exe"));
         for jobs in 1..=MAX_JOBS {
             let value = jobs.to_string();
             for flag in ["--jobs", "-j"] {
@@ -1518,6 +1706,7 @@ mod tests {
                 source: Some(source.clone()),
                 media: Some(media.clone()),
                 yazi_id: None,
+                refresh: false,
             })
             .collect();
         for job in &jobs {
@@ -1642,6 +1831,7 @@ mod tests {
                 source: Some(source.clone()),
                 media: Some(media.clone()),
                 yazi_id: None,
+                refresh: false,
             };
             scheduler.submit(job.clone());
             let active = scheduler.next();

@@ -1,10 +1,16 @@
 local M = {}
 local media_descriptors = {}
+local function active_tab()
+	return cx.active or cx.tab
+end
+local function file_stat(url)
+	return (fs.stat or fs.cha)(url)
+end
 local vimg_preview_available = ya.sync(function(state, available)
 	if available ~= nil then
 		state.vimg_preview_available = available
 	end
-	return state.vimg_preview_available ~= false, state.preview_helper
+	return state.vimg_preview_available ~= false, state.preview_helper, state.vimg or "vimg"
 end)
 local set_preview_helper = ya.sync(function(state, helper)
 	state.preview_helper = helper
@@ -15,19 +21,20 @@ local vimg_probe_available = ya.sync(function(state, available)
 	if available ~= nil then
 		state.vimg_probe_available = available
 	end
-	return state.vimg_probe_available ~= false
+	return state.vimg_probe_available ~= false, state.vimg or "vimg"
 end)
 local function cancel_stale_preview(state)
-	local hovered = cx.active.current.hovered
+	local hovered = active_tab().current.hovered
 	if state.preview and (not hovered or state.preview.file ~= tostring(hovered.url)) then
 		ps.pub_to(0, "vimg-gridthumb-cancel", { cache = state.preview.cache })
 		state.preview = nil
+		state.pending = nil
 	end
 end
 
-local publish_avif_request = ya.sync(function(state, request)
+local function publish_current_request(state, request)
 	cancel_stale_preview(state)
-	local hovered = cx.active.current.hovered
+	local hovered = active_tab().current.hovered
 	-- An async preload may finish after the user has moved to another file.
 	if not hovered or request.file ~= tostring(hovered.url) then
 		return
@@ -35,14 +42,65 @@ local publish_avif_request = ya.sync(function(state, request)
 	state.preview = { file = request.file, cache = request.cache }
 	request.latest = true
 	ps.pub_to(0, "vimg-gridthumb-request", request)
+end
+
+local publish_avif_request = ya.sync(function(state, request)
+	if not state.auto_start then
+		return publish_current_request(state, request)
+	end
+	cancel_stale_preview(state)
+	local hovered = active_tab().current.hovered
+	if not hovered or request.file ~= tostring(hovered.url) then
+		return
+	end
+	if state.pending and state.pending.cache == request.cache then
+		request.refresh = request.refresh or state.pending.refresh
+	end
+	state.preview = { file = request.file, cache = request.cache }
+	state.pending = request
+	if not state.service_starting then
+		state.service_starting = true
+		state.service_token = (state.service_token or 0) + 1
+		ya.emit("plugin", { "gridthumb", "start " .. state.service_token })
+	end
+end)
+
+local service_probe = ya.sync(function(state, token, finish)
+	local ready = not state.service_starting or token ~= state.service_token
+	if ready then
+		return true
+	elseif finish then
+		state.service_starting = false
+		state.pending = nil
+	elseif state.service_starting then
+		ps.pub_to(0, "vimg-gridthumb-ping", { token = state.service_token })
+	end
+	return not state.service_starting, state.vimg or "vimg", state.service_args or {}, state.ya
+end)
+
+local refresh_target = ya.sync(function()
+	local hovered = active_tab().current.hovered
+	local mime = hovered and hovered:mime()
+	if mime and mime:match("^video/") then
+		local skip = active_tab().preview.skip or 0
+		return {
+			file = { url = hovered.url },
+			skip = skip,
+			cache = ya.file_cache { file = hovered.bare or hovered, skip = skip },
+		}
+	end
 end)
 
 local function source_descriptor(url)
-	local cha = fs.cha(url)
+	local cha = file_stat(url)
 	if not cha or not cha.len or not cha.mtime then
 		return nil
 	end
-	return { size = cha.len, modified_s = math.floor(cha.mtime) }
+	local modified = type(cha.mtime) == "number" and cha.mtime or cha.mtime.unix
+	if not modified then
+		return nil
+	end
+	return { size = cha.len, modified_s = math.floor(modified) }
 end
 
 local function avif_is_current(file_url, cache_avif)
@@ -50,9 +108,9 @@ local function avif_is_current(file_url, cache_avif)
 	if not source then
 		return false
 	end
-	local cha_avif = fs.cha(cache_avif)
+	local cha_avif = file_stat(cache_avif)
 	local manifest = Url(string.format("%s.%d-%d.json", tostring(cache_avif), source.size, source.modified_s))
-	local cha_manifest = fs.cha(manifest)
+	local cha_manifest = file_stat(manifest)
 	return cha_avif and cha_avif.len > 0 and cha_manifest and cha_manifest.len > 0
 end
 
@@ -94,11 +152,27 @@ local function media_descriptor(url, meta)
 end
 
 function M:setup(options)
+	options = options or {}
+	self.vimg = options.vimg or "vimg"
+	self.ya = options.ya
+	self.auto_start = options.auto_start ~= false
+	self.service_args = options.service_args or {}
 	self.preview_helper = options and options.preview_helper or nil
 	ps.sub("hover", function() cancel_stale_preview(self) end)
 	ps.sub("tab", function() cancel_stale_preview(self) end)
+	ps.sub_remote("gridthumb-service-ready", function(body)
+		if not self.service_starting or not body or body.token ~= self.service_token then
+			return
+		end
+		self.service_starting = false
+		local request = self.pending
+		self.pending = nil
+		if request then
+			publish_current_request(self, request)
+		end
+	end)
 	ps.sub_remote("gridthumb-avif-ready", function(body)
-		local hovered = cx.active.current.hovered
+		local hovered = active_tab().current.hovered
 		if hovered and body and body.file == tostring(hovered.url) then
 			ya.dbg("[gridthumb] avif ready:", tostring(body.cache))
 			-- The source file is unchanged, but its animated cache is now ready.
@@ -106,6 +180,71 @@ function M:setup(options)
 			ya.emit("peek", { only_if = hovered.url, force = true })
 		end
 	end)
+end
+
+function M:start_service(token)
+	-- Probe before launching so other Yazi instances reuse the running service.
+	for _ = 1, 3 do
+		if service_probe(token) then
+			return
+		end
+		ya.sleep(0.1)
+	end
+	local ready, executable, args, ya_executable = service_probe(token)
+	if ready then
+		return
+	end
+	local command = ya.quote(executable) .. " serve"
+	if ya_executable then
+		command = command .. " --ya " .. ya.quote(ya_executable)
+	end
+	for _, arg in ipairs(args) do
+		command = command .. " " .. ya.quote(tostring(arg))
+	end
+	-- Yazi owns detachment and quoting; a dropped Command child would be killed.
+	ya.emit("shell", { command, orphan = true })
+	for _ = 1, 50 do
+		ya.sleep(0.1)
+		if service_probe(token) then
+			return
+		end
+	end
+	service_probe(token, true)
+	ya.notify { title = "gridthumb", content = "Preview service did not respond: " .. executable .. "; check vimg and ya versions/PATH", level = "error", timeout = 8 }
+end
+
+--- Bind `plugin gridthumb refresh` to a key in keymap.toml.
+function M:entry(job)
+	if job.args[1] == "start" then
+		return self:start_service(tonumber(job.args[2]))
+	elseif job.args[1] ~= "refresh" then
+		return
+	end
+	local target = refresh_target()
+	if not target then
+		return
+	end
+	local cache = target.cache
+	if not cache then
+		return
+	end
+	local avif = Url(tostring(cache) .. ".avif")
+	local paths = { cache, avif }
+	local source = source_descriptor(target.file.url)
+	if source then
+		paths[#paths + 1] = Url(string.format("%s.%d-%d.json", tostring(avif), source.size, source.modified_s))
+	end
+	for _, path in ipairs(paths) do
+		local ok, err = fs.remove("file", path)
+		if not ok and err and err.kind ~= "NotFound" then
+			return ya.notify { title = "gridthumb", content = "Cannot clear preview cache: " .. tostring(err), level = "error", timeout = 5 }
+		end
+	end
+	media_descriptors[tostring(target.file.url)] = nil
+	-- Force regeneration even if a previous capture republishes its cache while
+	-- these files are being removed. The service coalesces in-flight refreshes.
+	self:generate_avif(target, cache, true)
+	ya.emit("peek", { only_if = target.file.url, force = true })
 end
 
 function M:peek(job)
@@ -138,10 +277,10 @@ function M:peek(job)
 end
 
 function M:seek(job)
-	local h = cx.active.current.hovered
+	local h = active_tab().current.hovered
 	if h and h.url == job.file.url then
 		ya.emit("peek", {
-			math.max(0, cx.active.preview.skip + job.units),
+			math.max(0, active_tab().preview.skip + job.units),
 			only_if = job.file.url,
 		})
 	end
@@ -159,7 +298,7 @@ function M:preload(job)
 		return true
 	end
 
-	local cha = fs.cha(cache)
+	local cha = file_stat(cache)
 	local meta, err
 	if not (cha and cha.len > 0) then
 		meta = self.prepare_preview(job, cache)
@@ -182,7 +321,7 @@ function M:preload(job)
 	end
 
 	-- method 1: ffmpeg single-frame cache (skip if exists)
-	local cha = fs.cha(cache)
+	local cha = file_stat(cache)
 	if not (cha and cha.len > 0) then
 		-- A single keyframe does not amortize hardware-device initialization.
 		-- Keep decoding on the CPU; animated grids use the service's backend.
@@ -222,9 +361,9 @@ function M:preload(job)
 end
 
 --- Queue AVIF generation via vimg serve without delaying the static preview.
-function M:generate_avif(job, cache)
+function M:generate_avif(job, cache, refresh)
 	local cache_avif = tostring(cache) .. ".avif"
-	if avif_is_current(job.file.url, Url(cache_avif)) then
+	if not refresh and avif_is_current(job.file.url, Url(cache_avif)) then
 		return
 	end
 
@@ -238,6 +377,7 @@ function M:generate_avif(job, cache)
 		cache = cache_avif,
 		source_size = source.size,
 		source_modified_s = source.modified_s,
+		refresh = refresh or nil,
 	}
 	if source.duration_s then
 		request.duration_s = source.duration_s
@@ -303,8 +443,9 @@ function M.list_preview_meta(url)
 	-- The native build probes with libav in a much smaller process. Older or
 	-- unavailable vimg installations retain the original ffprobe path.
 	local output
-	if vimg_probe_available() then
-		output = Command("vimg"):arg({ "probe", "--", tostring(url) }):output()
+	local available, executable = vimg_probe_available()
+	if available then
+		output = Command(executable):arg({ "probe", "--", tostring(url) }):output()
 		if not output or output.status.code == 2 then
 			vimg_probe_available(false)
 		end
@@ -324,7 +465,7 @@ function M.list_preview_meta(url)
 end
 
 function M.prepare_preview(job, cache)
-	local available, helper = vimg_preview_available()
+	local available, helper, executable = vimg_preview_available()
 	if not available then
 		return
 	end
@@ -339,7 +480,7 @@ function M.prepare_preview(job, cache)
 		"--max-width", tostring(rt.preview.max_width), "--max-height", tostring(rt.preview.max_height),
 		"--quality", tostring(rt.preview.image_quality), "--", tostring(job.file.url),
 	}
-	local output = Command(helper or "vimg"):arg(args):output()
+	local output = Command(helper or executable):arg(args):output()
 	local meta
 	if helper then
 		if output and output.status.success then
@@ -349,7 +490,7 @@ function M.prepare_preview(job, cache)
 			or (type(meta) == "table" and meta.native_preview == false) then
 			-- A missing/old helper must not disable the full vimg capabilities.
 			set_preview_helper(nil)
-			output, meta = Command("vimg"):arg(args):output(), nil
+			output, meta = Command(executable):arg(args):output(), nil
 		end
 	end
 	if not output then

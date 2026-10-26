@@ -31,11 +31,21 @@ vimg join [OPTIONS] --columns <COLUMNS> --output <OUTPUT> <CAPTURE_IMAGES>...
 
 ### Command: serve
 
-Run the long-lived preview service used by `gridthumb.yazi`:
+`gridthumb.yazi` starts the long-lived preview service automatically when an
+animated preview is first needed. It probes DDS before launching, reuses an
+existing service, and waits for its readiness response before submitting the
+preview. If the service exits, the next request starts it again.
+
+To start the service manually:
 
 ```sh
 vimg serve --capture-backend auto
 ```
+
+The service is single-instance by default. Starting it again exits successfully
+before starting workers or subscribing to DDS. The OS releases the instance lock
+when the process exits, including after a crash. Other commands such as `preview`
+and `vcs` can still run while the service is active.
 
 On a cache miss, the plugin first shows a static keyframe, then requests the
 animated grid. Static extraction uses one software decoding thread to avoid
@@ -138,6 +148,52 @@ standalone `vimg vcs` commands keep OS scheduling.
 Copy [`gridthumb.yazi`](gridthumb.yazi) into Yazi's plugin directory and call
 `require("gridthumb"):setup()` from `init.lua`. `vimg send` remains available
 as a command-line DDS publisher for diagnostics and compatibility.
+
+Use an absolute `vimg` path if the executable on PATH is an older version:
+
+```lua
+require("gridthumb"):setup {
+    vimg = "D:/Repo/Rust/vimg/target/gridthumb-dev-runtime/vimg.exe",
+    -- Optional: use the ya executable shipped with the Yazi you are running.
+    ya = "D:/Repo/Rust/yazi/target/release-windows/ya.exe",
+    -- Optional service settings; defaults to one worker with automatic decoding.
+    service_args = { "--jobs", "1", "--capture-backend", "auto" },
+}
+```
+
+This path is used for service startup, probing and static previews. Set
+`auto_start = false` to manage the service manually. Automatic startup requires
+an updated `vimg` with the `vimg-gridthumb-ping`/`gridthumb-service-ready` DDS
+handshake. The `ya` option passes `--ya <path>` to the service for both DDS
+subscription and notifications; without it, the service uses `ya` from PATH.
+The CLI must match the running Yazi version, particularly when a custom build
+and a package-manager installation coexist.
+
+Bind a cache refresh key in Yazi's `keymap.toml`:
+
+```toml
+[[mgr.prepend_keymap]]
+on = "<F5>"
+run = "plugin gridthumb refresh"
+desc = "Regenerate current video preview"
+```
+
+This removes the hovered file's static image, animated grid and source manifest
+at the current preview position, then requests regeneration and forces a new
+preview. If generation is already running, the service runs one fresh job after
+it finishes and notifies Yazi when the refreshed grid is ready.
+Startup and cache refresh use Yazi's existing plugin, shell and `peek --force`
+interfaces; no Yazi source changes or recompilation are needed. Keep the F5
+binding in `keymap.toml` so it does not override other plugins' key bindings.
+
+For local Windows plugin development, copy the edited plugin before testing:
+
+```powershell
+Copy-Item -LiteralPath gridthumb.yazi/main.lua -Destination "$env:APPDATA/yazi/config/plugins/gridthumb.yazi/main.lua" -Force
+```
+
+Use `$env:YAZI_CONFIG_HOME/plugins/gridthumb.yazi` instead when the configuration
+directory is overridden. Restart Yazi after copying to reload the plugin.
 
 ### Measure resident previews on Windows
 
