@@ -35,6 +35,7 @@ final class H264Picture {
     cropTop: sps.cropTop,
     matrix: sps.color.matrix,
     fullRange: sps.color.fullRange,
+    sampleAspect: sps.sampleAspect,
     scaler: scaler,
   );
 }

@@ -41,11 +41,14 @@ final class YuvImageScaler {
     final green = Uint8List(frame.width * frame.height);
     final blue = Uint8List(green.length);
     final red = Uint8List(green.length);
+    final alpha = frame.hasAlpha ? Uint8List(green.length) : null;
     var i = 0;
     for (final pixel in frame) {
       green[i] = pixel.g.toInt();
       blue[i] = pixel.b.toInt();
-      red[i++] = pixel.r.toInt();
+      red[i] = pixel.r.toInt();
+      alpha?[i] = pixel.a.toInt();
+      i++;
     }
     final planes = _VideoPlanes(
       [
@@ -60,15 +63,22 @@ final class YuvImageScaler {
       ],
       0,
       0,
+      matrix: 0,
+      fullRange: true,
+      alpha: alpha == null
+          ? null
+          : _FilterPlane(
+              alpha,
+              frame.width,
+              frame.height,
+              8,
+              rowStep: frame.width,
+            ),
     );
-    return _renderFiltered(planes, matrix: 0, fullRange: true);
+    return _renderFiltered(planes);
   }
 
-  image.Image _renderFiltered(
-    _VideoPlanes source, {
-    required int matrix,
-    required bool fullRange,
-  }) {
+  image.Image _renderFiltered(_VideoPlanes source) {
     final scale = width == null && height == null ? filters!._finalScale : null;
     final frame = filters!._apply(source, deferScale: scale != null);
     if (scale != null) {
@@ -80,23 +90,32 @@ final class YuvImageScaler {
     } else if (width != null || height != null) {
       _outputScale ??= YuvImageScaler(width: width, height: height);
     }
-    final planes = frame.planes.map((plane) => plane.atOrigin).toList();
-    final y = planes.first;
-    final cb = planes.length == 3 ? planes[1] : null;
-    // Alpha follows the same full-resolution geometry and strides as luma.
-    final alpha = frame.alpha?.atOrigin;
+    var y = frame.planes.first.atOrigin;
+    var cb = frame.planes.length == 3 ? frame.planes[1].atOrigin : null;
+    var cr = frame.planes.length == 3 ? frame.planes[2].atOrigin : null;
+    var alpha = frame.alpha?.atOrigin;
+    // Painting one component can give it a different stride from its
+    // companion plane. The RGB converter shares strides for these pairs.
+    if (cb != null && cr != null && cb.rowStep != cr.rowStep) {
+      cb = cb.packed;
+      cr = cr.packed;
+    }
+    if (alpha != null && y.rowStep != alpha.rowStep) {
+      y = y.packed;
+      alpha = alpha.packed;
+    }
     return yuvImage(
       y: y.samples,
       cb: cb?.samples ?? const [],
-      cr: cb == null ? const [] : planes[2].samples,
+      cr: cr?.samples ?? const [],
       stride: y.rowStep,
       chromaStride: cb?.rowStep ?? 0,
       width: y.width,
       height: y.height,
       cropLeft: 0,
       cropTop: 0,
-      matrix: matrix,
-      fullRange: fullRange,
+      matrix: frame.matrix,
+      fullRange: frame.fullRange,
       lumaDepth: y.depth,
       chromaDepth: cb?.depth ?? y.depth,
       subsamplingX: frame.subX,

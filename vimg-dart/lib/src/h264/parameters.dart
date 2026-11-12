@@ -49,6 +49,7 @@ final class H264Sps {
     required this.width,
     required this.height,
     required this.color,
+    required this.sampleAspect,
     required this.timing,
     required this.scaling,
   });
@@ -140,6 +141,7 @@ final class H264Sps {
       width: width,
       height: height,
       color: vui?.color ?? (matrix: 2, fullRange: false),
+      sampleAspect: vui?.sampleAspect ?? 1,
       timing: vui?.timing,
       scaling: scaling,
     );
@@ -156,15 +158,15 @@ final class H264Sps {
   final bool frameOnly;
   final int cropLeft, cropTop, width, height;
   final H264Color color;
+  final double sampleAspect;
   final (int, int)? timing; // frame ticks, ticks per second
   final List<H264ScalingList?>? scaling;
 }
 
-({H264Color color, (int, int)? timing}) _readVui(Rbsp bits) {
-  if (bits.flag() && bits.read(8) == 255) {
-    bits.read(16);
-    bits.read(16);
-  }
+({H264Color color, double sampleAspect, (int, int)? timing}) _readVui(
+  Rbsp bits,
+) {
+  final sampleAspect = bits.readVuiSampleAspect();
   if (bits.flag()) bits.flag(); // overscan
   var fullRange = false;
   var matrix = 2;
@@ -185,7 +187,11 @@ final class H264Sps {
     final units = bits.read(32), scale = bits.read(32);
     if (units > 0 && scale > 0) timing = (2 * units, scale);
   }
-  return (color: (matrix: matrix, fullRange: fullRange), timing: timing);
+  return (
+    color: (matrix: matrix, fullRange: fullRange),
+    sampleAspect: sampleAspect,
+    timing: timing,
+  );
 }
 
 final class H264Pps {

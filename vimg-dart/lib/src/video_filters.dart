@@ -25,6 +25,14 @@ final class VideoFilterChain {
           filters.add(_Transpose(args));
         case 'scale':
           filters.add(_Scale(args));
+        case 'pad':
+          filters.add(_Pad(args));
+        case 'drawbox':
+          filters.add(_DrawBox(args));
+        case 'negate':
+          filters.add(_Negate(args));
+        case 'setsar' || 'setdar':
+          filters.add(_SetAspect(args, display: name == 'setdar'));
         case 'trim':
           timing.add(_Trim(args));
         case 'setpts':
@@ -157,6 +165,8 @@ const _dimensionVariables = {
   'oh',
   'out_h',
   'a',
+  'sar',
+  'dar',
   'hsub',
   'vsub',
 };
@@ -210,10 +220,7 @@ final class _Crop implements _SpatialFilter {
       '1' || 'true' => true,
       _ => throw const FormatException('crop exact must be 0 or 1'),
     };
-    if (options['keep_aspect'] case final value?
-        when value != '0' && value != 'false') {
-      throw const FormatException('Unsupported crop option: keep_aspect');
-    }
+    final keepAspect = _filterFlag(options['keep_aspect'], 'crop keep_aspect');
     const positionVariables = {..._dimensionVariables, 'x', 'y'};
     return _Crop._(
       parseFilterExpression(options['w'] ?? 'iw', _dimensionVariables),
@@ -221,13 +228,14 @@ final class _Crop implements _SpatialFilter {
       parseFilterExpression(options['x'] ?? '(iw-ow)/2', positionVariables),
       parseFilterExpression(options['y'] ?? '(ih-oh)/2', positionVariables),
       exact,
+      keepAspect,
     );
   }
 
-  _Crop._(this.width, this.height, this.x, this.y, this.exact);
+  _Crop._(this.width, this.height, this.x, this.y, this.exact, this.keepAspect);
 
   final FilterExpression width, height, x, y;
-  final bool exact;
+  final bool exact, keepAspect;
 
   @override
   _VideoPlanes apply(_VideoPlanes frame) {
@@ -256,6 +264,9 @@ final class _Crop implements _SpatialFilter {
         _subSize(cropW, sx),
         _subSize(cropH, sy),
       ),
+      sampleAspect: keepAspect
+          ? frame.sampleAspect * frame.width * cropH / (frame.height * cropW)
+          : null,
     );
   }
 }
@@ -302,6 +313,9 @@ final class _Transpose implements _SpatialFilter {
       ],
       frame.subY,
       frame.subX,
+      matrix: frame.matrix,
+      fullRange: frame.fullRange,
+      sampleAspect: 1 / frame.sampleAspect,
       alpha: frame.alpha?.orient(
         transpose: true,
         horizontal: direction.isOdd,
@@ -342,6 +356,7 @@ final class _Scale implements _SpatialFilter {
     final (w, h) = dimensions(frame);
     return frame.map(
       (plane, sx, sy) => _resize(plane, _subSize(w, sx), _subSize(h, sy)),
+      sampleAspect: frame.sampleAspect * frame.width * h / (frame.height * w),
     );
   }
 
@@ -421,13 +436,25 @@ final class _Scale implements _SpatialFilter {
 int _subSize(int size, int shift) => (size + (1 << shift) - 1) >> shift;
 
 final class _VideoPlanes {
-  _VideoPlanes(this.planes, this.subX, this.subY, {this.alpha});
+  _VideoPlanes(
+    this.planes,
+    this.subX,
+    this.subY, {
+    required this.matrix,
+    required this.fullRange,
+    this.sampleAspect = 1,
+    this.alpha,
+  });
   final List<_FilterPlane> planes;
   final int subX, subY;
   final _FilterPlane? alpha;
+  final int matrix;
+  final bool fullRange;
+  final double sampleAspect;
 
   int get width => planes.first.width;
   int get height => planes.first.height;
+  bool get rgb => matrix == 0 && planes.length == 3;
 
   Map<String, double> get variables => {
     'iw': width.toDouble(),
@@ -435,20 +462,36 @@ final class _VideoPlanes {
     'ih': height.toDouble(),
     'in_h': height.toDouble(),
     'a': width / height,
+    'sar': sampleAspect,
+    'dar': width / height * sampleAspect,
     'hsub': (1 << subX).toDouble(),
     'vsub': (1 << subY).toDouble(),
   };
 
-  _VideoPlanes map(_FilterPlane Function(_FilterPlane, int, int) transform) =>
-      _VideoPlanes(
-        [
-          transform(planes.first, 0, 0),
-          for (final plane in planes.skip(1)) transform(plane, subX, subY),
-        ],
-        subX,
-        subY,
-        alpha: alpha == null ? null : transform(alpha!, 0, 0),
-      );
+  _VideoPlanes map(
+    _FilterPlane Function(_FilterPlane, int, int) transform, {
+    double? sampleAspect,
+  }) => mapComponents(
+    (plane, sx, sy, _) => transform(plane, sx, sy),
+    sampleAspect: sampleAspect,
+  );
+
+  _VideoPlanes mapComponents(
+    _FilterPlane Function(_FilterPlane, int, int, int) transform, {
+    double? sampleAspect,
+  }) => _VideoPlanes(
+    [
+      transform(planes.first, 0, 0, 0),
+      for (var i = 1; i < planes.length; i++)
+        transform(planes[i], subX, subY, i),
+    ],
+    subX,
+    subY,
+    matrix: matrix,
+    fullRange: fullRange,
+    sampleAspect: sampleAspect ?? this.sampleAspect,
+    alpha: alpha == null ? null : transform(alpha!, 0, 0, 3),
+  );
 }
 
 /// A rectangular sample view. Crop, flips and transpose compose by changing
@@ -511,7 +554,12 @@ final class _FilterPlane {
     return _copy();
   }
 
-  _FilterPlane _copy() {
+  _FilterPlane get packed {
+    if (rowStep == width && columnStep == 1 && offset == 0) return this;
+    return _copy();
+  }
+
+  _FilterPlane _copy([int Function(int)? transform]) {
     final copy = depth <= 8
         ? Uint8List(width * height)
         : Uint16List(width * height);
@@ -519,7 +567,8 @@ final class _FilterPlane {
     for (var y = 0; y < height; y++) {
       var source = offset + y * rowStep;
       for (var x = 0; x < width; x++) {
-        copy[i++] = samples[source];
+        final value = samples[source];
+        copy[i++] = transform == null ? value : transform(value);
         source += columnStep;
       }
     }

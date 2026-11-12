@@ -103,11 +103,20 @@ fragments, and changes of sample description are pending.
 
 `extract` and `vcs` accept a comma-separated `--vfilter` chain such as
 `--vfilter 'crop=iw/2:ih,transpose=clock,hflip'`. The Dart filters include
-`crop`, `scale`, `hflip`, `vflip`, `transpose` and `null`. Crop and scale
+`crop`, `scale`, `pad`, `drawbox`, `negate`, `setsar`, `setdar`, `hflip`,
+`vflip`, `transpose` and `null`. Crop and scale
 accept static dimension expressions with arithmetic and functions such as
 `min`, `max` and `trunc`. Scale supports `flags=bicubic` (default) and
 `flags=neighbor`. Crop aligns to chroma samples by default and accepts
 `exact=1` for odd coordinates and dimensions.
+
+For example, `--vfilter 'pad=iw+32:ih+32:-1:-1:black,drawbox=8:8:64:40:yellow@0.5:3'`
+adds a centered border and draws a translucent box. Colors accept named
+values, RGB/RGBA hex and explicit opacity. `negate=components=y+u`
+inverts selected planes. `setsar` and `setdar` affect aspect expressions
+such as `pad=aspect=16/9`. Source sample aspect is read from H.264 and
+HEVC sequence parameters, with square pixels as the default.
+On deeper sources, `drawbox` retains native depth.
 
 Timing filters include `trim`, `setpts`, `settb` and `fps`. They run for
 each seek window before conversion to the requested capture rate. For example,
@@ -172,6 +181,7 @@ dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
 dart test/video_filters_test.dart
+dart test/video_paint_filters_test.dart
 dart test/video_timing_test.dart
 dart test/capture_test.dart
 dart test/avif_test.dart

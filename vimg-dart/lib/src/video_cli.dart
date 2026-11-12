@@ -94,7 +94,8 @@ abstract class _CaptureCommand extends VimgCommand {
       ..addOption(
         'vfilter',
         help:
-            'Video filter chain (crop, scale, hflip, vflip, transpose, trim, setpts, settb, fps, null).',
+            'Video filters include crop, scale, pad, drawbox, negate, hflip, '
+            'vflip, transpose, setsar, setdar, trim, setpts, settb and fps.',
       )
       ..addOption(
         'threads',

@@ -99,6 +99,7 @@ final class HevcSps {
     required this.temporalMvp,
     required this.strongIntraSmoothing,
     required this.colour,
+    this.sampleAspect = 1,
     required this.fieldSequence,
     required this.timing,
     required this.extensions,
@@ -199,6 +200,7 @@ final class HevcSps {
       temporalMvp: temporalMvp,
       strongIntraSmoothing: smoothing,
       colour: vui?.colour ?? _unspecifiedColour,
+      sampleAspect: vui?.sampleAspect ?? 1,
       fieldSequence: vui?.fieldSequence ?? false,
       timing: vui?.timing,
       extensions: extensions,
@@ -221,6 +223,7 @@ final class HevcSps {
   final List<HevcLongReference>? longReferences;
   final bool temporalMvp, strongIntraSmoothing, fieldSequence;
   final HevcColour colour;
+  final double sampleAspect;
   final (int, int)? timing; // frame ticks, ticks per second
   final int extensions, rangeExtension;
 
@@ -486,11 +489,14 @@ HevcCrop _crop(Rbsp bits, int chroma, int width, int height) {
   return (left: left, top: top, right: right, bottom: bottom);
 }
 
-({HevcColour colour, bool fieldSequence, (int, int)? timing}) _readVui(
-  Rbsp bits,
-  int layers,
-) {
-  if (bits.flag() && bits.read(8) == 255) bits.skip(32);
+({
+  HevcColour colour,
+  bool fieldSequence,
+  double sampleAspect,
+  (int, int)? timing,
+})
+_readVui(Rbsp bits, int layers) {
+  final sampleAspect = bits.readVuiSampleAspect();
   if (bits.flag()) bits.skip(1); // overscan
   var colour = _unspecifiedColour;
   if (bits.flag()) {
@@ -525,7 +531,12 @@ HevcCrop _crop(Rbsp bits, int chroma, int width, int height) {
     bits.skip(3);
     for (var i = 0; i < 5; i++) bits.ue();
   }
-  return (colour: colour, fieldSequence: field, timing: timing);
+  return (
+    colour: colour,
+    fieldSequence: field,
+    sampleAspect: sampleAspect,
+    timing: timing,
+  );
 }
 
 typedef _HrdCommon = ({bool nal, bool vcl, bool subPicture});

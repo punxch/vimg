@@ -52,6 +52,38 @@ final class Rbsp {
 
   bool flag() => bit() == 1;
 
+  /// AVC and HEVC use the same VUI sample aspect ratio codes.
+  double readVuiSampleAspect() {
+    if (!flag()) return 1;
+    final id = read(8);
+    if (id == 255) {
+      final width = read(16), height = read(16);
+      return width == 0 || height == 0 ? 1 : width / height;
+    }
+    const ratios = [
+      (1, 1),
+      (1, 1),
+      (12, 11),
+      (10, 11),
+      (16, 11),
+      (40, 33),
+      (24, 11),
+      (20, 11),
+      (32, 11),
+      (80, 33),
+      (18, 11),
+      (15, 11),
+      (64, 33),
+      (160, 99),
+      (4, 3),
+      (3, 2),
+      (2, 1),
+    ];
+    if (id >= ratios.length) return 1;
+    final (width, height) = ratios[id];
+    return width / height;
+  }
+
   int read(int count) {
     if (count < 0 || count > remaining) {
       throw FormatException('Truncated $codec field');

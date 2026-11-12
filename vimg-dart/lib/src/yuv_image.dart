@@ -8,6 +8,8 @@ import 'filter_expression.dart';
 import 'grid.dart';
 
 part 'video_filters.dart';
+part 'video_filter_colors.dart';
+part 'video_paint_filters.dart';
 part 'video_timing_filters.dart';
 part 'yuv_scaler.dart';
 
@@ -30,6 +32,7 @@ image.Image yuvImage({
   int subsamplingY = 1,
   List<int>? alpha,
   int alphaDepth = 8,
+  double sampleAspect = 1,
   YuvImageScaler? scaler,
 }) {
   if (scaler != null && scaler.filters != null) {
@@ -61,6 +64,9 @@ image.Image yuvImage({
       ],
       sx,
       sy,
+      matrix: matrix,
+      fullRange: fullRange,
+      sampleAspect: sampleAspect,
       alpha: alpha == null
           ? null
           : _FilterPlane(
@@ -72,7 +78,7 @@ image.Image yuvImage({
               offset: cropTop * stride + cropLeft,
             ),
     );
-    return scaler._renderFiltered(planes, matrix: matrix, fullRange: fullRange);
+    return scaler._renderFiltered(planes);
   }
   if (scaler != null) {
     final (scaledWidth, scaledHeight) = scaler._dimensions(width, height);

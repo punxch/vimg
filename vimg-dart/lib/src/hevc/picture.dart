@@ -44,6 +44,7 @@ final class HevcPicture {
     fullRange: sps.colour.fullRange,
     lumaDepth: sps.lumaDepth,
     chromaDepth: sps.chromaDepth,
+    sampleAspect: sps.sampleAspect,
     scaler: scaler,
   );
 }
