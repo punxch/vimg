@@ -41,7 +41,12 @@ with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
 same GOP, and select captures by presentation timestamp. `sample/input.mkv`
 can be used with `preview`, `extract` and `vcs`. `preview` selects an IDR for
-a quick static image. HEVC decoding is pending, along with Rust's
+a quick static image.
+
+Matroska and MP4/MOV also support progressive HEVC intra pictures in 4:2:0
+or monochrome, up to 12 bits. `preview` selects an HEVC random-access
+picture. `extract` and `vcs` work with intra-only HEVC video. HEVC inter
+prediction and range extension tools are pending, along with Rust's
 `authority` commands, FFmpeg filter expressions and hardware capture backends.
 
 The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses

@@ -563,6 +563,10 @@ _HrdCommon _readHrd(Rbsp bits, int layers, _HrdCommon? inherited) {
 
 void _endParameters(Rbsp bits) {
   bits.readStopBit();
-  if (bits.remaining != 0)
-    throw const FormatException('Unexpected HEVC parameter data');
+  // An Annex B remux can retain trailing_zero_8bits in a parameter-set NAL.
+  while (bits.remaining != 0) {
+    if (bits.read(8) != 0) {
+      throw const FormatException('Unexpected HEVC parameter data');
+    }
+  }
 }

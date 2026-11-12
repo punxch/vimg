@@ -7,13 +7,15 @@ import 'avi.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
-import 'video_configuration.dart';
 import 'h264/idr_picture.dart';
+import 'hevc/access_unit.dart';
+import 'hevc/intra_picture.dart';
 import 'iso_frames.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
 import 'matroska_frames.dart';
 import 'metadata.dart';
+import 'video_configuration.dart';
 
 final class Video {
   Video(String path) : _input = File(path).openSync() {
@@ -48,28 +50,49 @@ final class Video {
 
   void close() => _input.closeSync();
 
-  late final Uint8List _avcConfig = _openH264();
+  late final Uint8List _avcConfig = _configuration('h264');
   late final H264IdrDecoder _h264 = H264IdrDecoder(
     AvcConfiguration(_avcConfig),
   );
   late final _H264Timeline _h264Timeline = _indexH264();
+  late final HevcIntraDecoder _hevc = HevcIntraDecoder(
+    HevcConfiguration(_configuration('hevc')),
+  );
 
-  Uint8List _openH264() {
+  Uint8List _configuration(String codec) {
     final matroska = _matroska;
     final iso = _iso;
     final config = matroska != null
-        ? matroskaVideoConfiguration(matroska, 'h264')
-        : (iso != null ? isoVideoConfiguration(iso, 'h264') : null);
-    if (config == null)
+        ? matroskaVideoConfiguration(matroska, codec)
+        : (iso != null ? isoVideoConfiguration(iso, codec) : null);
+    if (config == null) {
+      final name = codec == 'h264' ? 'H.264' : 'HEVC';
       throw UnsupportedError(
-        'H.264 requires a Matroska or MP4 AVC configuration',
+        '$name requires a Matroska or MP4 codec configuration',
       );
+    }
     return config;
   }
 
   Iterable<FramePacket> packets({bool preview = false}) {
     if (codec == 'h264') {
       return preview ? _h264Keyframes() : _h264Timeline.presentation;
+    }
+    if (codec == 'hevc') {
+      final configuration = _hevc.configuration;
+      if (preview) {
+        return _containerPackets(true).where(
+          (packet) => configuration.containsRandomAccess(
+            packet.offset,
+            packet.size,
+            file.unsigned,
+          ),
+        );
+      }
+      return _containerPackets(false).toList()..sort((a, b) {
+        final time = a.seconds.compareTo(b.seconds);
+        return time != 0 ? time : a.offset.compareTo(b.offset);
+      });
     }
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
@@ -202,6 +225,7 @@ final class Video {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
+      'hevc' => _hevc.decode(bytes)?.rgb(),
       'rawvideo' => _avi?.decodeBitmap(bytes),
       _ => null,
     };

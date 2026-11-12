@@ -23,6 +23,24 @@ final class HevcCabac extends CabacEngine {
     }
     return decision(context.offset + increment);
   }
+
+  int bypassBits(int count) {
+    var value = 0;
+    for (var i = 0; i < count; i++) {
+      value = (value << 1) | bypass();
+    }
+    return value;
+  }
+
+  int bypassGolomb(int order) {
+    var base = 0;
+    while (bypass() != 0) {
+      base += 1 << order++;
+      if (order > 22)
+        throw const FormatException('Oversized HEVC CABAC escape');
+    }
+    return base + bypassBits(order);
+  }
 }
 
 Uint8List _initialModels(HevcSliceParameters slice) {

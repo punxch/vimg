@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import '../yuv_image.dart';
 import 'motion.dart';
 import 'parameters.dart';
 
@@ -22,35 +23,17 @@ final class H264Picture {
   MotionField? motionL0;
   MotionField? motionL1;
 
-  image.Image rgb() {
-    final pixels = image.Image(width: sps.width, height: sps.height);
-    final (rv, gu, gv, bu) = switch (sps.color.matrix) {
-      1 => (1.5748, 0.187324, 0.468124, 1.8556), // BT.709
-      9 || 10 => (1.4746, 0.164553, 0.571353, 1.8814), // BT.2020
-      _ => (1.402, 0.344136, 0.714136, 1.772), // BT.601 / unspecified
-    };
-    final fullRange = sps.color.fullRange;
-    final scale = fullRange ? 1.0 : 255 / 224;
-    const precision = 1 << 14;
-    final red = (rv * scale * precision).round();
-    final greenU = (gu * scale * precision).round();
-    final greenV = (gv * scale * precision).round();
-    final blue = (bu * scale * precision).round();
-    final yScale = (precision * (fullRange ? 1.0 : 255 / 219)).round();
-    final bias = fullRange ? 0 : 16;
-    for (final pixel in pixels) {
-      final x = sps.cropLeft + pixel.x;
-      final row = sps.cropTop + pixel.y;
-      final luma = (y[row * stride + x] - bias) * yScale + (precision >> 1);
-      final offset = (row >> 1) * (stride >> 1) + (x >> 1);
-      final u = cb.isEmpty ? 0 : cb[offset] - 128;
-      final v = cr.isEmpty ? 0 : cr[offset] - 128;
-      pixel.setRgb(
-        ((luma + red * v) >> 14).clamp(0, 255),
-        ((luma - greenU * u - greenV * v) >> 14).clamp(0, 255),
-        ((luma + blue * u) >> 14).clamp(0, 255),
-      );
-    }
-    return pixels;
-  }
+  image.Image rgb() => yuv420Image(
+    y: y,
+    cb: cb,
+    cr: cr,
+    stride: stride,
+    chromaStride: stride >> 1,
+    width: sps.width,
+    height: sps.height,
+    cropLeft: sps.cropLeft,
+    cropTop: sps.cropTop,
+    matrix: sps.color.matrix,
+    fullRange: sps.color.fullRange,
+  );
 }
