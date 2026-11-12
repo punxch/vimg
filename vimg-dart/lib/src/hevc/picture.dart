@@ -30,7 +30,7 @@ final class HevcPicture {
   final HevcPlane? cb, cr;
   final HevcMotionField? motion;
 
-  image.Image rgb() => yuvImage(
+  image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
     y: luma.samples,
     cb: cb?.samples ?? const [],
     cr: cr?.samples ?? const [],
@@ -44,6 +44,7 @@ final class HevcPicture {
     fullRange: sps.colour.fullRange,
     lumaDepth: sps.lumaDepth,
     chromaDepth: sps.chromaDepth,
+    scaler: scaler,
   );
 }
 

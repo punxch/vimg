@@ -21,6 +21,13 @@ import 'matroska.dart';
 import 'matroska_frames.dart';
 import 'metadata.dart';
 import 'video_configuration.dart';
+import 'yuv_image.dart';
+
+typedef _SelectedFrame = ({
+  FramePacket packet,
+  image.Image frame,
+  image.Image? original,
+});
 
 final class Video {
   Video(String path) : _input = File(path).openSync() {
@@ -199,9 +206,11 @@ final class Video {
     );
   }
 
-  Iterable<({FramePacket packet, image.Image frame})> _decodeAv1Selected(
-    Iterable<FramePacket> selected,
-  ) sync* {
+  Iterable<_SelectedFrame> _decodeAv1Selected(
+    Iterable<FramePacket> selected, {
+    YuvImageScaler? scaler,
+    bool includeOriginal = false,
+  }) sync* {
     final (timeline: timeline, configurations: configurations) = _av1Timeline;
     final targets = {
       for (final packet in selected)
@@ -223,17 +232,24 @@ final class Video {
       }
       while (next <= target) {
         final packet = timeline.decodeOrder[next++];
-        image.Image? displayed;
+        Av1Picture? displayed;
         for (final frame in units!.readSample(_read(packet))) {
           final picture = decoder!.decode(frame);
           if (frame.shown && next - 1 == target) {
-            displayed = decoder.display(frame, picture);
+            displayed = applyAv1FilmGrain(
+              picture,
+              frame.header.parameters.filmGrain,
+            );
           }
         }
         if (next - 1 == target) {
           if (displayed == null)
             throw const FormatException('AV1 sample has no display picture');
-          yield (packet: packet, frame: displayed);
+          final frame = displayed.rgb(scaler: scaler);
+          final original = includeOriginal
+              ? (scaler == null ? frame : displayed.rgb())
+              : null;
+          yield (packet: packet, frame: frame, original: original);
         }
       }
     }
@@ -281,16 +297,27 @@ final class Video {
     );
   }
 
-  Iterable<({FramePacket packet, image.Image frame})> decodeSelected(
-    Iterable<FramePacket> selected,
-  ) sync* {
+  Iterable<_SelectedFrame> decodeSelected(
+    Iterable<FramePacket> selected, {
+    YuvImageScaler? scaler,
+    bool includeOriginal = false,
+  }) sync* {
     if (codec == 'av1') {
-      yield* _decodeAv1Selected(selected);
+      yield* _decodeAv1Selected(
+        selected,
+        scaler: scaler,
+        includeOriginal: includeOriginal,
+      );
       return;
     }
     if (!usesReferencePictures) {
       for (final packet in selected) {
-        yield (packet: packet, frame: decode(packet));
+        final frame = decode(packet);
+        yield (
+          packet: packet,
+          frame: frame,
+          original: includeOriginal ? frame : null,
+        );
       }
       return;
     }
@@ -329,12 +356,16 @@ final class Video {
             ? hevcDecoder!.decode(bytes)
             : avcDecoder!.decode(bytes);
         if (next - 1 == target) {
-          final frame = switch (picture) {
-            HevcPicture picture => picture.rgb(),
-            H264Picture picture => picture.rgb(),
+          final render = switch (picture) {
+            HevcPicture picture => picture.rgb,
+            H264Picture picture => picture.rgb,
             _ => throw FormatException('Invalid $codec video frame'),
           };
-          yield (packet: packet, frame: frame);
+          final frame = render(scaler: scaler);
+          final original = includeOriginal
+              ? (scaler == null ? frame : render())
+              : null;
+          yield (packet: packet, frame: frame, original: original);
         }
       }
     }

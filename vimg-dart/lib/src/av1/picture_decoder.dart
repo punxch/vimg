@@ -70,7 +70,7 @@ final class Av1Picture {
   final Av1ColorConfig color;
   final List<Av1Plane> planes;
 
-  image.Image rgb() => yuvImage(
+  image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
     y: planes[0].samples,
     cb: color.monochrome ? const [] : planes[1].samples,
     cr: color.monochrome ? const [] : planes[2].samples,
@@ -86,6 +86,7 @@ final class Av1Picture {
     chromaDepth: color.depth,
     subsamplingX: color.subsamplingX,
     subsamplingY: color.subsamplingY,
+    scaler: scaler,
   );
 }
 

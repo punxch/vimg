@@ -1,4 +1,11 @@
+import 'dart:math' as math;
+import 'dart:typed_data';
+
 import 'package:image/image.dart' as image;
+
+import 'grid.dart';
+
+part 'yuv_scaler.dart';
 
 /// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.
 image.Image yuvImage({
@@ -17,7 +24,37 @@ image.Image yuvImage({
   int chromaDepth = 8,
   int subsamplingX = 1,
   int subsamplingY = 1,
+  YuvImageScaler? scaler,
 }) {
+  if (scaler != null) {
+    final (scaledWidth, scaledHeight) = fitDimensions(
+      width,
+      height,
+      width: scaler.width,
+      height: scaler.height,
+    );
+    if (scaledWidth != width || scaledHeight != height) {
+      return scaler._resize(
+        y: y,
+        cb: cb,
+        cr: cr,
+        stride: stride,
+        chromaStride: chromaStride,
+        sourceWidth: width,
+        sourceHeight: height,
+        width: scaledWidth,
+        height: scaledHeight,
+        cropLeft: cropLeft,
+        cropTop: cropTop,
+        matrix: matrix,
+        fullRange: fullRange,
+        lumaDepth: lumaDepth,
+        chromaDepth: chromaDepth,
+        subsamplingX: subsamplingX,
+        subsamplingY: subsamplingY,
+      );
+    }
+  }
   final pixels = image.Image(width: width, height: height);
   final (rv, gu, gv, bu) = switch (matrix) {
     1 => (1.5748, 0.187324, 0.468124, 1.8556), // BT.709

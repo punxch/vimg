@@ -23,7 +23,7 @@ final class H264Picture {
   MotionField? motionL0;
   MotionField? motionL1;
 
-  image.Image rgb() => yuvImage(
+  image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
     y: y,
     cb: cb,
     cr: cr,
@@ -35,5 +35,6 @@ final class H264Picture {
     cropTop: sps.cropTop,
     matrix: sps.color.matrix,
     fullRange: sps.color.fullRange,
+    scaler: scaler,
   );
 }

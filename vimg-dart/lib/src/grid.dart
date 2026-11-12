@@ -8,17 +8,39 @@ image.Image resizeToFit(
   int? height,
   bool enlarge = true,
 }) {
-  if (width == null && height == null) return frame;
-  final scale = math.min(
-    width == null ? double.infinity : width / frame.width,
-    height == null ? double.infinity : height / frame.height,
+  final (scaledWidth, scaledHeight) = fitDimensions(
+    frame.width,
+    frame.height,
+    width: width,
+    height: height,
+    enlarge: enlarge,
   );
-  if (scale == 1 || (!enlarge && scale >= 1)) return frame;
+  if (scaledWidth == frame.width && scaledHeight == frame.height) return frame;
   return image.copyResize(
     frame,
-    width: math.max(1, (frame.width * scale).round()),
-    height: math.max(1, (frame.height * scale).round()),
+    width: scaledWidth,
+    height: scaledHeight,
     interpolation: image.Interpolation.cubic,
+  );
+}
+
+(int, int) fitDimensions(
+  int sourceWidth,
+  int sourceHeight, {
+  int? width,
+  int? height,
+  bool enlarge = true,
+}) {
+  if (width == null && height == null) return (sourceWidth, sourceHeight);
+  final scale = math.min(
+    width == null ? double.infinity : width / sourceWidth,
+    height == null ? double.infinity : height / sourceHeight,
+  );
+  if (scale == 1 || (!enlarge && scale >= 1))
+    return (sourceWidth, sourceHeight);
+  return (
+    math.max(1, (sourceWidth * scale).round()),
+    math.max(1, (sourceHeight * scale).round()),
   );
 }
 

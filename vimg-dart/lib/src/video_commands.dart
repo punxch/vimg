@@ -9,6 +9,7 @@ import 'frame_packet.dart';
 import 'grid.dart';
 import 'output.dart';
 import 'video.dart';
+import 'yuv_image.dart';
 
 String videoStem(String input) {
   final name = File(input).uri.pathSegments.last;
@@ -205,11 +206,16 @@ void writeContactSheet(
     }
     final cached = <FramePacket, image.Image>{};
     if (inter) {
+      final scaler = width == null && height == null
+          ? null
+          : YuvImageScaler(width: width, height: height);
       var decodedBytes = 0;
       for (final result in video.decodeSelected(
         selected.expand((tile) => tile),
+        scaler: scaler,
+        includeOriginal: paths != null,
       )) {
-        final frame = resizeToFit(result.frame, width: width, height: height);
+        final frame = result.frame;
         decodedBytes += frame.width * frame.height * 3;
         if (decodedBytes > _decodedFrameLimit) {
           throw const FormatException(
@@ -217,8 +223,9 @@ void writeContactSheet(
           );
         }
         cached[result.packet] = frame;
-        if (paths != null)
-          _publishCaptures(paths[result.packet]!, result.frame);
+        if (paths != null) {
+          _publishCaptures(paths[result.packet]!, result.original!);
+        }
       }
     }
     final labels = plan.starts

@@ -304,10 +304,15 @@ Future<void> main(List<String> arguments) async {
         ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
         'H.264 animated contact sheet',
       );
-      check(
-        Directory(kept).listSync().length == 6,
-        'H.264 kept B-frame captures',
-      );
+      final captures = Directory(kept).listSync().cast<File>();
+      check(captures.length == 6, 'H.264 kept B-frame captures');
+      for (final capture in captures) {
+        final frame = image.decodeBmp(capture.readAsBytesSync())!;
+        check(
+          frame.width == 166 && frame.height == 110,
+          'H.264 --keep retains the original capture dimensions',
+        );
+      }
     }
   } finally {
     directory.deleteSync(recursive: true);
