@@ -104,6 +104,8 @@ dart test/probe_join_test.dart
 dart test/video_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart
+dart test/av1_coefficients_test.dart
+dart test/av1_transform_test.dart
 dart test/h264_test.dart
 dart test/hevc_test.dart
 dart test/authority_test.dart
