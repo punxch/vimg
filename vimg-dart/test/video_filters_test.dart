@@ -118,7 +118,7 @@ void _checkErrors() {
     'crop=5:2:w=4',
     'crop=iw-n:ih',
     'transpose=clock:passthrough=unknown',
-    'fps=20',
+    'reverse',
   ]) {
     _fails(() => VideoFilterChain.parse(chain), chain);
   }
@@ -231,11 +231,11 @@ Future<void> _checkCli(String? executable) async {
       '--output-dir',
       rejected,
       '--vfilter',
-      'fps=20',
+      'reverse',
       input,
     ], ok: false);
     check(
-      (result.stderr as String).contains('Unsupported video filter: fps') &&
+      (result.stderr as String).contains('Unsupported video filter: reverse') &&
           !Directory(rejected).existsSync(),
       'Reject unsupported filters before publishing',
     );

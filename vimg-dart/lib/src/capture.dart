@@ -1,8 +1,11 @@
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'capture_timeline.dart';
 import 'frame_packet.dart';
 
+part 'capture_filtered.dart';
 part 'capture_timing.dart';
 
 final class VideoOffset {
@@ -126,14 +129,16 @@ final class CapturePlan {
       ),
       growable: false,
     );
-    _rate = _captureRate(frames / _seekDecimal(_asFloat32(window)));
+    _seekWindow = _seekDecimal(_asFloat32(window));
+    _rate = captureRational(frames / _seekWindow);
   }
 
   late final double usableDuration;
   late final List<double> starts;
   final int frames;
   final double window;
-  late final _CaptureRate _rate;
+  late final double _seekWindow;
+  late final CaptureRational _rate;
 
   List<List<FramePacket>> select(
     Iterable<FramePacket> packets, {
@@ -188,6 +193,21 @@ final class CapturePlan {
     }
     return [for (final schedule in schedules) schedule.frames];
   }
+
+  List<List<FramePacket>> selectFiltered(
+    Iterable<FramePacket> packets,
+    CaptureTimeline Function(CaptureTimeline) filter, {
+    CaptureRational? timeBase,
+    double? frameRate,
+    CaptureSelection? onSelect,
+  }) => _selectFilteredCaptures(
+    this,
+    packets,
+    filter,
+    timeBase,
+    frameRate,
+    onSelect,
+  );
 }
 
 String timestampLabel(int seconds) {

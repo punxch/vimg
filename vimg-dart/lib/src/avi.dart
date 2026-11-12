@@ -122,6 +122,7 @@ final class Avi {
           width: width,
           height: height,
           timeBase: timeBase(scale, rate),
+          nominalFrameRate: rate / scale,
         ),
         bitmap: codec == 'rawvideo' && (bits == 24 || bits == 32)
             ? (

@@ -163,7 +163,8 @@ final class Matroska {
   VideoMetadata metadata() {
     var scale = 1000000;
     double? durationTicks;
-    final tracks = <({String codec, int width, int height})>[];
+    final tracks =
+        <({String codec, int width, int height, int? frameDuration})>[];
     final attachments = <VideoStream>[];
     for (final child in segmentElements()) {
       switch (child.id) {
@@ -180,6 +181,7 @@ final class Matroska {
               codec: trackCodec(track),
               width: number(video[0xb0]) ?? 0,
               height: number(video[0xba]) ?? 0,
+              frameDuration: number(track[0x23e383]),
             ));
           }
         case 0x1941a469:
@@ -200,6 +202,7 @@ final class Matroska {
             width: track.width,
             height: track.height,
             timeBase: base,
+            nominalFrameRate: _matroskaFrameRate(track.frameDuration),
           ),
         ...attachments,
       ],
@@ -232,6 +235,7 @@ final class Matroska {
       );
       return switch (tag.toUpperCase()) {
         'MJPG' || 'JPEG' => 'mjpeg',
+        'MPNG' || 'PNG ' => 'png',
         'H264' || 'X264' || 'AVC1' => 'h264',
         'HEVC' || 'H265' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' => 'mpeg4',
@@ -282,4 +286,19 @@ final class Matroska {
       attached: true,
     );
   }
+}
+
+double? _matroskaFrameRate(int? duration) {
+  if (duration == null || duration <= 0) return null;
+  // DefaultDuration stores whole nanoseconds. Recover common broadcast rates
+  // when the only difference is that timestamp precision.
+  final rate = 1e9 / duration;
+  final integer = rate.round();
+  if (integer > 0 && (duration - 1e9 / integer).abs() < 1) {
+    return integer.toDouble();
+  }
+  for (final numerator in [24000, 30000, 48000, 60000, 96000, 120000]) {
+    if ((duration - 1001e9 / numerator).abs() < 1) return numerator / 1001;
+  }
+  return rate;
 }

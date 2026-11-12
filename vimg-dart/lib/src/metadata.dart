@@ -4,6 +4,7 @@ final class VideoStream {
     required this.width,
     required this.height,
     required this.timeBase,
+    this.nominalFrameRate,
     this.attached = false,
   });
 
@@ -11,6 +12,7 @@ final class VideoStream {
   final int width;
   final int height;
   final String timeBase;
+  final double? nominalFrameRate;
   final bool attached;
 
   Map<String, Object> toJson() => {

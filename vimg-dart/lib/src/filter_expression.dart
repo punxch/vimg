@@ -89,12 +89,33 @@ final class _Parser {
       return switch (name) {
         'PI' => (_) => math.pi,
         'E' => (_) => math.e,
+        'PHI' => (_) => (1 + math.sqrt(5)) / 2,
+        'NAN' => (_) => double.nan,
+        'INF' => (_) => double.infinity,
         _ => throw FormatException('Unsupported video filter variable: $name'),
       };
     }
     final first = _sum(depth + 1);
     final second = _take(',') ? _sum(depth + 1) : null;
+    final third = second != null && _take(',') ? _sum(depth + 1) : null;
     if (!_take(')')) _fail();
+    if (third != null) {
+      final middle = second!;
+      return switch (name) {
+        'if' => (v) => first(v) != 0 ? middle(v) : third(v),
+        'ifnot' => (v) => first(v) == 0 ? middle(v) : third(v),
+        'between' => (v) => _boolean(
+          first(v) >= middle(v) && first(v) <= third(v),
+        ),
+        'clip' => (v) {
+          final low = middle(v), high = third(v), value = first(v);
+          return low.isNaN || high.isNaN || value.isNaN || low > high
+              ? double.nan
+              : value.clamp(low, high);
+        },
+        _ => throw FormatException('Unsupported video filter function: $name'),
+      };
+    }
     if (second != null) {
       return switch (name) {
         'min' => (v) => math.min(first(v), second(v)),
@@ -104,6 +125,13 @@ final class _Parser {
               first(v) -
               second(v) * _integer(first(v) / second(v), (x) => x.floor()),
         'pow' => (v) => math.pow(first(v), second(v)).toDouble(),
+        'if' => (v) => first(v) != 0 ? second(v) : 0,
+        'ifnot' => (v) => first(v) == 0 ? second(v) : 0,
+        'eq' => (v) => _boolean(first(v) == second(v)),
+        'lt' => (v) => _boolean(first(v) < second(v)),
+        'lte' => (v) => _boolean(first(v) <= second(v)),
+        'gt' => (v) => _boolean(first(v) > second(v)),
+        'gte' => (v) => _boolean(first(v) >= second(v)),
         _ => throw FormatException('Unsupported video filter function: $name'),
       };
     }
@@ -114,12 +142,22 @@ final class _Parser {
       'round' => (v) => _integer(first(v), (x) => x.round()),
       'trunc' => (v) => _integer(first(v), (x) => x.truncate()),
       'sqrt' => (v) => math.sqrt(first(v)),
+      'sin' => (v) => math.sin(first(v)),
+      'cos' => (v) => math.cos(first(v)),
+      'tan' => (v) => math.tan(first(v)),
+      'log' => (v) => math.log(first(v)),
+      'exp' => (v) => math.exp(first(v)),
+      'isnan' => (v) => _boolean(first(v).isNaN),
+      'isinf' => (v) => _boolean(first(v).isInfinite),
+      'not' => (v) => _boolean(first(v) == 0),
       _ => throw FormatException('Unsupported video filter function: $name'),
     };
   }
 
   double _integer(double value, int Function(double) round) =>
       value.isFinite ? round(value).toDouble() : value;
+
+  double _boolean(bool value) => value ? 1 : 0;
 
   String? _match(RegExp pattern) {
     _skipSpace();

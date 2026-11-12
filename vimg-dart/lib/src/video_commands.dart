@@ -97,6 +97,32 @@ image.Image _previewFrame(Video video, int seconds) {
 
 const defaultCaptureThreads = 4;
 
+List<List<FramePacket>> _selectCaptures(
+  Video video,
+  CapturePlan plan,
+  VideoFilterChain? filters, {
+  CaptureSelection? onSelect,
+}) {
+  final packets = video.packets();
+  if (filters == null || !filters.hasTimingFilters) {
+    return plan.select(packets, onSelect: onSelect);
+  }
+  final stream = video.metadata.streams.firstWhere(
+    (stream) => !stream.attached,
+  );
+  final [numerator, denominator] = stream.timeBase
+      .split('/')
+      .map(int.parse)
+      .toList();
+  return plan.selectFiltered(
+    packets,
+    filters.filterTiming,
+    timeBase: (numerator: numerator, denominator: denominator),
+    frameRate: stream.nominalFrameRate,
+    onSelect: onSelect,
+  );
+}
+
 Future<void> extractFrames(
   String input,
   String directory,
@@ -108,13 +134,15 @@ Future<void> extractFrames(
   VideoCaptureDecoder? decoder;
   try {
     final plan = CapturePlan(video.metadata.duration, options);
-    final selected = plan.select(video.packets());
+    final selected = _selectCaptures(video, plan, filters);
     Directory(directory).createSync(recursive: true);
     final paths = _capturePaths(input, directory, plan, selected);
     decoder = VideoCaptureDecoder(
       video,
       threads: threads,
-      scaler: filters == null ? null : YuvImageScaler(filters: filters),
+      scaler: filters?.hasSpatialFilters == true
+          ? YuvImageScaler(filters: filters)
+          : null,
     );
     await for (final decoded in decoder.decode(paths.keys)) {
       _publishCaptures(paths[decoded.packet]!, decoded.frame);
@@ -214,10 +242,11 @@ Future<void> writeContactSheet(
   VideoCaptureDecoder? decoder;
   try {
     final plan = CapturePlan(video.metadata.duration, options);
-    final selected = plan.select(video.packets(), onSelect: onSelect);
+    final selected = _selectCaptures(video, plan, filters, onSelect: onSelect);
     mark?.call('schedule');
     final inter = video.usesReferencePictures;
-    final scaleInDecoder = filters != null || video.scalesBeforeRgb;
+    final spatial = filters?.hasSpatialFilters == true ? filters : null;
+    final scaleInDecoder = spatial != null || video.scalesBeforeRgb;
     Map<FramePacket, List<String>>? paths;
     if (captureDirectory != null) {
       Directory(captureDirectory).createSync(recursive: true);
@@ -227,8 +256,8 @@ Future<void> writeContactSheet(
       video,
       threads: threads,
       scaler:
-          scaleInDecoder && (filters != null || width != null || height != null)
-          ? YuvImageScaler(width: width, height: height, filters: filters)
+          scaleInDecoder && (spatial != null || width != null || height != null)
+          ? YuvImageScaler(width: width, height: height, filters: spatial)
           : null,
       includeOriginal: paths != null && scaleInDecoder,
     );

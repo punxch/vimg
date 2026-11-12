@@ -81,8 +81,16 @@ fragments, and changes of sample description are pending.
 accept static dimension expressions with arithmetic and functions such as
 `min`, `max` and `trunc`. Scale supports `flags=bicubic` (default) and
 `flags=neighbor`. Crop aligns to chroma samples by default and accepts
-`exact=1` for odd coordinates and dimensions. Temporal filters, expressions
-using timestamps or sample aspect ratios, and branched graphs are pending.
+`exact=1` for odd coordinates and dimensions.
+
+Timing filters include `trim`, `setpts`, `settb` and `fps`. They run for
+each seek window before conversion to the requested capture rate. For example,
+`--vfilter 'trim=start=0.25,setpts=PTS-STARTPTS,fps=15'` skips the first
+quarter-second of each window and restarts its filtered timestamps at zero.
+`trim` accepts time, PTS and frame-count limits. `setpts` accepts deterministic
+expressions over timestamps, frame counts and rates. `settb` changes the
+time base, and `fps` supports start padding, rounding and EOF modes. Wall-clock
+expressions, frame-dependent spatial expressions and branched graphs are pending.
 
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered
@@ -138,6 +146,7 @@ dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
 dart test/video_filters_test.dart
+dart test/video_timing_test.dart
 dart test/capture_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart

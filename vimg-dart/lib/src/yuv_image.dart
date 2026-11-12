@@ -3,10 +3,12 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'capture_timeline.dart';
 import 'filter_expression.dart';
 import 'grid.dart';
 
 part 'video_filters.dart';
+part 'video_timing_filters.dart';
 part 'yuv_scaler.dart';
 
 /// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.

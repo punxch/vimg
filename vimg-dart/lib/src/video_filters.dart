@@ -1,14 +1,15 @@
 part of 'yuv_image.dart';
 
-/// A linear, spatial subset of FFmpeg's video filter syntax.
+/// A linear chain of static spatial operations and frame-timing filters.
 final class VideoFilterChain {
-  VideoFilterChain._(this.source, this._filters);
+  VideoFilterChain._(this.source, this._filters, this._timing);
 
   factory VideoFilterChain.parse(String source) {
     if (source.length > 2048) {
       throw const FormatException('Video filter chain exceeds 2048 characters');
     }
     final filters = <_SpatialFilter>[];
+    final timing = <_TimingFilter>[];
     for (final entry in _splitFilters(source, ',')) {
       final equal = entry.indexOf('=');
       final name = (equal < 0 ? entry : entry.substring(0, equal)).trim();
@@ -24,15 +25,34 @@ final class VideoFilterChain {
           filters.add(_Transpose(args));
         case 'scale':
           filters.add(_Scale(args));
+        case 'trim':
+          timing.add(_Trim(args));
+        case 'setpts':
+          timing.add(_SetPts(args));
+        case 'settb':
+          timing.add(_SetTimeBase(args));
+        case 'fps':
+          timing.add(_Fps(args));
         default:
           throw FormatException('Unsupported video filter: $name');
       }
     }
-    return VideoFilterChain._(source, filters);
+    return VideoFilterChain._(source, filters, timing);
   }
 
   final String source;
   final List<_SpatialFilter> _filters;
+  final List<_TimingFilter> _timing;
+
+  bool get hasSpatialFilters => _filters.isNotEmpty;
+  bool get hasTimingFilters => _timing.isNotEmpty;
+
+  CaptureTimeline filterTiming(CaptureTimeline timeline) {
+    for (final filter in _timing) {
+      timeline = filter.apply(timeline);
+    }
+    return timeline;
+  }
 
   _Scale? get _finalScale => switch (_filters.lastOrNull) {
     final _Scale scale => scale,
@@ -106,7 +126,8 @@ Map<String, String> _filterOptions(
   final options = <String, String>{};
   if (source == null) return options;
   var index = 0;
-  for (final arg in _splitFilters(source, ':')) {
+  // A colon escaped in both the graph and option layers remains literal.
+  for (final arg in _splitFilters(source.replaceAll(r'\\:', r'\:'), ':')) {
     final equal = arg.indexOf('=');
     if (equal < 0 && index >= positional.length) {
       throw FormatException('Unexpected video filter argument: $arg');
