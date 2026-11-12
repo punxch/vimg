@@ -56,9 +56,9 @@ and handle leading pictures that depend on an earlier GOP.
 `preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
 AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
-CDEF, horizontal super-resolution, and Wiener and SGRPROJ loop restoration.
+CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
+intra block copy for screen content.
 Film grain synthesis runs on AV1 display frames before RGB conversion.
-AV1 intra block copy remains pending.
 HEVC range extension tools, FFmpeg filter expressions and hardware capture
 backends remain pending.
 
@@ -111,6 +111,7 @@ dart test/video_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart
 dart test/av1_intra_test.dart
+dart test/av1_intrabc_test.dart
 dart test/av1_inter_test.dart
 dart test/av1_restoration_test.dart
 dart test/av1_superres_test.dart

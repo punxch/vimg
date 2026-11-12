@@ -30,6 +30,7 @@ import 'warp.dart';
 part 'film_grain.dart';
 part 'film_grain_table.dart';
 part 'inter_reconstruction.dart';
+part 'intra_block_copy.dart';
 part 'motion_field.dart';
 part 'restoration.dart';
 part 'superres.dart';
@@ -687,9 +688,8 @@ final class _PictureTile {
     if (!_segPreSkip && segmentation.updateMap) readSegment(skip);
     _readCdef(x, y, w4, h4, skip);
     _readBlockDeltas(w4, h4, skip);
-    if (frame.header.intrabc && _symbol(_Family.intrabc, const [30531]) != 0) {
-      throw UnsupportedError('AV1 intra block copy');
-    }
+    final intraCopy =
+        frame.header.intrabc && _symbol(_Family.intrabc, const [30531]) != 0;
 
     final lossless = params.losslessSegments[segment];
     final hasChroma =
@@ -697,7 +697,8 @@ final class _PictureTile {
         !(sx != 0 && w4 == 1 && x.isEven) &&
         !(sy != 0 && h4 == 1 && y.isEven);
     final features = segmentation.features[segment];
-    if (!intraFrame && _isInter(above, left, features, skipMode)) {
+    if (intraCopy ||
+        (!intraFrame && _isInter(above, left, features, skipMode))) {
       this._interBlock(
         x,
         y,
@@ -711,6 +712,7 @@ final class _PictureTile {
         lossless,
         hasChroma,
         features,
+        intraCopy: intraCopy,
       );
       return;
     }

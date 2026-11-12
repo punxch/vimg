@@ -68,15 +68,17 @@ Av1MvStack av1FindMvStack({
 }) {
   final compound = ref1 > 0;
   final global = (
-    av1GlobalMv(
-      globals[ref0 - 1],
-      x,
-      y,
-      width4,
-      height4,
-      highPrecision,
-      integer,
-    ),
+    ref0 == 0
+        ? av1ZeroMv
+        : av1GlobalMv(
+            globals[ref0 - 1],
+            x,
+            y,
+            width4,
+            height4,
+            highPrecision,
+            integer,
+          ),
     compound
         ? av1GlobalMv(
             globals[ref1 - 1],
@@ -246,7 +248,7 @@ Av1MvStack av1FindMvStack({
     }
   }
 
-  if (candidates.length < 2) {
+  if (ref0 > 0 && candidates.length < 2) {
     final same = [<Av1Mv>[], <Av1Mv>[]], different = [<Av1Mv>[], <Av1Mv>[]];
     final limit = math.min(limitX, limitY);
     for (final row in [true, false]) {

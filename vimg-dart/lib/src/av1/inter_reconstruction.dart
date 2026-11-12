@@ -24,24 +24,27 @@ extension _InterReconstruction on _PictureTile {
     bool skipMode,
     bool lossless,
     bool hasChroma,
-    List<int?> features,
-  ) {
-    final motion = _motionSyntax.read(
-      x: x,
-      y: y,
-      width4: w4,
-      height4: h4,
-      columns: state.columns,
-      rows: state.rows,
-      blockSize: blockSize,
-      skipMode: skipMode,
-      segmentFeatures: features,
-      neighbor: _motionNeighbor,
-      inTile: _inside,
-      distance: _distance,
-      scaled: _scaled,
-      temporal: field?.at,
-    );
+    List<int?> features, {
+    required bool intraCopy,
+  }) {
+    final motion = intraCopy
+        ? _readIntraCopy(x, y, w4, h4, hasChroma)
+        : _motionSyntax.read(
+            x: x,
+            y: y,
+            width4: w4,
+            height4: h4,
+            columns: state.columns,
+            rows: state.rows,
+            blockSize: blockSize,
+            skipMode: skipMode,
+            segmentFeatures: features,
+            neighbor: _motionNeighbor,
+            inTile: _inside,
+            distance: _distance,
+            scaled: _scaled,
+            temporal: field?.at,
+          );
     final width = w4 * 4, height = h4 * 4;
     final maxTx = lossless
         ? Av1TxSize.tx4x4
@@ -209,7 +212,8 @@ extension _InterReconstruction on _PictureTile {
     final x = (x4 >> px) << 2, y = (y4 >> py) << 2;
     final left = w4 == 1 && px != 0, above = h4 == 1 && py != 0;
     final minX = x4 - (left ? 1 : 0), minY = y4 - (above ? 1 : 0);
-    if ((left || above) &&
+    if (motion.ref0 != 0 &&
+        (left || above) &&
         (motion.compound == null) &&
         _at(minX, minY)?.motion != null &&
         _at(x4, minY)?.motion != null &&
@@ -251,10 +255,14 @@ extension _InterReconstruction on _PictureTile {
       final global =
           motion.mode0 == Av1MvMode.global &&
           (compound == null || motion.mode1 == Av1MvMode.global);
-      final gm = frame.header.parameters.globalMotion[ref - 1];
+      final gm = ref == 0
+          ? null
+          : frame.header.parameters.globalMotion[ref - 1];
       final matrix =
           motion.warp ??
-          (global && gm.type.index > 1 && !_scaled(ref) ? gm.matrix : null);
+          (global && gm != null && gm.type.index > 1 && !_scaled(ref)
+              ? gm.matrix
+              : null);
       _convolveReference(
         p,
         x,
@@ -308,6 +316,10 @@ extension _InterReconstruction on _PictureTile {
     required bool compound,
     List<int>? matrix,
   }) {
+    if (ref == 0) {
+      _predictIntraCopy(p, x, y, w, h, mv, output);
+      return;
+    }
     final (px, py) = p == 0 ? (0, 0) : (sx, sy);
     final reference = references[ref - 1];
     final source = reference.picture.planes[p];

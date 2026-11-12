@@ -463,24 +463,31 @@ final class Av1InterSyntax {
     return _symbol(_Cdf.drl, interDrlModeCdf[ctx], ctx) != 0;
   }
 
-  Av1Mv _readMv(Av1Mv mv) {
-    final joint = _symbol(_Cdf.joint, interMvJointCdf);
-    final y = mv.y + ((joint & 2) == 0 ? 0 : _component(0));
-    final x = mv.x + ((joint & 1) == 0 ? 0 : _component(1));
+  Av1Mv readIntraCopyMv(Av1Mv predictor) => _readMv(predictor, intraCopy: true);
+
+  Av1Mv _readMv(Av1Mv mv, {bool intraCopy = false}) {
+    final joint = _mvSymbol(intraCopy, _Cdf.joint, interMvJointCdf);
+    final y = mv.y + ((joint & 2) == 0 ? 0 : _component(0, intraCopy));
+    final x = mv.x + ((joint & 1) == 0 ? 0 : _component(1, intraCopy));
     return (x: x, y: y);
   }
 
-  int _component(int plane) {
-    final sign = _symbol(_Cdf.sign, interMvSignCdf, plane);
-    final kind = _symbol(_Cdf.mvClass, interMvClassCdf[plane], plane);
+  int _component(int plane, bool intraCopy) {
+    final sign = _mvSymbol(intraCopy, _Cdf.sign, interMvSignCdf, plane);
+    final kind = _mvSymbol(
+      intraCopy,
+      _Cdf.mvClass,
+      interMvClassCdf[plane],
+      plane,
+    );
     var bits = kind == 0
-        ? _symbol(_Cdf.class0, interMvClass0BitCdf, plane)
+        ? _mvSymbol(intraCopy, _Cdf.class0, interMvClass0BitCdf, plane)
         : 1 << kind;
     for (var i = 0; i < kind; i++) {
-      bits |= _symbol(_Cdf.mvBit, interMvBitCdf[i], plane, i) << i;
+      bits |= _mvSymbol(intraCopy, _Cdf.mvBit, interMvBitCdf[i], plane, i) << i;
     }
     var fraction = 3, high = 1;
-    if (!header.motion.integer) {
+    if (!intraCopy && !header.motion.integer) {
       fraction = kind == 0
           ? _symbol(
               _Cdf.class0Fraction,
@@ -498,6 +505,16 @@ final class Av1InterSyntax {
     final magnitude = ((bits << 3) | (fraction << 1) | high) + 1;
     return sign == 0 ? magnitude : -magnitude;
   }
+
+  int _mvSymbol(
+    bool intraCopy,
+    _Cdf family,
+    List<int> defaults, [
+    int a = 0,
+    int b = 0,
+  ]) => intraCopy
+      ? reader.adaptive(context.cdf((family, a, b, true), defaults))
+      : _symbol(family, defaults, a, b);
 
   int _symbol(_Cdf family, List<int> defaults, [int a = 0, int b = 0]) =>
       reader.adaptive(context.cdf((family, a, b), defaults));
