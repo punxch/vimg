@@ -17,7 +17,7 @@ On Windows, use `-o build/vimg.exe`.
 
 ## Available commands
 
-- `vimg probe video.mkv` reads Matroska/WebM and MP4/MOV metadata and prints
+- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV and AVI metadata and prints
   vimg-compatible JSON.
 - `vimg join -c3 -H160 image1.png image2.png -o grid.png` resizes images and
   composes a contact sheet. Pass a repeated `--label` to label successive tiles.
@@ -35,7 +35,8 @@ depend on the library's encoders and decoders.
   script for the Dart CLI.
 
 Extraction and contact sheets currently decode MJPEG and PNG tracks in
-Matroska or unfragmented MP4/MOV. AVIF output and decoding inter-frame formats
+Matroska, unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit
+and 32-bit BGR. AVIF output and decoding inter-frame formats
 such as H.264 and HEVC are pending. The bundled `sample/input.mkv` can be probed
 and requires an H.264 decoder for extraction and contact sheets. The Rust
 `authority` commands, FFmpeg filter expressions, and native hardware capture

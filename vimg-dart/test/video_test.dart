@@ -21,8 +21,10 @@ Future<void> main(List<String> arguments) async {
     final mkv = matroskaFixture(temp);
     final mov = isoFixture(temp);
     final webm = matroskaFixture(temp, vp8: true);
+    final avi = aviFixture(temp);
+    final raw = aviFixture(temp, raw: true);
     final jpeg = File('${temp.path}/preview.cache');
-    for (final source in [mkv, mov, webm]) {
+    for (final source in [mkv, mov, webm, avi]) {
       final result = await run([
         'preview',
         '--output',
@@ -49,6 +51,25 @@ Future<void> main(List<String> arguments) async {
         'Preview selected the 2-second frame',
       );
     }
+    final rawProbe = await run(['probe', raw.path]);
+    final rawMetadata = jsonDecode(rawProbe.stdout as String) as Map;
+    check(
+      rawMetadata['streams'][0]['codec_name'] == 'rawvideo',
+      'AVI raw video metadata',
+    );
+    final rawOutput = Directory('${temp.path}/raw');
+    await run(['extract', '-n1', '--output-dir', rawOutput.path, raw.path]);
+    final rawFrame = image.decodeBmp(
+      (rawOutput.listSync().single as File).readAsBytesSync(),
+    )!;
+    check(
+      rawFrame.width == 3 &&
+          rawFrame.height == 2 &&
+          rawFrame.getPixel(2, 0).r == 255 &&
+          rawFrame.getPixel(2, 1).b == 255,
+      'AVI BGR pixels, bottom-up rows and alignment',
+    );
+
     final upper = await run([
       'preview',
       '--output',

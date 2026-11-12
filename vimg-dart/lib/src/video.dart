@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'avi.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'iso_frames.dart';
@@ -18,6 +19,8 @@ final class Video {
       final signature = file.unsigned(0, 4);
       if (signature == 0x1a45dfa3) {
         _matroska = Matroska(file);
+      } else if (signature == 0x52494646) {
+        _avi = Avi(file);
       } else {
         _iso = IsoMedia(file);
       }
@@ -31,8 +34,10 @@ final class Video {
   late final BinaryFile file;
   Matroska? _matroska;
   IsoMedia? _iso;
+  Avi? _avi;
 
-  late final VideoMetadata metadata = _matroska?.metadata() ?? _iso!.metadata();
+  late final VideoMetadata metadata =
+      _matroska?.metadata() ?? _avi?.metadata() ?? _iso!.metadata();
 
   String get codec =>
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
@@ -42,9 +47,12 @@ final class Video {
 
   Iterable<FramePacket> packets({bool preview = false}) {
     final keyframes = preview && codec == 'vp8';
-    if (codec != 'mjpeg' && codec != 'png' && !keyframes) {
+    final avi = _avi;
+    final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
+    if (codec != 'mjpeg' && codec != 'png' && !keyframes && !bitmap) {
       throw UnsupportedError('Pure Dart decoding for $codec is unavailable');
     }
+    if (avi != null) return avi.packets();
     final matroska = _matroska;
     return matroska == null
         ? isoFrames(_iso!, keyframes: keyframes)
@@ -52,6 +60,7 @@ final class Video {
   }
 
   image.Image? cover() {
+    if (_avi != null) return null;
     final matroska = _matroska;
     final covers = matroska == null
         ? isoCovers(_iso!)
@@ -73,6 +82,7 @@ final class Video {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
+      'rawvideo' => _avi?.decodeBitmap(bytes),
       _ => null,
     };
     if (frame == null) throw FormatException('Invalid $codec video frame');

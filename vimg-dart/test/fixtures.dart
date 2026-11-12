@@ -157,3 +157,84 @@ File isoFixture(Directory directory) {
     ]),
   ]);
 }
+
+File aviFixture(Directory directory, {bool raw = false}) {
+  List<int> little(int value, int width) =>
+      uint(value, width).reversed.toList();
+  List<int> chunk(String id, List<int> data) => [
+    ...ascii.encode(id),
+    ...little(data.length, 4),
+    ...data,
+    if (data.length.isOdd) 0,
+  ];
+  List<int> list(String id, List<int> data) =>
+      chunk('LIST', [...ascii.encode(id), ...data]);
+  List<int> stream(String type, String handler, int count) => chunk('strh', [
+    ...ascii.encode(type),
+    ...ascii.encode(handler),
+    ...List.filled(12, 0),
+    ...little(1, 4),
+    ...little(1, 4),
+    ...List.filled(4, 0),
+    ...little(count, 4),
+    ...List.filled(20, 0),
+  ]);
+
+  final header = list('hdrl', [
+    ...list('strl', stream('auds', '    ', 8)),
+    ...list('strl', [
+      ...stream('vids', raw ? 'DIB ' : 'MJPG', 8),
+      ...chunk('strf', [
+        ...little(40, 4),
+        ...little(raw ? 3 : 32, 4),
+        ...little(raw ? 2 : 24, 4),
+        ...little(1, 2),
+        ...little(24, 2),
+        if (raw) ...List.filled(4, 0) else ...ascii.encode('MJPG'),
+        ...List.filled(20, 0),
+      ]),
+    ]),
+  ]);
+  // 3px rows with 3 bytes of padding. BMP's first stored row is the bottom.
+  final bitmap = [
+    255,
+    0,
+    0,
+    255,
+    0,
+    0,
+    255,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    255,
+    0,
+    0,
+    255,
+    0,
+    0,
+    255,
+    0,
+    0,
+    0,
+  ];
+  final movie = list('movi', [
+    ...chunk('JUNK', [1]),
+    for (var frame = 0; frame < 8; frame++)
+      ...list('rec ', [
+        ...chunk('00wb', [1, 2]),
+        ...chunk(
+          raw ? '01db' : '01dc',
+          raw ? bitmap : image.encodeJpg(solidFrame(frame)),
+        ),
+      ]),
+  ]);
+  return File('${directory.path}/${raw ? 'raw' : 'mjpeg'}.avi')
+    ..writeAsBytesSync(
+      chunk('RIFF', [...ascii.encode('AVI '), ...header, ...movie]),
+    );
+}
