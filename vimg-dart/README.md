@@ -57,7 +57,8 @@ and handle leading pictures that depend on an earlier GOP.
 AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, and Wiener and SGRPROJ loop restoration.
-AV1 intra block copy and film grain synthesis remain pending.
+Film grain synthesis runs on AV1 display frames before RGB conversion.
+AV1 intra block copy remains pending.
 HEVC range extension tools, FFmpeg filter expressions and hardware capture
 backends remain pending.
 
@@ -113,6 +114,7 @@ dart test/av1_intra_test.dart
 dart test/av1_inter_test.dart
 dart test/av1_restoration_test.dart
 dart test/av1_superres_test.dart
+dart test/av1_film_grain_test.dart
 dart test/av1_coefficients_test.dart
 dart test/av1_transform_test.dart
 dart test/h264_test.dart

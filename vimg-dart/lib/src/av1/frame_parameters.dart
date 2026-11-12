@@ -303,12 +303,14 @@ Av1FilmGrain? readAv1FilmGrain(
   Av1SequenceHeader seq, {
   required bool visible,
   required bool inter,
-  required Av1FilmGrain Function(int) fromReference,
+  required Av1FilmGrain? Function(int) fromReference,
 }) {
   if (!seq.filmGrain || !visible || !bits.flag()) return null;
   final seed = bits.read(16);
   if (inter && !bits.flag()) {
     final source = fromReference(bits.read(3));
+    // A reference that reset its grain parameters contributes no grain.
+    if (source == null) return null;
     return (
       seed: seed,
       luma: source.luma,

@@ -27,6 +27,8 @@ import 'tile_group.dart';
 import 'transform.dart';
 import 'warp.dart';
 
+part 'film_grain.dart';
+part 'film_grain_table.dart';
 part 'inter_reconstruction.dart';
 part 'motion_field.dart';
 part 'restoration.dart';
@@ -60,7 +62,7 @@ final class Av1Plane {
   }
 }
 
-/// Reconstructed reference planes at the upscaled frame dimensions.
+/// AV1 sample planes at the upscaled frame dimensions.
 final class Av1Picture {
   Av1Picture(this.color, this.planes);
 
@@ -86,16 +88,10 @@ final class Av1Picture {
   );
 }
 
-image.Image decodeAv1IntraImage(Av1CodedFrame frame) {
-  _requireDisplayTools(frame);
-  return decodeAv1Intra(frame).rgb();
-}
-
-void _requireDisplayTools(Av1CodedFrame frame) {
-  if (frame.header.parameters.filmGrain != null) {
-    throw UnsupportedError('AV1 film grain synthesis');
-  }
-}
+image.Image decodeAv1IntraImage(Av1CodedFrame frame) => applyAv1FilmGrain(
+  decodeAv1Intra(frame),
+  frame.header.parameters.filmGrain,
+).rgb();
 
 Av1Picture decodeAv1Intra(
   Av1CodedFrame frame, {
@@ -152,10 +148,8 @@ final class Av1StreamDecoder {
     return result.picture;
   }
 
-  image.Image display(Av1CodedFrame frame, Av1Picture picture) {
-    _requireDisplayTools(frame);
-    return picture.rgb();
-  }
+  image.Image display(Av1CodedFrame frame, Av1Picture picture) =>
+      applyAv1FilmGrain(picture, frame.header.parameters.filmGrain).rgb();
 }
 
 _DecodedPicture _decodePicture(

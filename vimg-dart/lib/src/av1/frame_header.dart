@@ -281,11 +281,10 @@ Av1Header readAv1FrameHeader(
     visible: show || showable,
     inter: type == Av1FrameType.inter,
     fromReference: (index) {
-      final source = references.contains(index)
-          ? reference(index).parameters.filmGrain
-          : null;
-      return source ??
-          (throw const FormatException('Unavailable AV1 film grain reference'));
+      if (!references.contains(index)) {
+        throw const FormatException('Unavailable AV1 film grain reference');
+      }
+      return reference(index).parameters.filmGrain;
     },
   );
   return (
