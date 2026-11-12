@@ -1,10 +1,13 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'b_motion.dart';
 import 'cabac.dart';
 import 'motion.dart';
+import 'reference.dart';
 import 'slice_header.dart';
 
+part 'b_slice.dart';
 part 'p_slice.dart';
 
 int blockX(int block) => (block & 1) | ((block >> 1) & 2);
@@ -23,7 +26,7 @@ final class Macroblock {
   bool get intra16 => type > 0 && type < 25;
 
   var transform8x8 = false;
-  var skipped = false;
+  var skipped = false, direct = false;
   var lumaPattern = 0, chromaPattern = 0;
   var chromaMode = 0, qp = 0;
   var codedLuma = 0, codedChroma = 0, codedDc = 0;
@@ -73,6 +76,79 @@ final class CabacSlice {
   int _qp;
 
   bool endOfSlice() => _cabac.terminate();
+
+  void _interResiduals(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    bool allow8x8,
+  ) {
+    _patterns(block, left, top);
+    if (header.pps.transform8x8 && block.lumaPattern != 0 && allow8x8) {
+      final context = _count(
+        left?.transform8x8 == true,
+        top?.transform8x8 == true,
+      );
+      block.transform8x8 = _cabac.decision(399 + context) != 0;
+    }
+    _readQuantizerAndResiduals(block, left, top);
+  }
+
+  int _referenceIndex(int context, int active) {
+    if (active == 1) return 0;
+    var index = 0;
+    while (_cabac.decision(54 + context) != 0) {
+      if (++index >= active) {
+        throw const FormatException('H.264 reference index is out of range');
+      }
+      context = (context >> 2) + 4;
+    }
+    return index;
+  }
+
+  void _readVector(
+    MotionField field,
+    MotionPartition part,
+    int owner,
+    int ref,
+  ) {
+    final left = field.differenceAt(part.x - 1, part.y, owner);
+    final top = field.differenceAt(part.x, part.y - 1, owner);
+    final dx = _motionDifference(40, left.x.abs() + top.x.abs());
+    final dy = _motionDifference(47, left.y.abs() + top.y.abs());
+    final predicted = field.predict(part, owner, ref);
+    final vector = (
+      x: signedMotion(predicted.x + dx),
+      y: signedMotion(predicted.y + dy),
+    );
+    field.setVector(part, vector, (x: dx, y: dy));
+  }
+
+  int _motionDifference(int base, int difference) {
+    final context = difference > 32 ? 2 : (difference > 2 ? 1 : 0);
+    if (_cabac.decision(base + context) == 0) return 0;
+    var magnitude = 1;
+    while (magnitude < 9 &&
+        _cabac.decision(base + 3 + math.min(3, magnitude - 1)) != 0) {
+      magnitude++;
+    }
+    if (magnitude == 9) {
+      var bits = 3;
+      while (_cabac.bypass() != 0) {
+        magnitude += 1 << bits++;
+        if (bits >= 16)
+          throw const FormatException(
+            'Oversized H.264 motion vector difference',
+          );
+      }
+      for (var i = bits - 1; i >= 0; i--) {
+        magnitude += _cabac.bypass() << i;
+      }
+    }
+    if (magnitude > 32767)
+      throw const FormatException('H.264 motion vector is out of range');
+    return _cabac.bypass() == 0 ? magnitude : -magnitude;
+  }
 
   Macroblock readIntra(Macroblock? left, Macroblock? top) {
     final block = Macroblock(header, _type(left, top));

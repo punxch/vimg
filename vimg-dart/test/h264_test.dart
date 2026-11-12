@@ -38,10 +38,53 @@ const _pPlanes = [
   [0x0b3a07f4, 0xa6299768, 0x6165d8b5],
 ];
 
+// Reference B pictures, implicit weights, spatial direct motion and two slices.
+const _spatialBPlanes = [
+  [0xd8ba8846, 0xc4a51824, 0xca288f69],
+  [0x061d47fb, 0x5d2c2283, 0x33c08b57],
+  [0x0f091492, 0x7dbfe7aa, 0xf8049edd],
+  [0x70f1a5c8, 0xc5ec89e7, 0x9f9322fe],
+  [0x27ab7865, 0x2d903402, 0x82b865fe],
+  [0x2dbe44f2, 0x69e8c53d, 0xfd2e6885],
+  [0x1544cecd, 0xe529fd22, 0x13963487],
+  [0xc9c5a734, 0x1860b8d7, 0xc46c30c2],
+  [0xba0078c4, 0x914f7a67, 0x7da69ea3],
+  [0x2766d6df, 0x8b921aad, 0xce465826],
+  [0x45733304, 0x54f8da98, 0x2f34e70e],
+  [0xb3b8513e, 0xa86e9702, 0xa54c3f9f],
+  [0x00185cff, 0x3e50cf6c, 0x31a213ef],
+  [0x5f06c145, 0xf74834c9, 0x17ae6d1a],
+  [0x3003848c, 0x0e34ecf1, 0xefce8d51],
+  [0x34b3f49e, 0x5b97073d, 0xaa428190],
+  [0x574916d9, 0x6e270572, 0xf6bc19c4],
+];
+
+// Temporal direct motion with an MP4 composition offset table.
+const _temporalBPlanes = [
+  [0x8bc55aa5, 0x4ebf3135, 0x0c0fab46],
+  [0xc7631710, 0xfa9391c2, 0x7b7dace2],
+  [0xaa91f8fb, 0x46435fc4, 0x28e440d8],
+  [0xf4c25807, 0xabb4f2e2, 0xdc11f2a3],
+  [0x272e0991, 0x04b2b1ed, 0xc61b06c2],
+  [0x9c049078, 0xb807ac9e, 0x7e0d361a],
+  [0xbc877cfb, 0xd5ffdc1a, 0xd1722ed4],
+  [0xbae53dd6, 0xb5564d84, 0xc2ee0270],
+  [0x91bcf4a1, 0xc9de3887, 0xdb141798],
+  [0x0608d54d, 0x191445ca, 0xcdbd321c],
+  [0xbfb32b70, 0x73ce0c78, 0x17a3dec7],
+  [0x103621eb, 0x845265ff, 0x45e24e89],
+  [0x7fa43a3b, 0xbcdf2c56, 0x0c38d255],
+  [0xc62c84fe, 0x61e19c3d, 0xf64d0b5c],
+  [0x6edd3b94, 0xb2e34ec1, 0x20e9661a],
+  [0x75fe7b7a, 0xdaaf4c68, 0x97a18080],
+  [0xeff7cd2e, 0xc5d312c6, 0xc104e449],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
   bool inter = false,
+  (int, int) dimensions = (78, 50),
 }) {
   final handle = File(input).openSync();
   try {
@@ -52,20 +95,23 @@ void _checkPlanes(
     final config = matroska == null
         ? isoAvcConfiguration(iso!)
         : matroskaAvcConfiguration(matroska);
-    final packets = matroska == null
-        ? isoFrames(iso!)
-        : matroskaFrames(matroska);
+    final packets =
+        (matroska == null ? isoFrames(iso!) : matroskaFrames(matroska))
+            .toList();
+    final display = [...packets]
+      ..sort((a, b) => a.seconds.compareTo(b.seconds));
+    final indexes = {for (var i = 0; i < display.length; i++) display[i]: i};
+    check(indexes.length == expected.length, 'H.264 fixture frame count');
     final avc = AvcConfiguration(config!);
     final decode = inter
         ? H264StreamDecoder(avc).decode
         : H264IdrDecoder(avc).decode;
-    var frames = 0;
     for (final packet in packets) {
-      check(frames < expected.length, 'Unexpected AVC packet');
+      final frame = indexes[packet]!;
       final picture = decode(file.read(packet.offset, packet.size))!;
       final sps = picture.sps;
       check(
-        sps.profile == 100 && sps.width == 78 && sps.height == 50,
+        sps.profile == 100 && (sps.width, sps.height) == dimensions,
         'H.264 dimensions and profile',
       );
       for (final (index, plane) in [
@@ -83,13 +129,11 @@ void _checkPlanes(
           sps.height >> shift,
         );
         check(
-          hash == expected[frames][index],
-          'H.264 frame $frames plane $index differs from FFmpeg: ${hash.toRadixString(16)}',
+          hash == expected[frame][index],
+          'H.264 $input frame $frame plane $index differs from FFmpeg: ${hash.toRadixString(16)}',
         );
       }
-      frames++;
     }
-    check(frames == expected.length, 'H.264 fixture frame count');
   } finally {
     handle.closeSync();
   }
@@ -111,10 +155,14 @@ Future<void> main(List<String> arguments) async {
   const mp4 = 'test/fixtures/cabac-idr.mp4';
   const interMkv = 'test/fixtures/cabac-p.mkv';
   const interMp4 = 'test/fixtures/cabac-p.mp4';
+  const spatial = 'test/fixtures/cabac-b-spatial.mkv';
+  const temporal = 'test/fixtures/cabac-b-temporal.mp4';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
   _checkPlanes(interMp4, _pPlanes, inter: true);
+  _checkPlanes(spatial, _spatialBPlanes, inter: true, dimensions: (166, 110));
+  _checkPlanes(temporal, _temporalBPlanes, inter: true, dimensions: (166, 110));
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -159,20 +207,28 @@ Future<void> main(List<String> arguments) async {
     check(frame.width == 78 && frame.height == 50, 'H.264 extracted BMP');
 
     final avif = File('${directory.path}/grid.avif');
+    final kept = '${directory.path}/kept';
     await run([
       'vcs',
       '-c2',
       '-n2',
       '-H24',
-      '-f2',
+      '-f3',
       '-t500ms',
+      '--keep',
+      '--output-dir',
+      kept,
       '-o',
       avif.path,
-      interMp4,
+      temporal,
     ]);
     check(
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
       'H.264 animated contact sheet',
+    );
+    check(
+      Directory(kept).listSync().length == 6,
+      'H.264 kept B-frame captures',
     );
   } finally {
     directory.deleteSync(recursive: true);

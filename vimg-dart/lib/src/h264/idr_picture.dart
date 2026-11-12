@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'access_unit.dart';
+import 'b_motion.dart';
 import 'deblock.dart';
 import 'cabac_slice.dart';
 import 'intra_prediction.dart';
@@ -82,6 +83,9 @@ H264Picture _decodePicture(
   if (slices.any((slice) => slice.kind != SliceKind.intra)) {
     picture.motionL0 = MotionField(sps.mbWidth * 4, sps.mbHeight * 4);
   }
+  if (slices.any((slice) => slice.kind == SliceKind.b)) {
+    picture.motionL1 = MotionField(sps.mbWidth * 4, sps.mbHeight * 4);
+  }
   final decoder = _Reconstruction(picture, first.pps);
   for (final slice in slices) {
     if (!first.samePicture(slice)) {
@@ -103,6 +107,7 @@ H264Picture _decodePicture(
     picture.cr,
     sps.mbWidth,
     picture.motionL0,
+    picture.motionL1,
   );
   return picture;
 }
@@ -126,15 +131,22 @@ final class _Reconstruction {
 
   void decode(SliceHeader slice, PendingPicture? pending) {
     final reader = CabacSlice(slice);
-    if (slice.kind == SliceKind.b)
-      throw UnsupportedError('H.264 B slices are unavailable');
-    final references = slice.kind == SliceKind.p
-        ? pending!.list0(slice)
-        : const <ReferencePicture?>[];
-    final identities = references
-        .map((ref) => ref?.picture == null ? null : ref!.identity)
-        .toList();
     final motion = picture.motionL0;
+    final motion1 = picture.motionL1;
+    final references = switch (slice.kind) {
+      SliceKind.intra => (
+        l0: const <ReferencePicture?>[],
+        l1: const <ReferencePicture?>[],
+      ),
+      SliceKind.p => (
+        l0: pending!.pList(slice),
+        l1: const <ReferencePicture?>[],
+      ),
+      SliceKind.b => pending!.bLists(slice),
+    };
+    final b = slice.kind == SliceKind.b
+        ? BDirect(slice, pending!.poc, references, motion!, motion1!)
+        : null;
     var address = slice.firstMb;
     while (true) {
       if (address >= blocks.length || blocks[address] != null) {
@@ -150,17 +162,16 @@ final class _Reconstruction {
       final topRight = row == 0 || x + 1 == width
           ? null
           : _neighbor(address - width + 1, slice);
-      final block = slice.kind == SliceKind.intra
-          ? reader.readIntra(left, top)
-          : reader.readP(left, top, motion!, x, row, identities);
+      final block = switch (slice.kind) {
+        SliceKind.intra => reader.readIntra(left, top),
+        SliceKind.p => reader.readP(left, top, motion!, x, row, references.l0),
+        SliceKind.b => reader.readB(left, top, b!, x, row),
+      };
       if (block.intra) {
         if (slice.kind == SliceKind.intra && motion != null) {
-          motion.setIntra((
-            x: x * 4,
-            y: row * 4,
-            width: 4,
-            height: 4,
-          ), slice.firstMb + 1);
+          final whole = (x: x * 4, y: row * 4, width: 4, height: 4);
+          motion.setUnused(whole, slice.firstMb + 1);
+          motion1?.setUnused(whole, slice.firstMb + 1);
         }
         bool usable(Macroblock? other) =>
             other != null && (!slice.pps.constrainedIntra || other.intra);
@@ -178,7 +189,9 @@ final class _Reconstruction {
           x,
           row,
           motion!,
+          b?.l1,
           references,
+          pending!.poc,
         );
       }
       blocks[address++] = block;
@@ -281,21 +294,25 @@ final class _Reconstruction {
     int mbX,
     int mbY,
     MotionField motion,
-    List<ReferencePicture?> references,
+    MotionField? motion1,
+    ReferenceLists references,
+    int poc,
   ) {
     final slice = block.slice;
     final owner = slice.firstMb + 1;
     final stride = picture.stride;
     final offset = (mbY * stride + mbX) * 16;
-    predictL0(
+    predictInter(
       _predict.pixels,
       0,
       mbX,
       mbY,
       owner,
       motion,
+      motion1,
       references,
-      slice.weights,
+      slice,
+      poc,
     );
     _copyPcm(_predict.pixels, 0, picture.y, offset, stride, 16);
     if (block.codedLuma != 0) {
@@ -328,15 +345,17 @@ final class _Reconstruction {
     final chromaOffset = (mbY * chromaStride + mbX) * 8;
     for (var component = 0; component < 2; component++) {
       final plane = component == 0 ? picture.cb : picture.cr;
-      predictL0(
+      predictInter(
         _predict.pixels,
         component + 1,
         mbX,
         mbY,
         owner,
         motion,
+        motion1,
         references,
-        slice.weights,
+        slice,
+        poc,
       );
       _copyPcm(_predict.pixels, 0, plane, chromaOffset, chromaStride, 8);
       if (block.chromaPattern == 0) continue;

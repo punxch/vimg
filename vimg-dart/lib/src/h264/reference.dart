@@ -22,7 +22,21 @@ final class ReferencePicture {
 
 typedef _History = ({int frame, int wrap, int msb, int lsb});
 typedef _Order = ({int top, int bottom, _History next});
+typedef ReferenceLists = ({
+  List<ReferencePicture?> l0,
+  List<ReferencePicture?> l1,
+});
 const _initialHistory = (frame: 0, wrap: 0, msb: 0, lsb: 0);
+
+ReferencePicture getReference(List<ReferencePicture?> references, int index) {
+  final ref = index >= 0 && index < references.length
+      ? references[index]
+      : null;
+  if (ref?.picture == null) {
+    throw const FormatException('H.264 reference picture is unavailable');
+  }
+  return ref!;
+}
 
 /// A staged picture shares the decoded reference store across its slices.
 /// Each slice independently builds its active reference lists.
@@ -36,30 +50,25 @@ final class PendingPicture {
 
   int get poc => math.min(_order.top, _order.bottom);
 
-  List<ReferencePicture?> list0(SliceHeader slice) {
+  List<ReferencePicture?> pList(SliceHeader slice) {
     final short = _store.where((ref) => ref.longIndex == null).toList();
-    if (slice.kind == SliceKind.p) {
-      final max = 1 << slice.pps.sps.frameNumBits;
-      short.sort(
-        (a, b) => _shortNumber(
-          b,
-          slice.frameNum,
-          max,
-        ).compareTo(_shortNumber(a, slice.frameNum, max)),
-      );
-      return _modified(
-        [...short, ..._longReferences()],
-        slice,
-        slice.activeL0,
-        slice.list0,
-      );
-    }
-    return _bLists(slice).l0;
+    final max = 1 << slice.pps.sps.frameNumBits;
+    short.sort(
+      (a, b) => _shortNumber(
+        b,
+        slice.frameNum,
+        max,
+      ).compareTo(_shortNumber(a, slice.frameNum, max)),
+    );
+    return _modified(
+      [...short, ..._longReferences()],
+      slice,
+      slice.activeL0,
+      slice.list0,
+    );
   }
 
-  ({List<ReferencePicture?> l0, List<ReferencePicture?> l1}) _bLists(
-    SliceHeader slice,
-  ) {
+  ReferenceLists bLists(SliceHeader slice) {
     final past = <ReferencePicture>[];
     final future = <ReferencePicture>[];
     for (final ref in _store.where((ref) => ref.longIndex == null)) {

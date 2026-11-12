@@ -14,6 +14,7 @@ void deblockPicture(
   Uint8List cr,
   int width,
   MotionField? motion,
+  MotionField? motion1,
 ) {
   final stride = width * 16;
   for (var address = 0; address < blocks.length; address++) {
@@ -33,8 +34,17 @@ void deblockPicture(
       var neighbor = neighborAddress < 0 ? null : blocks[neighborAddress];
       if (slice.deblocking == 2 && neighbor?.slice != slice) neighbor = null;
 
-      int strength(int edge, int segment) =>
-          _strength(block, neighbor, motion, x, row, vertical, edge, segment);
+      int strength(int edge, int segment) => _strength(
+        block,
+        neighbor,
+        motion,
+        motion1,
+        x,
+        row,
+        vertical,
+        edge,
+        segment,
+      );
       _edges(
         y,
         start,
@@ -88,6 +98,7 @@ int _strength(
   Macroblock block,
   Macroblock? neighbor,
   MotionField? motion,
+  MotionField? motion1,
   int mbX,
   int mbY,
   bool vertical,
@@ -104,13 +115,19 @@ int _strength(
       other.codedLuma & (1 << blockIndex(px & 3, py & 3)) != 0) {
     return 2;
   }
-  final a = motion!.vectorAt(px, py);
-  final b = motion.vectorAt(x, y);
-  return motion.identityAt(px, py) != motion.identityAt(x, y) ||
-          (a.x - b.x).abs() >= 4 ||
-          (a.y - b.y).abs() >= 4
-      ? 1
-      : 0;
+  bool same(MotionField first, MotionField second) {
+    if (first.identityAt(px, py) != second.identityAt(x, y)) return false;
+    final a = first.vectorAt(px, py);
+    final b = second.vectorAt(x, y);
+    return (a.x - b.x).abs() < 4 && (a.y - b.y).abs() < 4;
+  }
+
+  final primary = same(motion!, motion);
+  if (motion1 == null) return primary ? 0 : 1;
+  return (primary && same(motion1, motion1)) ||
+          (same(motion, motion1) && same(motion1, motion))
+      ? 0
+      : 1;
 }
 
 void _edges(

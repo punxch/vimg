@@ -20,6 +20,7 @@ final class H264Picture {
   final int stride;
   final Uint8List y, cb, cr;
   MotionField? motionL0;
+  MotionField? motionL1;
 
   image.Image rgb() {
     final pixels = image.Image(width: sps.width, height: sps.height);

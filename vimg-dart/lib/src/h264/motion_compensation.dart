@@ -1,63 +1,84 @@
 import 'dart:typed_data';
 
+import 'b_motion.dart';
 import 'motion.dart';
 import 'reference.dart';
 import 'slice_header.dart';
 
 /// Inter prediction for progressive 8-bit pictures (§8.4.2.2–8.4.2.3).
-void predictL0(
+void predictInter(
   Uint8List output,
   int plane,
   int mbX,
   int mbY,
   int owner,
-  MotionField motion,
-  List<ReferencePicture?> references,
-  PredictionWeights? weights,
+  MotionField motion0,
+  MotionField? motion1,
+  ReferenceLists references,
+  SliceHeader header,
+  int poc,
 ) {
   final luma = plane == 0;
   final block = luma ? 4 : 2;
   final size = block * 4;
+  final unit = luma ? 4 : 8;
+  final weights = header.weights;
   final denominator = luma ? weights?.lumaShift : weights?.chromaShift;
   for (var py = 0; py < 4; py++) {
     for (var px = 0; px < 4; px++) {
       final x = mbX * 4 + px, y = mbY * 4 + py;
-      final refIndex = motion.referenceAt(x, y, owner);
-      final reference = references[refIndex]?.picture;
-      if (reference == null)
-        throw const FormatException('H.264 reference picture is unavailable');
-      final motionVector = motion.vectorAt(x, y);
-      final samples = switch (plane) {
-        0 => reference.y,
-        1 => reference.cb,
-        _ => reference.cr,
-      };
-      final stride = luma ? reference.stride : reference.stride >> 1;
-      final height = samples.length ~/ stride;
-      final weight = weights?.l0[refIndex][plane];
-      final unit = luma ? 4 : 8;
-      final sourceX = x * block * unit + motionVector.x;
-      final sourceY = y * block * unit + motionVector.y;
+      final index0 = motion0.referenceAt(x, y, owner);
+      final index1 = motion1?.referenceAt(x, y, owner) ?? -1;
+      final first = index0 < 0
+          ? null
+          : _source(getReference(references.l0, index0), plane, x, y, motion0);
+      final second = index1 < 0
+          ? null
+          : _source(getReference(references.l1, index1), plane, x, y, motion1!);
+      if (first == null && second == null) {
+        throw const FormatException('H.264 inter block has no reference');
+      }
+      final weight0 = index0 < 0 ? null : weights?.l0[index0][plane];
+      final weight1 = index1 < 0 ? null : weights?.l1[index1][plane];
       final targetX = px * block, targetY = py * block;
+      var implicit = 32;
+      if (first != null &&
+          second != null &&
+          header.pps.weightedB == 2 &&
+          first.ref.longIndex == null &&
+          second.ref.longIndex == null &&
+          first.ref.poc != second.ref.poc) {
+        final scale = distanceScale(first.ref.poc, second.ref.poc, poc) >> 2;
+        if (scale >= -64 && scale <= 128) implicit = scale;
+      }
       for (var row = 0; row < block; row++) {
         for (var col = 0; col < block; col++) {
-          var sample = luma
-              ? _luma(
-                  samples,
-                  stride,
-                  height,
-                  sourceX + col * unit,
-                  sourceY + row * unit,
-                )
-              : _chroma(
-                  samples,
-                  stride,
-                  height,
-                  sourceX + col * unit,
-                  sourceY + row * unit,
-                );
-          if (weight != null) {
-            sample = _weighted(sample, weight, denominator!);
+          final dx = col * unit, dy = row * unit;
+          final int sample;
+          if (first == null || second == null) {
+            final raw = _interSample(first ?? second!, luma, dx, dy);
+            final weight = weight0 ?? weight1;
+            sample = weight == null
+                ? raw
+                : _weighted(raw, weight, denominator!);
+          } else {
+            final a = _interSample(first, luma, dx, dy);
+            final b = _interSample(second, luma, dx, dy);
+            if (weight0 != null && weight1 != null) {
+              final shift = denominator!;
+              sample =
+                  (((a * weight0.weight + b * weight1.weight + (1 << shift)) >>
+                              (shift + 1)) +
+                          ((weight0.offset + weight1.offset + 1) >> 1))
+                      .clamp(0, 255);
+            } else {
+              sample = implicit == 32
+                  ? _average(a, b)
+                  : (((64 - implicit) * a + implicit * b + 32) >> 6).clamp(
+                      0,
+                      255,
+                    );
+            }
           }
           output[(targetY + row) * size + targetX + col] = sample;
         }
@@ -65,6 +86,56 @@ void predictL0(
     }
   }
 }
+
+typedef _Source = ({
+  ReferencePicture ref,
+  Uint8List data,
+  int stride,
+  int height,
+  int x,
+  int y,
+});
+
+_Source _source(
+  ReferencePicture ref,
+  int plane,
+  int x,
+  int y,
+  MotionField field,
+) {
+  final picture = ref.picture!;
+  final data = switch (plane) {
+    0 => picture.y,
+    1 => picture.cb,
+    _ => picture.cr,
+  };
+  final stride = plane == 0 ? picture.stride : picture.stride >> 1;
+  final vector = field.vectorAt(x, y);
+  return (
+    ref: ref,
+    data: data,
+    stride: stride,
+    height: data.length ~/ stride,
+    x: 16 * x + vector.x,
+    y: 16 * y + vector.y,
+  );
+}
+
+int _interSample(_Source source, bool luma, int dx, int dy) => luma
+    ? _luma(
+        source.data,
+        source.stride,
+        source.height,
+        source.x + dx,
+        source.y + dy,
+      )
+    : _chroma(
+        source.data,
+        source.stride,
+        source.height,
+        source.x + dx,
+        source.y + dy,
+      );
 
 int _weighted(int sample, PredictionWeight weight, int shift) {
   final round = shift == 0 ? 0 : 1 << (shift - 1);

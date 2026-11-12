@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 typedef MotionVector = ({int x, int y});
 typedef MotionPartition = ({int x, int y, int width, int height});
+typedef _Candidate = ({int reference, MotionVector vector});
 
 const zeroMotion = (x: 0, y: 0);
 
@@ -24,6 +25,7 @@ final class MotionField {
   late final Int32List _identity, _owners;
   late final Uint8List _decoded;
   late final Int16List _vectors, _differences;
+  Uint8List? _direct;
 
   int _index(int x, int y) =>
       x < 0 || x >= width || y < 0 || y >= height ? -1 : y * width + x;
@@ -46,6 +48,21 @@ final class MotionField {
   }
 
   int identityAt(int x, int y) => _identity[y * width + x];
+
+  int storedReferenceAt(int x, int y) => _reference[y * width + x];
+
+  bool directAt(int x, int y, int owner) {
+    final index = _index(x, y);
+    return index >= 0 && _owners[index] == owner && _direct?[index] == 1;
+  }
+
+  void markDirect(MotionPartition part) {
+    final direct = _direct ??= Uint8List(width * height);
+    for (var y = part.y; y < part.y + part.height; y++) {
+      final start = y * width + part.x;
+      direct.fillRange(start, start + part.width, 1);
+    }
+  }
 
   void setReference(MotionPartition part, int owner, int index, int identity) {
     for (var y = part.y; y < part.y + part.height; y++) {
@@ -74,12 +91,12 @@ final class MotionField {
     }
   }
 
-  void setIntra(MotionPartition part, int owner) {
+  void setUnused(MotionPartition part, int owner) {
     setReference(part, owner, -1, -1);
     setVector(part, zeroMotion, zeroMotion);
   }
 
-  ({int reference, MotionVector vector})? _candidate(int x, int y, int owner) {
+  _Candidate? _candidate(int x, int y, int owner) {
     final index = _index(x, y);
     if (index < 0 || _owners[index] != owner || _decoded[index] == 0)
       return null;
@@ -100,11 +117,7 @@ final class MotionField {
 
   MotionVector predict(MotionPartition part, int owner, int reference) {
     final x = part.x, y = part.y;
-    final a = _candidate(x - 1, y, owner);
-    final b = _candidate(x, y - 1, owner);
-    final c =
-        _candidate(x + part.width, y - 1, owner) ??
-        _candidate(x - 1, y - 1, owner);
+    final (a, b, c) = _neighbors(part, owner);
     if (part.width == 4 && part.height == 2) {
       final preferred = y & 2 == 0 ? b : a;
       if (preferred?.reference == reference) return preferred!.vector;
@@ -127,7 +140,40 @@ final class MotionField {
     final cv = c?.vector ?? zeroMotion;
     return (x: _median(av.x, bv.x, cv.x), y: _median(av.y, bv.y, cv.y));
   }
+
+  int spatialReference(MotionPartition part, int owner) {
+    final (a, b, c) = _neighbors(part, owner);
+    var result = -1;
+    for (final candidate in [a, b, c]) {
+      final ref = candidate?.reference ?? -1;
+      if (ref >= 0 && (result < 0 || ref < result)) result = ref;
+    }
+    return result;
+  }
+
+  (_Candidate?, _Candidate?, _Candidate?) _neighbors(
+    MotionPartition part,
+    int owner,
+  ) {
+    final x = part.x, y = part.y;
+    final cx = x + part.width, cy = y - 1;
+    // A prefilled direct or unused-list block can belong to a later 8×8.
+    final later =
+        cx ~/ 4 == x ~/ 4 &&
+        cy >= 0 &&
+        cy ~/ 4 == y ~/ 4 &&
+        _scanIndex(cx, cy) >= _scanIndex(x, y);
+    final corner =
+        (later ? null : _candidate(cx, cy, owner)) ??
+        _candidate(x - 1, cy, owner);
+    return (_candidate(x - 1, y, owner), _candidate(x, cy, owner), corner);
+  }
 }
+
+int _scanIndex(int x, int y) =>
+    ((y & 2) << 2) | ((x & 2) << 1) | ((y & 1) << 1) | (x & 1);
+
+int signedMotion(int value) => ((value + 32768) & 65535) - 32768;
 
 int _median(int a, int b, int c) =>
     math.max(math.min(a, b), math.min(math.max(a, b), c));
