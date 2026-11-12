@@ -8,7 +8,7 @@ import 'metadata.dart';
 
 const _ebml = 0x1a45dfa3;
 const _segment = 0x18538067;
-const _cluster = 0x1f43b675;
+const matroskaCluster = 0x1f43b675;
 
 const _codecs = {
   'V_AV1': 'av1',
@@ -22,6 +22,7 @@ const _codecs = {
   'V_VP8': 'vp8',
   'V_VP9': 'vp9',
   'V_MJPEG': 'mjpeg',
+  'V_PNG': 'png',
   'V_FFV1': 'ffv1',
   'V_PRORES': 'prores',
   'V_THEORA': 'theora',
@@ -89,7 +90,7 @@ final class Matroska {
       var offset = root.data;
       while (offset < root.end) {
         var child = element(offset, root.end);
-        if (child.id == _cluster && child.unknownSize) {
+        if (child.id == matroskaCluster && child.unknownSize) {
           // A live muxer may omit the cluster size. The next Segment-level
           // element closes it.
           var boundary = child.data;
@@ -119,7 +120,7 @@ final class Matroska {
   }
 
   static const _segmentIds = {
-    _cluster,
+    matroskaCluster,
     0x114d9b74,
     0x1549a966,
     0x1654ae6b,
@@ -173,21 +174,17 @@ final class Matroska {
             throw const FormatException('Invalid Matroska timestamp scale');
           durationTicks = floating(info[0x4489]);
         case 0x1654ae6b:
-          for (final entry in elements(child.data, child.end)) {
-            if (entry.id != 0xae) continue;
-            final track = fields(entry);
-            if (number(track[0x83]) != 1 || !track.containsKey(0xe0)) continue;
+          for (final track in videoTracks(child)) {
             final video = fields(track[0xe0]!);
             tracks.add((
-              codec: _codec(track),
+              codec: trackCodec(track),
               width: number(video[0xb0]) ?? 0,
               height: number(video[0xba]) ?? 0,
             ));
           }
         case 0x1941a469:
-          for (final entry in elements(child.data, child.end)) {
-            if (entry.id != 0x61a7) continue;
-            final attached = _attachment(fields(entry));
+          for (final entry in pictureAttachments(child)) {
+            final attached = _attachment(entry);
             if (attached != null) attachments.add(attached);
           }
       }
@@ -209,7 +206,15 @@ final class Matroska {
     );
   }
 
-  String _codec(Map<int, EbmlElement> track) {
+  Iterable<Map<int, EbmlElement>> videoTracks(EbmlElement tracks) sync* {
+    for (final entry in elements(tracks.data, tracks.end)) {
+      if (entry.id != 0xae) continue;
+      final track = fields(entry);
+      if (number(track[0x83]) == 1 && track.containsKey(0xe0)) yield track;
+    }
+  }
+
+  String trackCodec(Map<int, EbmlElement> track) {
     final codec = text(track[0x86]);
     final config = track[0x63a2];
     if (codec == 'V_MS/VFW/FOURCC' &&
@@ -230,6 +235,17 @@ final class Matroska {
       };
     }
     return _codecs[codec] ?? 'unknown';
+  }
+
+  Iterable<Map<int, EbmlElement>> pictureAttachments(EbmlElement parent) sync* {
+    for (final entry in elements(parent.data, parent.end)) {
+      if (entry.id != 0x61a7) continue;
+      final attachment = fields(entry);
+      if (text(attachment[0x4660])?.startsWith('image/') == true &&
+          attachment.containsKey(0x465c)) {
+        yield attachment;
+      }
+    }
   }
 
   VideoStream? _attachment(Map<int, EbmlElement> entry) {

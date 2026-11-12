@@ -1,19 +1,11 @@
-import 'dart:io';
-
-import 'binary_file.dart';
-import 'iso_media.dart';
-import 'matroska.dart';
 import 'metadata.dart';
+import 'video.dart';
 
 VideoMetadata probe(String path) {
-  final input = File(path).openSync();
+  final video = Video(path);
   try {
-    final file = BinaryFile(input);
-    return switch (file.unsigned(0, 4)) {
-      0x1a45dfa3 => Matroska(file).metadata(),
-      _ => IsoMedia(file).metadata(),
-    };
+    return video.metadata;
   } finally {
-    input.closeSync();
+    video.close();
   }
 }

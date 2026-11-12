@@ -98,9 +98,9 @@ final class IsoMedia {
           final stream = _stream(media, mediaTiming?.scale);
           if (stream != null) streams.add(stream);
         case 'udta':
-          streams.addAll(_covers(child(box, 'meta')));
+          streams.addAll(_coverStreams(child(box, 'meta')));
         case 'meta':
-          streams.addAll(_covers(box));
+          streams.addAll(_coverStreams(box));
       }
     }
     return VideoMetadata(
@@ -145,7 +145,7 @@ final class IsoMedia {
     );
   }
 
-  Iterable<VideoStream> _covers(MediaBox? meta) sync* {
+  Iterable<MediaBox> coverData(MediaBox? meta) sync* {
     if (meta == null) return;
     for (final list in children(
       meta,
@@ -154,26 +154,29 @@ final class IsoMedia {
       for (final cover in children(list).where((box) => box.type == 'covr')) {
         for (final data in children(cover).where((box) => box.type == 'data')) {
           requireBytes(data, 8);
-          final length = data.end - data.data - 8;
-          if (length > 32 * 1024 * 1024) continue;
-          final bytes = file.read(data.data + 8, length);
           final kind = file.unsigned(data.data + 1, 3);
-          final decoder = switch (kind) {
-            13 => image.JpegDecoder(),
-            14 => image.PngDecoder(),
-            _ => null,
-          };
-          final info = decoder?.startDecode(bytes);
-          if (info == null) continue;
-          yield VideoStream(
-            codec: kind == 13 ? 'mjpeg' : 'png',
-            width: info.width,
-            height: info.height,
-            timeBase: '1/90000',
-            attached: true,
-          );
+          if (kind == 13 || kind == 14) yield data;
         }
       }
+    }
+  }
+
+  Iterable<VideoStream> _coverStreams(MediaBox? meta) sync* {
+    for (final data in coverData(meta)) {
+      final length = data.end - data.data - 8;
+      if (length > 32 * 1024 * 1024) continue;
+      final bytes = file.read(data.data + 8, length);
+      final kind = file.unsigned(data.data + 1, 3);
+      final decoder = kind == 13 ? image.JpegDecoder() : image.PngDecoder();
+      final info = decoder.startDecode(bytes);
+      if (info == null) continue;
+      yield VideoStream(
+        codec: kind == 13 ? 'mjpeg' : 'png',
+        width: info.width,
+        height: info.height,
+        timeBase: '1/90000',
+        attached: true,
+      );
     }
   }
 }

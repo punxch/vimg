@@ -6,25 +6,7 @@ import 'package:image/image.dart' as image;
 
 import 'package:vimg_dart/src/probe.dart';
 
-void check(bool condition, String message) {
-  if (!condition) throw StateError(message);
-}
-
-List<int> uint(int value, int width) => [
-  for (var shift = (width - 1) * 8; shift >= 0; shift -= 8)
-    (value >> shift) & 255,
-];
-
-List<int> ebml(List<int> id, List<int> data) => [
-  ...id,
-  0x80 | data.length,
-  ...data,
-];
-List<int> box(String tag, List<int> data) => [
-  ...uint(data.length + 8, 4),
-  ...latin1.encode(tag),
-  ...data,
-];
+import 'fixtures.dart';
 
 void testProbe(Directory temp) {
   final matroska = File('${temp.path}/test.mkv');

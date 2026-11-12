@@ -7,12 +7,16 @@ import 'package:image/image.dart' as image;
 import 'grid.dart';
 import 'output.dart';
 import 'probe.dart';
+import 'video_cli.dart';
 
 CommandRunner<void> createRunner() =>
     CommandRunner<void>('vimg', 'Generate contact sheets and video previews.')
       ..argParser.addFlag('version', negatable: false)
       ..addCommand(_Probe())
-      ..addCommand(_Join());
+      ..addCommand(_Join())
+      ..addCommand(ExtractCommand())
+      ..addCommand(PreviewCommand())
+      ..addCommand(VcsCommand());
 
 Future<void> runCli(List<String> arguments) async {
   final runner = createRunner();
@@ -27,6 +31,9 @@ Future<void> runCli(List<String> arguments) async {
     stderr.writeln(error);
     exitCode = 64;
   } on FormatException catch (error) {
+    stderr.writeln('vimg: ${error.message}');
+    exitCode = 1;
+  } on UnsupportedError catch (error) {
     stderr.writeln('vimg: ${error.message}');
     exitCode = 1;
   } on FileSystemException catch (error) {
@@ -49,7 +56,7 @@ final class _Probe extends Command<void> {
   }
 }
 
-final class _Join extends Command<void> {
+final class _Join extends VimgCommand {
   _Join() {
     argParser
       ..addOption(
@@ -73,23 +80,13 @@ final class _Join extends Command<void> {
   @override
   String get description => 'Join images into a grid.';
 
-  int? dimension(String name, int minimum) {
-    final value = argResults!.option(name);
-    if (value == null) return null;
-    final number = int.tryParse(value);
-    if (number == null || number < minimum) {
-      usageException('--$name must be an integer >= $minimum.');
-    }
-    return number;
-  }
-
   @override
   void run() {
     final arguments = argResults!;
     if (arguments.rest.isEmpty) usageException('Provide at least one image.');
-    final columns = dimension('columns', 0)!;
-    final width = dimension('capture-width', 1);
-    final height = dimension('capture-height', 1);
+    final columns = integer('columns')!;
+    final width = integer('capture-width', min: 1, max: 16384);
+    final height = integer('capture-height', min: 1, max: 16384);
     final output = arguments.option('output')!;
     final encoder = image.findEncoderForNamedImage(output);
     if (encoder == null) {
