@@ -31,6 +31,12 @@ depend on the library's encoders and decoders.
 - `vimg extract -n3 --output-dir frames video.mkv` writes sampled BMP frames.
 - `vimg vcs -c3 -H160 -n9 video.mkv -o grid.avif` writes an animated AVIF.
   Pass `-f1` for a still, `--webp 1` for WebP or choose a `.jpg` output for JPEG.
+- `vimg authority record -c3 -H160 -n9 --output grid.avif --manifest grid.json video.mkv`
+  records the fixed Preview profile, the selected source PTS and pre-encoder
+  and decoded PNGs.
+- `vimg authority verify reference.avif candidate.avif --min-ssim 0.999`
+  compares animation structure and every frame. Visual comparison currently
+  supports AVIF animations produced by the Dart palette encoder.
 - `vimg print-completions [bash|zsh|fish|powershell|elvish]` prints a completion
   script for the Dart CLI.
 
@@ -47,8 +53,13 @@ Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in 4:2:0
 or monochrome, up to 12 bits. `preview` selects an HEVC random-access
 picture. `extract` and `vcs` decode from the preceding random-access point
 and handle leading pictures that depend on an earlier GOP. HEVC range
-extension tools are pending, along with Rust's `authority` commands,
-FFmpeg filter expressions and hardware capture backends.
+extension tools, general AV1 decoding for Rust-produced authority AVIFs,
+FFmpeg filter expressions and hardware capture backends are pending.
+
+The authority manifest identifies the capture backend as
+`production-dart-capture`. Its `input_frame_index` is the zero-based index
+in the presentation timeline used for Dart capture. The source PTS is
+stored as integer ticks with a rational time base, before applying playback edits.
 
 The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses
 separate palettes for green samples and blue/red pairs. Blocks with up to
@@ -94,6 +105,7 @@ dart test/video_test.dart
 dart test/avif_test.dart
 dart test/h264_test.dart
 dart test/hevc_test.dart
+dart test/authority_test.dart
 dart compile exe bin/vimg.dart -o build/vimg
 dart compile exe test/fake_ya.dart -o build/fake-ya
 dart test/service_test.dart build/vimg build/fake-ya

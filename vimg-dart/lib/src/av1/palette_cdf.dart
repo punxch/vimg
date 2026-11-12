@@ -180,3 +180,17 @@ const paletteChromaMapCdf = [
     [31190, 31329, 31516, 31679, 31825, 32026, 32322],
   ],
 ];
+
+const paletteColorContexts = [-1, -1, 0, -1, -1, 4, 3, 2, 1];
+
+List<int> partitionEdgeCdf(List<int> cdf, {required bool rightEdge}) {
+  final splits = rightEdge
+      ? const [1, 3, 4, 5, 6, 8]
+      : const [2, 3, 4, 6, 7, 9];
+  var other = 32768;
+  for (final symbol in splits) {
+    final end = symbol == cdf.length ? 32768 : cdf[symbol];
+    other -= end - cdf[symbol - 1];
+  }
+  return [other];
+}

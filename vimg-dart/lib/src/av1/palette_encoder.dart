@@ -120,10 +120,6 @@ final class _PaletteTile {
       _blocksWide = (frame.width + 7) ~/ 8,
       _blocksHigh = (frame.height + 7) ~/ 8;
 
-  static const _colorContext = [-1, -1, 0, -1, -1, 4, 3, 2, 1];
-  static const _rightEdgeSplits = [1, 3, 4, 5, 6, 8];
-  static const _bottomEdgeSplits = [2, 3, 4, 6, 7, 9];
-
   final Uint8List _rgb;
   final int _width;
   final int _height;
@@ -163,13 +159,7 @@ final class _PaletteTile {
     if (bottom && right) {
       _range.symbol(cdf, 3); // PARTITION_SPLIT
     } else if (bottom || right) {
-      final split = bottom ? _rightEdgeSplits : _bottomEdgeSplits;
-      var other = 32768;
-      for (final symbol in split) {
-        final end = symbol == cdf.length ? 32768 : cdf[symbol];
-        other -= end - cdf[symbol - 1];
-      }
-      _range.symbol([other], 1);
+      _range.symbol(partitionEdgeCdf(cdf, rightEdge: bottom), 1);
     }
     _partition(row, col, logSize - 1);
     _partition(row, col + half, logSize - 1);
@@ -276,7 +266,7 @@ final class _PaletteTile {
         }
         // The sum consists of at most three non-zero neighbor scores.
         final hash = 2 * sum - maximum;
-        _range.symbol(contexts[_colorContext[hash]], rank);
+        _range.symbol(contexts[paletteColorContexts[hash]], rank);
       }
     }
   }

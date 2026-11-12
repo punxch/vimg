@@ -12,6 +12,8 @@ typedef _Track = ({
   int index,
   VideoStream stream,
   double step,
+  int scale,
+  int rate,
   _Bitmap? bitmap,
 });
 
@@ -113,6 +115,8 @@ final class Avi {
       tracks.add((
         index: index,
         step: step,
+        scale: scale,
+        rate: rate,
         stream: VideoStream(
           codec: codec,
           width: width,
@@ -152,13 +156,14 @@ final class Avi {
       for (final chunk in _chunks(riff.data + 4, riff.end)) {
         if (!_list(chunk, 'movi')) continue;
         for (final sample in _samples(chunk, track.index, 0)) {
-          final timestamp = frame++ * track.step;
+          final index = frame++;
           // AVI zero-length samples mark dropped frames.
           if (sample.end == sample.data) continue;
           yield (
-            seconds: timestamp,
+            seconds: index * track.step,
             offset: sample.data,
             size: sample.end - sample.data,
+            timestamp: frameTimestamp(index, track.scale, track.rate),
           );
         }
       }

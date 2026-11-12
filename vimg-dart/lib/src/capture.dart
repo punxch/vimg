@@ -78,6 +78,14 @@ final class CaptureOptions {
   final double window;
 }
 
+typedef CaptureSelection =
+    void Function(
+      int animationIndex,
+      int captureIndex,
+      FramePacket packet,
+      int inputFrameIndex,
+    );
+
 final class CapturePlan {
   CapturePlan(double? videoDuration, CaptureOptions options)
     : frames = options.frames,
@@ -113,7 +121,10 @@ final class CapturePlan {
   final int frames;
   final double window;
 
-  List<List<FramePacket>> select(Iterable<FramePacket> packets) {
+  List<List<FramePacket>> select(
+    Iterable<FramePacket> packets, {
+    CaptureSelection? onSelect,
+  }) {
     final targets = [
       for (var tile = 0; tile < starts.length; tile++)
         for (var frame = 0; frame < frames; frame++)
@@ -128,8 +139,9 @@ final class CapturePlan {
       (_) => List<FramePacket?>.filled(frames, null),
     );
     FramePacket? previous;
-    var index = 0;
+    var index = 0, inputIndex = -1;
     for (final packet in packets) {
+      inputIndex++;
       if (previous != null && packet.seconds < previous.seconds) {
         throw const FormatException('Out-of-order presentation timestamps');
       }
@@ -137,14 +149,18 @@ final class CapturePlan {
           targets[index].seconds <= packet.seconds) {
         final target = targets[index++];
         final first = previous;
-        final frame =
+        final usePrevious =
             first != null &&
-                target.seconds - first.seconds <
-                    packet.seconds - target.seconds &&
-                first.seconds >= starts[target.tile]
-            ? first
-            : packet;
+            target.seconds - first.seconds < packet.seconds - target.seconds &&
+            first.seconds >= starts[target.tile];
+        final frame = usePrevious ? first : packet;
         selected[target.tile][target.frame] = frame;
+        onSelect?.call(
+          target.frame,
+          target.tile,
+          frame,
+          inputIndex - (usePrevious ? 1 : 0),
+        );
       }
       if (index == targets.length) break;
       previous = packet;
@@ -156,6 +172,7 @@ final class CapturePlan {
     for (; index < targets.length; index++) {
       final target = targets[index];
       selected[target.tile][target.frame] = previous;
+      onSelect?.call(target.frame, target.tile, previous!, inputIndex);
     }
     return [for (final tile in selected) tile.cast<FramePacket>()];
   }

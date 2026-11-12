@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
+import 'package:vimg_dart/src/av1/palette_decoder.dart';
 import 'package:vimg_dart/src/avif_encoder.dart';
 import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/iso_media.dart';
@@ -55,6 +56,23 @@ Future<void> _checkAvif(
   File(path).writeAsBytesSync(encoder.finish());
   final input = File(path).openSync();
   final elementary = BytesBuilder(copy: false);
+  final decoder = Av1PaletteDecoder();
+  final source = expected.takeBytes();
+  void checkSample(Uint8List sample, int frame) {
+    final decoded = decoder.decode(sample);
+    check(decoded.width == width && decoded.height == height, 'AV1 frame size');
+    final start = (frame < frameCount ? frame : frameCount - 1) * planeSize * 3;
+    for (final pixel in decoded) {
+      final i = start + pixel.y * width + pixel.x;
+      check(
+        pixel.g == source[i] &&
+            pixel.b == source[i + planeSize] &&
+            pixel.r == source[i + 2 * planeSize],
+        'Dart AV1 palette round trip',
+      );
+    }
+  }
+
   try {
     final file = BinaryFile(input);
     final iso = IsoMedia(file);
@@ -71,9 +89,11 @@ Future<void> _checkAvif(
     final firstLength = file.unsigned(extent.data + 18, 4);
     check(offset == boxes['mdat']!.data, 'Primary image starts in mdat');
     if (frameCount == 1) {
+      final sample = file.read(offset, firstLength);
+      checkSample(sample, 0);
       elementary
         ..add([0x12, 0])
-        ..add(file.read(offset, firstLength));
+        ..add(sample);
     } else {
       final movie = iso.movie();
       final media = iso.child(iso.child(movie, 'trak'), 'mdia')!;
@@ -99,9 +119,11 @@ Future<void> _checkAvif(
       );
       for (var frame = 0; frame < count; frame++) {
         final length = file.unsigned(sizes + 12 + frame * 4, 4);
+        final sample = file.read(offset, length);
+        checkSample(sample, frame);
         elementary
           ..add([0x12, 0])
-          ..add(file.read(offset, length));
+          ..add(sample);
         offset += length;
       }
       check(offset == boxes['mdat']!.end, 'Sample extents cover mdat');
@@ -125,7 +147,6 @@ Future<void> _checkAvif(
   ]);
   check(result.exitCode == 0, 'dav1d failed: ${result.stderr}');
   final decoded = File(decodedPath).readAsBytesSync();
-  final source = expected.takeBytes();
   final last = source.length - planeSize * 3;
   final length = source.length + (frameCount == 1 ? 0 : planeSize * 3);
   check(decoded.length == length, 'Decoded frame count');

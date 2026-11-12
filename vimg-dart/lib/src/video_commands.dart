@@ -156,6 +156,9 @@ void _publishCaptures(List<String> paths, image.Image frame) {
 
 const _decodedFrameLimit = 256 * 1024 * 1024;
 
+typedef GridFrameVisitor =
+    void Function(int index, image.Image grid, int tileWidth, int tileHeight);
+
 void writeContactSheet(
   String input,
   String output,
@@ -167,6 +170,8 @@ void writeContactSheet(
   int webp = 75,
   String? captureDirectory,
   void Function(String stage)? mark,
+  CaptureSelection? onSelect,
+  GridFrameVisitor? onGrid,
 }) {
   final extension = output.split('.').last.toLowerCase();
   final image.Encoder? encoder;
@@ -186,7 +191,7 @@ void writeContactSheet(
   final video = Video(input);
   try {
     final plan = CapturePlan(video.metadata.duration, options);
-    final selected = plan.select(video.packets());
+    final selected = plan.select(video.packets(), onSelect: onSelect);
     mark?.call('schedule');
     final inter = video.usesReferencePictures;
     Map<FramePacket, List<String>>? paths;
@@ -221,7 +226,7 @@ void writeContactSheet(
         .toList();
     final tiles = List<image.Image?>.filled(selected.length, null);
     final last = List<FramePacket?>.filled(selected.length, null);
-    image.Image? animation;
+    image.Image? animation, previousGrid;
     AvifEncoder? avif;
     for (var frame = 0; frame < options.frames; frame++) {
       var changed = false;
@@ -234,11 +239,12 @@ void writeContactSheet(
         last[tile] = packet;
         changed = true;
       }
+      final first = tiles.first!;
       if (!changed && avif != null) {
         avif.repeatFrame();
+        onGrid?.call(frame, previousGrid!, first.width, first.height);
         continue;
       }
-      final first = tiles.first!;
       final effectiveColumns = columns == 0
           ? tiles.length
           : math.min(columns, tiles.length);
@@ -257,6 +263,10 @@ void writeContactSheet(
         );
       }
       final grid = composeGrid(tiles.cast<image.Image>(), columns, labels);
+      if (onGrid != null) {
+        onGrid(frame, grid, first.width, first.height);
+        previousGrid = grid;
+      }
       if (encoder == null) {
         avif ??= AvifEncoder(
           grid.width,

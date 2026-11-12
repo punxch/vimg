@@ -8,7 +8,12 @@ Iterable<FramePacket> matroskaCovers(Matroska media) sync* {
     if (element.id != 0x1941a469) continue;
     for (final attachment in media.pictureAttachments(element)) {
       final data = attachment[0x465c]!;
-      yield (seconds: 0, offset: data.data, size: data.end - data.data);
+      yield (
+        seconds: 0,
+        offset: data.data,
+        size: data.end - data.data,
+        timestamp: null,
+      );
     }
   }
 }
@@ -26,6 +31,8 @@ Iterable<FramePacket> matroskaFrames(
       case 0x1549a966:
         timestampScale =
             media.number(media.fields(element)[0x2ad7b1]) ?? 1000000;
+        if (timestampScale <= 0)
+          throw const FormatException('Invalid Matroska timestamp scale');
       case 0x1654ae6b:
         final track = media.videoTracks(element).firstOrNull;
         if (track == null) break;
@@ -103,11 +110,17 @@ Iterable<FramePacket> _block(
   final flags = header.getUint8(2);
   final sync = groupKeyframe ?? flags & 0x80 != 0;
   if (keyframes && !sync) return;
-  final seconds = (clusterTime + header.getInt16(0)) * (timestampScale / 1e9);
+  final pts = clusterTime + header.getInt16(0);
+  final seconds = pts * (timestampScale / 1e9);
   offset += 3;
   final lacing = (flags >> 1) & 3;
   if (lacing == 0) {
-    final packet = (seconds: seconds, offset: offset, size: block.end - offset);
+    final packet = (
+      seconds: seconds,
+      offset: offset,
+      size: block.end - offset,
+      timestamp: frameTimestamp(pts, timestampScale, 1000000000),
+    );
     onSample?.call(packet, sync);
     yield packet;
     return;
@@ -155,11 +168,29 @@ Iterable<FramePacket> _block(
   final step = blockDuration == null
       ? (frameDuration ?? 0) / 1e9
       : blockDuration * (timestampScale / 1e9) / count;
+  FrameTimestamp laceTimestamp(int index) {
+    if (blockDuration == null) {
+      final duration = frameDuration ?? 0;
+      final unit = timestampScale.gcd(duration);
+      final lacePts =
+          pts * (timestampScale ~/ unit) + index * (duration ~/ unit);
+      return frameTimestamp(lacePts, unit, 1000000000);
+    }
+    final divisor = count.gcd(blockDuration);
+    final ticks = count ~/ divisor;
+    return frameTimestamp(
+      pts * ticks + index * (blockDuration ~/ divisor),
+      timestampScale,
+      1000000000 * ticks,
+    );
+  }
+
   for (var index = 0; index < count; index++) {
     final packet = (
       seconds: seconds + index * step,
       offset: offset,
       size: sizes[index],
+      timestamp: laceTimestamp(index),
     );
     onSample?.call(packet, sync);
     yield packet;

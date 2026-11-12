@@ -10,7 +10,12 @@ Iterable<FramePacket> isoCovers(IsoMedia media) sync* {
       _ => null,
     };
     for (final data in media.coverData(meta)) {
-      yield (seconds: 0, offset: data.data + 8, size: data.end - data.data - 8);
+      yield (
+        seconds: 0,
+        offset: data.data + 8,
+        size: data.end - data.data - 8,
+        timestamp: null,
+      );
     }
   }
 }
@@ -19,9 +24,10 @@ Iterable<FramePacket> isoFrames(
   IsoMedia media, {
   bool keyframes = false,
   FrameVisitor? onSample,
+  MediaBox? selectedTrack,
 }) sync* {
   final movie = media.movie();
-  final track = media.firstVideoTrack(moov: movie);
+  final track = selectedTrack ?? media.firstVideoTrack(moov: movie);
   if (track == null) return;
   final trackMedia = media.child(track, 'mdia');
   final trackTiming = media.timing(media.child(trackMedia, 'mdhd'));
@@ -96,7 +102,12 @@ Iterable<FramePacket> isoFrames(
           (syncRow < sync.count && sync.value(syncRow, 0) == sample + 1);
       if (isSync && sync != null) syncRow++;
       final seconds = (pts - edit.start) / scale + edit.delay;
-      final packet = (seconds: seconds, offset: offset, size: size);
+      final packet = (
+        seconds: seconds,
+        offset: offset,
+        size: size,
+        timestamp: frameTimestamp(pts, 1, scale),
+      );
       // Samples trimmed by an edit may still be needed for inter prediction.
       onSample?.call(packet, isSync);
       if ((!keyframes || isSync) &&

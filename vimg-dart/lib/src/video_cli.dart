@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:args/command_runner.dart';
 
+import 'authority.dart';
 import 'capture.dart';
 import 'video_commands.dart';
 
@@ -120,7 +121,14 @@ final class ExtractCommand extends _CaptureCommand {
 }
 
 final class VcsCommand extends _CaptureCommand {
-  VcsCommand() {
+  VcsCommand({bool authority = false}) : _authority = authority {
+    if (authority) {
+      argParser.addOption(
+        'manifest',
+        mandatory: true,
+        help: 'Destination JSON authority manifest.',
+      );
+    }
     argParser
       ..addOption(
         'columns',
@@ -154,10 +162,14 @@ final class VcsCommand extends _CaptureCommand {
       );
   }
 
+  final bool _authority;
+
   @override
-  String get name => 'vcs';
+  String get name => _authority ? 'record' : 'vcs';
   @override
-  String get description => 'Create a video contact sheet.';
+  String get description => _authority
+      ? 'Write the Preview AVIF, source timestamps and visual reference frames.'
+      : 'Create a video contact sheet.';
 
   @override
   void run() {
@@ -173,25 +185,101 @@ final class VcsCommand extends _CaptureCommand {
       usageException('--avif-fps must be between 0.001 and 1000.');
     }
     final directory = args.option('output-dir')!;
-    final suffix = integer('webp', max: 255)! == 0 ? 'avif' : 'webp';
+    final webp = integer('webp', max: 255)!;
+    final suffix = webp == 0 ? 'avif' : 'webp';
     final output =
         args.option('output') ??
         outputPath(directory, '${videoStem(input)}.$suffix');
     final lower = output.toLowerCase();
     final jpeg = lower.endsWith('.jpg') || lower.endsWith('.jpeg');
     final timings = args.flag('profile') ? _Timings() : null;
-    writeContactSheet(
-      input,
-      output,
-      options(jpeg ? 1 : 30),
-      columns: integer('columns')!,
-      width: width,
-      height: height,
-      fps: fps,
-      captureDirectory: args.flag('keep') ? directory : null,
-      mark: timings?.mark,
-    );
+    final capture = options(jpeg ? 1 : 30);
+    final columns = integer('columns')!;
+    final captures = args.flag('keep') ? directory : null;
+    if (_authority) {
+      if (args.option('output') == null || !output.endsWith('.avif')) {
+        usageException(
+          'Authority recording requires --output with an .avif extension.',
+        );
+      }
+      if (columns != 3 ||
+          height != 160 ||
+          width != null ||
+          capture.number != 9 ||
+          capture.frames != 30 ||
+          capture.window != 1.5 ||
+          capture.start.value != 0 ||
+          capture.end.value != 0 ||
+          fps != 20 ||
+          webp != 0) {
+        usageException(
+          'Authority recording requires the fixed Preview profile '
+          '(-c3 -H160 -n9, 30 frames/1.5s, 20fps, no offsets).',
+        );
+      }
+      recordAuthority(
+        input,
+        output,
+        args.option('manifest')!,
+        capture,
+        columns: columns,
+        height: height!,
+        fps: fps,
+        captureDirectory: captures,
+        mark: timings?.mark,
+      );
+    } else {
+      writeContactSheet(
+        input,
+        output,
+        capture,
+        columns: columns,
+        width: width,
+        height: height,
+        fps: fps,
+        captureDirectory: captures,
+        mark: timings?.mark,
+      );
+    }
     timings?.report('vimg-vcs-timing');
+  }
+}
+
+final class AuthorityCommand extends Command<void> {
+  AuthorityCommand() {
+    addSubcommand(VcsCommand(authority: true));
+    addSubcommand(_VerifyAuthority());
+  }
+
+  @override
+  String get name => 'authority';
+  @override
+  String get description => 'Record or verify a video preview authority.';
+}
+
+final class _VerifyAuthority extends Command<void> {
+  _VerifyAuthority() {
+    argParser.addOption(
+      'min-ssim',
+      defaultsTo: '0.999',
+      help: 'Minimum SSIM for every frame.',
+    );
+  }
+
+  @override
+  String get name => 'verify';
+  @override
+  String get description => 'Compare two AVIF animations frame by frame.';
+
+  @override
+  void run() {
+    final args = argResults!;
+    final paths = args.rest;
+    if (paths.length != 2)
+      usageException('Provide a reference and a candidate AVIF.');
+    final minimum = double.tryParse(args.option('min-ssim')!);
+    if (minimum == null) usageException('--min-ssim must be a number.');
+    verifyAuthority(paths[0], paths[1], minimum);
   }
 }
 

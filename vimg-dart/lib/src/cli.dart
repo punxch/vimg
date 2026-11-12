@@ -20,6 +20,7 @@ CommandRunner<void> createRunner() =>
       ..addCommand(ExtractCommand())
       ..addCommand(PreviewCommand())
       ..addCommand(VcsCommand())
+      ..addCommand(AuthorityCommand())
       ..addCommand(ServeCommand())
       ..addCommand(SendCommand())
       ..addCommand(PrintCompletionsCommand());
