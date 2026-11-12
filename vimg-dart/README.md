@@ -17,8 +17,8 @@ On Windows, use `-o build/vimg.exe`.
 
 ## Available commands
 
-- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV, AVI and MPEG-TS metadata and prints
-  vimg-compatible JSON.
+- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV, AVI, MPEG-TS,
+  MPEG-PS and standalone MPEG video metadata and prints vimg-compatible JSON.
 - `vimg join -c3 -H160 image1.png image2.png -o grid.png` resizes images and
   composes a contact sheet. Pass a repeated `--label` to label successive tiles.
 
@@ -60,15 +60,22 @@ MPEG-TS supports H.264, HEVC, MPEG-1 Video and MPEG-2 Video in 188-byte TS,
 supported video track found through the program tables. It groups video
 access units, preserves source PTS across 33-bit rollover and accounts for
 an earlier audio start in the same program. Capture workers read the
-selected GOPs directly from the source file. Reordered pictures without
-usable presentation timestamps remain pending.
+selected GOPs directly from the source file.
 
-Matroska and MPEG-TS support MPEG-1 and MPEG-2 I/P/B pictures. MPEG-2
+Matroska, MPEG-TS, MPEG-PS and elementary `.m1v`/`.m2v` streams support
+MPEG-1 and MPEG-2 I/P/B pictures. MPEG-2
 supports progressive and interlaced frame pictures, including field-based
 motion prediction and field DCT. Capture handles B-pictures that depend on
-an earlier GOP and selects I-pictures for static previews. MPEG Program
-Streams (including VOB), separate field pictures and scalable MPEG-2
-profiles remain pending.
+an earlier GOP and selects I-pictures for static previews. When MPEG-1 or
+MPEG-2 PES packets omit some picture timestamps, capture reconstructs
+presentation order from the GOP and picture headers. Elementary streams
+start at zero and use sequence timing, including signalled repeated fields.
+
+Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
+`.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS
+and LPCM tracks. A program stream map can also identify H.264 or HEVC.
+Separate MPEG field pictures, scalable MPEG-2, DVD title navigation and
+reordered H.264 or HEVC pictures without usable timestamps remain pending.
 
 `preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
 AVIF animation reader handles intra and inter pictures, including hidden
@@ -178,6 +185,7 @@ dart test/hevc_test.dart
 dart test/iso_fragments_test.dart
 dart test/transport_stream_test.dart
 dart test/mpeg_video_test.dart
+dart test/program_stream_test.dart
 dart test/prores_test.dart
 dart test/authority_test.dart
 dart compile exe bin/vimg.dart -o build/vimg

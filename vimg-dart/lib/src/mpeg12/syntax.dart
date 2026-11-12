@@ -138,7 +138,12 @@ final class MpegPictureHeader {
   }
 }
 
-typedef MpegPictureInfo = ({int type, bool closedGop, bool brokenLink});
+typedef MpegPictureInfo = ({
+  int type,
+  int temporalReference,
+  bool closedGop,
+  bool brokenLink,
+});
 
 MpegPictureInfo mpegPictureInfo(Uint8List header, int gopFlags) {
   if (header.length < 2) {
@@ -146,6 +151,7 @@ MpegPictureInfo mpegPictureInfo(Uint8List header, int gopFlags) {
   }
   return (
     type: (header[1] >> 3) & 7,
+    temporalReference: (header[0] << 2) | (header[1] >> 6),
     closedGop: gopFlags & 64 != 0,
     brokenLink: gopFlags & 32 != 0,
   );

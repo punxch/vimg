@@ -11,22 +11,26 @@ import 'metadata.dart';
 import 'mpeg12/syntax.dart';
 import 'rbsp.dart';
 
+part 'program_stream.dart';
 part 'transport_packets.dart';
 
-/// MPEG-TS video samples are delimited by start codes. Index entries keep
+/// MPEG systems video samples are delimited by start codes. Index entries keep
 /// their first physical byte and elementary-stream length so workers can seek
 /// directly to a selected frame without buffering or indexing the whole file.
-final class TransportVideo {
-  TransportVideo._(this._input);
+final class MpegSystemsVideo {
+  MpegSystemsVideo._(this._input);
 
-  static TransportVideo? detect(BinaryFile file) {
-    final input = _TransportInput.detect(file);
-    return input == null ? null : TransportVideo._(input);
+  static MpegSystemsVideo? detect(BinaryFile file) {
+    final _PacketSource? input =
+        _ProgramInput.detect(file) ??
+        _TransportInput.detect(file) ??
+        _ElementaryVideo.detect(file);
+    return input == null ? null : MpegSystemsVideo._(input);
   }
 
-  final _TransportInput _input;
+  final _PacketSource _input;
   late final _Program _program = _input.program();
-  late final _TransportIndex _index = _scan();
+  late final _SystemsIndex _index = _scan();
 
   String get programCodec => _program.codec;
   VideoMetadata metadata() => _index.metadata;
@@ -52,54 +56,17 @@ final class TransportVideo {
   };
 
   Uint8List read(FramePacket frame) {
-    final data = Uint8List(frame.size);
-    var written = 0;
-    final pes = _PesReader((bytes, start, end, _) {
-      final count = math.min(end - start, data.length - written);
-      data.setRange(written, written + count, bytes, start);
-      written += count;
-    });
-    final continuity = _Continuity();
-    int? pid;
-    for (final packet in _input.packets(frame.offset)) {
-      pid ??= packet.pid;
-      if (packet.pid != pid || !continuity.accept(packet)) continue;
-      if (written == 0) {
-        final start = packet.start + frame.offset - packet.position;
-        if (start < packet.payload || start >= packet.end) {
-          throw const FormatException('Invalid MPEG-TS access unit offset');
-        }
-        pes.resume(packet, start);
-      } else {
-        pes.add(packet);
-      }
-      if (written == data.length) {
-        return isMpegVideo(programCodec) ? data : _lengthPrefix(data);
-      }
-    }
-    throw const FormatException('Truncated MPEG-TS access unit');
+    final data = _input.read(frame, _program.videoId);
+    return isMpegVideo(programCodec) ? data : _lengthPrefix(data);
   }
 
-  _TransportIndex _scan() {
+  _SystemsIndex _scan() {
     final program = _program;
     final video = _AccessUnits(program.codec);
-    final audio = {
-      for (final entry in program.audio.entries)
-        entry.key: _AudioClock(entry.value),
-    };
-    final videoContinuity = _Continuity();
-    final pes = _PesReader(video.payload, onTime: video.timestamp);
-    for (final packet in _input.packets()) {
-      if (packet.pid == program.videoPid) {
-        if (videoContinuity.accept(packet)) pes.add(packet);
-      } else {
-        audio[packet.pid]?.add(packet);
-      }
-    }
-    pes.finish();
+    final audio = _input.scan(program, video);
     video.finish();
     if (video.frames.isEmpty) {
-      throw const FormatException('MPEG-TS contains no video access units');
+      throw const FormatException('MPEG stream contains no video access units');
     }
     int? previous;
     var previousIndex = 0;
@@ -121,8 +88,9 @@ final class TransportVideo {
       previous = dts;
       previousIndex = i;
     }
-    if (stamps.isEmpty) {
-      throw const FormatException('Missing MPEG-TS video timestamps');
+    final elementary = _input is _ElementaryVideo;
+    if (stamps.isEmpty && !elementary) {
+      throw const FormatException('Missing MPEG video timestamps');
     }
     final estimatedPeriod = cadence.entries.fold<int?>(null, (mode, entry) {
       if (mode == null ||
@@ -137,36 +105,38 @@ final class TransportVideo {
         ? timing.$2 / timing.$1
         : estimatedPeriod == null
         ? null
-        : _tsFrequency / estimatedPeriod;
+        : _mpegClock / estimatedPeriod;
     final period = timing != null
-        ? math.max(1, timing.$1 * _tsFrequency ~/ timing.$2)
+        ? math.max(1, timing.$1 * _mpegClock ~/ timing.$2)
         : estimatedPeriod;
-    if (stamps.length != video.frames.length && (reordered || period == null)) {
+    final missing = stamps.length != video.frames.length;
+    final mpegTiming = missing && video.bitstreamCodec != null ? timing : null;
+    if (missing && mpegTiming == null && (reordered || period == null)) {
       throw UnsupportedError(
-        'MPEG-TS video has access units without a usable presentation timestamp',
+        'MPEG video has access units without a usable presentation timestamp',
       );
     }
-    final pts = <int>[];
-    var anchor = stamps.entries.first;
-    for (var i = 0; i < video.frames.length; i++) {
-      final stamp = stamps[i];
-      if (stamp != null) anchor = MapEntry(i, stamp);
-      final distance = i - anchor.key;
-      pts.add(
-        anchor.value +
-            (timing == null
-                ? distance * (period ?? 0)
-                : (distance * timing.$1 * _tsFrequency / timing.$2).round()),
-      );
-    }
+    final pts = mpegTiming != null
+        ? _mpegPresentationTimes(video.frames, stamps, mpegTiming)
+        : _presentationTimes(video.frames.length, stamps, timing, period);
+    int? packetDuration(_AccessUnit frame) =>
+        timing != null && frame.fields != 2
+        ? math.max(1, frame.fields * timing.$1 * _mpegClock ~/ (2 * timing.$2))
+        : period;
     var start = pts.reduce(math.min);
-    // FFprobe estimates the MPEG-1 transport duration using the field rate.
-    // Packet durations continue to describe complete coded frames.
-    final tail = video.bitstreamCodec == 'mpeg1video'
-        ? (period ?? 0) ~/ 2
-        : period ?? 0;
-    var end = pts.reduce(math.max) + tail;
-    for (final track in audio.values) {
+    // FFprobe estimates program-stream duration from explicit PES timestamps.
+    // Inferred timestamps keep the remaining decoded pictures seekable.
+    var end = start;
+    for (final (i, frame) in video.frames.indexed) {
+      if (_input is _ProgramInput && !stamps.containsKey(i)) continue;
+      final duration = packetDuration(frame) ?? 0;
+      // For MPEG-1 systems, FFprobe uses the field rate in this estimate.
+      final tail = !elementary && video.bitstreamCodec == 'mpeg1video'
+          ? duration ~/ 2
+          : duration;
+      end = math.max(end, pts[i] + tail);
+    }
+    for (final track in audio) {
       final first = track.first;
       final last = track.last;
       if (first == null || last == null) continue;
@@ -176,29 +146,31 @@ final class TransportVideo {
     }
     final (width, height) =
         video.dimensions ??
-        (throw const FormatException('Missing MPEG-TS video sequence header'));
+        (throw const FormatException('Missing MPEG video sequence header'));
+    final duration = _input is _ProgramInput
+        ? (_mpegMicroseconds(end) - _mpegMicroseconds(start)) / 1000000
+        : (end - start) / _mpegClock;
     return (
-      metadata:
-          VideoMetadata(end > start ? (end - start) / _tsFrequency : null, [
-            VideoStream(
-              codec: video.bitstreamCodec ?? program.codec,
-              width: width,
-              height: height,
-              timeBase: '1/$_tsFrequency',
-              nominalFrameRate: nominalRate,
-            ),
-          ]),
+      metadata: VideoMetadata(duration > 0 ? duration : null, [
+        VideoStream(
+          codec: video.bitstreamCodec ?? program.codec,
+          width: width,
+          height: height,
+          timeBase: '1/$_mpegClock',
+          nominalFrameRate: nominalRate,
+        ),
+      ]),
       packets: [
         for (final (i, frame) in video.frames.indexed)
           (
             offset: frame.offset,
             size: frame.size,
-            seconds: (pts[i] - start) / _tsFrequency,
+            seconds: (pts[i] - start) / _mpegClock,
             timestamp: frameTimestamp(
               pts[i],
               1,
-              _tsFrequency,
-              duration: period,
+              _mpegClock,
+              duration: packetDuration(frame),
             ),
           ),
       ],
@@ -209,10 +181,72 @@ final class TransportVideo {
   }
 }
 
-const _tsFrequency = 90000;
-const _tsWrap = 1 << 33;
+List<int> _presentationTimes(
+  int count,
+  Map<int, int> stamps,
+  (int, int)? timing,
+  int? period,
+) {
+  if (stamps.length == count) {
+    return List.generate(count, (i) => stamps[i]!, growable: false);
+  }
+  var anchor = stamps.entries.first;
+  return List.generate(count, (i) {
+    final stamp = stamps[i];
+    if (stamp != null) anchor = MapEntry(i, stamp);
+    final distance = i - anchor.key;
+    return anchor.value +
+        (timing == null
+            ? distance * (period ?? 0)
+            : (distance * (timing.$1 * _mpegClock / timing.$2)).round());
+  }, growable: false);
+}
 
-typedef _TransportIndex = ({
+/// MPEG PES packets can carry several pictures with a PTS for only the first
+/// picture starting in the packet. Temporal references order all pictures
+/// within their GOP, including leading B-pictures after an I-picture.
+List<int> _mpegPresentationTimes(
+  List<_AccessUnit> frames,
+  Map<int, int> stamps,
+  (int, int) timing,
+) {
+  final order = List.generate(frames.length, (i) => i);
+  order.sort((a, b) {
+    final first = frames[a].mpegOrder!, second = frames[b].mpegOrder!;
+    final group = first.$1.compareTo(second.$1);
+    if (group != 0) return group;
+    final picture = first.$2.compareTo(second.$2);
+    return picture == 0 ? a.compareTo(b) : picture;
+  });
+  final positions = List.filled(frames.length, 0);
+  var fields = 0;
+  for (final index in order) {
+    positions[index] = fields;
+    fields += frames[index].fields;
+  }
+  var anchor = stamps.isEmpty
+      ? order.first
+      : order.firstWhere(stamps.containsKey);
+  final numerator = timing.$1 * _mpegClock;
+  final denominator = timing.$2 * 2;
+  final result = List.filled(frames.length, 0);
+  for (final index in order) {
+    final stamp = stamps[index];
+    if (stamp != null) anchor = index;
+    final distance = positions[index] - positions[anchor];
+    final ticks =
+        (distance.abs() * numerator + denominator ~/ 2) ~/ denominator;
+    result[index] = (stamps[anchor] ?? 0) + distance.sign * ticks;
+  }
+  return result;
+}
+
+const _mpegClock = 90000;
+const _ptsWrap = 1 << 33;
+
+int _mpegMicroseconds(int ticks) => ((ticks.abs() * 100 + 4) ~/ 9) * ticks.sign;
+
+typedef _SystemsIndex = ({
   VideoMetadata metadata,
   List<FramePacket> packets,
   Map<int, int> types,
@@ -222,62 +256,141 @@ typedef _TransportIndex = ({
 
 int _unwrapTimestamp(int raw, int? anchor) {
   if (anchor == null) {
-    return raw >= _tsWrap - 60 * _tsFrequency ? raw - _tsWrap : raw;
+    return raw >= _ptsWrap - 60 * _mpegClock ? raw - _ptsWrap : raw;
   }
-  final delta = (raw - anchor + (_tsWrap >> 1)) % _tsWrap - (_tsWrap >> 1);
+  final delta = (raw - anchor + (_ptsWrap >> 1)) % _ptsWrap - (_ptsWrap >> 1);
   return anchor + delta;
 }
 
-final class _AudioClock {
-  _AudioClock(this.type);
+typedef _Program = ({int videoId, String codec, Map<int, int> audio});
 
-  final int type;
-  int? first, last, duration;
-  final _continuity = _Continuity();
-  late final _PesReader _pes = _PesReader(
-    _payload,
-    onTime: (pts, _) {
-      first ??= pts;
-      last = pts;
-    },
-  );
+abstract interface class _PacketSource {
+  _Program program();
+  Iterable<_AudioClock> scan(_Program program, _AccessUnits video);
+  Uint8List read(FramePacket frame, int videoId);
+}
 
-  void add(_TransportPacket packet) {
-    if (_continuity.accept(packet)) _pes.add(packet);
+/// A standalone H.262 or MPEG-1 elementary stream has sequence timing and
+/// temporal references but carries no systems clock or PES timestamps.
+final class _ElementaryVideo implements _PacketSource {
+  _ElementaryVideo(this.file);
+
+  static _ElementaryVideo? detect(BinaryFile file) {
+    if (file.length < 16 || file.unsigned(0, 4) != 0x000001b3) return null;
+    final bytes = file.read(0, math.min(1024, file.length));
+    final units = mpegStartCodes(bytes).iterator;
+    if (!units.moveNext()) return null;
+    final header = units.current;
+    if (!units.moveNext() ||
+        !const {0, 0xb2, 0xb5, 0xb8}.contains(units.current.code)) {
+      return null;
+    }
+    try {
+      MpegSequence(Uint8List.sublistView(bytes, header.data, header.end));
+      return _ElementaryVideo(file);
+    } on FormatException {
+      return null;
+    }
   }
 
-  void _payload(Uint8List bytes, int start, int end, int position) {
-    if (duration != null ||
-        type != 0x0f ||
-        end - start < 7 ||
-        bytes[start] != 0xff ||
-        bytes[start + 1] & 0xf6 != 0xf0) {
-      return;
+  final BinaryFile file;
+
+  @override
+  _Program program() => (videoId: 0, codec: 'mpeg2video', audio: const {});
+
+  @override
+  Iterable<_AudioClock> scan(_Program program, _AccessUnits video) {
+    const chunkSize = 256 * 1024;
+    for (var offset = 0; offset < file.length; offset += chunkSize) {
+      final bytes = file.read(
+        offset,
+        math.min(chunkSize, file.length - offset),
+      );
+      video.payload(bytes, 0, bytes.length, offset);
     }
-    const rates = [
-      96000,
-      88200,
-      64000,
-      48000,
-      44100,
-      32000,
-      24000,
-      22050,
-      16000,
-      12000,
-      11025,
-      8000,
-      7350,
-    ];
-    final index = (bytes[start + 2] >> 2) & 15;
-    if (index < rates.length) {
-      final blocks = (bytes[start + 6] & 3) + 1;
-      duration = blocks * 1024 * _tsFrequency ~/ rates[index];
-    }
+    return const [];
+  }
+
+  @override
+  Uint8List read(FramePacket frame, int videoId) =>
+      file.read(frame.offset, frame.size);
+}
+
+(int, int)? _mpeg2PesTime(Uint8List bytes, int size) {
+  if (bytes[6] & 0x30 != 0)
+    throw UnsupportedError('Scrambled MPEG PES payload');
+  final flags = bytes[7] >> 6;
+  if (flags == 1 || (flags == 2 && size < 14) || (flags == 3 && size < 19)) {
+    throw const FormatException('Invalid MPEG PES timestamp flags');
+  }
+  if (flags == 0) return null;
+  final pts = _pesTimestamp(bytes, 9, flags);
+  return (pts, flags == 3 ? _pesTimestamp(bytes, 14, 1) : pts);
+}
+
+int _pesTimestamp(Uint8List bytes, int start, int prefix) {
+  final a = bytes[start], b = bytes[start + 1], c = bytes[start + 2];
+  final d = bytes[start + 3], e = bytes[start + 4];
+  if (a >> 4 != prefix || a & c & e & 1 == 0) {
+    throw const FormatException('Invalid MPEG PES timestamp');
+  }
+  return ((a & 14) << 29) | (b << 22) | ((c & 254) << 14) | (d << 7) | (e >> 1);
+}
+
+int? _adtsDuration(Uint8List bytes, int start, int end) {
+  if (end - start < 7 ||
+      bytes[start] != 0xff ||
+      bytes[start + 1] & 0xf6 != 0xf0) {
+    return null;
+  }
+  const rates = [
+    96000,
+    88200,
+    64000,
+    48000,
+    44100,
+    32000,
+    24000,
+    22050,
+    16000,
+    12000,
+    11025,
+    8000,
+    7350,
+  ];
+  final index = (bytes[start + 2] >> 2) & 15;
+  final blocks = (bytes[start + 6] & 3) + 1;
+  return index < rates.length
+      ? blocks * 1024 * _mpegClock ~/ rates[index]
+      : null;
+}
+
+final class _AudioClock {
+  int? first, last, duration;
+
+  void timestamp(int pts, [int? packetDuration]) {
+    first ??= pts;
+    last = pts;
+    if (packetDuration != null) duration = packetDuration;
   }
 }
 
-typedef _AccessUnit = ({int offset, int size, int type, (int, int)? time});
+String? _videoCodec(int streamType) => switch (streamType) {
+  0x01 => 'mpeg1video',
+  0x02 => 'mpeg2video',
+  0x1b => 'h264',
+  0x24 => 'hevc',
+  _ => null,
+};
+
+typedef _AccessUnit = ({
+  int offset,
+  int size,
+  int type,
+  int fields,
+  (int, int)? time,
+  (int, int)? mpegOrder,
+});
 
 final class _AccessUnits {
   _AccessUnits(String codec)
@@ -287,6 +400,9 @@ final class _AccessUnits {
   final bool _hevc;
   final MpegHeaders? _mpeg;
   var _gopFlags = 0;
+  var _mpegGroup = 0, _fields = 2;
+  int? _mpegReference;
+  (int, int)? _mpegOrder;
   final frames = <_AccessUnit>[];
   final configurations = <int, Uint8List>{};
   final mpegPictures = <int, MpegPictureInfo>{};
@@ -401,17 +517,22 @@ final class _AccessUnits {
     if (_frameType != null && (code == 0 || code == 0xb3 || code == 0xb8)) {
       _frame(_nalStart);
     }
-    // A TS can start in the middle of a picture. Only a new picture or
+    // A stream can start in the middle of a picture. Only a new picture or
     // sequence prefix can begin the first complete access unit.
     if (_frameStart < 0 && code != 0 && code != 0xb3 && code != 0xb8) return;
     _beginUnit();
     final payload = Uint8List.sublistView(bytes, 1);
+    if (code == 0xb3 || code == 0xb8) {
+      _mpegGroup++;
+      _mpegReference = null;
+    }
     if (code == 0xb8 && payload.length >= 4) {
       _gopFlags = payload[3];
     } else if (code == 0) {
       final info = mpegPictureInfo(payload, _gopFlags);
       _gopFlags = 0;
-      _beginPicture(info.type);
+      _beginPicture(info.type, timestampPosition: _nalStart);
+      _mpegOrder = (_mpegGroup, _pictureOrder(info));
       mpegPictures[_framePosition] = info;
       final sequence = headers.sequence;
       if (sequence != null) {
@@ -422,9 +543,33 @@ final class _AccessUnits {
       }
       if (info.type == 1)
         configurations[_framePosition] = headers.configuration();
+    } else if (code == 0xb5 && payload.length >= 5 && payload[0] >> 4 == 8) {
+      final flags = payload[3];
+      if (flags & 2 != 0) {
+        if (headers.sequence?.progressive == true) {
+          _fields = flags & 0x80 != 0 ? 6 : 4;
+        } else if (payload[4] & 0x80 != 0) {
+          _fields = 3;
+        }
+      }
     } else if (_parameter) {
       headers.add(code, payload);
     }
+  }
+
+  int _pictureOrder(MpegPictureInfo info) {
+    final temporal = info.temporalReference;
+    final reference = _mpegReference;
+    if (info.type == 3) {
+      if (reference == null) return temporal;
+      // A B-picture precedes the latest reference picture in presentation
+      // order. The ten-bit counter can wrap between those two pictures.
+      return reference + ((temporal - reference) & 1023) - 1024;
+    }
+    final next = reference == null
+        ? temporal
+        : reference + ((temporal - reference) & 1023);
+    return _mpegReference = next;
   }
 
   void _beginUnit() {
@@ -433,11 +578,12 @@ final class _AccessUnits {
     _framePosition = _nalPosition;
   }
 
-  void _beginPicture(int type) {
+  void _beginPicture(int type, {int? timestampPosition}) {
     _frameType = type;
     // A PES timestamp applies to its first new access unit. A continuation
     // may start a PES without starting a picture.
-    while (_timestamps.isNotEmpty && _timestamps.first.$1 <= _frameStart) {
+    final position = timestampPosition ?? _frameStart;
+    while (_timestamps.isNotEmpty && _timestamps.first.$1 <= position) {
       _frameTime = _timestamps.removeFirst().$2;
     }
   }
@@ -487,10 +633,14 @@ final class _AccessUnits {
       offset: _framePosition,
       size: end - _frameStart,
       type: type,
+      fields: _fields,
       time: _frameTime,
+      mpegOrder: _mpegOrder,
     ));
     _frameType = null;
     _frameTime = null;
+    _fields = 2;
+    _mpegOrder = null;
     _frameStart = -1;
   }
 

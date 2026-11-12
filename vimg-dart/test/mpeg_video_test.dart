@@ -3,7 +3,7 @@ import 'dart:io';
 import 'package:vimg_dart/src/matroska.dart';
 import 'package:vimg_dart/src/matroska_frames.dart';
 import 'package:vimg_dart/src/mpeg12/decode.dart';
-import 'package:vimg_dart/src/transport_stream.dart';
+import 'package:vimg_dart/src/mpeg_systems.dart';
 import 'package:vimg_dart/src/video.dart';
 import 'package:vimg_dart/src/video_configuration.dart';
 
@@ -119,7 +119,7 @@ Future<void> _compare(
   final video = Video(path);
   final workers = VideoCaptureDecoder(video, threads: 2);
   try {
-    final transport = TransportVideo.detect(video.file);
+    final transport = MpegSystemsVideo.detect(video.file);
     final matroska = transport == null ? Matroska(video.file) : null;
     final sequence = matroska == null
         ? null

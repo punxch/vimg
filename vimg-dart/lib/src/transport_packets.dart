@@ -1,10 +1,8 @@
-part of 'transport_stream.dart';
+part of 'mpeg_systems.dart';
 
 const _tsPacketSize = 188;
 
-typedef _Program = ({int videoPid, String codec, Map<int, int> audio});
-
-final class _TransportInput {
+final class _TransportInput implements _PacketSource {
   _TransportInput(this.file, this.stride, this.sync);
 
   static _TransportInput? detect(BinaryFile file) {
@@ -51,6 +49,7 @@ final class _TransportInput {
     }
   }
 
+  @override
   _Program program() {
     final pat = _Sections(0);
     final tables = <int, _Sections>{};
@@ -89,6 +88,51 @@ final class _TransportInput {
     }
     throw const FormatException('Missing MPEG-TS program tables');
   }
+
+  @override
+  Iterable<_AudioClock> scan(_Program program, _AccessUnits video) {
+    final audio = {
+      for (final entry in program.audio.entries)
+        entry.key: _TransportAudio(entry.value),
+    };
+    final continuity = _Continuity();
+    final pes = _PesReader(video.payload, onTime: video.timestamp);
+    for (final packet in packets()) {
+      if (packet.pid == program.videoId) {
+        if (continuity.accept(packet)) pes.add(packet);
+      } else {
+        audio[packet.pid]?.add(packet);
+      }
+    }
+    pes.finish();
+    return audio.values.map((track) => track.clock);
+  }
+
+  @override
+  Uint8List read(FramePacket frame, int videoId) {
+    final data = Uint8List(frame.size);
+    var written = 0;
+    final pes = _PesReader((bytes, start, end, _) {
+      final count = math.min(end - start, data.length - written);
+      data.setRange(written, written + count, bytes, start);
+      written += count;
+    });
+    final continuity = _Continuity();
+    for (final packet in packets(frame.offset)) {
+      if (packet.pid != videoId || !continuity.accept(packet)) continue;
+      if (written == 0) {
+        final start = packet.start + frame.offset - packet.position;
+        if (start < packet.payload || start >= packet.end) {
+          throw const FormatException('Invalid MPEG-TS access unit offset');
+        }
+        pes.resume(packet, start);
+      } else {
+        pes.add(packet);
+      }
+      if (written == data.length) return data;
+    }
+    throw const FormatException('Truncated MPEG-TS access unit');
+  }
 }
 
 _Program? _programMap(Uint8List section) {
@@ -101,13 +145,7 @@ _Program? _programMap(Uint8List section) {
   while (i + 5 <= end) {
     final type = section[i];
     final pid = _uint16(section, i + 1) & 8191;
-    final videoCodec = switch (type) {
-      0x01 => 'mpeg1video',
-      0x02 => 'mpeg2video',
-      0x1b => 'h264',
-      0x24 => 'hevc',
-      _ => null,
-    };
+    final videoCodec = _videoCodec(type);
     if (videoPid == null && videoCodec != null) {
       videoPid = pid;
       codec = videoCodec;
@@ -134,7 +172,7 @@ _Program? _programMap(Uint8List section) {
     throw const FormatException('Invalid MPEG-TS program descriptors');
   return videoPid == null
       ? null
-      : (videoPid: videoPid, codec: codec!, audio: audio);
+      : (videoId: videoPid, codec: codec!, audio: audio);
 }
 
 final class _TransportPacket {
@@ -319,30 +357,10 @@ final class _PesReader {
       if (_remaining! < 0)
         throw const FormatException('Invalid MPEG-TS PES length');
     }
-    final flags = (_header[7] >> 6) & 3;
-    if (flags == 1 ||
-        (flags == 2 && _headerSize < 14) ||
-        (flags == 3 && _headerSize < 19)) {
-      throw const FormatException('Invalid MPEG-TS PES timestamp flags');
-    }
-    if (flags >= 2) {
-      final pts = _time(9, flags);
-      onTime?.call(pts, flags == 3 ? _time(14, 1) : pts);
+    if (_mpeg2PesTime(_header, _headerSize) case final time?) {
+      onTime?.call(time.$1, time.$2);
     }
     _inHeader = false;
-  }
-
-  int _time(int start, int prefix) {
-    final a = _header[start], b = _header[start + 1], c = _header[start + 2];
-    final d = _header[start + 3], e = _header[start + 4];
-    if (a >> 4 != prefix || a & c & e & 1 == 0) {
-      throw const FormatException('Invalid MPEG-TS PES timestamp');
-    }
-    return ((a & 14) << 29) |
-        (b << 22) |
-        ((c & 254) << 14) |
-        (d << 7) |
-        (e >> 1);
   }
 
   void _emit(_TransportPacket packet, int start) {
@@ -369,3 +387,25 @@ final class _PesReader {
 }
 
 int _uint16(Uint8List bytes, int i) => (bytes[i] << 8) | bytes[i + 1];
+
+final class _TransportAudio {
+  _TransportAudio(this.type);
+
+  final int type;
+  final clock = _AudioClock();
+  final _continuity = _Continuity();
+  late final _PesReader _pes = _PesReader(
+    _payload,
+    onTime: (pts, _) {
+      clock.timestamp(pts);
+    },
+  );
+
+  void add(_TransportPacket packet) {
+    if (_continuity.accept(packet)) _pes.add(packet);
+  }
+
+  void _payload(Uint8List bytes, int start, int end, int position) {
+    if (type == 0x0f) clock.duration ??= _adtsDuration(bytes, start, end);
+  }
+}

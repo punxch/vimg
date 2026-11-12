@@ -21,8 +21,8 @@ import 'matroska_frames.dart';
 import 'metadata.dart';
 import 'mpeg12/decode.dart';
 import 'mpeg12/syntax.dart';
+import 'mpeg_systems.dart';
 import 'prores.dart';
-import 'transport_stream.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
@@ -44,8 +44,8 @@ final class Video {
       } else if (signature == 0x52494646) {
         _avi = Avi(file);
       } else {
-        _transport = TransportVideo.detect(file);
-        if (_transport == null) _iso = IsoMedia(file);
+        _systems = MpegSystemsVideo.detect(file);
+        if (_systems == null) _iso = IsoMedia(file);
       }
     } catch (_) {
       _input.closeSync();
@@ -59,20 +59,20 @@ final class Video {
   Matroska? _matroska;
   IsoMedia? _iso;
   Avi? _avi;
-  TransportVideo? _transport;
+  MpegSystemsVideo? _systems;
 
   late final VideoMetadata metadata =
       _matroska?.metadata() ??
       _avi?.metadata() ??
-      _transport?.metadata() ??
+      _systems?.metadata() ??
       _iso!.metadata();
 
   String get codec =>
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
       (throw const FormatException('No video stream'));
 
-  // Workers only need the codec family signalled by the transport tables.
-  String get _decodeCodec => _transport?.programCodec ?? codec;
+  // Workers only need the codec family from the container headers.
+  String get _decodeCodec => _systems?.programCodec ?? codec;
 
   bool get usesReferencePictures {
     final name = _decodeCodec;
@@ -128,10 +128,10 @@ final class Video {
   }
 
   Iterable<FramePacket> packets({bool preview = false}) {
-    final transport = _transport;
-    if (transport != null) {
+    final systems = _systems;
+    if (systems != null) {
       return preview
-          ? transport.packets(true)
+          ? systems.packets(true)
           : (isMpegVideo(codec) ? _mpegTimeline.timeline : _timeline)
                 .presentation;
     }
@@ -182,9 +182,8 @@ final class Video {
     bool keyframes, {
     FrameVisitor? onSample,
   }) {
-    final transport = _transport;
-    if (transport != null)
-      return transport.packets(keyframes, onSample: onSample);
+    final systems = _systems;
+    if (systems != null) return systems.packets(keyframes, onSample: onSample);
     final matroska = _matroska;
     return matroska == null
         ? isoFrames(_iso!, keyframes: keyframes, onSample: onSample)
@@ -251,10 +250,10 @@ final class Video {
   }
 
   _VideoTimeline _indexVideo() {
-    final transport = _transport;
+    final systems = _systems;
     final isHevc = codec == 'hevc';
-    final hevc = transport == null && isHevc ? _hevc.configuration : null;
-    final avc = transport == null && !isHevc ? _h264.configuration : null;
+    final hevc = systems == null && isHevc ? _hevc.configuration : null;
+    final avc = systems == null && !isHevc ? _h264.configuration : null;
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
@@ -268,8 +267,8 @@ final class Video {
           packet.size,
           file.unsigned,
         );
-        final type = transport?.nalType(packet) ?? header?.type;
-        final randomAccess = transport != null
+        final type = systems?.nalType(packet) ?? header?.type;
+        final randomAccess = systems != null
             ? sync
             : header?.randomAccess == true ||
                   (avc != null && sync && _isIdr(avc, packet));
@@ -299,7 +298,7 @@ final class Video {
   }
 
   ({_VideoTimeline timeline, Map<int, Uint8List> configurations}) _indexMpeg() {
-    final transport = _transport;
+    final systems = _systems;
     final headers = MpegHeaders();
     final matroska = _matroska;
     final initial = matroska == null
@@ -317,7 +316,7 @@ final class Video {
     final index = <FramePacket, int>{}, configurations = <int, Uint8List>{};
     var start = -1, bStart = -1;
     MpegPictureInfo pictureInfo(FramePacket packet) {
-      if (transport != null) return transport.mpegPicture(packet);
+      if (systems != null) return systems.mpegPicture(packet);
       final bytes = _read(packet);
       MpegPictureInfo? picture;
       var flags = 0;
@@ -345,40 +344,38 @@ final class Video {
 
     final presentation =
         _containerPackets(
-          false,
-          onSample: (packet, _) {
-            final position = decodeOrder.length;
-            final picture = pictureInfo(packet);
-            switch (picture.type) {
-              case 1:
-                // Leading B-pictures in an open GOP can use the previous GOP.
-                bStart = picture.closedGop
-                    ? position
-                    : (picture.brokenLink ? -1 : start);
-                start = position;
-                if (transport != null) {
-                  configurations[position] = transport.configurationAt(packet)!;
-                }
-              case 2:
-                bStart = start;
-              case 3:
-                break;
-              default:
-                throw UnsupportedError(
-                  'MPEG picture coding type ${picture.type} is unavailable',
-                );
-            }
-            index[packet] = position;
-            decodeOrder.add(packet);
-            gopStart.add(picture.type == 3 ? bStart : start);
-          },
-        ).where((packet) => gopStart[index[packet]!] >= 0).toList()..sort((
-          a,
-          b,
-        ) {
-          final byTime = a.seconds.compareTo(b.seconds);
-          return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
-        });
+            false,
+            onSample: (packet, _) {
+              final position = decodeOrder.length;
+              final picture = pictureInfo(packet);
+              switch (picture.type) {
+                case 1:
+                  // Leading B-pictures in an open GOP can use the previous GOP.
+                  bStart = picture.closedGop
+                      ? position
+                      : (picture.brokenLink ? -1 : start);
+                  start = position;
+                  if (systems != null) {
+                    configurations[position] = systems.configurationAt(packet)!;
+                  }
+                case 2:
+                  bStart = start;
+                case 3:
+                  break;
+                default:
+                  throw UnsupportedError(
+                    'MPEG picture coding type ${picture.type} is unavailable',
+                  );
+              }
+              index[packet] = position;
+              decodeOrder.add(packet);
+              gopStart.add(picture.type == 3 ? bStart : start);
+            },
+          ).where((packet) => gopStart[index[packet]!] >= 0).toList()
+          ..sort((a, b) {
+            final byTime = a.seconds.compareTo(b.seconds);
+            return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+          });
     return (
       timeline: (
         decodeOrder: decodeOrder,
@@ -430,7 +427,7 @@ final class Video {
           ? _av1Timeline.configurations[start]!
           : mpeg
           ? _mpegTimeline.configurations[start]!
-          : _transport?.configurationAt(timeline.decodeOrder[start]),
+          : _systems?.configurationAt(timeline.decodeOrder[start]),
     );
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
@@ -561,7 +558,7 @@ final class Video {
   }
 
   image.Image? cover() {
-    if (_avi != null || _transport != null) return null;
+    if (_avi != null || _systems != null) return null;
     final matroska = _matroska;
     final covers = matroska == null
         ? isoCovers(_iso!)
@@ -578,13 +575,11 @@ final class Video {
     if (packet.size <= 0 || packet.size > 64 * 1024 * 1024) {
       throw const FormatException('Invalid video frame size');
     }
-    return _transport?.read(packet) ?? file.read(packet.offset, packet.size);
+    return _systems?.read(packet) ?? file.read(packet.offset, packet.size);
   }
 
   image.Image decode(FramePacket packet, {bool preview = false}) {
-    if (_transport != null ||
-        isMpegVideo(codec) ||
-        (codec == 'av1' && !preview))
+    if (_systems != null || isMpegVideo(codec) || (codec == 'av1' && !preview))
       return decodeSelected([packet]).single.frame;
     if (codec == 'prores') {
       return _proRes(packet, preserveAlpha: !preview).rgb();
