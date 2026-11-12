@@ -95,28 +95,31 @@ image.Image _previewFrame(Video video, int seconds) {
   return video.decode(last, preview: true);
 }
 
-void extractFrames(String input, String directory, CaptureOptions options) {
+const defaultCaptureThreads = 4;
+
+Future<void> extractFrames(
+  String input,
+  String directory,
+  CaptureOptions options, {
+  int threads = defaultCaptureThreads,
+}) async {
   final video = Video(input);
+  VideoCaptureDecoder? decoder;
   try {
     final plan = CapturePlan(video.metadata.duration, options);
     final selected = plan.select(video.packets());
     Directory(directory).createSync(recursive: true);
-    _writeCaptures(video, input, directory, plan, selected);
+    final paths = _capturePaths(input, directory, plan, selected);
+    decoder = VideoCaptureDecoder(video, threads: threads);
+    await for (final decoded in decoder.decode(paths.keys)) {
+      _publishCaptures(paths[decoded.packet]!, decoded.frame);
+    }
   } finally {
-    video.close();
-  }
-}
-
-void _writeCaptures(
-  Video video,
-  String input,
-  String directory,
-  CapturePlan plan,
-  List<List<FramePacket>> selected,
-) {
-  final paths = _capturePaths(input, directory, plan, selected);
-  for (final decoded in video.decodeSelected(paths.keys)) {
-    _publishCaptures(paths[decoded.packet]!, decoded.frame);
+    try {
+      await decoder?.close();
+    } finally {
+      video.close();
+    }
   }
 }
 
@@ -170,7 +173,7 @@ int _avifQIndex(int crf, {required bool animated}) {
 typedef GridFrameVisitor =
     void Function(int index, image.Image grid, int tileWidth, int tileHeight);
 
-void writeContactSheet(
+Future<void> writeContactSheet(
   String input,
   String output,
   CaptureOptions options, {
@@ -180,11 +183,12 @@ void writeContactSheet(
   double fps = 20,
   int avifCrf = defaultAvifCrf,
   int webp = 75,
+  int threads = defaultCaptureThreads,
   String? captureDirectory,
   void Function(String stage)? mark,
   CaptureSelection? onSelect,
   GridFrameVisitor? onGrid,
-}) {
+}) async {
   final extension = output.split('.').last.toLowerCase();
   final image.Encoder? encoder;
   switch (extension) {
@@ -201,6 +205,7 @@ void writeContactSheet(
   }
   _checkOutput(input, output);
   final video = Video(input);
+  VideoCaptureDecoder? decoder;
   try {
     final plan = CapturePlan(video.metadata.duration, options);
     final selected = plan.select(video.packets(), onSelect: onSelect);
@@ -209,22 +214,21 @@ void writeContactSheet(
     Map<FramePacket, List<String>>? paths;
     if (captureDirectory != null) {
       Directory(captureDirectory).createSync(recursive: true);
-      if (inter) {
-        paths = _capturePaths(input, captureDirectory, plan, selected);
-      } else {
-        _writeCaptures(video, input, captureDirectory, plan, selected);
-      }
+      paths = _capturePaths(input, captureDirectory, plan, selected);
     }
+    decoder = VideoCaptureDecoder(
+      video,
+      threads: threads,
+      scaler: inter && (width != null || height != null)
+          ? YuvImageScaler(width: width, height: height)
+          : null,
+      includeOriginal: inter && paths != null,
+    );
     final cached = <FramePacket, image.Image>{};
     if (inter) {
-      final scaler = width == null && height == null
-          ? null
-          : YuvImageScaler(width: width, height: height);
       var decodedBytes = 0;
-      for (final result in video.decodeSelected(
+      await for (final result in decoder.decode(
         selected.expand((tile) => tile),
-        scaler: scaler,
-        includeOriginal: paths != null,
       )) {
         final frame = result.frame;
         decodedBytes += frame.width * frame.height * 3;
@@ -248,15 +252,28 @@ void writeContactSheet(
     AvifEncoder? avif;
     GridComposer? composer;
     for (var frame = 0; frame < options.frames; frame++) {
+      final missing = <FramePacket, List<int>>{};
       var changed = false;
       for (var tile = 0; tile < tiles.length; tile++) {
         final packet = selected[tile][frame];
         if (last[tile] == packet) continue;
-        tiles[tile] =
-            cached[packet] ??
-            resizeToFit(video.decode(packet), width: width, height: height);
         last[tile] = packet;
+        if (inter) {
+          tiles[tile] = cached[packet]!;
+        } else {
+          missing.putIfAbsent(packet, () => []).add(tile);
+        }
         changed = true;
+      }
+      if (missing.isNotEmpty) {
+        await for (final result in decoder.decode(missing.keys)) {
+          final captures = paths?.remove(result.packet);
+          if (captures != null) _publishCaptures(captures, result.frame);
+          final tile = resizeToFit(result.frame, width: width, height: height);
+          for (final index in missing[result.packet]!) {
+            tiles[index] = tile;
+          }
+        }
       }
       final first = tiles.first!;
       if (!changed && avif != null) {
@@ -312,6 +329,10 @@ void writeContactSheet(
     publishBytes(output, bytes);
     mark?.call('publish');
   } finally {
-    video.close();
+    try {
+      await decoder?.close();
+    } finally {
+      video.close();
+    }
   }
 }

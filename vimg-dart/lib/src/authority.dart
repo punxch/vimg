@@ -14,7 +14,7 @@ import 'video_commands.dart';
 const _marker = '.vimg-authority';
 const _signature = 'vimg-authority-v1\n';
 
-void recordAuthority(
+Future<void> recordAuthority(
   String input,
   String output,
   String manifest,
@@ -22,9 +22,10 @@ void recordAuthority(
   required int columns,
   required int height,
   required double fps,
+  int threads = defaultCaptureThreads,
   String? captureDirectory,
   void Function(String stage)? mark,
-}) {
+}) async {
   final outputFile = File(output).absolute;
   final manifestFile = File(manifest).absolute;
   final framePath = '${manifestFile.path}.frames';
@@ -50,7 +51,7 @@ void recordAuthority(
       lock.lockSync(FileLock.blockingExclusive);
     }
     _validatePaths(input, outputFile, manifestFile, framePath);
-    _record(
+    await _record(
       input,
       output,
       manifest,
@@ -58,6 +59,7 @@ void recordAuthority(
       columns,
       height,
       fps,
+      threads,
       outputFile,
       manifestFile,
       Directory(framePath),
@@ -71,7 +73,7 @@ void recordAuthority(
   }
 }
 
-void _record(
+Future<void> _record(
   String input,
   String output,
   String manifest,
@@ -79,12 +81,13 @@ void _record(
   int columns,
   int height,
   double fps,
+  int threads,
   File outputFile,
   File manifestFile,
   Directory container,
   String? captureDirectory,
   void Function(String stage)? mark,
-) {
+) async {
   if (_type(container.path) != FileSystemEntityType.notFound &&
       !_owned(container))
     throw FormatException(
@@ -110,13 +113,14 @@ void _record(
       ..createSync();
     _markOwned(frames);
     final recorder = _Recorder(frames, options.number, options.frames);
-    writeContactSheet(
+    await writeContactSheet(
       input,
       stagedOutput.path,
       options,
       columns: columns,
       height: height,
       fps: fps,
+      threads: threads,
       captureDirectory: captureDirectory,
       mark: mark,
       onSelect: recorder.selection,

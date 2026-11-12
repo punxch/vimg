@@ -137,10 +137,18 @@ Future<void> main(List<String> arguments) async {
     );
 
     final avif = File('${temp.path}/grid.avif');
-    await run(['vcs', '-c2', '-H24', '-n2', '-f2', mkv.path, '-o', avif.path]);
+    final gridArgs = ['vcs', '-c2', '-H24', '-n2', '-f2', mkv.path];
+    await run([...gridArgs, '-T0', '-o', avif.path]);
     check(
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
       'Default VCS format is an AVIF image sequence',
+    );
+    final serial = File('${temp.path}/grid-serial.avif');
+    await run([...gridArgs, '--threads', '1', '-o', serial.path]);
+    check(
+      base64Encode(avif.readAsBytesSync()) ==
+          base64Encode(serial.readAsBytesSync()),
+      'Serial and automatic-thread MJPEG grids are identical',
     );
 
     final avifStill = File('${temp.path}/grid-still.avif');

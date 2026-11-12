@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
@@ -11,10 +13,8 @@ import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
 import 'h264/idr_picture.dart';
-import 'h264/picture.dart';
 import 'hevc/access_unit.dart';
 import 'hevc/decode_picture.dart';
-import 'hevc/picture.dart';
 import 'iso_frames.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
@@ -23,6 +23,8 @@ import 'metadata.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
+part 'video_workers.dart';
+
 typedef _SelectedFrame = ({
   FramePacket packet,
   image.Image frame,
@@ -30,7 +32,7 @@ typedef _SelectedFrame = ({
 });
 
 final class Video {
-  Video(String path) : _input = File(path).openSync() {
+  Video(this.path) : _input = File(path).openSync() {
     try {
       file = BinaryFile(_input);
       final signature = file.unsigned(0, 4);
@@ -47,6 +49,7 @@ final class Video {
     }
   }
 
+  final String path;
   final RandomAccessFile _input;
   late final BinaryFile file;
   Matroska? _matroska;
@@ -206,55 +209,6 @@ final class Video {
     );
   }
 
-  Iterable<_SelectedFrame> _decodeAv1Selected(
-    Iterable<FramePacket> selected, {
-    YuvImageScaler? scaler,
-    bool includeOriginal = false,
-  }) sync* {
-    final (timeline: timeline, configurations: configurations) = _av1Timeline;
-    final targets = {
-      for (final packet in selected)
-        timeline.index[packet] ??
-            (throw const FormatException('Unknown AV1 video packet')),
-    }.toList()..sort();
-    var group = -1, next = 0;
-    Av1AccessUnits? units;
-    Av1StreamDecoder? decoder;
-    for (final target in targets) {
-      final start = timeline.gopStart[target];
-      if (start < 0)
-        throw const FormatException('AV1 picture has no preceding keyframe');
-      if (group != start) {
-        units = Av1AccessUnits()..configure(configurations[start]!);
-        decoder = Av1StreamDecoder();
-        group = start;
-        next = start;
-      }
-      while (next <= target) {
-        final packet = timeline.decodeOrder[next++];
-        Av1Picture? displayed;
-        for (final frame in units!.readSample(_read(packet))) {
-          final picture = decoder!.decode(frame);
-          if (frame.shown && next - 1 == target) {
-            displayed = applyAv1FilmGrain(
-              picture,
-              frame.header.parameters.filmGrain,
-            );
-          }
-        }
-        if (next - 1 == target) {
-          if (displayed == null)
-            throw const FormatException('AV1 sample has no display picture');
-          final frame = displayed.rgb(scaler: scaler);
-          final original = includeOriginal
-              ? (scaler == null ? frame : displayed.rgb())
-              : null;
-          yield (packet: packet, frame: frame, original: original);
-        }
-      }
-    }
-  }
-
   _VideoTimeline _indexVideo() {
     final hevc = codec == 'hevc' ? _hevc.configuration : null;
     final avc = hevc == null ? _h264.configuration : null;
@@ -302,72 +256,124 @@ final class Video {
     YuvImageScaler? scaler,
     bool includeOriginal = false,
   }) sync* {
-    if (codec == 'av1') {
-      yield* _decodeAv1Selected(
-        selected,
-        scaler: scaler,
-        includeOriginal: includeOriginal,
-      );
-      return;
+    for (final run in _decodeRuns(selected)) {
+      yield* _decodeRun(run, scaler, includeOriginal);
     }
+  }
+
+  /// Split exactly where the serial decoder would restart. In particular, an
+  /// HEVC leading picture can require decoding across a random-access point.
+  Iterable<_DecodeRun> _decodeRuns(Iterable<FramePacket> selected) sync* {
     if (!usesReferencePictures) {
       for (final packet in selected) {
-        final frame = decode(packet);
-        yield (
-          packet: packet,
-          frame: frame,
-          original: includeOriginal ? frame : null,
-        );
+        yield (packets: [packet], targets: const [0], configuration: null);
       }
       return;
     }
-
-    final timeline = _timeline;
+    final av1 = codec == 'av1';
+    final timeline = av1 ? _av1Timeline.timeline : _timeline;
     final targets = {
       for (final packet in selected)
         timeline.index[packet] ??
-            (throw const FormatException('Unknown video packet')),
+            (throw FormatException('Unknown ${av1 ? 'AV1 ' : ''}video packet')),
     }.toList()..sort();
-    final hevc = codec == 'hevc';
-    H264StreamDecoder? avcDecoder;
-    HevcStreamDecoder? hevcDecoder;
-    var group = -1;
-    var next = 0;
+    var start = -1, end = -1;
+    var wanted = <int>[];
+    _DecodeRun run() => (
+      packets: timeline.decodeOrder.sublist(start, end + 1),
+      targets: wanted,
+      configuration: av1 ? _av1Timeline.configurations[start]! : null,
+    );
     for (final target in targets) {
-      final start = timeline.gopStart[target];
-      if (start < 0) {
-        throw const FormatException(
-          'Picture has no preceding random-access point',
+      final anchor = timeline.gopStart[target];
+      if (anchor < 0) {
+        throw FormatException(
+          av1
+              ? 'AV1 picture has no preceding keyframe'
+              : 'Picture has no preceding random-access point',
         );
       }
-      if (group < 0 || start < group || start >= next) {
-        if (hevc) {
-          hevcDecoder = HevcStreamDecoder(HevcConfiguration(_hevcConfig));
-        } else {
-          avcDecoder = H264StreamDecoder(AvcConfiguration(_avcConfig));
-        }
-        group = start;
-        next = start;
+      if (start < 0 ||
+          (av1 ? anchor != start : anchor < start || anchor > end)) {
+        if (start >= 0) yield run();
+        start = anchor;
+        wanted = [];
       }
-      while (next <= target) {
-        final packet = timeline.decodeOrder[next++];
-        final bytes = _read(packet);
-        final picture = hevc
-            ? hevcDecoder!.decode(bytes)
-            : avcDecoder!.decode(bytes);
-        if (next - 1 == target) {
-          final render = switch (picture) {
-            HevcPicture picture => picture.rgb,
-            H264Picture picture => picture.rgb,
-            _ => throw FormatException('Invalid $codec video frame'),
-          };
-          final frame = render(scaler: scaler);
-          final original = includeOriginal
-              ? (scaler == null ? frame : render())
-              : null;
-          yield (packet: packet, frame: frame, original: original);
-        }
+      wanted.add(target - start);
+      end = target;
+    }
+    if (start >= 0) yield run();
+  }
+
+  Iterable<_SelectedFrame> _decodeRun(
+    _DecodeRun run,
+    YuvImageScaler? scaler,
+    bool includeOriginal,
+  ) sync* {
+    if (!usesReferencePictures) {
+      final packet = run.packets.single;
+      final frame = decode(packet);
+      yield (
+        packet: packet,
+        frame: frame,
+        original: includeOriginal ? frame : null,
+      );
+      return;
+    }
+    final readPicture = _pictureReader(run.configuration);
+    var target = 0;
+    for (final (i, packet) in run.packets.indexed) {
+      final selected = i == run.targets[target];
+      final render = readPicture(_read(packet), selected);
+      if (!selected) continue;
+      if (render == null) {
+        throw FormatException(
+          codec == 'av1'
+              ? 'AV1 sample has no display picture'
+              : 'Invalid $codec video frame',
+        );
       }
+      final frame = render(scaler: scaler);
+      final original = includeOriginal
+          ? (scaler == null ? frame : render())
+          : null;
+      yield (packet: packet, frame: frame, original: original);
+      target++;
+    }
+  }
+
+  _RenderPicture? Function(Uint8List, bool) _pictureReader(
+    Uint8List? configuration,
+  ) {
+    switch (codec) {
+      case 'av1':
+        final units = Av1AccessUnits()..configure(configuration!);
+        final decoder = Av1StreamDecoder();
+        return (bytes, selected) {
+          Av1Picture? displayed;
+          for (final frame in units.readSample(bytes)) {
+            final picture = decoder.decode(frame);
+            if (selected && frame.shown) {
+              displayed = applyAv1FilmGrain(
+                picture,
+                frame.header.parameters.filmGrain,
+              );
+            }
+          }
+          return displayed?.rgb;
+        };
+      case 'hevc':
+        final decoder = HevcStreamDecoder(HevcConfiguration(_hevcConfig));
+        return (bytes, selected) {
+          final picture = decoder.decode(bytes);
+          return selected ? picture?.rgb : null;
+        };
+      default:
+        final decoder = H264StreamDecoder(AvcConfiguration(_avcConfig));
+        return (bytes, selected) {
+          final picture = decoder.decode(bytes);
+          return selected ? picture?.rgb : null;
+        };
     }
   }
 
@@ -394,7 +400,7 @@ final class Video {
 
   image.Image decode(FramePacket packet, {bool preview = false}) {
     if (codec == 'av1' && !preview)
-      return _decodeAv1Selected([packet]).single.frame;
+      return decodeSelected([packet]).single.frame;
     final bytes = _read(packet);
     if (codec == 'h264') {
       return _h264.decode(bytes)?.rgb() ??
@@ -446,4 +452,11 @@ typedef _VideoTimeline = ({
   List<FramePacket> presentation,
   Map<FramePacket, int> index,
   List<int> gopStart,
+});
+
+typedef _RenderPicture = image.Image Function({YuvImageScaler? scaler});
+typedef _DecodeRun = ({
+  List<FramePacket> packets,
+  List<int> targets,
+  Uint8List? configuration,
 });

@@ -15,7 +15,7 @@ String _profile(GridFormat format) => switch (format) {
 
 Future<bool> renderPreview(PreviewJob job) => Isolate.run(() => _render(job));
 
-bool _render(PreviewJob job) {
+Future<bool> _render(PreviewJob job) async {
   final format = GridFormat.fromCache(job.cache);
   final target = File(job.cache).absolute;
   final source = File(job.file).absolute;
@@ -32,7 +32,7 @@ bool _render(PreviewJob job) {
   final staging = target.parent.createTempSync('.vimg-preview-');
   try {
     final staged = File.fromUri(staging.uri.resolve('preview.${format.name}'));
-    writeContactSheet(
+    await writeContactSheet(
       source.path,
       staged.path,
       const CaptureOptions(number: 9, frames: 30),

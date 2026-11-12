@@ -91,6 +91,12 @@ abstract class _CaptureCommand extends VimgCommand {
         help: 'Duration per capture.',
       )
       ..addOption(
+        'threads',
+        abbr: 'T',
+        defaultsTo: '$defaultCaptureThreads',
+        help: 'Maximum parallel capture decoders. 0 uses available CPUs.',
+      )
+      ..addOption(
         'output-dir',
         defaultsTo: '.',
         help: 'Directory for generated files.',
@@ -116,8 +122,12 @@ final class ExtractCommand extends _CaptureCommand {
   String get description => 'Extract video frames as BMP images.';
 
   @override
-  void run() =>
-      extractFrames(video, argResults!.option('output-dir')!, options(1));
+  Future<void> run() => extractFrames(
+    video,
+    argResults!.option('output-dir')!,
+    options(1),
+    threads: integer('threads')!,
+  );
 }
 
 final class VcsCommand extends _CaptureCommand {
@@ -177,7 +187,7 @@ final class VcsCommand extends _CaptureCommand {
       : 'Create a video contact sheet.';
 
   @override
-  void run() {
+  Future<void> run() async {
     final args = argResults!;
     final input = video;
     final width = integer('capture-width', min: 1, max: 16384);
@@ -192,6 +202,7 @@ final class VcsCommand extends _CaptureCommand {
     final directory = args.option('output-dir')!;
     final webp = integer('webp', max: 255)!;
     final avifCrf = integer('avif-crf', max: 63)!;
+    final threads = integer('threads')!;
     final suffix = webp == 0 ? 'avif' : 'webp';
     final output =
         args.option('output') ??
@@ -224,7 +235,7 @@ final class VcsCommand extends _CaptureCommand {
           '(-c3 -H160 -n9, 30 frames/1.5s, 20fps, no offsets).',
         );
       }
-      recordAuthority(
+      await recordAuthority(
         input,
         output,
         args.option('manifest')!,
@@ -232,11 +243,12 @@ final class VcsCommand extends _CaptureCommand {
         columns: columns,
         height: height!,
         fps: fps,
+        threads: threads,
         captureDirectory: captures,
         mark: timings?.mark,
       );
     } else {
-      writeContactSheet(
+      await writeContactSheet(
         input,
         output,
         capture,
@@ -245,6 +257,7 @@ final class VcsCommand extends _CaptureCommand {
         height: height,
         fps: fps,
         avifCrf: avifCrf,
+        threads: threads,
         captureDirectory: captures,
         mark: timings?.mark,
       );

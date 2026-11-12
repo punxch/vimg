@@ -69,6 +69,10 @@ The authority manifest identifies the capture backend as
 in the presentation timeline used for Dart capture. The source PTS is
 stored as integer ticks with a rational time base, before applying playback edits.
 
+`extract`, `vcs`, and `authority record` accept `-T` / `--threads`. The default
+is 4 capture workers. `-T0` uses available CPUs and `-T1` decodes serially.
+Workers share the capture schedule and decode independent runs of pictures.
+
 Contact sheet AVIFs use the pure Dart 10-bit 4:2:0 encoder with DCT residuals.
 Animated sheets search the preceding reconstructed frame for quarter-pixel
 motion and reuse reconstructed frames for repeats. Dart maps `--avif-crf`
