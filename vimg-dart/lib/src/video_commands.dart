@@ -188,7 +188,7 @@ void writeContactSheet(
     final plan = CapturePlan(video.metadata.duration, options);
     final selected = plan.select(video.packets());
     mark?.call('schedule');
-    final inter = video.codec == 'h264';
+    final inter = video.usesReferencePictures;
     Map<FramePacket, List<String>>? paths;
     if (captureDirectory != null) {
       Directory(captureDirectory).createSync(recursive: true);

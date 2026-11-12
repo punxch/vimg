@@ -43,11 +43,12 @@ same GOP, and select captures by presentation timestamp. `sample/input.mkv`
 can be used with `preview`, `extract` and `vcs`. `preview` selects an IDR for
 a quick static image.
 
-Matroska and MP4/MOV also support progressive HEVC intra pictures in 4:2:0
+Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in 4:2:0
 or monochrome, up to 12 bits. `preview` selects an HEVC random-access
-picture. `extract` and `vcs` work with intra-only HEVC video. HEVC inter
-prediction and range extension tools are pending, along with Rust's
-`authority` commands, FFmpeg filter expressions and hardware capture backends.
+picture. `extract` and `vcs` decode from the preceding random-access point
+and handle leading pictures that depend on an earlier GOP. HEVC range
+extension tools are pending, along with Rust's `authority` commands,
+FFmpeg filter expressions and hardware capture backends.
 
 The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses
 separate palettes for green samples and blue/red pairs. Blocks with up to

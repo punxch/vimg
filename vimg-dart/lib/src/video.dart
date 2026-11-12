@@ -8,8 +8,10 @@ import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
 import 'h264/idr_picture.dart';
+import 'h264/picture.dart';
 import 'hevc/access_unit.dart';
-import 'hevc/intra_picture.dart';
+import 'hevc/decode_picture.dart';
+import 'hevc/picture.dart';
 import 'iso_frames.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
@@ -48,15 +50,18 @@ final class Video {
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
       (throw const FormatException('No video stream'));
 
+  bool get usesReferencePictures => codec == 'h264' || codec == 'hevc';
+
   void close() => _input.closeSync();
 
   late final Uint8List _avcConfig = _configuration('h264');
   late final H264IdrDecoder _h264 = H264IdrDecoder(
     AvcConfiguration(_avcConfig),
   );
-  late final _H264Timeline _h264Timeline = _indexH264();
+  late final _VideoTimeline _timeline = _indexVideo();
+  late final Uint8List _hevcConfig = _configuration('hevc');
   late final HevcIntraDecoder _hevc = HevcIntraDecoder(
-    HevcConfiguration(_configuration('hevc')),
+    HevcConfiguration(_hevcConfig),
   );
 
   Uint8List _configuration(String codec) {
@@ -76,7 +81,7 @@ final class Video {
 
   Iterable<FramePacket> packets({bool preview = false}) {
     if (codec == 'h264') {
-      return preview ? _h264Keyframes() : _h264Timeline.presentation;
+      return preview ? _h264Keyframes() : _timeline.presentation;
     }
     if (codec == 'hevc') {
       final configuration = _hevc.configuration;
@@ -89,10 +94,7 @@ final class Video {
           ),
         );
       }
-      return _containerPackets(false).toList()..sort((a, b) {
-        final time = a.seconds.compareTo(b.seconds);
-        return time != 0 ? time : a.offset.compareTo(b.offset);
-      });
+      return _timeline.presentation;
     }
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
@@ -124,22 +126,36 @@ final class Video {
     ).where((packet) => _isIdr(configuration, packet));
   }
 
-  _H264Timeline _indexH264() {
-    final configuration = _h264.configuration;
+  _VideoTimeline _indexVideo() {
+    final hevc = codec == 'hevc' ? _hevc.configuration : null;
+    final avc = hevc == null ? _h264.configuration : null;
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
-    var start = -1;
+    var start = -1, previous = -1;
     final presentation = _containerPackets(
       false,
       onSample: (packet, sync) {
         final position = decodeOrder.length;
-        if (sync && _isIdr(configuration, packet)) start = position;
+        final header = hevc?.pictureHeader(
+          packet.offset,
+          packet.size,
+          file.unsigned,
+        );
+        if (header?.randomAccess == true ||
+            (avc != null && sync && _isIdr(avc, packet))) {
+          // RASL pictures following a CRA can still refer across it.
+          previous = header?.type == 21 ? start : -1;
+          start = position;
+        }
         index[packet] = position;
         decodeOrder.add(packet);
-        gopStart.add(start);
+        gopStart.add(header?.rasl == true ? previous : start);
       },
     ).toList();
+    if (hevc != null) {
+      presentation.removeWhere((packet) => gopStart[index[packet]!] < 0);
+    }
     presentation.sort((a, b) {
       final byTime = a.seconds.compareTo(b.seconds);
       return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
@@ -155,40 +171,53 @@ final class Video {
   Iterable<({FramePacket packet, image.Image frame})> decodeSelected(
     Iterable<FramePacket> selected,
   ) sync* {
-    if (codec != 'h264') {
+    if (!usesReferencePictures) {
       for (final packet in selected) {
         yield (packet: packet, frame: decode(packet));
       }
       return;
     }
 
-    final timeline = _h264Timeline;
+    final timeline = _timeline;
     final targets = {
       for (final packet in selected)
         timeline.index[packet] ??
-            (throw const FormatException('Unknown H.264 video packet')),
+            (throw const FormatException('Unknown video packet')),
     }.toList()..sort();
-    H264StreamDecoder? decoder;
+    final hevc = codec == 'hevc';
+    H264StreamDecoder? avcDecoder;
+    HevcStreamDecoder? hevcDecoder;
     var group = -1;
     var next = 0;
     for (final target in targets) {
       final start = timeline.gopStart[target];
       if (start < 0) {
-        throw const FormatException('H.264 picture has no preceding IDR');
+        throw const FormatException(
+          'Picture has no preceding random-access point',
+        );
       }
-      if (start != group) {
-        decoder = H264StreamDecoder(AvcConfiguration(_avcConfig));
+      if (group < 0 || start < group || start >= next) {
+        if (hevc) {
+          hevcDecoder = HevcStreamDecoder(HevcConfiguration(_hevcConfig));
+        } else {
+          avcDecoder = H264StreamDecoder(AvcConfiguration(_avcConfig));
+        }
         group = start;
         next = start;
       }
       while (next <= target) {
         final packet = timeline.decodeOrder[next++];
-        final picture = decoder!.decode(_read(packet));
+        final bytes = _read(packet);
+        final picture = hevc
+            ? hevcDecoder!.decode(bytes)
+            : avcDecoder!.decode(bytes);
         if (next - 1 == target) {
-          if (picture == null) {
-            throw const FormatException('Invalid H.264 video frame');
-          }
-          yield (packet: packet, frame: picture.rgb());
+          final frame = switch (picture) {
+            HevcPicture picture => picture.rgb(),
+            H264Picture picture => picture.rgb(),
+            _ => throw FormatException('Invalid $codec video frame'),
+          };
+          yield (packet: packet, frame: frame);
         }
       }
     }
@@ -221,11 +250,14 @@ final class Video {
       return _h264.decode(bytes)?.rgb() ??
           decodeSelected([packet]).single.frame;
     }
+    if (codec == 'hevc') {
+      return _hevc.decode(bytes)?.rgb() ??
+          decodeSelected([packet]).single.frame;
+    }
     final frame = switch (codec) {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
-      'hevc' => _hevc.decode(bytes)?.rgb(),
       'rawvideo' => _avi?.decodeBitmap(bytes),
       _ => null,
     };
@@ -250,7 +282,7 @@ final class Video {
   }
 }
 
-typedef _H264Timeline = ({
+typedef _VideoTimeline = ({
   List<FramePacket> decodeOrder,
   List<FramePacket> presentation,
   Map<FramePacket, int> index,

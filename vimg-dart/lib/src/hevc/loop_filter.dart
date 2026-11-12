@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'ctu_layout.dart';
+import 'motion_field.dart';
 import 'picture.dart';
 import 'sao.dart';
 import 'slice_header.dart';
@@ -17,6 +18,8 @@ final class HevcLoopFilter {
     this.qp,
     this.edges,
     this.disabled,
+    this.intra,
+    this.lumaCbf,
     this.sao,
   );
 
@@ -25,7 +28,7 @@ final class HevcLoopFilter {
   final Int32List owners;
   final List<HevcSliceHeader?> headers;
   final Int8List qp;
-  final Uint8List edges, disabled;
+  final Uint8List edges, disabled, intra, lumaCbf;
   final List<HevcSao> sao;
 
   int _cell(int x, int y) => (y >> 2) * (picture.luma.width >> 2) + (x >> 2);
@@ -66,14 +69,27 @@ final class HevcLoopFilter {
         final keepP = disabled[pCell] != 0, keepQ = disabled[qCell] != 0;
         if (keepP && keepQ) continue;
         final average = (qp[pCell] + qp[qCell] + 1) >> 1;
-        // All reconstructed edges here adjoin an intra CU (bS = 2).
+        final int strength;
+        if (intra[pCell] != 0 || intra[qCell] != 0) {
+          strength = 2;
+        } else if (edges[qCell] & (flag << 2) != 0 &&
+            (lumaCbf[pCell] != 0 || lumaCbf[qCell] != 0)) {
+          strength = 1;
+        } else {
+          final motion = picture.motion!;
+          if (!hevcMotionBoundary(motion.at(px, py)!, motion.at(x, y)!))
+            continue;
+          strength = 1;
+        }
         final beta =
             _beta[(average + parameters.beta).clamp(0, 51)] << (luma.depth - 8);
         final tc =
-            _tc[(average + 2 + parameters.tc).clamp(0, 53)] << (luma.depth - 8);
+            _tc[(average + 2 * (strength - 1) + parameters.tc).clamp(0, 53)] <<
+            (luma.depth - 8);
         if (beta > 0 && tc > 0)
           _luma(luma, x, y, vertical, beta, tc, keepP, keepQ);
-        if (picture.cb == null ||
+        if (strength != 2 ||
+            picture.cb == null ||
             (vertical ? x : y) & 15 != 0 ||
             (vertical ? y : x) & 7 != 0)
           continue;

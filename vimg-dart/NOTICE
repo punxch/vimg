@@ -13,8 +13,10 @@ The H.264 inter macroblock parser and CAVLC tables use Rui Carmo's go-264
 as a reference (cecca3835cbdf52167c9d892caacfa8eda6eb406). See
 licenses/go-264.txt for the MIT terms.
 
-The HEVC CABAC context tables, intra reconstruction and loop filters use
+The HEVC CABAC context tables, reconstruction and loop filters use
 OxideAV's H.265 decoder as a reference (5191305e536509b9d4045a3511773c0ea5d7b0fe). See
 licenses/oxideav-h265.txt for the MIT terms.
 The HEVC tiled PCM fixture remuxes r453-pcm-tiles-explicit-96x64.hevc
 from the same project.
+The HEVC inter fixtures remux r456-lowdelay-tiles-sl-rdoq-aq-qp29.hevc and
+r456-pyramid-rdoq-sdh-tu2-wp-wpp-qp30.hevc from that project.

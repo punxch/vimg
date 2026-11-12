@@ -3,10 +3,11 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import '../yuv_image.dart';
+import 'motion_field.dart';
 import 'parameters.dart';
 
 final class HevcPicture {
-  HevcPicture(this.sps)
+  HevcPicture(this.sps, {bool inter = false})
     : luma = HevcPlane(sps.codedWidth, sps.codedHeight, sps.lumaDepth),
       cb = sps.chromaArrayType == 0
           ? null
@@ -21,11 +22,13 @@ final class HevcPicture {
               sps.codedWidth >> 1,
               sps.codedHeight >> 1,
               sps.chromaDepth,
-            );
+            ),
+      motion = inter ? HevcMotionField(sps.codedWidth, sps.codedHeight) : null;
 
   final HevcSps sps;
   final HevcPlane luma;
   final HevcPlane? cb, cr;
+  final HevcMotionField? motion;
 
   image.Image rgb() => yuv420Image(
     y: luma.samples,

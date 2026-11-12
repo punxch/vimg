@@ -122,15 +122,25 @@ final class HevcConfiguration {
     int start,
     int length,
     int Function(int, int) read,
+  ) => pictureHeader(start, length, read)?.randomAccess == true;
+
+  HevcNalHeader? pictureHeader(
+    int start,
+    int length,
+    int Function(int, int) read,
   ) {
     for (final extent in _extents(start, length, read)) {
       final header = readHevcNalHeader(read(extent.start, 2));
       if (header.layer != 0 || !header.codedSlice) continue;
       if (extent.end - extent.start < 3)
         throw const FormatException('Missing HEVC slice payload');
-      return header.randomAccess && read(extent.start + 2, 1) & 0x80 != 0;
+      if (read(extent.start + 2, 1) & 0x80 == 0)
+        throw const FormatException(
+          'HEVC sample starts with a partial picture',
+        );
+      return header;
     }
-    return false;
+    return null;
   }
 
   Iterable<({int start, int end})> _extents(
