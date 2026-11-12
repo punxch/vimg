@@ -70,8 +70,8 @@ in the presentation timeline used for Dart capture. The source PTS is
 stored as integer ticks with a rational time base, before applying playback edits.
 
 Contact sheet AVIFs use the pure Dart 10-bit 4:2:0 encoder with DCT residuals.
-Animated sheets predict from the preceding reconstructed frame at the same
-pixel positions and reuse reconstructed frames for repeats. Dart maps `--avif-crf`
+Animated sheets search the preceding reconstructed frame for quarter-pixel
+motion and reuse reconstructed frames for repeats. Dart maps `--avif-crf`
 to its own AV1 quantizers. `join` uses the 8-bit 4:4:4 palette encoder for
 still AVIF images. Both encoders support one AV1 Level 5.1 tile.
 

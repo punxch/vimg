@@ -8,8 +8,11 @@ import 'inter_prediction.dart';
 import 'inter_prediction_tables.dart';
 import 'motion_vectors.dart';
 import 'range_decoder.dart';
+import 'range_encoder.dart';
 import 'sequence_header.dart';
 import 'warp.dart';
+
+part 'inter_motion_encoder.dart';
 
 enum _Cdf {
   refMode,

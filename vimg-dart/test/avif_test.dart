@@ -25,8 +25,50 @@ Future<void> main(List<String> arguments) async {
       await _checkAvif(temp, width, height, frames, arguments.firstOrNull);
     }
     await _checkTransformAnimation(temp, arguments.firstOrNull);
+    _checkMotionSavings(temp);
   } finally {
     temp.deleteSync(recursive: true);
+  }
+}
+
+void _checkMotionSavings(Directory temp) {
+  const width = 151, height = 99;
+  final source = <image.Image>[];
+  final encoder = AvifEncoder(width, height, fps: 20, qIndex: 24);
+  for (final (dx, dy) in [(0, 0), (3, -2), (6, -4)]) {
+    final frame = image.Image(width: width, height: height);
+    for (final pixel in frame) {
+      final x = (pixel.x + dx).clamp(0, width - 1);
+      final y = (pixel.y + dy).clamp(0, height - 1);
+      final luma =
+          48 +
+          ((x * 13 + y * 17 + x * y * 7 + 41 * ((x ~/ 7 ^ y ~/ 9) & 3)) & 127);
+      pixel.setRgb(luma + x ~/ 8, luma + y ~/ 8, luma);
+    }
+    source.add(frame);
+    encoder.addFrame(frame);
+  }
+  final path = '${temp.path}/motion.avif';
+  File(path).writeAsBytesSync(encoder.finish());
+  final animation = AvifAnimation.open(path);
+  try {
+    final samples = animation
+        .codedFrames()
+        .map((entry) => entry.packet.size)
+        .toList();
+    check(samples.length == source.length, 'Motion fixture frame count');
+    check(
+      samples.skip(1).every((bytes) => bytes * 4 < samples.first),
+      'The translated texture compresses into small inter samples',
+    );
+    for (final (i, frame) in animation.decodeFrames().indexed) {
+      check(
+        frameSsim(source[i], frame) >= 0.995,
+        'Motion fixture fidelity at $i',
+      );
+    }
+  } finally {
+    animation.close();
   }
 }
 

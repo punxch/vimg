@@ -44,7 +44,7 @@ enum Av1GlobalMotionType { identity, translation, rotZoom, affine }
 
 typedef Av1GlobalMotion = ({Av1GlobalMotionType type, List<int> matrix});
 
-const _identity = (
+const av1IdentityGlobalMotion = (
   type: Av1GlobalMotionType.identity,
   matrix: [0, 0, 65536, 0, 0, 65536],
 );
@@ -213,14 +213,14 @@ List<Av1GlobalMotion> readAv1GlobalMotion(
   List<Av1GlobalMotion>? previous,
 ) {
   Av1GlobalMotion motion(int i) {
-    if (intra || !bits.flag()) return _identity;
+    if (intra || !bits.flag()) return av1IdentityGlobalMotion;
     final type = bits.flag()
         ? Av1GlobalMotionType.rotZoom
         : bits.flag()
         ? Av1GlobalMotionType.translation
         : Av1GlobalMotionType.affine;
-    final prior = previous?[i].matrix ?? _identity.matrix;
-    final matrix = List.of(_identity.matrix);
+    final prior = previous?[i].matrix ?? av1IdentityGlobalMotion.matrix;
+    final matrix = List.of(av1IdentityGlobalMotion.matrix);
     int param(int index, int absoluteBits, int shift) {
       final offset = index % 3 == 2 ? 65536 : 0;
       final r = (prior[index] - offset) >> shift;

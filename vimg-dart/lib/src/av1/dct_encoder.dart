@@ -6,13 +6,19 @@ import 'package:image/image.dart' as image;
 import 'bitstream.dart';
 import 'coefficients.dart';
 import 'entropy_context.dart';
+import 'frame_parameters.dart';
 import 'inter_cdfs.dart';
+import 'inter_prediction.dart';
+import 'inter_syntax.dart';
 import 'intra_cdfs.dart';
 import 'intra_prediction.dart';
+import 'motion_vectors.dart';
 import 'quantizer.dart';
 import 'quantizer_tables.dart';
 import 'range_encoder.dart';
 import 'transform.dart';
+
+part 'block_motion_search.dart';
 
 /// 10-bit 4:2:0 AV1 with quantized DCT residuals and one temporal reference.
 final class Av1DctEncoder {
@@ -44,6 +50,7 @@ final class Av1DctEncoder {
   final bool still;
   late final Uint8List sequence = _sequence();
   List<Uint16List>? _reference;
+  Av1EntropyContext? _referenceContext;
   static const _keyframeInterval = 32;
   int _framesSinceKey = _keyframeInterval;
   bool _referenceShowable = false;
@@ -100,9 +107,11 @@ final class Av1DctEncoder {
 
   Uint8List _encode(image.Image? pixels, {required bool keyframe}) {
     final inter = !keyframe;
+    final priorContext = inter ? _referenceContext : null;
+    final newSegmentation = inter && priorContext == null;
     final bits = BitWriter();
     if (!still) bits.write(inter ? 3 : 1, 4); // shown inter or keyframe
-    if (inter) bits.write(1, 1); // error resilient, no primary context
+    if (inter) bits.write(0, 1); // permit the last reference's entropy context
     bits.write(0, 1); // adapt tile probabilities
     if (still) {
       bits.write(0, 1); // no screen content tools
@@ -111,6 +120,7 @@ final class Av1DctEncoder {
     }
     if (inter) {
       bits
+        ..write(0, 3) // primary reference is LAST_FRAME
         ..write(1, 8) // update slot 0
         ..write(0, 21); // each reference type points to slot 0
     }
@@ -121,7 +131,8 @@ final class Av1DctEncoder {
         5,
       ); // no high precision, fixed regular filter, simple motion
     }
-    if (!still) bits.write(1, 1); // reset probabilities for each frame
+    if (!still)
+      bits.write(inter ? 0 : 1, 1); // retain adapted inter probabilities
     bits.write(1, 1); // uniform tiles
     if (width > 64) bits.write(0, 1); // one column
     if (height > 64) bits.write(0, 1); // one row
@@ -130,13 +141,18 @@ final class Av1DctEncoder {
       ..write(0, 4) // no quantizer deltas or matrices
       ..write(inter ? 1 : 0, 1);
     if (inter) {
-      // Segment zero uses the last reference and its identity global motion.
-      // Every block selects this segment, with no per-block motion syntax.
-      bits
-        ..write(0, 5)
-        ..write(9, 4) // SEG_LVL_REF_FRAME = LAST_FRAME
-        ..write(1, 2) // no forced skip, SEG_LVL_GLOBALMV
-        ..write(0, 56); // remaining segments have no enabled features
+      bits.write(newSegmentation ? 1 : 0, 1); // update the map after a keyframe
+      if (newSegmentation) {
+        bits
+          ..write(0, 1) // no temporal segment prediction
+          ..write(1, 1) // set segmentation features
+          ..write(0, 5)
+          ..write(9, 4) // segment zero uses LAST_FRAME
+          ..write(0, 2) // no forced skip or global motion
+          ..write(0, 56); // remaining segments have no enabled features
+      } else {
+        bits.write(0, 1); // inherit the segment features as well as the map
+      }
     }
     bits
       ..write(0, 1) // no delta-Q
@@ -150,12 +166,14 @@ final class Av1DctEncoder {
       height,
       pixels,
       qIndex,
-      inter ? _reference : null,
+      reference: inter ? _reference : null,
+      priorContext: priorContext,
     );
     final payload = BytesBuilder(copy: false)
       ..add(bits.finish())
       ..add(tile.encode());
     if (!still && pixels != null) _reference = tile.reconstructed;
+    _referenceContext = inter ? tile._context : null;
     _framesSinceKey = keyframe ? 1 : _framesSinceKey + 1;
     _referenceShowable = inter;
     return obu(6, payload.takeBytes());
@@ -165,10 +183,18 @@ final class Av1DctEncoder {
 enum _Syntax { partition, segment, skip, luma, chroma, transform }
 
 final class _DctTile {
-  _DctTile(this.width, this.height, image.Image? pixels, this.q, this.reference)
-    : columns = 2 * ((width + 7) >> 3),
-      rows = 2 * ((height + 7) >> 3),
-      repeat = pixels == null {
+  _DctTile(
+    this.width,
+    this.height,
+    image.Image? pixels,
+    this.q, {
+    required this.reference,
+    required Av1EntropyContext? priorContext,
+  }) : columns = 2 * ((width + 7) >> 3),
+       rows = 2 * ((height + 7) >> 3),
+       newSegmentation = reference != null && priorContext == null,
+       _context = priorContext?.copy(resetCount: true) ?? Av1EntropyContext(q),
+       repeat = pixels == null {
     if (pixels == null) return;
     _planes = [
       _DctPlane(columns * 4, rows * 4),
@@ -203,12 +229,13 @@ final class _DctTile {
   final int width, height, q, columns, rows;
   final List<Uint16List>? reference;
   final bool repeat;
+  final bool newSegmentation;
   bool get inter => reference != null;
   List<Uint16List> get reconstructed => [
     for (final plane in _planes) plane.reconstructed,
   ];
   final _range = RangeEncoder();
-  late final _context = Av1EntropyContext(q);
+  final Av1EntropyContext _context;
   late final _coefficients = Av1CoefficientEncoder(
     _range,
     _context.coefficients,
@@ -223,12 +250,27 @@ final class _DctTile {
     matrix: null,
   ), Av1DctEncoder.depth);
   final _predictor = Av1IntraPredictor();
+  late final _interPredictor = Av1InterPredictor();
+  late final _motionWriter = Av1SingleReferenceMotionEncoder(_range, _context);
+  late final _motionSearch = _BlockMotionSearch(
+    width,
+    height,
+    _planes[0].stride,
+    _planes[0].source,
+    reference![0],
+    av1AcQuantizers[1][q],
+  );
   final _forward = _ForwardDct();
   final _inverse = Av1InverseTransform();
   final _residual = Int32List(256);
+  final _dequantizedTrial = Int32List(256);
   late final List<_DctPlane> _planes;
   late final _blockSizes = Uint8List(columns * rows);
   late final _skips = Uint8List(columns * rows);
+  late final _motionBlocks = List<Av1InterNeighbor?>.filled(
+    columns * rows,
+    null,
+  );
 
   Uint8List encode() {
     for (var y = 0; y < rows; y += 16) {
@@ -278,20 +320,43 @@ final class _DctTile {
     final at = y4 * columns + x4;
     final skipContext =
         (y4 == 0 ? 0 : _skips[at - columns]) + (x4 == 0 ? 0 : _skips[at - 1]);
+    final stack = inter ? _stack(x4, y4, side) : null;
+    var mv = stack == null || repeat
+        ? av1ZeroMv
+        : _motionSearch.find(x4 * 4, y4 * 4, side * 4, stack);
     var skip = true;
     if (!repeat) {
-      for (final (p, plane) in _planes.indexed) {
-        final shift = p == 0 ? 2 : 1;
-        final n = side << shift;
-        final x = x4 << shift, y = y4 << shift;
-        final size = Av1TxSize.of(n, n);
-        _predict(plane, p, x, y, size);
-        final dc = av1DcQuantizers[1][q], ac = av1AcQuantizers[1][q];
-        final nonzero = _forward.quantize(plane, x, y, size, dc, ac);
-        skip &= !nonzero;
+      final moving = mv != av1ZeroMv;
+      final candidate = _prepareBlock(x4, y4, side, mv, measure: moving);
+      skip = candidate.rate == 0;
+      if (moving) {
+        for (final plane in _planes) {
+          plane.swapTrial();
+        }
+        final stationary = _prepareBlock(
+          x4,
+          y4,
+          side,
+          av1ZeroMv,
+          measure: true,
+        );
+        final motionRate =
+            candidate.rate +
+            Av1SingleReferenceMotionEncoder.estimatedBits(stack!, mv);
+        // Check all planes after transform quantization. A luma match can
+        // leave more chroma residual or less accurately reconstructed detail.
+        if (motionRate < stationary.rate &&
+            candidate.error <= stationary.error) {
+          for (final plane in _planes) {
+            plane.swapTrial();
+          }
+        } else {
+          mv = av1ZeroMv;
+          skip = stationary.rate == 0;
+        }
       }
     }
-    if (inter) {
+    if (newSegmentation) {
       final ctx = x4 == 0 || y4 == 0 ? 0 : 2;
       _range.adaptive(
         _context.cdf((_Syntax.segment, ctx), intraSegmentCdfs[ctx]),
@@ -307,10 +372,16 @@ final class _DctTile {
         ..adaptive(_context.cdf(_Syntax.luma, intraLumaCdfs[0][0]), 0)
         ..adaptive(_context.cdf(_Syntax.chroma, intraUvCdfs[1][0]), 0);
     }
+    final motion = stack == null ? null : _motionWriter.write(stack, mv);
+    final motionBlock = motion == null
+        ? null
+        : (width4: side, height4: side, motion: motion);
     for (var row = y4; row < y4 + side; row++) {
       final start = row * columns + x4;
       _blockSizes.fillRange(start, start + side, side);
       _skips.fillRange(start, start + side, skip ? 1 : 0);
+      if (motionBlock != null)
+        _motionBlocks.fillRange(start, start + side, motionBlock);
     }
     if (repeat) return;
     for (final (p, plane) in _planes.indexed) {
@@ -342,22 +413,7 @@ final class _DctTile {
             }
           },
         );
-        _quantizer.apply(
-          plane.coefficients,
-          size,
-          Av1TxType.dctDct,
-          p,
-          currentQ: q,
-          segmentDelta: 0,
-        );
-        _inverse.apply(
-          plane.coefficients,
-          _residual,
-          size,
-          Av1TxType.dctDct,
-          Av1DctEncoder.depth,
-          lossless: false,
-        );
+        _inverseResidual(plane.coefficients, size, p);
       }
       for (var row = 0; row < n; row++) {
         final start = (y + row) * plane.stride + x;
@@ -382,16 +438,157 @@ final class _DctTile {
     }
   }
 
-  void _predict(_DctPlane plane, int p, int x, int y, Av1TxSize size) {
+  ({int rate, int error}) _prepareBlock(
+    int x4,
+    int y4,
+    int side,
+    Av1Mv mv, {
+    required bool measure,
+  }) {
+    var rate = 0;
+    var error = 0;
+    final dc = av1DcQuantizers[1][q], ac = av1AcQuantizers[1][q];
+    // A wider zero bin omits small inter AC differences while retaining the
+    // same quantizer step for DC and larger AC coefficients.
+    final acDeadZone = inter ? 0.75 : 0.5;
+    for (final (p, plane) in _planes.indexed) {
+      final shift = p == 0 ? 2 : 1;
+      final n = side << shift;
+      final x = x4 << shift, y = y4 << shift;
+      final size = Av1TxSize.of(n, n);
+      _predict(plane, p, x, y, size, mv);
+      final levels = _forward.quantize(plane, x, y, size, dc, ac, acDeadZone);
+      rate += levels;
+      if (measure) {
+        error +=
+            _reconstructionError(plane, p, x, y, size, levels != 0) *
+            (p == 0 ? 1 : 3);
+      }
+    }
+    return (rate: rate, error: error);
+  }
+
+  int _reconstructionError(
+    _DctPlane plane,
+    int p,
+    int x,
+    int y,
+    Av1TxSize size,
+    bool residual,
+  ) {
+    final n = size.width;
+    if (residual) {
+      _dequantizedTrial.setRange(0, n * n, plane.coefficients);
+      _inverseResidual(_dequantizedTrial, size, p);
+    }
+    final sub = p == 0 ? 0 : 1;
+    final w = math.min(n, ((width + sub) >> sub) - x);
+    final h = math.min(n, ((height + sub) >> sub) - y);
+    const maximum = (1 << Av1DctEncoder.depth) - 1;
+    var error = 0;
+    for (var row = 0; row < h; row++) {
+      final start = (y + row) * plane.stride + x;
+      for (var col = 0; col < w; col++) {
+        final i = row * n + col;
+        final sample = (plane.prediction[i] + (residual ? _residual[i] : 0))
+            .clamp(0, maximum);
+        final delta = plane.source[start + col] - sample;
+        error += delta * delta;
+      }
+    }
+    return error;
+  }
+
+  void _inverseResidual(Int32List coefficients, Av1TxSize size, int p) {
+    _quantizer.apply(
+      coefficients,
+      size,
+      Av1TxType.dctDct,
+      p,
+      currentQ: q,
+      segmentDelta: 0,
+    );
+    _inverse.apply(
+      coefficients,
+      _residual,
+      size,
+      Av1TxType.dctDct,
+      Av1DctEncoder.depth,
+      lossless: false,
+    );
+  }
+
+  bool _inside(int x, int y) => x >= 0 && x < columns && y >= 0 && y < rows;
+
+  Av1InterNeighbor? _neighbor(int x, int y) =>
+      _inside(x, y) ? _motionBlocks[y * columns + x] : null;
+
+  Av1MvStack _stack(int x, int y, int side) => av1FindMvStack(
+    x: x,
+    y: y,
+    width4: side,
+    height4: side,
+    columns: columns,
+    rows: rows,
+    ref0: 1,
+    ref1: -1,
+    highPrecision: false,
+    integer: false,
+    globals: const [av1IdentityGlobalMotion],
+    distance: (_) => 0,
+    neighbor: _neighbor,
+    temporal: null,
+    inTile: _inside,
+  );
+
+  void _predict(
+    _DctPlane plane,
+    int p,
+    int x,
+    int y,
+    Av1TxSize size,
+    Av1Mv mv,
+  ) {
     final n = size.width;
     if (reference case final prior?) {
-      final w = p == 0 ? width : (width + 1) >> 1;
-      final h = p == 0 ? height : (height + 1) >> 1;
+      final sub = p == 0 ? 0 : 1;
+      final fractionBits = 3 + sub;
+      if ((mv.x | mv.y) & ((1 << fractionBits) - 1) != 0) {
+        final output = _interPredictor.first;
+        _interPredictor.convolve(
+          output,
+          prior[p],
+          stride: plane.stride,
+          referenceWidth: width,
+          referenceHeight: height,
+          frameWidth: width,
+          frameHeight: height,
+          x: x,
+          y: y,
+          width: n,
+          height: n,
+          sx: sub,
+          sy: sub,
+          mv: mv,
+          filterX: 0,
+          filterY: 0,
+          depth: Av1DctEncoder.depth,
+          compound: false,
+        );
+        final maximum = (1 << Av1DctEncoder.depth) - 1;
+        for (var i = 0; i < n * n; i++) {
+          plane.prediction[i] = output[i].clamp(0, maximum);
+        }
+        return;
+      }
+      final w = (width + sub) >> sub, h = (height + sub) >> sub;
+      final startX = x + (mv.x >> fractionBits),
+          startY = y + (mv.y >> fractionBits);
       for (var row = 0; row < n; row++) {
-        final at = math.min(y + row, h - 1) * plane.stride;
+        final at = (startY + row).clamp(0, h - 1) * plane.stride;
         for (var col = 0; col < n; col++) {
           plane.prediction[row * n + col] =
-              prior[p][at + math.min(x + col, w - 1)];
+              prior[p][at + (startX + col).clamp(0, w - 1)];
         }
       }
     } else {
@@ -429,6 +626,18 @@ final class _DctPlane {
   final Uint16List source;
   final Uint16List reconstructed;
   final Av1CoefficientNeighbors neighbors;
+  var _block = _DctBlock(), _trial = _DctBlock();
+  Int32List get coefficients => _block.coefficients;
+  Uint16List get prediction => _block.prediction;
+
+  void swapTrial() {
+    final prior = _block;
+    _block = _trial;
+    _trial = prior;
+  }
+}
+
+final class _DctBlock {
   final coefficients = Int32List(256);
   final prediction = Uint16List(256);
 }
@@ -449,7 +658,15 @@ final class _ForwardDct {
   };
   final _rows = Int32List(256);
 
-  bool quantize(_DctPlane plane, int x, int y, Av1TxSize size, int dc, int ac) {
+  int quantize(
+    _DctPlane plane,
+    int x,
+    int y,
+    Av1TxSize size,
+    int dc,
+    int ac,
+    double deadZone,
+  ) {
     final n = size.width;
     final basis = _basis[n]!;
     for (var row = 0; row < n; row++) {
@@ -470,7 +687,7 @@ final class _ForwardDct {
     final gain = 1 << (size.rowShift + size.quantShift + 6);
     final scaleDc = gain / (denominator * dc);
     final scaleAc = gain / (denominator * ac);
-    var nonzero = false;
+    var rate = 0;
     for (var f = 0; f < n; f++) {
       for (var col = 0; col < n; col++) {
         var sum = 0;
@@ -478,11 +695,12 @@ final class _ForwardDct {
           sum += basis[f * n + i] * _rows[i * n + col];
         }
         final idx = f * n + col;
-        final level = (sum * (idx == 0 ? scaleDc : scaleAc)).round();
+        final scaled = sum * (idx == 0 ? scaleDc : scaleAc);
+        final level = idx != 0 && scaled.abs() < deadZone ? 0 : scaled.round();
         plane.coefficients[idx] = level;
-        nonzero |= level != 0;
+        if (level != 0) rate += 2 + level.abs().bitLength;
       }
     }
-    return nonzero;
+    return rate;
   }
 }
