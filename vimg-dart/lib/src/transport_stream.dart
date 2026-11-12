@@ -8,11 +8,12 @@ import 'h264/parameters.dart';
 import 'hevc/nal.dart';
 import 'hevc/parameters.dart';
 import 'metadata.dart';
+import 'mpeg12/syntax.dart';
 import 'rbsp.dart';
 
 part 'transport_packets.dart';
 
-/// MPEG-TS AVC and HEVC samples are Annex B access units. Index entries keep
+/// MPEG-TS video samples are delimited by start codes. Index entries keep
 /// their first physical byte and elementary-stream length so workers can seek
 /// directly to a selected frame without buffering or indexing the whole file.
 final class TransportVideo {
@@ -27,7 +28,7 @@ final class TransportVideo {
   late final _Program _program = _input.program();
   late final _TransportIndex _index = _scan();
 
-  String get codec => _program.codec;
+  String get programCodec => _program.codec;
   VideoMetadata metadata() => _index.metadata;
 
   Iterable<FramePacket> packets(bool preview, {FrameVisitor? onSample}) sync* {
@@ -39,11 +40,16 @@ final class TransportVideo {
   }
 
   int nalType(FramePacket packet) => _index.types[packet.offset]!;
+  MpegPictureInfo mpegPicture(FramePacket packet) =>
+      _index.mpegPictures[packet.offset]!;
   Uint8List? configurationAt(FramePacket packet) =>
       _index.configurations[packet.offset];
 
-  bool _randomAccess(int type) =>
-      codec == 'h264' ? type == 5 : type >= 16 && type <= 21;
+  bool _randomAccess(int type) => switch (programCodec) {
+    'h264' => type == 5,
+    'hevc' => type >= 16 && type <= 21,
+    _ => type == 1,
+  };
 
   Uint8List read(FramePacket frame) {
     final data = Uint8List(frame.size);
@@ -67,7 +73,9 @@ final class TransportVideo {
       } else {
         pes.add(packet);
       }
-      if (written == data.length) return _lengthPrefix(data);
+      if (written == data.length) {
+        return isMpegVideo(programCodec) ? data : _lengthPrefix(data);
+      }
     }
     throw const FormatException('Truncated MPEG-TS access unit');
   }
@@ -152,7 +160,12 @@ final class TransportVideo {
       );
     }
     var start = pts.reduce(math.min);
-    var end = pts.reduce(math.max) + (period ?? 0);
+    // FFprobe estimates the MPEG-1 transport duration using the field rate.
+    // Packet durations continue to describe complete coded frames.
+    final tail = video.bitstreamCodec == 'mpeg1video'
+        ? (period ?? 0) ~/ 2
+        : period ?? 0;
+    var end = pts.reduce(math.max) + tail;
     for (final track in audio.values) {
       final first = track.first;
       final last = track.last;
@@ -168,7 +181,7 @@ final class TransportVideo {
       metadata:
           VideoMetadata(end > start ? (end - start) / _tsFrequency : null, [
             VideoStream(
-              codec: codec,
+              codec: video.bitstreamCodec ?? program.codec,
               width: width,
               height: height,
               timeBase: '1/$_tsFrequency',
@@ -190,6 +203,7 @@ final class TransportVideo {
           ),
       ],
       types: {for (final frame in video.frames) frame.offset: frame.type},
+      mpegPictures: video.mpegPictures,
       configurations: video.configurations,
     );
   }
@@ -202,6 +216,7 @@ typedef _TransportIndex = ({
   VideoMetadata metadata,
   List<FramePacket> packets,
   Map<int, int> types,
+  Map<int, MpegPictureInfo> mpegPictures,
   Map<int, Uint8List> configurations,
 });
 
@@ -265,18 +280,24 @@ final class _AudioClock {
 typedef _AccessUnit = ({int offset, int size, int type, (int, int)? time});
 
 final class _AccessUnits {
-  _AccessUnits(String codec) : _hevc = codec == 'hevc';
+  _AccessUnits(String codec)
+    : _hevc = codec == 'hevc',
+      _mpeg = isMpegVideo(codec) ? MpegHeaders() : null;
 
   final bool _hevc;
+  final MpegHeaders? _mpeg;
+  var _gopFlags = 0;
   final frames = <_AccessUnit>[];
   final configurations = <int, Uint8List>{};
+  final mpegPictures = <int, MpegPictureInfo>{};
   final _parameters = <(int, int), Uint8List>{};
   Uint8List? _configuration;
+  String? bitstreamCodec;
   (int, int)? dimensions;
   (int, int)? timing;
   final _prefix = BytesBuilder(copy: false);
   bool _parameter = false;
-  int _length = 0, _zeros = 0, _zeroPosition = 0;
+  int _length = 0, _zeros = 0, _zeroPosition = 0, _lastZero = 0;
   int _nalStart = -1, _nalPosition = 0;
   int _frameStart = -1, _framePosition = 0;
   int? _frameType;
@@ -288,17 +309,26 @@ final class _AccessUnits {
   }
 
   void payload(Uint8List bytes, int start, int end, int position) {
-    // Only NAL headers and parameter sets are needed during indexing.
+    // Keep only the headers and parameter sets needed for indexing.
     var copyStart = start;
     for (var i = start; i < end; i++) {
       final byte = bytes[i];
       if (byte == 0) {
-        if (_zeros == 0) _zeroPosition = position + i - start;
+        final physical = position + i - start;
+        if (_mpeg != null) {
+          _zeroPosition = _lastZero;
+          _lastZero = physical;
+        } else if (_zeros == 0) {
+          _zeroPosition = physical;
+        }
         _zeros++;
       } else {
         if (byte == 1 && _zeros >= 2) {
-          final boundary = _length + i - start - _zeros;
-          _append(bytes, copyStart, math.max(copyStart, i - _zeros));
+          // MPEG video uses exactly two zero bytes. A longer zero run can
+          // include meaningful trailing bytes from its previous header.
+          final zeros = _mpeg == null ? _zeros : 2;
+          final boundary = _length + i - start - zeros;
+          _append(bytes, copyStart, math.max(copyStart, i - zeros));
           _nal();
           _nalStart = boundary;
           _nalPosition = _zeroPosition;
@@ -314,10 +344,17 @@ final class _AccessUnits {
   void _append(Uint8List bytes, int start, int end) {
     if (_nalStart < 0 || start >= end) return;
     if (_prefix.isEmpty) {
-      final type = _hevc ? (bytes[start] >> 1) & 63 : bytes[start] & 31;
-      _parameter = _hevc ? type >= 32 && type <= 34 : type == 7 || type == 8;
+      final byte = bytes[start];
+      final type = _hevc ? (byte >> 1) & 63 : byte & 31;
+      _parameter = _mpeg != null
+          ? byte == 0xb3 || byte == 0xb5
+          : _hevc
+          ? type >= 32 && type <= 34
+          : type == 7 || type == 8;
     }
-    final limit = _parameter ? 65535 : 4;
+    final limit = _mpeg != null
+        ? (_parameter ? 512 : 5)
+        : (_parameter ? 65535 : 4);
     final count = math.min(end - start, limit - _prefix.length);
     if (count > 0)
       _prefix.add(Uint8List.sublistView(bytes, start, start + count));
@@ -326,6 +363,11 @@ final class _AccessUnits {
   void _nal() {
     final bytes = _prefix.takeBytes();
     if (bytes.isEmpty) return;
+    final mpeg = _mpeg;
+    if (mpeg != null) {
+      _mpegUnit(mpeg, bytes);
+      return;
+    }
     final header = _hevc ? HevcNal(bytes).header : null;
     if (header != null && header.layer != 0) return;
     final type = header?.type ?? (bytes[0] & 31);
@@ -342,23 +384,61 @@ final class _AccessUnits {
               type >= 48 && type <= 55
         : type >= 6 && type <= 9 || type >= 14 && type <= 18;
     if (_frameType != null && (prefix || startsPicture)) _frame(_nalStart);
-    if (_frameStart < 0) {
-      _frameStart = _nalStart;
-      _framePosition = _nalPosition;
-    }
+    _beginUnit();
     if (_parameter) _parameterSet(bytes);
     if (slice && _frameType == null) {
-      _frameType = type;
-      // A PES timestamp applies to its first new access unit. A continuation
-      // may start a PES without starting a picture.
-      while (_timestamps.isNotEmpty && _timestamps.first.$1 <= _frameStart) {
-        _frameTime = _timestamps.removeFirst().$2;
-      }
+      _beginPicture(type);
       if ((_hevc && type >= 16 && type <= 21) || (!_hevc && type == 5)) {
         configurations[_framePosition] = _configuration ??= _prefixNals(
           _parameters.values,
         );
       }
+    }
+  }
+
+  void _mpegUnit(MpegHeaders headers, Uint8List bytes) {
+    final code = bytes[0];
+    if (_frameType != null && (code == 0 || code == 0xb3 || code == 0xb8)) {
+      _frame(_nalStart);
+    }
+    // A TS can start in the middle of a picture. Only a new picture or
+    // sequence prefix can begin the first complete access unit.
+    if (_frameStart < 0 && code != 0 && code != 0xb3 && code != 0xb8) return;
+    _beginUnit();
+    final payload = Uint8List.sublistView(bytes, 1);
+    if (code == 0xb8 && payload.length >= 4) {
+      _gopFlags = payload[3];
+    } else if (code == 0) {
+      final info = mpegPictureInfo(payload, _gopFlags);
+      _gopFlags = 0;
+      _beginPicture(info.type);
+      mpegPictures[_framePosition] = info;
+      final sequence = headers.sequence;
+      if (sequence != null) {
+        // Some muxers use stream type 0x02 for both MPEG video generations.
+        bitstreamCodec ??= sequence.mpeg2 ? 'mpeg2video' : 'mpeg1video';
+        dimensions ??= (sequence.width, sequence.height);
+        timing ??= sequence.timing;
+      }
+      if (info.type == 1)
+        configurations[_framePosition] = headers.configuration();
+    } else if (_parameter) {
+      headers.add(code, payload);
+    }
+  }
+
+  void _beginUnit() {
+    if (_frameStart >= 0) return;
+    _frameStart = _nalStart;
+    _framePosition = _nalPosition;
+  }
+
+  void _beginPicture(int type) {
+    _frameType = type;
+    // A PES timestamp applies to its first new access unit. A continuation
+    // may start a PES without starting a picture.
+    while (_timestamps.isNotEmpty && _timestamps.first.$1 <= _frameStart) {
+      _frameTime = _timestamps.removeFirst().$2;
     }
   }
 

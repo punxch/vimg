@@ -55,13 +55,20 @@ or monochrome, up to 12 bits. `preview` selects an HEVC random-access
 picture. `extract` and `vcs` decode from the preceding random-access point
 and handle leading pictures that depend on an earlier GOP.
 
-MPEG-TS supports the same H.264 and HEVC profiles in 188-byte TS, 192-byte
-M2TS and 204-byte transport packets. Capture uses the first supported video
-track found through the program tables. It groups Annex B access units,
-preserves source PTS across 33-bit rollover and accounts for an earlier
-audio start in the same program. Capture workers read the selected GOPs
-directly from the source file. Reordered pictures without usable
-presentation timestamps and MPEG-2 Video decoding remain pending.
+MPEG-TS supports H.264, HEVC, MPEG-1 Video and MPEG-2 Video in 188-byte TS,
+192-byte M2TS and 204-byte transport packets. Capture uses the first
+supported video track found through the program tables. It groups video
+access units, preserves source PTS across 33-bit rollover and accounts for
+an earlier audio start in the same program. Capture workers read the
+selected GOPs directly from the source file. Reordered pictures without
+usable presentation timestamps remain pending.
+
+Matroska and MPEG-TS support MPEG-1 and MPEG-2 I/P/B pictures. MPEG-2
+supports progressive and interlaced frame pictures, including field-based
+motion prediction and field DCT. Capture handles B-pictures that depend on
+an earlier GOP and selects I-pictures for static previews. MPEG Program
+Streams (including VOB), separate field pictures and scalable MPEG-2
+profiles remain pending.
 
 `preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
 AVIF animation reader handles intra and inter pictures, including hidden
@@ -169,6 +176,8 @@ dart test/av1_transform_test.dart
 dart test/h264_test.dart
 dart test/hevc_test.dart
 dart test/iso_fragments_test.dart
+dart test/transport_stream_test.dart
+dart test/mpeg_video_test.dart
 dart test/prores_test.dart
 dart test/authority_test.dart
 dart compile exe bin/vimg.dart -o build/vimg

@@ -85,9 +85,7 @@ final class _TransportInput {
       if (program != null) return program;
     }
     if (programs.isNotEmpty) {
-      throw UnsupportedError(
-        'MPEG-TS has no supported H.264 or HEVC video stream',
-      );
+      throw UnsupportedError('MPEG-TS has no supported video stream');
     }
     throw const FormatException('Missing MPEG-TS program tables');
   }
@@ -103,9 +101,16 @@ _Program? _programMap(Uint8List section) {
   while (i + 5 <= end) {
     final type = section[i];
     final pid = _uint16(section, i + 1) & 8191;
-    if (videoPid == null && (type == 0x1b || type == 0x24)) {
+    final videoCodec = switch (type) {
+      0x01 => 'mpeg1video',
+      0x02 => 'mpeg2video',
+      0x1b => 'h264',
+      0x24 => 'hevc',
+      _ => null,
+    };
+    if (videoPid == null && videoCodec != null) {
       videoPid = pid;
-      codec = type == 0x1b ? 'h264' : 'hevc';
+      codec = videoCodec;
     }
     if (const {
       3,

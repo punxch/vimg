@@ -19,6 +19,8 @@ import 'iso_media.dart';
 import 'matroska.dart';
 import 'matroska_frames.dart';
 import 'metadata.dart';
+import 'mpeg12/decode.dart';
+import 'mpeg12/syntax.dart';
 import 'prores.dart';
 import 'transport_stream.dart';
 import 'video_configuration.dart';
@@ -66,12 +68,19 @@ final class Video {
       _iso!.metadata();
 
   String get codec =>
-      _transport?.codec ??
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
       (throw const FormatException('No video stream'));
 
-  bool get usesReferencePictures =>
-      codec == 'h264' || codec == 'hevc' || codec == 'av1';
+  // Workers only need the codec family signalled by the transport tables.
+  String get _decodeCodec => _transport?.programCodec ?? codec;
+
+  bool get usesReferencePictures {
+    final name = _decodeCodec;
+    return name == 'h264' ||
+        name == 'hevc' ||
+        name == 'av1' ||
+        isMpegVideo(name);
+  }
 
   bool get scalesBeforeRgb => usesReferencePictures || codec == 'prores';
 
@@ -88,6 +97,7 @@ final class Video {
   );
   late final Uint8List _av1Config = _av1Configuration();
   late final _av1Timeline = _indexAv1();
+  late final _mpegTimeline = _indexMpeg();
 
   Uint8List _av1Configuration() {
     final matroska = _matroska;
@@ -120,7 +130,18 @@ final class Video {
   Iterable<FramePacket> packets({bool preview = false}) {
     final transport = _transport;
     if (transport != null) {
-      return preview ? transport.packets(true) : _timeline.presentation;
+      return preview
+          ? transport.packets(true)
+          : (isMpegVideo(codec) ? _mpegTimeline.timeline : _timeline)
+                .presentation;
+    }
+    if (isMpegVideo(codec)) {
+      final indexed = _mpegTimeline;
+      return preview
+          ? indexed.configurations.keys.map(
+              (i) => indexed.timeline.decodeOrder[i],
+            )
+          : indexed.timeline.presentation;
     }
     if (codec == 'h264') {
       return preview ? _h264Keyframes() : _timeline.presentation;
@@ -277,6 +298,98 @@ final class Video {
     );
   }
 
+  ({_VideoTimeline timeline, Map<int, Uint8List> configurations}) _indexMpeg() {
+    final transport = _transport;
+    final headers = MpegHeaders();
+    final matroska = _matroska;
+    final initial = matroska == null
+        ? null
+        : matroskaVideoConfiguration(matroska, codec);
+    if (initial != null) {
+      for (final unit in mpegStartCodes(initial)) {
+        headers.add(
+          unit.code,
+          Uint8List.sublistView(initial, unit.data, unit.end),
+        );
+      }
+    }
+    final decodeOrder = <FramePacket>[], gopStart = <int>[];
+    final index = <FramePacket, int>{}, configurations = <int, Uint8List>{};
+    var start = -1, bStart = -1;
+    MpegPictureInfo pictureInfo(FramePacket packet) {
+      if (transport != null) return transport.mpegPicture(packet);
+      final bytes = _read(packet);
+      MpegPictureInfo? picture;
+      var flags = 0;
+      for (final unit in mpegStartCodes(bytes)) {
+        if (unit.code >= 1 && unit.code <= 0xaf) break;
+        if (unit.code == 0) {
+          picture = mpegPictureInfo(
+            Uint8List.sublistView(bytes, unit.data, unit.end),
+            flags,
+          );
+          if (picture.type == 1)
+            configurations[decodeOrder.length] = headers.configuration();
+        } else if (unit.code == 0xb8 && unit.end - unit.data >= 4) {
+          flags = bytes[unit.data + 3];
+        } else {
+          headers.add(
+            unit.code,
+            Uint8List.sublistView(bytes, unit.data, unit.end),
+          );
+        }
+      }
+      return picture ??
+          (throw const FormatException('Missing MPEG video picture'));
+    }
+
+    final presentation =
+        _containerPackets(
+          false,
+          onSample: (packet, _) {
+            final position = decodeOrder.length;
+            final picture = pictureInfo(packet);
+            switch (picture.type) {
+              case 1:
+                // Leading B-pictures in an open GOP can use the previous GOP.
+                bStart = picture.closedGop
+                    ? position
+                    : (picture.brokenLink ? -1 : start);
+                start = position;
+                if (transport != null) {
+                  configurations[position] = transport.configurationAt(packet)!;
+                }
+              case 2:
+                bStart = start;
+              case 3:
+                break;
+              default:
+                throw UnsupportedError(
+                  'MPEG picture coding type ${picture.type} is unavailable',
+                );
+            }
+            index[packet] = position;
+            decodeOrder.add(packet);
+            gopStart.add(picture.type == 3 ? bStart : start);
+          },
+        ).where((packet) => gopStart[index[packet]!] >= 0).toList()..sort((
+          a,
+          b,
+        ) {
+          final byTime = a.seconds.compareTo(b.seconds);
+          return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+        });
+    return (
+      timeline: (
+        decodeOrder: decodeOrder,
+        presentation: presentation,
+        index: index,
+        gopStart: gopStart,
+      ),
+      configurations: configurations,
+    );
+  }
+
   Iterable<_SelectedFrame> decodeSelected(
     Iterable<FramePacket> selected, {
     YuvImageScaler? scaler,
@@ -297,7 +410,12 @@ final class Video {
       return;
     }
     final av1 = codec == 'av1';
-    final timeline = av1 ? _av1Timeline.timeline : _timeline;
+    final mpeg = isMpegVideo(codec);
+    final timeline = av1
+        ? _av1Timeline.timeline
+        : mpeg
+        ? _mpegTimeline.timeline
+        : _timeline;
     final targets = {
       for (final packet in selected)
         timeline.index[packet] ??
@@ -310,6 +428,8 @@ final class Video {
       targets: wanted,
       configuration: av1
           ? _av1Timeline.configurations[start]!
+          : mpeg
+          ? _mpegTimeline.configurations[start]!
           : _transport?.configurationAt(timeline.decodeOrder[start]),
     );
     for (final target in targets) {
@@ -393,7 +513,7 @@ final class Video {
   _RenderPicture? Function(Uint8List, bool) _pictureReader(
     Uint8List? configuration,
   ) {
-    switch (codec) {
+    switch (_decodeCodec) {
       case 'av1':
         final units = Av1AccessUnits()..configure(configuration!);
         final decoder = Av1StreamDecoder();
@@ -419,6 +539,13 @@ final class Video {
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
+        };
+      case 'mpeg1video' || 'mpeg2video':
+        final decoder = MpegStreamDecoder(configuration);
+        return (bytes, selected) {
+          if (selected) return decoder.decode(bytes).rgb;
+          decoder.advance(bytes);
+          return null;
         };
       default:
         final decoder = H264StreamDecoder(
@@ -455,7 +582,9 @@ final class Video {
   }
 
   image.Image decode(FramePacket packet, {bool preview = false}) {
-    if (_transport != null || (codec == 'av1' && !preview))
+    if (_transport != null ||
+        isMpegVideo(codec) ||
+        (codec == 'av1' && !preview))
       return decodeSelected([packet]).single.frame;
     if (codec == 'prores') {
       return _proRes(packet, preserveAlpha: !preview).rgb();
