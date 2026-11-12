@@ -100,6 +100,7 @@ final class HevcSps {
     required this.strongIntraSmoothing,
     required this.colour,
     required this.fieldSequence,
+    required this.timing,
     required this.extensions,
     required this.rangeExtension,
   });
@@ -199,6 +200,7 @@ final class HevcSps {
       strongIntraSmoothing: smoothing,
       colour: vui?.colour ?? _unspecifiedColour,
       fieldSequence: vui?.fieldSequence ?? false,
+      timing: vui?.timing,
       extensions: extensions,
       rangeExtension: range,
     );
@@ -219,6 +221,7 @@ final class HevcSps {
   final List<HevcLongReference>? longReferences;
   final bool temporalMvp, strongIntraSmoothing, fieldSequence;
   final HevcColour colour;
+  final (int, int)? timing; // frame ticks, ticks per second
   final int extensions, rangeExtension;
 
   int get width => codedWidth - crop.left - crop.right;
@@ -483,7 +486,10 @@ HevcCrop _crop(Rbsp bits, int chroma, int width, int height) {
   return (left: left, top: top, right: right, bottom: bottom);
 }
 
-({HevcColour colour, bool fieldSequence}) _readVui(Rbsp bits, int layers) {
+({HevcColour colour, bool fieldSequence, (int, int)? timing}) _readVui(
+  Rbsp bits,
+  int layers,
+) {
   if (bits.flag() && bits.read(8) == 255) bits.skip(32);
   if (bits.flag()) bits.skip(1); // overscan
   var colour = _unspecifiedColour;
@@ -508,8 +514,10 @@ HevcCrop _crop(Rbsp bits, int chroma, int width, int height) {
   if (bits.flag()) {
     for (var i = 0; i < 4; i++) bits.ue(); // default display window
   }
+  (int, int)? timing;
   if (bits.flag()) {
-    bits.skip(64);
+    final units = bits.read(32), scale = bits.read(32);
+    if (units > 0 && scale > 0) timing = (units, scale);
     if (bits.flag()) bits.ue();
     if (bits.flag()) _readHrd(bits, layers, null);
   }
@@ -517,7 +525,7 @@ HevcCrop _crop(Rbsp bits, int chroma, int width, int height) {
     bits.skip(3);
     for (var i = 0; i < 5; i++) bits.ue();
   }
-  return (colour: colour, fieldSequence: field);
+  return (colour: colour, fieldSequence: field, timing: timing);
 }
 
 typedef _HrdCommon = ({bool nal, bool vcl, bool subPicture});

@@ -20,6 +20,7 @@ import 'matroska.dart';
 import 'matroska_frames.dart';
 import 'metadata.dart';
 import 'prores.dart';
+import 'transport_stream.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
@@ -41,7 +42,8 @@ final class Video {
       } else if (signature == 0x52494646) {
         _avi = Avi(file);
       } else {
-        _iso = IsoMedia(file);
+        _transport = TransportVideo.detect(file);
+        if (_transport == null) _iso = IsoMedia(file);
       }
     } catch (_) {
       _input.closeSync();
@@ -55,11 +57,16 @@ final class Video {
   Matroska? _matroska;
   IsoMedia? _iso;
   Avi? _avi;
+  TransportVideo? _transport;
 
   late final VideoMetadata metadata =
-      _matroska?.metadata() ?? _avi?.metadata() ?? _iso!.metadata();
+      _matroska?.metadata() ??
+      _avi?.metadata() ??
+      _transport?.metadata() ??
+      _iso!.metadata();
 
   String get codec =>
+      _transport?.codec ??
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
       (throw const FormatException('No video stream'));
 
@@ -111,6 +118,10 @@ final class Video {
   }
 
   Iterable<FramePacket> packets({bool preview = false}) {
+    final transport = _transport;
+    if (transport != null) {
+      return preview ? transport.packets(true) : _timeline.presentation;
+    }
     if (codec == 'h264') {
       return preview ? _h264Keyframes() : _timeline.presentation;
     }
@@ -150,6 +161,9 @@ final class Video {
     bool keyframes, {
     FrameVisitor? onSample,
   }) {
+    final transport = _transport;
+    if (transport != null)
+      return transport.packets(keyframes, onSample: onSample);
     final matroska = _matroska;
     return matroska == null
         ? isoFrames(_iso!, keyframes: keyframes, onSample: onSample)
@@ -216,8 +230,10 @@ final class Video {
   }
 
   _VideoTimeline _indexVideo() {
-    final hevc = codec == 'hevc' ? _hevc.configuration : null;
-    final avc = hevc == null ? _h264.configuration : null;
+    final transport = _transport;
+    final isHevc = codec == 'hevc';
+    final hevc = transport == null && isHevc ? _hevc.configuration : null;
+    final avc = transport == null && !isHevc ? _h264.configuration : null;
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
@@ -231,18 +247,22 @@ final class Video {
           packet.size,
           file.unsigned,
         );
-        if (header?.randomAccess == true ||
-            (avc != null && sync && _isIdr(avc, packet))) {
+        final type = transport?.nalType(packet) ?? header?.type;
+        final randomAccess = transport != null
+            ? sync
+            : header?.randomAccess == true ||
+                  (avc != null && sync && _isIdr(avc, packet));
+        if (randomAccess) {
           // RASL pictures following a CRA can still refer across it.
-          previous = header?.type == 21 ? start : -1;
+          previous = isHevc && type == 21 ? start : -1;
           start = position;
         }
         index[packet] = position;
         decodeOrder.add(packet);
-        gopStart.add(header?.rasl == true ? previous : start);
+        gopStart.add(isHevc && (type == 8 || type == 9) ? previous : start);
       },
     ).toList();
-    if (hevc != null) {
+    if (isHevc) {
       presentation.removeWhere((packet) => gopStart[index[packet]!] < 0);
     }
     presentation.sort((a, b) {
@@ -288,7 +308,9 @@ final class Video {
     _DecodeRun run() => (
       packets: timeline.decodeOrder.sublist(start, end + 1),
       targets: wanted,
-      configuration: av1 ? _av1Timeline.configurations[start]! : null,
+      configuration: av1
+          ? _av1Timeline.configurations[start]!
+          : _transport?.configurationAt(timeline.decodeOrder[start]),
     );
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
@@ -389,13 +411,21 @@ final class Video {
           return displayed?.rgb;
         };
       case 'hevc':
-        final decoder = HevcStreamDecoder(HevcConfiguration(_hevcConfig));
+        final decoder = HevcStreamDecoder(
+          configuration == null
+              ? HevcConfiguration(_hevcConfig)
+              : HevcConfiguration.inBand(configuration),
+        );
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
       default:
-        final decoder = H264StreamDecoder(AvcConfiguration(_avcConfig));
+        final decoder = H264StreamDecoder(
+          configuration == null
+              ? AvcConfiguration(_avcConfig)
+              : AvcConfiguration.inBand(configuration),
+        );
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
@@ -404,7 +434,7 @@ final class Video {
   }
 
   image.Image? cover() {
-    if (_avi != null) return null;
+    if (_avi != null || _transport != null) return null;
     final matroska = _matroska;
     final covers = matroska == null
         ? isoCovers(_iso!)
@@ -421,11 +451,11 @@ final class Video {
     if (packet.size <= 0 || packet.size > 64 * 1024 * 1024) {
       throw const FormatException('Invalid video frame size');
     }
-    return file.read(packet.offset, packet.size);
+    return _transport?.read(packet) ?? file.read(packet.offset, packet.size);
   }
 
   image.Image decode(FramePacket packet, {bool preview = false}) {
-    if (codec == 'av1' && !preview)
+    if (_transport != null || (codec == 'av1' && !preview))
       return decodeSelected([packet]).single.frame;
     if (codec == 'prores') {
       return _proRes(packet, preserveAlpha: !preview).rgb();

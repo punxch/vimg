@@ -17,7 +17,7 @@ On Windows, use `-o build/vimg.exe`.
 
 ## Available commands
 
-- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV and AVI metadata and prints
+- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV, AVI and MPEG-TS metadata and prints
   vimg-compatible JSON.
 - `vimg join -c3 -H160 image1.png image2.png -o grid.png` resizes images and
   composes a contact sheet. Pass a repeated `--label` to label successive tiles.
@@ -54,6 +54,14 @@ Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in 4:2:0
 or monochrome, up to 12 bits. `preview` selects an HEVC random-access
 picture. `extract` and `vcs` decode from the preceding random-access point
 and handle leading pictures that depend on an earlier GOP.
+
+MPEG-TS supports the same H.264 and HEVC profiles in 188-byte TS, 192-byte
+M2TS and 204-byte transport packets. Capture uses the first supported video
+track found through the program tables. It groups Annex B access units,
+preserves source PTS across 33-bit rollover and accounts for an earlier
+audio start in the same program. Capture workers read the selected GOPs
+directly from the source file. Reordered pictures without usable
+presentation timestamps and MPEG-2 Video decoding remain pending.
 
 `preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
 AVIF animation reader handles intra and inter pictures, including hidden

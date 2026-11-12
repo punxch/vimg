@@ -49,6 +49,7 @@ final class H264Sps {
     required this.width,
     required this.height,
     required this.color,
+    required this.timing,
     required this.scaling,
   });
 
@@ -111,9 +112,7 @@ final class H264Sps {
     final height = 16 * mbHeight - top - bottom;
     if (width <= 0 || height <= 0)
       throw const FormatException('Invalid H.264 crop');
-    final color = bits.flag()
-        ? _readColor(bits)
-        : (matrix: 2, fullRange: false);
+    final vui = bits.flag() ? _readVui(bits) : null;
     return H264Sps._(
       id: id,
       profile: profile,
@@ -140,7 +139,8 @@ final class H264Sps {
       cropTop: top,
       width: width,
       height: height,
-      color: color,
+      color: vui?.color ?? (matrix: 2, fullRange: false),
+      timing: vui?.timing,
       scaling: scaling,
     );
   }
@@ -156,24 +156,36 @@ final class H264Sps {
   final bool frameOnly;
   final int cropLeft, cropTop, width, height;
   final H264Color color;
+  final (int, int)? timing; // frame ticks, ticks per second
   final List<H264ScalingList?>? scaling;
 }
 
-H264Color _readColor(Rbsp bits) {
+({H264Color color, (int, int)? timing}) _readVui(Rbsp bits) {
   if (bits.flag() && bits.read(8) == 255) {
     bits.read(16);
     bits.read(16);
   }
   if (bits.flag()) bits.flag(); // overscan
-  if (!bits.flag()) return (matrix: 2, fullRange: false);
-  bits.read(3); // video format
-  final fullRange = bits.flag();
+  var fullRange = false;
   var matrix = 2;
   if (bits.flag()) {
-    bits.read(16); // color primaries and transfer characteristics
-    matrix = bits.read(8);
+    bits.skip(3); // video format
+    fullRange = bits.flag();
+    if (bits.flag()) {
+      bits.skip(16); // color primaries and transfer characteristics
+      matrix = bits.read(8);
+    }
   }
-  return (matrix: matrix, fullRange: fullRange);
+  if (bits.flag()) {
+    bits.ue(); // chroma sample location, top field
+    bits.ue(); // chroma sample location, bottom field
+  }
+  (int, int)? timing;
+  if (bits.flag()) {
+    final units = bits.read(32), scale = bits.read(32);
+    if (units > 0 && scale > 0) timing = (2 * units, scale);
+  }
+  return (color: (matrix: matrix, fullRange: fullRange), timing: timing);
 }
 
 final class H264Pps {

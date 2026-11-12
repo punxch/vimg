@@ -6,6 +6,15 @@ import 'slice_header.dart';
 
 /// HEVCDecoderConfigurationRecord (hvcC) and its length-prefixed samples.
 final class HevcConfiguration {
+  HevcConfiguration.inBand(Uint8List parameterSets) : lengthBytes = 4 {
+    final units = nals(parameterSets).toList();
+    for (final type in [32, 33, 34]) {
+      for (final nal in units) {
+        if (nal.header.type == type) store(nal);
+      }
+    }
+  }
+
   HevcConfiguration(Uint8List record) {
     if (record.length < 23 ||
         record[0] != 1 ||

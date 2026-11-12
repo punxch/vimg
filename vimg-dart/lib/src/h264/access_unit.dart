@@ -6,6 +6,15 @@ import 'parameters.dart';
 /// Matroska and ISO BMFF. Parameter sets carried in avc3 samples can replace
 /// the sets stored in the container.
 final class AvcConfiguration {
+  AvcConfiguration.inBand(Uint8List parameterSets) : lengthBytes = 4 {
+    final units = nals(parameterSets).toList();
+    for (final type in [7, 8]) {
+      for (final nal in units) {
+        if (nal[0] & 31 == type) store(nal);
+      }
+    }
+  }
+
   AvcConfiguration(Uint8List avcC) {
     if (avcC.length < 7 ||
         avcC[0] != 1 ||
