@@ -74,6 +74,15 @@ final class IsoMedia {
       boxes(0, file.length).where((box) => box.type == 'moov').firstOrNull ??
       (throw const FormatException('Missing ISO media movie box'));
 
+  MediaBox? firstVideoTrack({MediaBox? moov}) =>
+      children(moov ?? movie()).where((box) {
+        if (box.type != 'trak') return false;
+        final handler = child(child(box, 'mdia'), 'hdlr');
+        if (handler == null) return false;
+        requireBytes(handler, 12);
+        return tag(handler.data + 8) == 'vide';
+      }).firstOrNull;
+
   VideoMetadata metadata() {
     final moov = movie();
     final movieTiming = timing(child(moov, 'mvhd'));

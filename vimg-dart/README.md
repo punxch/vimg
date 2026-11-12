@@ -34,12 +34,14 @@ depend on the library's encoders and decoders.
 - `vimg print-completions [bash|zsh|fish|powershell|elvish]` prints a completion
   script for the Dart CLI.
 
-Extraction and contact sheets currently decode MJPEG and PNG tracks in
-Matroska, unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit
-and 32-bit BGR. Decoding inter-frame formats such as H.264 and HEVC is pending. The bundled `sample/input.mkv` can be probed
-and requires an H.264 decoder for extraction and contact sheets. The Rust
-`authority` commands, FFmpeg filter expressions, and native hardware capture
-backends are also pending.
+Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
+unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit
+BGR. Matroska and MP4/MOV support progressive 8-bit CABAC H.264 IDR pictures.
+The `preview` command selects an IDR picture from H.264 files, including
+`sample/input.mkv`. Extraction and contact sheets require independently
+decodable H.264 frames in the sampled range. CAVLC, H.264 P/B pictures and
+HEVC decoding are pending, along with Rust's `authority` commands, FFmpeg
+filter expressions and hardware capture backends.
 
 The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses
 separate palettes for green samples and blue/red pairs. Blocks with up to
@@ -83,6 +85,7 @@ dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
 dart test/avif_test.dart
+dart test/h264_test.dart
 dart compile exe bin/vimg.dart -o build/vimg
 dart compile exe test/fake_ya.dart -o build/fake-ya
 dart test/service_test.dart build/vimg build/fake-ya

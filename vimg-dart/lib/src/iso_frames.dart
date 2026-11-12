@@ -20,13 +20,7 @@ Iterable<FramePacket> isoFrames(
   bool keyframes = false,
 }) sync* {
   final movie = media.movie();
-  final track = media.children(movie).where((box) {
-    if (box.type != 'trak') return false;
-    final handler = media.child(media.child(box, 'mdia'), 'hdlr');
-    if (handler == null) return false;
-    media.requireBytes(handler, 12);
-    return media.tag(handler.data + 8) == 'vide';
-  }).firstOrNull;
+  final track = media.firstVideoTrack(moov: movie);
   if (track == null) return;
   final trackMedia = media.child(track, 'mdia');
   final trackTiming = media.timing(media.child(trackMedia, 'mdhd'));

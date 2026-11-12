@@ -6,6 +6,9 @@ import 'package:image/image.dart' as image;
 import 'avi.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
+import 'h264/access_unit.dart';
+import 'h264/container.dart';
+import 'h264/idr_picture.dart';
 import 'iso_frames.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
@@ -45,7 +48,23 @@ final class Video {
 
   void close() => _input.closeSync();
 
+  late final H264IdrDecoder _h264 = _openH264();
+
+  H264IdrDecoder _openH264() {
+    final matroska = _matroska;
+    final iso = _iso;
+    final config = matroska != null
+        ? matroskaAvcConfiguration(matroska)
+        : (iso != null ? isoAvcConfiguration(iso) : null);
+    if (config == null)
+      throw UnsupportedError(
+        'H.264 requires a Matroska or MP4 AVC configuration',
+      );
+    return H264IdrDecoder(AvcConfiguration(config));
+  }
+
   Iterable<FramePacket> packets({bool preview = false}) {
+    if (codec == 'h264') return _h264Packets(preview);
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
     final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
@@ -53,10 +72,29 @@ final class Video {
       throw UnsupportedError('Pure Dart decoding for $codec is unavailable');
     }
     if (avi != null) return avi.packets();
+    return _containerPackets(keyframes);
+  }
+
+  Iterable<FramePacket> _containerPackets(bool keyframes) {
     final matroska = _matroska;
     return matroska == null
         ? isoFrames(_iso!, keyframes: keyframes)
         : matroskaFrames(matroska, keyframes: keyframes);
+  }
+
+  Iterable<FramePacket> _h264Packets(bool preview) sync* {
+    final configuration = _h264.configuration;
+    for (final packet in _containerPackets(preview)) {
+      if (configuration.containsIdr(
+        packet.offset,
+        packet.size,
+        file.unsigned,
+      )) {
+        yield packet;
+      } else if (!preview) {
+        throw UnsupportedError('H.264 inter-picture decoding is unavailable');
+      }
+    }
   }
 
   image.Image? cover() {
@@ -82,6 +120,7 @@ final class Video {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
+      'h264' => _h264.decode(bytes)?.rgb(),
       'rawvideo' => _avi?.decodeBitmap(bytes),
       _ => null,
     };
