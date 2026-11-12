@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:args/command_runner.dart';
 import 'package:image/image.dart' as image;
 
+import 'completions.dart';
 import 'grid.dart';
 import 'output.dart';
 import 'probe.dart';
@@ -19,7 +20,8 @@ CommandRunner<void> createRunner() =>
       ..addCommand(PreviewCommand())
       ..addCommand(VcsCommand())
       ..addCommand(ServeCommand())
-      ..addCommand(SendCommand());
+      ..addCommand(SendCommand())
+      ..addCommand(PrintCompletionsCommand());
 
 Future<void> runCli(List<String> arguments) async {
   final runner = createRunner();
