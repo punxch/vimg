@@ -44,7 +44,8 @@ unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit
 BGR. Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
-same GOP, and select captures by presentation timestamp. `sample/input.mkv`
+same GOP, and schedule captures using the source frame durations and the
+Rust CLI's constant-frame-rate selection rules. `sample/input.mkv`
 can be used with `preview`, `extract` and `vcs`. `preview` selects an IDR for
 a quick static image.
 
@@ -108,6 +109,7 @@ vimg send --yazi-id 123 video.mkv /path/to/cache.avif
 dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
+dart test/capture_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart
 dart test/av1_intra_test.dart

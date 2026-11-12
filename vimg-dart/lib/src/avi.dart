@@ -163,7 +163,12 @@ final class Avi {
             seconds: index * track.step,
             offset: sample.data,
             size: sample.end - sample.data,
-            timestamp: frameTimestamp(index, track.scale, track.rate),
+            timestamp: frameTimestamp(
+              index,
+              track.scale,
+              track.rate,
+              duration: 1,
+            ),
           );
         }
       }

@@ -119,7 +119,12 @@ Iterable<FramePacket> _block(
       seconds: seconds,
       offset: offset,
       size: block.end - offset,
-      timestamp: frameTimestamp(pts, timestampScale, 1000000000),
+      timestamp: frameTimestamp(
+        pts,
+        timestampScale,
+        1000000000,
+        duration: blockDuration ?? (frameDuration ?? 0) ~/ timestampScale,
+      ),
     );
     onSample?.call(packet, sync);
     yield packet;
@@ -174,7 +179,12 @@ Iterable<FramePacket> _block(
       final unit = timestampScale.gcd(duration);
       final lacePts =
           pts * (timestampScale ~/ unit) + index * (duration ~/ unit);
-      return frameTimestamp(lacePts, unit, 1000000000);
+      return frameTimestamp(
+        lacePts,
+        unit,
+        1000000000,
+        duration: duration ~/ unit,
+      );
     }
     final divisor = count.gcd(blockDuration);
     final ticks = count ~/ divisor;
@@ -182,6 +192,7 @@ Iterable<FramePacket> _block(
       pts * ticks + index * (blockDuration ~/ divisor),
       timestampScale,
       1000000000 * ticks,
+      duration: blockDuration ~/ divisor,
     );
   }
 

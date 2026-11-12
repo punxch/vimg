@@ -106,7 +106,7 @@ Iterable<FramePacket> isoFrames(
         seconds: seconds,
         offset: offset,
         size: size,
-        timestamp: frameTimestamp(pts, 1, scale),
+        timestamp: frameTimestamp(pts, 1, scale, duration: step),
       );
       // Samples trimmed by an edit may still be needed for inter prediction.
       onSample?.call(packet, isSync);

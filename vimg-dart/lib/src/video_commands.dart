@@ -131,10 +131,10 @@ Map<FramePacket, List<String>> _capturePaths(
   final frameWidth = plan.frames.toString().length;
   final names = <String>{};
   for (var tile = 0; tile < selected.length; tile++) {
-    final seconds = plan.starts[tile].floor().toString().padLeft(
-      secondsWidth,
-      '0',
-    );
+    final seconds = math
+        .max(0, plan.starts[tile].floor())
+        .toString()
+        .padLeft(secondsWidth, '0');
     for (var frame = 0; frame < plan.frames; frame++) {
       final index = (frame + 1).toString().padLeft(frameWidth, '0');
       final base = '$stem-${seconds}s-$index';

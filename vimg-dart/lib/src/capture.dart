@@ -1,6 +1,9 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'frame_packet.dart';
+
+part 'capture_timing.dart';
 
 final class VideoOffset {
   const VideoOffset(this.value, {this.percent = false});
@@ -90,13 +93,19 @@ final class CapturePlan {
   CapturePlan(double? videoDuration, CaptureOptions options)
     : frames = options.frames,
       window = options.window {
-    if (videoDuration == null || videoDuration <= 0) {
+    if (videoDuration == null ||
+        !videoDuration.isFinite ||
+        videoDuration <= 0) {
       throw const FormatException('Missing positive video duration');
     }
-    final first = options.start.seconds(videoDuration);
-    usableDuration = videoDuration - first - options.end.seconds(videoDuration);
-    if (first < 0 ||
-        options.end.seconds(videoDuration) < 0 ||
+    // CaptureWindow in the Rust CLI calculates the seek arguments as f32.
+    final duration = _asFloat32(videoDuration);
+    final startOffset = _offsetFloat32(options.start, duration);
+    final endOffset = _offsetFloat32(options.end, duration);
+    usableDuration = _asFloat32(_asFloat32(duration - startOffset) - endOffset);
+    if (startOffset < 0 ||
+        endOffset < 0 ||
+        !usableDuration.isFinite ||
         usableDuration <= 0) {
       throw const FormatException('Invalid video duration after offsets');
     }
@@ -107,78 +116,82 @@ final class CapturePlan {
         !window.isFinite) {
       throw const FormatException('Invalid capture plan (limit 100000 frames)');
     }
-    final step = usableDuration / options.number;
-    final lastStart = math.max(0.0, videoDuration - window);
+    final step = _asFloat32(usableDuration / options.number);
+    final firstCenter = _asFloat32(startOffset + _asFloat32(step * 0.5));
+    final lastStart = _asFloat32(duration - _asFloat32(window));
     starts = List.generate(
       options.number,
-      (i) => math.min(first + step * (i + 0.5), lastStart),
+      (i) => _seekDecimal(
+        math.min(_asFloat32(firstCenter + _asFloat32(step * i)), lastStart),
+      ),
       growable: false,
     );
+    _rate = _captureRate(frames / _seekDecimal(_asFloat32(window)));
   }
 
   late final double usableDuration;
   late final List<double> starts;
   final int frames;
   final double window;
+  late final _CaptureRate _rate;
 
   List<List<FramePacket>> select(
     Iterable<FramePacket> packets, {
     CaptureSelection? onSelect,
   }) {
-    final targets = [
-      for (var tile = 0; tile < starts.length; tile++)
-        for (var frame = 0; frame < frames; frame++)
-          (
-            tile: tile,
-            frame: frame,
-            seconds: starts[tile] + window * frame / frames,
-          ),
-    ]..sort((a, b) => a.seconds.compareTo(b.seconds));
-    final selected = List.generate(
-      starts.length,
-      (_) => List<FramePacket?>.filled(frames, null),
-    );
-    FramePacket? previous;
-    var index = 0, inputIndex = -1;
+    final schedules = [
+      for (final (index, start) in starts.indexed)
+        _CaptureSchedule(index, start, frames, _rate, onSelect),
+    ];
+    final active = <_CaptureSchedule>[];
+    var nextWindow = 0, inputIndex = -1;
+    FramePacket? pending;
+    double? lastDuration;
+
+    void submit(FramePacket packet, double duration) {
+      while (nextWindow < schedules.length &&
+          schedules[nextWindow].containsStart(packet)) {
+        active.add(schedules[nextWindow++]);
+      }
+      active.removeWhere((schedule) {
+        schedule.push(packet, inputIndex, duration);
+        return schedule.complete;
+      });
+    }
+
     for (final packet in packets) {
+      if (pending != null) {
+        final elapsed = packet.seconds - pending.seconds;
+        if (elapsed < 0) {
+          throw const FormatException('Out-of-order presentation timestamps');
+        }
+        final duration =
+            _durationSeconds(pending) ??
+            (elapsed > 0 ? elapsed : lastDuration ?? _rate.period);
+        submit(pending, duration);
+        lastDuration = duration;
+        if (nextWindow == schedules.length && active.isEmpty) break;
+      }
+      pending = packet;
       inputIndex++;
-      if (previous != null && packet.seconds < previous.seconds) {
-        throw const FormatException('Out-of-order presentation timestamps');
+    }
+    if (pending == null) throw const FormatException('No video frames');
+    if (nextWindow < schedules.length || active.isNotEmpty) {
+      submit(
+        pending,
+        _durationSeconds(pending) ?? lastDuration ?? _rate.period,
+      );
+      // Retain the final source frame if the requested window reaches EOF.
+      for (final schedule in schedules) {
+        schedule.finish(pending, inputIndex);
       }
-      while (index < targets.length &&
-          targets[index].seconds <= packet.seconds) {
-        final target = targets[index++];
-        final first = previous;
-        final usePrevious =
-            first != null &&
-            target.seconds - first.seconds < packet.seconds - target.seconds &&
-            first.seconds >= starts[target.tile];
-        final frame = usePrevious ? first : packet;
-        selected[target.tile][target.frame] = frame;
-        onSelect?.call(
-          target.frame,
-          target.tile,
-          frame,
-          inputIndex - (usePrevious ? 1 : 0),
-        );
-      }
-      if (index == targets.length) break;
-      previous = packet;
     }
-    if (index < targets.length && previous == null) {
-      throw const FormatException('No video frames');
-    }
-    // Short streams can end before the requested window. Extend the final frame.
-    for (; index < targets.length; index++) {
-      final target = targets[index];
-      selected[target.tile][target.frame] = previous;
-      onSelect?.call(target.frame, target.tile, previous!, inputIndex);
-    }
-    return [for (final tile in selected) tile.cast<FramePacket>()];
+    return [for (final schedule in schedules) schedule.frames];
   }
 }
 
 String timestampLabel(int seconds) {
+  seconds = math.max(0, seconds);
   final hours = seconds ~/ 3600;
   final minutes = (seconds ~/ 60 % 60).toString().padLeft(2, '0');
   final remainder = (seconds % 60).toString().padLeft(2, '0');
