@@ -281,6 +281,11 @@ final class _Transpose implements _SpatialFilter {
       ],
       frame.subY,
       frame.subX,
+      alpha: frame.alpha?.orient(
+        transpose: true,
+        horizontal: direction.isOdd,
+        vertical: direction >= 2,
+      ),
     );
   }
 }
@@ -395,9 +400,10 @@ final class _Scale implements _SpatialFilter {
 int _subSize(int size, int shift) => (size + (1 << shift) - 1) >> shift;
 
 final class _VideoPlanes {
-  _VideoPlanes(this.planes, this.subX, this.subY);
+  _VideoPlanes(this.planes, this.subX, this.subY, {this.alpha});
   final List<_FilterPlane> planes;
   final int subX, subY;
+  final _FilterPlane? alpha;
 
   int get width => planes.first.width;
   int get height => planes.first.height;
@@ -420,6 +426,7 @@ final class _VideoPlanes {
         ],
         subX,
         subY,
+        alpha: alpha == null ? null : transform(alpha!, 0, 0),
       );
 }
 

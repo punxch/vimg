@@ -158,6 +158,7 @@ final class IsoMedia {
       'mp4v' => 'mpeg4',
       'jpeg' || 'mjpa' || 'mjpb' || 'mjpg' => 'mjpeg',
       'ap4h' || 'ap4x' || 'apch' || 'apcn' || 'apcs' || 'apco' => 'prores',
+      'aprn' || 'aprh' => 'prores_raw',
       'png ' => 'png',
       'raw ' || 'yuv2' || '2vuy' => 'rawvideo',
       _ => 'unknown',

@@ -26,6 +26,8 @@ image.Image yuvImage({
   int chromaDepth = 8,
   int subsamplingX = 1,
   int subsamplingY = 1,
+  List<int>? alpha,
+  int alphaDepth = 8,
   YuvImageScaler? scaler,
 }) {
   if (scaler != null && scaler.filters != null) {
@@ -57,6 +59,16 @@ image.Image yuvImage({
       ],
       sx,
       sy,
+      alpha: alpha == null
+          ? null
+          : _FilterPlane(
+              alpha,
+              width,
+              height,
+              alphaDepth,
+              rowStep: stride,
+              offset: cropTop * stride + cropLeft,
+            ),
     );
     return scaler._renderFiltered(planes, matrix: matrix, fullRange: fullRange);
   }
@@ -81,10 +93,16 @@ image.Image yuvImage({
         chromaDepth: chromaDepth,
         subsamplingX: subsamplingX,
         subsamplingY: subsamplingY,
+        alpha: alpha,
+        alphaDepth: alphaDepth,
       );
     }
   }
-  final pixels = image.Image(width: width, height: height);
+  final pixels = image.Image(
+    width: width,
+    height: height,
+    numChannels: alpha == null ? 3 : 4,
+  );
   final (rv, gu, gv, bu) = switch (matrix) {
     1 => (1.5748, 0.187324, 0.468124, 1.8556), // BT.709
     9 || 10 => (1.4746, 0.164553, 0.571353, 1.8814), // BT.2020
@@ -125,6 +143,13 @@ image.Image yuvImage({
       ((luma - greenU * u - greenV * v) >> 14).clamp(0, 255),
       ((luma + blue * u) >> 14).clamp(0, 255),
     );
+  }
+  if (alpha != null) {
+    final maximum = (1 << alphaDepth) - 1;
+    for (final pixel in pixels) {
+      final sample = alpha[(cropTop + pixel.y) * stride + cropLeft + pixel.x];
+      pixel.a = (sample * 255 + (maximum >> 1)) ~/ maximum;
+    }
   }
   return pixels;
 }

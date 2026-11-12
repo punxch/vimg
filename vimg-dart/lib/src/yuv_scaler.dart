@@ -83,6 +83,8 @@ final class YuvImageScaler {
     final planes = frame.planes.map((plane) => plane.atOrigin).toList();
     final y = planes.first;
     final cb = planes.length == 3 ? planes[1] : null;
+    // Alpha follows the same full-resolution geometry and strides as luma.
+    final alpha = frame.alpha?.atOrigin;
     return yuvImage(
       y: y.samples,
       cb: cb?.samples ?? const [],
@@ -99,6 +101,8 @@ final class YuvImageScaler {
       chromaDepth: cb?.depth ?? y.depth,
       subsamplingX: frame.subX,
       subsamplingY: frame.subY,
+      alpha: alpha?.samples,
+      alphaDepth: alpha?.depth ?? 8,
       scaler: _outputScale,
     );
   }
@@ -125,6 +129,8 @@ final class YuvImageScaler {
     required int chromaDepth,
     required int subsamplingX,
     required int subsamplingY,
+    required List<int>? alpha,
+    required int alphaDepth,
   }) {
     if (width * height > 100000000) {
       throw const FormatException('Grid exceeds 100 million pixels');
@@ -191,7 +197,11 @@ final class YuvImageScaler {
       chromaDepth,
       fractionalBits,
     );
-    final pixels = image.Image(width: width, height: height);
+    final pixels = image.Image(
+      width: width,
+      height: height,
+      numChannels: alpha == null ? 3 : 4,
+    );
     if (useTable) {
       final color = (matrix: matrix, fullRange: fullRange);
       if (_tableColor != color) {
@@ -212,6 +222,22 @@ final class YuvImageScaler {
         lumaDepth,
         chromaDepth,
       );
+    }
+    if (alpha != null) {
+      const fractionalBits = 9;
+      final scaled = _luma.resize(
+        alpha,
+        stride,
+        cropTop * stride + cropLeft,
+        alphaDepth,
+        fractionalBits,
+      );
+      final maximum = ((1 << alphaDepth) - 1) << (17 - alphaDepth);
+      var index = 0;
+      for (final pixel in pixels) {
+        final sample = scaled[index++].clamp(0, maximum);
+        pixel.a = (sample * 255 + (maximum >> 1)) ~/ maximum;
+      }
     }
     return pixels;
   }

@@ -217,6 +217,7 @@ Future<void> writeContactSheet(
     final selected = plan.select(video.packets(), onSelect: onSelect);
     mark?.call('schedule');
     final inter = video.usesReferencePictures;
+    final scaleInDecoder = filters != null || video.scalesBeforeRgb;
     Map<FramePacket, List<String>>? paths;
     if (captureDirectory != null) {
       Directory(captureDirectory).createSync(recursive: true);
@@ -225,10 +226,11 @@ Future<void> writeContactSheet(
     decoder = VideoCaptureDecoder(
       video,
       threads: threads,
-      scaler: filters != null || inter && (width != null || height != null)
+      scaler:
+          scaleInDecoder && (filters != null || width != null || height != null)
           ? YuvImageScaler(width: width, height: height, filters: filters)
           : null,
-      includeOriginal: paths != null && (inter || filters != null),
+      includeOriginal: paths != null && scaleInDecoder,
     );
     final cached = <FramePacket, image.Image>{};
     if (inter) {
@@ -277,9 +279,9 @@ Future<void> writeContactSheet(
           if (captures != null) {
             _publishCaptures(captures, result.original ?? result.frame);
           }
-          final tile = filters == null
-              ? resizeToFit(result.frame, width: width, height: height)
-              : result.frame;
+          final tile = scaleInDecoder
+              ? result.frame
+              : resizeToFit(result.frame, width: width, height: height);
           for (final index in missing[result.packet]!) {
             tiles[index] = tile;
           }

@@ -172,7 +172,12 @@ typedef _WorkerInput = ({
   int index,
   SendPort events,
 });
-typedef _PackedImage = ({int width, int height, TransferableTypedData rgb});
+typedef _PackedImage = ({
+  int width,
+  int height,
+  int channels,
+  TransferableTypedData pixels,
+});
 typedef _DecodedFrame = ({
   int worker,
   FramePacket packet,
@@ -226,17 +231,23 @@ Future<void> _decodeWorker(_WorkerInput input) async {
   }
 }
 
-_PackedImage _packImage(image.Image frame) => (
-  width: frame.width,
-  height: frame.height,
-  rgb: TransferableTypedData.fromList([
-    frame.getBytes(order: image.ChannelOrder.rgb),
-  ]),
-);
+_PackedImage _packImage(image.Image frame) {
+  final alpha = frame.numChannels == 4;
+  return (
+    width: frame.width,
+    height: frame.height,
+    channels: alpha ? 4 : 3,
+    pixels: TransferableTypedData.fromList([
+      frame.getBytes(
+        order: alpha ? image.ChannelOrder.rgba : image.ChannelOrder.rgb,
+      ),
+    ]),
+  );
+}
 
 image.Image _unpackImage(_PackedImage frame) => image.Image.fromBytes(
   width: frame.width,
   height: frame.height,
-  bytes: frame.rgb.materialize(),
-  numChannels: 3,
+  bytes: frame.pixels.materialize(),
+  numChannels: frame.channels,
 );

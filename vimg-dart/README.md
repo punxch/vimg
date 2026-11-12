@@ -63,6 +63,11 @@ intra block copy for screen content.
 Film grain synthesis runs on AV1 display frames before RGB conversion.
 HEVC range extension tools and hardware capture backends remain pending.
 
+MP4/MOV and Matroska support Apple ProRes 422 and 4444, including Proxy,
+LT, HQ and XQ. The decoder handles progressive frames and both interlaced
+field orders. BMP extraction, including `vcs --keep`, retains 8-bit or 16-bit
+source alpha as an 8-bit BMP alpha channel. ProRes RAW remains pending.
+
 MP4/MOV files can contain conventional sample tables, movie fragments, or both.
 Fragmented files use a local initialization movie and local media data. Probe
 derives duration from the track runs when the initialization has zero duration.
@@ -147,6 +152,7 @@ dart test/av1_transform_test.dart
 dart test/h264_test.dart
 dart test/hevc_test.dart
 dart test/iso_fragments_test.dart
+dart test/prores_test.dart
 dart test/authority_test.dart
 dart compile exe bin/vimg.dart -o build/vimg
 dart compile exe test/fake_ya.dart -o build/fake-ya

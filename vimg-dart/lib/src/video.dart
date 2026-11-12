@@ -19,6 +19,7 @@ import 'iso_media.dart';
 import 'matroska.dart';
 import 'matroska_frames.dart';
 import 'metadata.dart';
+import 'prores.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
@@ -64,6 +65,8 @@ final class Video {
 
   bool get usesReferencePictures =>
       codec == 'h264' || codec == 'hevc' || codec == 'av1';
+
+  bool get scalesBeforeRgb => usesReferencePictures || codec == 'prores';
 
   void close() => _input.closeSync();
 
@@ -132,7 +135,11 @@ final class Video {
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
     final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
-    if (codec != 'mjpeg' && codec != 'png' && !keyframes && !bitmap) {
+    if (codec != 'mjpeg' &&
+        codec != 'png' &&
+        codec != 'prores' &&
+        !keyframes &&
+        !bitmap) {
       throw UnsupportedError('Pure Dart decoding for $codec is unavailable');
     }
     if (avi != null) return avi.packets();
@@ -311,8 +318,21 @@ final class Video {
   ) sync* {
     if (!usesReferencePictures) {
       final packet = run.packets.single;
-      final source = decode(packet);
-      final frame = scaler?.filterRgb(source) ?? source;
+      final _RenderPicture render;
+      if (codec == 'prores') {
+        final keepAlpha =
+            includeOriginal ||
+            (scaler?.width == null && scaler?.height == null);
+        final picture = _proRes(packet, preserveAlpha: keepAlpha);
+        render = ({scaler}) => picture.rgb(
+          scaler: scaler,
+          includeAlpha: scaler?.width == null && scaler?.height == null,
+        );
+      } else {
+        final source = decode(packet);
+        render = ({scaler}) => scaler?.filterRgb(source) ?? source;
+      }
+      final frame = render(scaler: scaler);
       final unscaled = scaler?.unscaled;
       yield (
         packet: packet,
@@ -321,7 +341,7 @@ final class Video {
             ? null
             : identical(unscaled, scaler)
             ? frame
-            : unscaled?.filterRgb(source) ?? source,
+            : render(scaler: unscaled),
       );
       return;
     }
@@ -407,6 +427,9 @@ final class Video {
   image.Image decode(FramePacket packet, {bool preview = false}) {
     if (codec == 'av1' && !preview)
       return decodeSelected([packet]).single.frame;
+    if (codec == 'prores') {
+      return _proRes(packet, preserveAlpha: !preview).rgb();
+    }
     final bytes = _read(packet);
     if (codec == 'h264') {
       return _h264.decode(bytes)?.rgb() ??
@@ -438,6 +461,13 @@ final class Video {
 
   image.Image _rgb(image.Image frame) =>
       frame.convert(format: image.Format.uint8, numChannels: 3);
+
+  ProResPicture _proRes(FramePacket packet, {required bool preserveAlpha}) =>
+      decodeProRes(
+        _read(packet),
+        allowBareFrame: _matroska != null,
+        preserveAlpha: preserveAlpha,
+      );
 
   image.Image? _vp8Keyframe(Uint8List bytes) {
     if (bytes.length < 10 || bytes[0] & 1 != 0) return null;

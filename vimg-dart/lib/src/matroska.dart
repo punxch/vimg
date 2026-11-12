@@ -217,6 +217,12 @@ final class Matroska {
   String trackCodec(Map<int, EbmlElement> track) {
     final codec = text(track[0x86]);
     final config = track[0x63a2];
+    if (codec == 'V_PRORES' &&
+        config != null &&
+        config.end - config.data == 4) {
+      final tag = file.unsigned(config.data, 4);
+      if (tag == 0x6170726e || tag == 0x61707268) return 'prores_raw';
+    }
     if (codec == 'V_MS/VFW/FOURCC' &&
         config != null &&
         config.end - config.data >= 20) {
