@@ -16,6 +16,7 @@ Iterable<FramePacket> matroskaCovers(Matroska media) sync* {
 Iterable<FramePacket> matroskaFrames(
   Matroska media, {
   bool keyframes = false,
+  FrameVisitor? onSample,
 }) sync* {
   int? trackNumber;
   int? frameDuration;
@@ -54,13 +55,15 @@ Iterable<FramePacket> matroskaFrames(
               clusterTime,
               timestampScale,
               frameDuration,
-              requireSimpleKeyframe: keyframes,
+              keyframes: keyframes,
+              onSample: onSample,
             );
           } else if (child.id == 0xa0) {
             final group = media.fields(child);
             final block = group[0xa1];
-            if (block == null || (keyframes && group.containsKey(0xfb)))
-              continue;
+            if (block == null) continue;
+            final sync = !group.containsKey(0xfb);
+            if (keyframes && !sync) continue;
             final duration = media.number(group[0x9b]);
             yield* _block(
               media,
@@ -70,6 +73,8 @@ Iterable<FramePacket> matroskaFrames(
               timestampScale,
               frameDuration,
               blockDuration: duration,
+              groupKeyframe: sync,
+              onSample: onSample,
             );
           }
         }
@@ -85,7 +90,9 @@ Iterable<FramePacket> _block(
   int timestampScale,
   int? frameDuration, {
   int? blockDuration,
-  bool requireSimpleKeyframe = false,
+  bool keyframes = false,
+  bool? groupKeyframe,
+  FrameVisitor? onSample,
 }) sync* {
   final trackField = media.vint(block.data, block.end);
   if (trackField.value != track) return;
@@ -94,12 +101,15 @@ Iterable<FramePacket> _block(
     throw const FormatException('Truncated Matroska Block');
   final header = ByteData.sublistView(media.file.read(offset, 3));
   final flags = header.getUint8(2);
-  if (requireSimpleKeyframe && flags & 0x80 == 0) return;
+  final sync = groupKeyframe ?? flags & 0x80 != 0;
+  if (keyframes && !sync) return;
   final seconds = (clusterTime + header.getInt16(0)) * (timestampScale / 1e9);
   offset += 3;
   final lacing = (flags >> 1) & 3;
   if (lacing == 0) {
-    yield (seconds: seconds, offset: offset, size: block.end - offset);
+    final packet = (seconds: seconds, offset: offset, size: block.end - offset);
+    onSample?.call(packet, sync);
+    yield packet;
     return;
   }
 
@@ -146,7 +156,13 @@ Iterable<FramePacket> _block(
       ? (frameDuration ?? 0) / 1e9
       : blockDuration * (timestampScale / 1e9) / count;
   for (var index = 0; index < count; index++) {
-    yield (seconds: seconds + index * step, offset: offset, size: sizes[index]);
+    final packet = (
+      seconds: seconds + index * step,
+      offset: offset,
+      size: sizes[index],
+    );
+    onSample?.call(packet, sync);
+    yield packet;
     offset += sizes[index];
   }
 }

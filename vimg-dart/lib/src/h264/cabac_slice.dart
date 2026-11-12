@@ -1,24 +1,29 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'access_unit.dart';
 import 'cabac.dart';
+import 'motion.dart';
+import 'slice_header.dart';
+
+part 'p_slice.dart';
 
 int blockX(int block) => (block & 1) | ((block >> 1) & 2);
 int blockY(int block) => ((block >> 1) & 1) | ((block >> 2) & 2);
 int blockIndex(int x, int y) =>
     ((y & 2) << 2) | ((x & 2) << 1) | ((y & 1) << 1) | (x & 1);
 
-final class IntraBlock {
-  IntraBlock(this.slice, this.type);
+final class Macroblock {
+  Macroblock(this.slice, this.type);
 
-  final IdrSlice slice;
+  final SliceHeader slice;
   final int type;
+  bool get intra => type >= 0;
   bool get pcm => type == 25;
   bool get nxn => type == 0;
   bool get intra16 => type > 0 && type < 25;
 
   var transform8x8 = false;
+  var skipped = false;
   var lumaPattern = 0, chromaPattern = 0;
   var chromaMode = 0, qp = 0;
   var codedLuma = 0, codedChroma = 0, codedDc = 0;
@@ -43,7 +48,7 @@ enum _Residual {
 /// Coefficients remain in zigzag order here. The reconstruction stage maps
 /// them to the transform matrix. These buffers belong to one slice reader
 /// and are reused immediately after reconstructing a macroblock.
-final class IntraCoefficients {
+final class MacroblockCoefficients {
   final luma = Int32List(256);
   final lumaDc = Int32List(16);
   final chroma = Int32List(128);
@@ -51,22 +56,26 @@ final class IntraCoefficients {
   final pcm = Uint8List(384);
 }
 
-final class CabacIntraSlice {
-  CabacIntraSlice(this.header)
-    : _cabac = Cabac(header.bits, header.qp),
+final class CabacSlice {
+  CabacSlice(this.header)
+    : _cabac = Cabac(
+        header.bits,
+        header.qp,
+        interInit: header.kind == SliceKind.intra ? null : header.cabacInit,
+      ),
       _qp = header.qp;
 
-  final IdrSlice header;
+  final SliceHeader header;
   final Cabac _cabac;
-  final coefficients = IntraCoefficients();
+  final coefficients = MacroblockCoefficients();
   final _positions = Uint8List(64);
   var _previousQpDelta = false;
   int _qp;
 
   bool endOfSlice() => _cabac.terminate();
 
-  IntraBlock read(IntraBlock? left, IntraBlock? top) {
-    final block = IntraBlock(header, _type(left, top));
+  Macroblock readIntra(Macroblock? left, Macroblock? top) {
+    final block = Macroblock(header, _type(left, top));
     if (block.pcm) {
       final bits = _cabac.bits;
       bits.align(0);
@@ -95,6 +104,15 @@ final class CabacIntraSlice {
       block.chromaMode = _chromaMode(left, top);
     }
     if (block.nxn) _patterns(block, left, top);
+    _readQuantizerAndResiduals(block, left, top);
+    return block;
+  }
+
+  void _readQuantizerAndResiduals(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+  ) {
     var delta = 0;
     if (block.intra16 || block.lumaPattern != 0 || block.chromaPattern != 0) {
       delta = _qpDelta();
@@ -103,31 +121,44 @@ final class CabacIntraSlice {
     _previousQpDelta = delta != 0;
     block.qp = _qp;
     _residuals(block, left, top);
-    return block;
   }
 
-  int _type(IntraBlock? left, IntraBlock? top) {
-    final neighbors = _count(
-      left != null && !left.nxn,
-      top != null && !top.nxn,
-    );
-    if (_cabac.decision(3 + neighbors) == 0) return 0;
+  int _type(Macroblock? left, Macroblock? top) {
+    final intraSlice = header.kind == SliceKind.intra;
+    final base = switch (header.kind) {
+      SliceKind.intra => 3,
+      SliceKind.p => 17,
+      SliceKind.b => 32,
+    };
+    final neighbors = intraSlice
+        ? _count(left != null && !left.nxn, top != null && !top.nxn)
+        : 0;
+    if (_cabac.decision(base + neighbors) == 0) return 0;
     if (_cabac.terminate()) return 25;
-    final luma = _cabac.decision(6);
-    final chroma = _cabac.decision(7) == 0 ? 0 : 1 + _cabac.decision(8);
-    final prediction = 2 * _cabac.decision(9) + _cabac.decision(10);
+    final state = intraSlice ? base + 2 : base;
+    final luma = _cabac.decision(state + 1);
+    final chroma = _cabac.decision(state + 2) == 0
+        ? 0
+        : 1 + _cabac.decision(state + (intraSlice ? 3 : 2));
+    final prediction =
+        2 * _cabac.decision(state + (intraSlice ? 4 : 3)) +
+        _cabac.decision(state + (intraSlice ? 5 : 3));
     return 1 + 12 * luma + 4 * chroma + prediction;
   }
 
-  void _predictionModes(IntraBlock block, IntraBlock? left, IntraBlock? top) {
+  void _predictionModes(Macroblock block, Macroblock? left, Macroblock? top) {
     block.modes = Uint8List(16);
     final step = block.transform8x8 ? 2 : 1;
     final count = step == 2 ? 4 : 16;
     for (var index = 0; index < count; index++) {
       final x = blockX(index * step * step);
       final y = blockY(index * step * step);
-      final a = x == 0 ? left : block;
-      final b = y == 0 ? top : block;
+      var a = x == 0 ? left : block;
+      var b = y == 0 ? top : block;
+      if (header.pps.constrainedIntra) {
+        if (a?.intra == false) a = null;
+        if (b?.intra == false) b = null;
+      }
       var mode = a == null || b == null
           ? 2
           : math.min(
@@ -147,7 +178,7 @@ final class CabacIntraSlice {
     }
   }
 
-  int _chromaMode(IntraBlock? left, IntraBlock? top) {
+  int _chromaMode(Macroblock? left, Macroblock? top) {
     final neighbors = _count(
       (left?.chromaMode ?? 0) > 0,
       (top?.chromaMode ?? 0) > 0,
@@ -157,7 +188,7 @@ final class CabacIntraSlice {
     return 2 + _cabac.decision(67);
   }
 
-  void _patterns(IntraBlock block, IntraBlock? left, IntraBlock? top) {
+  void _patterns(Macroblock block, Macroblock? left, Macroblock? top) {
     for (var i = 0; i < 4; i++) {
       final x = i & 1;
       final y = i >> 1;
@@ -170,7 +201,7 @@ final class CabacIntraSlice {
       block.lumaPattern |= _cabac.decision(73 + neighbors) << i;
     }
     if (header.pps.sps.chromaFormat != 1) return;
-    int pattern(IntraBlock? block) =>
+    int pattern(Macroblock? block) =>
         block?.pcm == true ? 2 : block?.chromaPattern ?? 0;
     final a = pattern(left);
     final b = pattern(top);
@@ -189,7 +220,7 @@ final class CabacIntraSlice {
     return value.isOdd ? (value + 1) >> 1 : -(value >> 1);
   }
 
-  void _residuals(IntraBlock block, IntraBlock? left, IntraBlock? top) {
+  void _residuals(Macroblock block, Macroblock? left, Macroblock? top) {
     coefficients.luma.fillRange(0, 256, 0);
     coefficients.lumaDc.fillRange(0, 16, 0);
     coefficients.chroma.fillRange(0, 128, 0);
@@ -197,7 +228,7 @@ final class CabacIntraSlice {
     if (block.intra16 &&
         _decode(
           _Residual.lumaDc,
-          _pair(_dcFlag(left, 0), _dcFlag(top, 0)),
+          _pair(_dcFlag(left, 0, block.intra), _dcFlag(top, 0, block.intra)),
           coefficients.lumaDc,
           0,
           16,
@@ -217,8 +248,16 @@ final class CabacIntraSlice {
         final x = blockX(i);
         final y = blockY(i);
         final context = _pair(
-          _lumaFlag(x == 0 ? left : block, blockIndex((x - 1) & 3, y)),
-          _lumaFlag(y == 0 ? top : block, blockIndex(x, (y - 1) & 3)),
+          _lumaFlag(
+            x == 0 ? left : block,
+            blockIndex((x - 1) & 3, y),
+            block.intra,
+          ),
+          _lumaFlag(
+            y == 0 ? top : block,
+            blockIndex(x, (y - 1) & 3),
+            block.intra,
+          ),
         );
         final ac = block.intra16;
         if (_decode(
@@ -236,7 +275,10 @@ final class CabacIntraSlice {
     for (var plane = 0; plane < 2; plane++) {
       if (_decode(
         _Residual.chromaDc,
-        _pair(_dcFlag(left, plane + 1), _dcFlag(top, plane + 1)),
+        _pair(
+          _dcFlag(left, plane + 1, block.intra),
+          _dcFlag(top, plane + 1, block.intra),
+        ),
         coefficients.chromaDc,
         plane * 4,
         4,
@@ -249,8 +291,8 @@ final class CabacIntraSlice {
       final x = i & 1;
       final y = (i >> 1) & 1;
       final context = _pair(
-        _chromaFlag(x == 0 ? left : block, i ^ 1),
-        _chromaFlag(y == 0 ? top : block, i ^ 2),
+        _chromaFlag(x == 0 ? left : block, i ^ 1, block.intra),
+        _chromaFlag(y == 0 ? top : block, i ^ 2, block.intra),
       );
       if (_decode(
         _Residual.chromaAc,
@@ -308,12 +350,12 @@ final class CabacIntraSlice {
   }
 }
 
-bool _dcFlag(IntraBlock? block, int index) =>
-    block == null || block.pcm || _set(block.codedDc, index);
-bool _lumaFlag(IntraBlock? block, int index) =>
-    block == null || block.pcm || _set(block.codedLuma, index);
-bool _chromaFlag(IntraBlock? block, int index) =>
-    block == null || block.pcm || _set(block.codedChroma, index);
+bool _dcFlag(Macroblock? block, int index, bool intra) =>
+    block == null ? intra : block.pcm || _set(block.codedDc, index);
+bool _lumaFlag(Macroblock? block, int index, bool intra) =>
+    block == null ? intra : block.pcm || _set(block.codedLuma, index);
+bool _chromaFlag(Macroblock? block, int index, bool intra) =>
+    block == null ? intra : block.pcm || _set(block.codedChroma, index);
 bool _set(int flags, int index) => flags & (1 << index) != 0;
 int _count(bool a, bool b) => (a ? 1 : 0) + (b ? 1 : 0);
 int _pair(bool a, bool b) => (a ? 1 : 0) + (b ? 2 : 0);

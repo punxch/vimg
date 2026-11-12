@@ -48,9 +48,13 @@ final class Video {
 
   void close() => _input.closeSync();
 
-  late final H264IdrDecoder _h264 = _openH264();
+  late final Uint8List _avcConfig = _openH264();
+  late final H264IdrDecoder _h264 = H264IdrDecoder(
+    AvcConfiguration(_avcConfig),
+  );
+  late final _H264Timeline _h264Timeline = _indexH264();
 
-  H264IdrDecoder _openH264() {
+  Uint8List _openH264() {
     final matroska = _matroska;
     final iso = _iso;
     final config = matroska != null
@@ -60,11 +64,13 @@ final class Video {
       throw UnsupportedError(
         'H.264 requires a Matroska or MP4 AVC configuration',
       );
-    return H264IdrDecoder(AvcConfiguration(config));
+    return config;
   }
 
   Iterable<FramePacket> packets({bool preview = false}) {
-    if (codec == 'h264') return _h264Packets(preview);
+    if (codec == 'h264') {
+      return preview ? _h264Keyframes() : _h264Timeline.presentation;
+    }
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
     final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
@@ -75,24 +81,92 @@ final class Video {
     return _containerPackets(keyframes);
   }
 
-  Iterable<FramePacket> _containerPackets(bool keyframes) {
+  Iterable<FramePacket> _containerPackets(
+    bool keyframes, {
+    FrameVisitor? onSample,
+  }) {
     final matroska = _matroska;
     return matroska == null
-        ? isoFrames(_iso!, keyframes: keyframes)
-        : matroskaFrames(matroska, keyframes: keyframes);
+        ? isoFrames(_iso!, keyframes: keyframes, onSample: onSample)
+        : matroskaFrames(matroska, keyframes: keyframes, onSample: onSample);
   }
 
-  Iterable<FramePacket> _h264Packets(bool preview) sync* {
+  bool _isIdr(AvcConfiguration configuration, FramePacket packet) =>
+      configuration.containsIdr(packet.offset, packet.size, file.unsigned);
+
+  Iterable<FramePacket> _h264Keyframes() {
     final configuration = _h264.configuration;
-    for (final packet in _containerPackets(preview)) {
-      if (configuration.containsIdr(
-        packet.offset,
-        packet.size,
-        file.unsigned,
-      )) {
-        yield packet;
-      } else if (!preview) {
-        throw UnsupportedError('H.264 inter-picture decoding is unavailable');
+    return _containerPackets(
+      true,
+    ).where((packet) => _isIdr(configuration, packet));
+  }
+
+  _H264Timeline _indexH264() {
+    final configuration = _h264.configuration;
+    final decodeOrder = <FramePacket>[];
+    final index = <FramePacket, int>{};
+    final gopStart = <int>[];
+    var start = -1;
+    final presentation = _containerPackets(
+      false,
+      onSample: (packet, sync) {
+        final position = decodeOrder.length;
+        if (sync && _isIdr(configuration, packet)) start = position;
+        index[packet] = position;
+        decodeOrder.add(packet);
+        gopStart.add(start);
+      },
+    ).toList();
+    presentation.sort((a, b) {
+      final byTime = a.seconds.compareTo(b.seconds);
+      return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+    });
+    return (
+      decodeOrder: decodeOrder,
+      presentation: presentation,
+      index: index,
+      gopStart: gopStart,
+    );
+  }
+
+  Iterable<({FramePacket packet, image.Image frame})> decodeSelected(
+    Iterable<FramePacket> selected,
+  ) sync* {
+    if (codec != 'h264') {
+      for (final packet in selected) {
+        yield (packet: packet, frame: decode(packet));
+      }
+      return;
+    }
+
+    final timeline = _h264Timeline;
+    final targets = {
+      for (final packet in selected)
+        timeline.index[packet] ??
+            (throw const FormatException('Unknown H.264 video packet')),
+    }.toList()..sort();
+    H264StreamDecoder? decoder;
+    var group = -1;
+    var next = 0;
+    for (final target in targets) {
+      final start = timeline.gopStart[target];
+      if (start < 0) {
+        throw const FormatException('H.264 picture has no preceding IDR');
+      }
+      if (start != group) {
+        decoder = H264StreamDecoder(AvcConfiguration(_avcConfig));
+        group = start;
+        next = start;
+      }
+      while (next <= target) {
+        final packet = timeline.decodeOrder[next++];
+        final picture = decoder!.decode(_read(packet));
+        if (next - 1 == target) {
+          if (picture == null) {
+            throw const FormatException('Invalid H.264 video frame');
+          }
+          yield (packet: packet, frame: picture.rgb());
+        }
       }
     }
   }
@@ -111,16 +185,23 @@ final class Video {
     return null;
   }
 
-  image.Image decode(FramePacket packet) {
+  Uint8List _read(FramePacket packet) {
     if (packet.size <= 0 || packet.size > 64 * 1024 * 1024) {
       throw const FormatException('Invalid video frame size');
     }
-    final bytes = file.read(packet.offset, packet.size);
+    return file.read(packet.offset, packet.size);
+  }
+
+  image.Image decode(FramePacket packet) {
+    final bytes = _read(packet);
+    if (codec == 'h264') {
+      return _h264.decode(bytes)?.rgb() ??
+          decodeSelected([packet]).single.frame;
+    }
     final frame = switch (codec) {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
-      'h264' => _h264.decode(bytes)?.rgb(),
       'rawvideo' => _avi?.decodeBitmap(bytes),
       _ => null,
     };
@@ -144,3 +225,10 @@ final class Video {
     return image.decodeWebP(riff);
   }
 }
+
+typedef _H264Timeline = ({
+  List<FramePacket> decodeOrder,
+  List<FramePacket> presentation,
+  Map<FramePacket, int> index,
+  List<int> gopStart,
+});

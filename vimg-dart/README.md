@@ -36,12 +36,13 @@ depend on the library's encoders and decoders.
 
 Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
 unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit
-BGR. Matroska and MP4/MOV support progressive 8-bit CABAC H.264 IDR pictures.
+BGR. Matroska and MP4/MOV support progressive 8-bit CABAC H.264 I/P pictures
+with 4:2:0 or monochrome chroma. `extract` and `vcs` decode forward from the
+preceding IDR and reuse reference pictures for captures in the same GOP.
 The `preview` command selects an IDR picture from H.264 files, including
-`sample/input.mkv`. Extraction and contact sheets require independently
-decodable H.264 frames in the sampled range. CAVLC, H.264 P/B pictures and
-HEVC decoding are pending, along with Rust's `authority` commands, FFmpeg
-filter expressions and hardware capture backends.
+`sample/input.mkv`. Full contact sheets for that sample also require H.264 B
+pictures. B pictures, CAVLC and HEVC decoding are pending, along with Rust's
+`authority` commands, FFmpeg filter expressions and hardware capture backends.
 
 The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses
 separate palettes for green samples and blue/red pairs. Blocks with up to

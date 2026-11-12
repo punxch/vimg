@@ -3,12 +3,15 @@ import 'dart:typed_data';
 import 'cabac_tables.dart';
 import 'rbsp.dart';
 
-/// H.264 binary arithmetic decoding for progressive intra slices (§9.3).
+/// H.264 binary arithmetic decoding for progressive slices (§9.3).
 final class Cabac {
-  Cabac(this.bits, int qp) {
+  Cabac(this.bits, int qp, {int? interInit}) {
+    final table = interInit == null
+        ? intraContextInit
+        : interContextInit[interInit];
     for (var context = 0; context < _models.length; context++) {
-      final m = intraContextInit[context * 2];
-      final n = intraContextInit[context * 2 + 1];
+      final m = table[context * 2];
+      final n = table[context * 2 + 1];
       final pre = (((m * qp) >> 4) + n).clamp(1, 126);
       // Store pStateIdx in the high bits and valMPS in the low bit.
       _models[context] = pre < 64 ? (63 - pre) << 1 : ((pre - 64) << 1) | 1;

@@ -35,6 +35,12 @@ final class H264Sps {
     required this.pocType,
     required this.pocLsbBits,
     required this.deltaPocAlwaysZero,
+    required this.pocCycle,
+    required this.nonReferenceOffset,
+    required this.bottomOffset,
+    required this.maxReferences,
+    required this.allowGaps,
+    required this.direct8x8,
     required this.mbWidth,
     required this.mbHeight,
     required this.frameOnly,
@@ -72,25 +78,25 @@ final class H264Sps {
     final pocType = bits.ue(2);
     var pocBits = 0;
     var deltaAlwaysZero = false;
+    var pocCycle = const <int>[];
+    var nonReferenceOffset = 0, bottomOffset = 0;
     if (pocType == 0) {
       pocBits = bits.ue(12) + 4;
     } else if (pocType == 1) {
       deltaAlwaysZero = bits.flag();
-      bits.se(); // offset_for_non_ref_pic
-      bits.se(); // offset_for_top_to_bottom_field
+      nonReferenceOffset = bits.se();
+      bottomOffset = bits.se();
       final cycle = bits.ue(255);
-      for (var i = 0; i < cycle; i++) {
-        bits.se();
-      }
+      pocCycle = List.generate(cycle, (_) => bits.se(), growable: false);
     }
-    bits.ue(16); // max_num_ref_frames
-    bits.bit(); // gaps_in_frame_num_value_allowed_flag
+    final maxReferences = bits.ue(16);
+    final allowGaps = bits.flag();
     final mbWidth = bits.ue(4095) + 1;
     final mapHeight = bits.ue(4095) + 1;
     final frameOnly = bits.flag();
     if (!frameOnly) bits.bit(); // mb_adaptive_frame_field_flag
     final mbHeight = mapHeight * (frameOnly ? 1 : 2);
-    bits.bit(); // direct_8x8_inference_flag
+    final direct8x8 = bits.flag();
     var left = 0, top = 0, right = 0, bottom = 0;
     if (bits.flag()) {
       final subsampling = separate ? 0 : chroma;
@@ -121,6 +127,12 @@ final class H264Sps {
       pocType: pocType,
       pocLsbBits: pocBits,
       deltaPocAlwaysZero: deltaAlwaysZero,
+      pocCycle: pocCycle,
+      nonReferenceOffset: nonReferenceOffset,
+      bottomOffset: bottomOffset,
+      maxReferences: maxReferences,
+      allowGaps: allowGaps,
+      direct8x8: direct8x8,
       mbWidth: mbWidth,
       mbHeight: mbHeight,
       frameOnly: frameOnly,
@@ -137,6 +149,9 @@ final class H264Sps {
   final bool separateColorPlane, transformBypass;
   final int frameNumBits, pocType, pocLsbBits;
   final bool deltaPocAlwaysZero;
+  final List<int> pocCycle;
+  final int nonReferenceOffset, bottomOffset, maxReferences;
+  final bool allowGaps, direct8x8;
   final int mbWidth, mbHeight;
   final bool frameOnly;
   final int cropLeft, cropTop, width, height;
@@ -167,6 +182,10 @@ final class H264Pps {
     required this.sps,
     required this.cabac,
     required this.bottomFieldPocPresent,
+    required this.activeL0,
+    required this.activeL1,
+    required this.weightedP,
+    required this.weightedB,
     required this.initialQp,
     required this.chromaOffset,
     required this.secondChromaOffset,
@@ -190,9 +209,12 @@ final class H264Pps {
     final bottomPoc = bits.flag();
     final groups = bits.ue(7) + 1;
     if (groups > 1) _skipSliceGroups(bits, groups);
-    bits.ue(31); // default active reference indexes (L0 and L1)
-    bits.ue(31);
-    bits.read(3); // weighted_pred_flag and weighted_bipred_idc
+    final activeL0 = bits.ue(31) + 1;
+    final activeL1 = bits.ue(31) + 1;
+    final weightedP = bits.flag();
+    final weightedB = bits.read(2);
+    if (weightedB > 2)
+      throw const FormatException('Invalid H.264 weighted_bipred_idc');
     final qp = 26 + bits.se();
     bits.se(); // pic_init_qs_minus26
     final chromaOffset = bits.se();
@@ -225,6 +247,10 @@ final class H264Pps {
       sps: sps,
       cabac: cabac,
       bottomFieldPocPresent: bottomPoc,
+      activeL0: activeL0,
+      activeL1: activeL1,
+      weightedP: weightedP,
+      weightedB: weightedB,
       initialQp: qp,
       chromaOffset: chromaOffset,
       secondChromaOffset: secondOffset,
@@ -239,7 +265,8 @@ final class H264Pps {
 
   final int id;
   final H264Sps sps;
-  final bool cabac, bottomFieldPocPresent;
+  final bool cabac, bottomFieldPocPresent, weightedP;
+  final int activeL0, activeL1, weightedB;
   final int initialQp, chromaOffset, secondChromaOffset;
   final bool deblockingControl,
       constrainedIntra,

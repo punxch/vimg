@@ -18,6 +18,7 @@ Iterable<FramePacket> isoCovers(IsoMedia media) sync* {
 Iterable<FramePacket> isoFrames(
   IsoMedia media, {
   bool keyframes = false,
+  FrameVisitor? onSample,
 }) sync* {
   final movie = media.movie();
   final track = media.firstVideoTrack(moov: movie);
@@ -34,7 +35,9 @@ Iterable<FramePacket> isoFrames(
   final chunkMap = _Table(media, table, 'stsc', 12);
   final durations = _Table(media, table, 'stts', 8);
   final composition = _Table.optional(media, table, 'ctts', 8);
-  final sync = keyframes ? _Table.optional(media, table, 'stss', 4) : null;
+  final sync = keyframes || onSample != null
+      ? _Table.optional(media, table, 'stss', 4)
+      : null;
   final wideChunks = media.child(table, 'co64') != null;
   final chunks = _Table(
     media,
@@ -92,11 +95,14 @@ Iterable<FramePacket> isoFrames(
           sync == null ||
           (syncRow < sync.count && sync.value(syncRow, 0) == sample + 1);
       if (isSync && sync != null) syncRow++;
-      if (isSync && pts >= edit.start) {
-        final seconds = (pts - edit.start) / scale + edit.delay;
-        if (edit.end == null || seconds < edit.end!) {
-          yield (seconds: seconds, offset: offset, size: size);
-        }
+      final seconds = (pts - edit.start) / scale + edit.delay;
+      final packet = (seconds: seconds, offset: offset, size: size);
+      // Samples trimmed by an edit may still be needed for inter prediction.
+      onSample?.call(packet, isSync);
+      if ((!keyframes || isSync) &&
+          pts >= edit.start &&
+          (edit.end == null || seconds < edit.end!)) {
+        yield packet;
       }
       timestamp += step;
       durationUsed++;

@@ -1,17 +1,19 @@
 import 'dart:typed_data';
 
 import 'deblock_tables.dart';
-import 'intra_blocks.dart';
+import 'motion.dart';
+import 'cabac_slice.dart';
 import 'transforms.dart';
 
-/// H.264 deblocking for an intra picture (§8.7). The filter is applied in
-/// macroblock order after intra prediction has read the unfiltered planes.
-void deblockIntra(
-  List<IntraBlock?> blocks,
+/// H.264 deblocking (§8.7) in macroblock order. Inter edges use per-4×4
+/// residual and reference information to choose the boundary strength.
+void deblockPicture(
+  List<Macroblock?> blocks,
   Uint8List y,
   Uint8List cb,
   Uint8List cr,
   int width,
+  MotionField? motion,
 ) {
   final stride = width * 16;
   for (var address = 0; address < blocks.length; address++) {
@@ -30,6 +32,9 @@ void deblockIntra(
           : (row == 0 ? -1 : address - width);
       var neighbor = neighborAddress < 0 ? null : blocks[neighborAddress];
       if (slice.deblocking == 2 && neighbor?.slice != slice) neighbor = null;
+
+      int strength(int edge, int segment) =>
+          _strength(block, neighbor, motion, x, row, vertical, edge, segment);
       _edges(
         y,
         start,
@@ -41,6 +46,7 @@ void deblockIntra(
         neighbor?.qp,
         slice.alphaOffset,
         slice.betaOffset,
+        strength,
       );
       if (cb.isNotEmpty) {
         final cbQp = chromaQp(block.qp, pps.chromaOffset);
@@ -56,6 +62,7 @@ void deblockIntra(
           neighbor == null ? null : chromaQp(neighbor.qp, pps.chromaOffset),
           slice.alphaOffset,
           slice.betaOffset,
+          strength,
         );
         _edges(
           cr,
@@ -70,10 +77,40 @@ void deblockIntra(
               : chromaQp(neighbor.qp, pps.secondChromaOffset),
           slice.alphaOffset,
           slice.betaOffset,
+          strength,
         );
       }
     }
   }
+}
+
+int _strength(
+  Macroblock block,
+  Macroblock? neighbor,
+  MotionField? motion,
+  int mbX,
+  int mbY,
+  bool vertical,
+  int edge,
+  int segment,
+) {
+  final other = edge == 0 ? neighbor! : block;
+  if (block.intra || other.intra) return edge == 0 ? 4 : 3;
+  final x = mbX * 4 + (vertical ? edge : segment);
+  final y = mbY * 4 + (vertical ? segment : edge);
+  final px = x - (vertical ? 1 : 0);
+  final py = y - (vertical ? 0 : 1);
+  if (block.codedLuma & (1 << blockIndex(x & 3, y & 3)) != 0 ||
+      other.codedLuma & (1 << blockIndex(px & 3, py & 3)) != 0) {
+    return 2;
+  }
+  final a = motion!.vectorAt(px, py);
+  final b = motion.vectorAt(x, y);
+  return motion.identityAt(px, py) != motion.identityAt(x, y) ||
+          (a.x - b.x).abs() >= 4 ||
+          (a.y - b.y).abs() >= 4
+      ? 1
+      : 0;
 }
 
 void _edges(
@@ -87,33 +124,39 @@ void _edges(
   int? neighborQp,
   int alphaOffset,
   int betaOffset,
+  int Function(int edge, int segment) strengthAt,
 ) {
   final across = vertical ? 1 : stride;
   final along = vertical ? stride : 1;
+  final chroma = width == 8;
+  final segmentWidth = width ~/ 4;
   for (
     var edge = neighborQp == null ? spacing : 0;
     edge < width;
     edge += spacing
   ) {
-    final boundary = edge == 0;
-    final averaged = boundary ? (qp + neighborQp! + 1) >> 1 : qp;
+    final averaged = edge == 0 ? (qp + neighborQp! + 1) >> 1 : qp;
     final index = (averaged + alphaOffset).clamp(0, 51);
     final alpha = deblockAlpha[index];
     final beta = deblockBeta[(averaged + betaOffset).clamp(0, 51)];
     if (alpha == 0 || beta == 0) continue;
-    final chroma = width == 8;
-    final offset = start + edge * across;
-    for (var i = 0; i < width; i++) {
-      _filter(
-        plane,
-        offset + i * along,
-        across,
-        alpha,
-        beta,
-        deblockLimit[index],
-        chroma: chroma,
-        boundary: boundary,
-      );
+    for (var segment = 0; segment < 4; segment++) {
+      final strength = strengthAt(edge ~/ segmentWidth, segment);
+      if (strength == 0) continue;
+      final limit = strength == 4 ? 0 : deblockLimit[strength - 1][index];
+      final offset = start + edge * across + segment * segmentWidth * along;
+      for (var i = 0; i < segmentWidth; i++) {
+        _filter(
+          plane,
+          offset + i * along,
+          across,
+          alpha,
+          beta,
+          limit,
+          chroma: chroma,
+          boundary: strength == 4,
+        );
+      }
     }
   }
 }

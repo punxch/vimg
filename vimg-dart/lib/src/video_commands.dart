@@ -113,6 +113,19 @@ void _writeCaptures(
   CapturePlan plan,
   List<List<FramePacket>> selected,
 ) {
+  final paths = _capturePaths(input, directory, plan, selected);
+  for (final decoded in video.decodeSelected(paths.keys)) {
+    _publishCaptures(paths[decoded.packet]!, decoded.frame);
+  }
+}
+
+Map<FramePacket, List<String>> _capturePaths(
+  String input,
+  String directory,
+  CapturePlan plan,
+  List<List<FramePacket>> selected,
+) {
+  final paths = <FramePacket, List<String>>{};
   final stem = videoStem(input);
   final secondsWidth = plan.usableDuration.floor().toString().length;
   final frameWidth = plan.frames.toString().length;
@@ -126,13 +139,22 @@ void _writeCaptures(
       final index = (frame + 1).toString().padLeft(frameWidth, '0');
       final base = '$stem-${seconds}s-$index';
       final name = names.add(base) ? base : '$base-${tile + 1}';
-      publishBytes(
-        outputPath(directory, '$name.bmp'),
-        image.encodeBmp(video.decode(selected[tile][frame])),
-      );
+      paths
+          .putIfAbsent(selected[tile][frame], () => [])
+          .add(outputPath(directory, '$name.bmp'));
     }
   }
+  return paths;
 }
+
+void _publishCaptures(List<String> paths, image.Image frame) {
+  final bytes = image.encodeBmp(frame);
+  for (final path in paths) {
+    publishBytes(path, bytes);
+  }
+}
+
+const _decodedFrameLimit = 256 * 1024 * 1024;
 
 void writeContactSheet(
   String input,
@@ -166,9 +188,33 @@ void writeContactSheet(
     final plan = CapturePlan(video.metadata.duration, options);
     final selected = plan.select(video.packets());
     mark?.call('schedule');
+    final inter = video.codec == 'h264';
+    Map<FramePacket, List<String>>? paths;
     if (captureDirectory != null) {
       Directory(captureDirectory).createSync(recursive: true);
-      _writeCaptures(video, input, captureDirectory, plan, selected);
+      if (inter) {
+        paths = _capturePaths(input, captureDirectory, plan, selected);
+      } else {
+        _writeCaptures(video, input, captureDirectory, plan, selected);
+      }
+    }
+    final cached = <FramePacket, image.Image>{};
+    if (inter) {
+      var decodedBytes = 0;
+      for (final result in video.decodeSelected(
+        selected.expand((tile) => tile),
+      )) {
+        final frame = resizeToFit(result.frame, width: width, height: height);
+        decodedBytes += frame.width * frame.height * 3;
+        if (decodedBytes > _decodedFrameLimit) {
+          throw const FormatException(
+            'Contact sheet exceeds 256 MiB of decoded tiles',
+          );
+        }
+        cached[result.packet] = frame;
+        if (paths != null)
+          _publishCaptures(paths[result.packet]!, result.frame);
+      }
     }
     final labels = plan.starts
         .map((start) => timestampLabel(start.floor()))
@@ -182,8 +228,9 @@ void writeContactSheet(
       for (var tile = 0; tile < tiles.length; tile++) {
         final packet = selected[tile][frame];
         if (last[tile] == packet) continue;
-        final decoded = video.decode(packet);
-        tiles[tile] = resizeToFit(decoded, width: width, height: height);
+        tiles[tile] =
+            cached[packet] ??
+            resizeToFit(video.decode(packet), width: width, height: height);
         last[tile] = packet;
         changed = true;
       }
@@ -204,7 +251,7 @@ void writeContactSheet(
                   rows *
                   options.frames *
                   3 >
-              256 * 1024 * 1024) {
+              _decodedFrameLimit) {
         throw const FormatException(
           'Contact sheet exceeds 256 MiB of decoded frames',
         );

@@ -1,7 +1,6 @@
 import 'dart:typed_data';
 
 import 'parameters.dart';
-import 'rbsp.dart';
 
 /// AVCDecoderConfigurationRecord and length-prefixed samples used by AVC in
 /// Matroska and ISO BMFF. Parameter sets carried in avc3 samples can replace
@@ -100,64 +99,4 @@ final class AvcConfiguration {
       offset += size;
     }
   }
-}
-
-final class IdrSlice {
-  IdrSlice(Uint8List nal, Map<int, H264Pps> pictures)
-    : bits = Rbsp.fromNal(nal) {
-    if (nal[0] & 31 != 5 || nal[0] & 0x60 == 0) {
-      throw const FormatException('Expected an H.264 IDR slice');
-    }
-    firstMb = bits.ue();
-    if (bits.ue(9) % 5 != 2)
-      throw const FormatException('H.264 IDR slice is not intra');
-    final picture = pictures[bits.ue(255)];
-    if (picture == null)
-      throw const FormatException('H.264 slice references a missing PPS');
-    pps = picture;
-    final sps = pps.sps;
-    if (!sps.frameOnly || pps.sliceGroups != 1 || sps.separateColorPlane) {
-      throw UnsupportedError(
-        'Interlaced and slice-group H.264 pictures are unavailable',
-      );
-    }
-    frameNum = bits.read(sps.frameNumBits);
-    idrId = bits.ue(65535);
-    if (sps.pocType == 0) {
-      pocLsb = bits.read(sps.pocLsbBits);
-      if (pps.bottomFieldPocPresent) bits.se();
-    } else if (sps.pocType == 1 && !sps.deltaPocAlwaysZero) {
-      bits.se();
-      if (pps.bottomFieldPocPresent) bits.se();
-    }
-    if (pps.redundantPicCount && bits.ue(127) != 0) {
-      throw UnsupportedError('Redundant H.264 slices are unavailable');
-    }
-    bits.read(2); // no_output_of_prior_pics_flag and long_term_reference_flag
-    qp = pps.initialQp + bits.se();
-    if (qp < -6 * (sps.lumaDepth - 8) ||
-        qp > 51 ||
-        firstMb >= sps.mbWidth * sps.mbHeight) {
-      throw const FormatException(
-        'Invalid H.264 slice QP or macroblock address',
-      );
-    }
-    if (pps.deblockingControl) {
-      deblocking = bits.ue(2);
-      if (deblocking != 1) {
-        alphaOffset = 2 * bits.se();
-        betaOffset = 2 * bits.se();
-        if (alphaOffset.abs() > 12 || betaOffset.abs() > 12) {
-          throw const FormatException('Invalid H.264 deblocking offset');
-        }
-      }
-    }
-    if (pps.cabac) bits.align(1);
-  }
-
-  final Rbsp bits;
-  late final int firstMb, frameNum, idrId, qp;
-  int? pocLsb;
-  late final H264Pps pps;
-  var deblocking = 0, alphaOffset = 0, betaOffset = 0;
 }

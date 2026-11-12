@@ -117,47 +117,51 @@ int chromaQp(int luma, int offset) {
   return index < 30 ? index : _chromaQp[index - 30];
 }
 
-final class IntraScaling {
-  IntraScaling(H264Pps pps) {
+final class ScalingMatrices {
+  ScalingMatrices(H264Pps pps) {
     final seq = pps.sps.scaling;
     final pic = pps.scaling;
-    final default4 = _raster(scan4, _default4Scan);
-    final seqY = seq == null
-        ? List.filled(16, 16)
-        : _resolve(seq, 0, scan4, default4, default4);
-    final seqCb = seq == null ? seqY : _resolve(seq, 1, scan4, seqY, default4);
-    final seqCr = seq == null
-        ? seqCb
-        : _resolve(seq, 2, scan4, seqCb, default4);
-    final seq8 = seq == null
-        ? List.filled(64, 16)
-        : _resolve(seq, 6, scan8, _default8, _default8);
-    if (pic == null) {
-      four = [seqY, seqCb, seqCr];
-      eight = seq8;
-    } else {
-      final y = _resolve(
-        pic,
-        0,
-        scan4,
-        seq == null ? default4 : seqY,
-        default4,
-      );
-      final cb = _resolve(pic, 1, scan4, y, default4);
-      final cr = _resolve(pic, 2, scan4, cb, default4);
-      four = [y, cb, cr];
-      eight = _resolve(
-        pic,
-        6,
-        scan8,
-        seq == null ? _default8 : seq8,
-        _default8,
-      );
+    List<List<int>> fourGroup(int start, List<int> defaults) {
+      var sequence = seq == null ? List.filled(16, 16) : defaults;
+      var picture = defaults;
+      final weights = <List<int>>[];
+      for (var plane = 0; plane < 3; plane++) {
+        if (seq != null)
+          sequence = _resolve(seq, start + plane, scan4, sequence, defaults);
+        if (pic == null) {
+          picture = sequence;
+        } else {
+          final fallback = plane == 0 && seq != null ? sequence : picture;
+          picture = _resolve(pic, start + plane, scan4, fallback, defaults);
+        }
+        weights.add(picture);
+      }
+      return weights;
     }
+
+    List<int> eightGroup(int index, List<int> defaults) {
+      final sequence = seq == null
+          ? List.filled(64, 16)
+          : _resolve(seq, index, scan8, defaults, defaults);
+      return pic == null
+          ? sequence
+          : _resolve(
+              pic,
+              index,
+              scan8,
+              seq == null ? defaults : sequence,
+              defaults,
+            );
+    }
+
+    four = fourGroup(0, _raster(scan4, _default4Scan));
+    interFour = fourGroup(3, _defaultInter4);
+    eight = eightGroup(6, _default8);
+    interEight = eightGroup(7, _defaultInter8);
   }
 
-  late final List<List<int>> four;
-  late final List<int> eight;
+  late final List<List<int>> four, interFour;
+  late final List<int> eight, interEight;
 
   static List<int> _resolve(
     List<H264ScalingList?> matrices,
@@ -264,6 +268,23 @@ const _default8 = [
   40,
   42,
 ];
+
+// dart format off
+const _defaultInter4 = [
+  10, 14, 20, 24, 14, 20, 24, 27,
+  20, 24, 27, 30, 24, 27, 30, 34,
+];
+const _defaultInter8 = [
+  9, 13, 15, 17, 19, 21, 22, 24,
+  13, 13, 17, 19, 21, 22, 24, 25,
+  15, 17, 19, 21, 22, 24, 25, 27,
+  17, 19, 21, 22, 24, 25, 27, 28,
+  19, 21, 22, 24, 25, 27, 28, 30,
+  21, 22, 24, 25, 27, 28, 30, 32,
+  22, 24, 25, 27, 28, 30, 32, 33,
+  24, 25, 27, 28, 30, 32, 33, 35,
+];
+// dart format on
 
 /// Inverse scanning, scaling and transforms (§8.5). The residual buffer is
 /// reused for each block to keep the frame's working set proportional to pixels.

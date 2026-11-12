@@ -17,12 +17,32 @@ import 'fixtures.dart';
 // Synthetic 78×50 YUV encoded with x264 High Profile, two IDR frames and two
 // slices per frame. Checksums use FFmpeg's decoded, cropped YUV420p planes
 // with deblocking enabled.
-const _expected = [
+const _idrPlanes = [
   [0xbf89f3e5, 0xd17539ad, 0xe0ee3d2d],
   [0x1124f8a0, 0x4679dbc8, 0x248ac689],
 ];
 
-void _checkPlanes(String input) {
+// Twelve frames using multiple references, weighted prediction and two slices.
+const _pPlanes = [
+  [0xb31104a6, 0x487edb44, 0x8f405e49],
+  [0x99d0f526, 0x3ee4a477, 0x5ca5f999],
+  [0x0f705928, 0x2d9b6e65, 0xc9253506],
+  [0xe80c67ac, 0x5033de0e, 0xb98831d7],
+  [0x34dee6fe, 0xd5cc08a9, 0x3e4f59ee],
+  [0xd6310950, 0x8d4c5161, 0xe1e92887],
+  [0xa50e40d6, 0x7a7cc41f, 0xdd4742df],
+  [0x5c14d537, 0x99a1e53e, 0x3e3fff1f],
+  [0xfb7d5331, 0x4279441e, 0x8459ff13],
+  [0x7b5bd543, 0x6862dd3a, 0xf1985475],
+  [0xd7365a8e, 0xe93b2a4c, 0x63899bdd],
+  [0x0b3a07f4, 0xa6299768, 0x6165d8b5],
+];
+
+void _checkPlanes(
+  String input,
+  List<List<int>> expected, {
+  bool inter = false,
+}) {
   final handle = File(input).openSync();
   try {
     final file = BinaryFile(handle);
@@ -35,11 +55,14 @@ void _checkPlanes(String input) {
     final packets = matroska == null
         ? isoFrames(iso!)
         : matroskaFrames(matroska);
-    final decoder = H264IdrDecoder(AvcConfiguration(config!));
+    final avc = AvcConfiguration(config!);
+    final decode = inter
+        ? H264StreamDecoder(avc).decode
+        : H264IdrDecoder(avc).decode;
     var frames = 0;
     for (final packet in packets) {
-      check(frames < _expected.length, 'Unexpected AVC packet');
-      final picture = decoder.decode(file.read(packet.offset, packet.size))!;
+      check(frames < expected.length, 'Unexpected AVC packet');
+      final picture = decode(file.read(packet.offset, packet.size))!;
       final sps = picture.sps;
       check(
         sps.profile == 100 && sps.width == 78 && sps.height == 50,
@@ -60,13 +83,13 @@ void _checkPlanes(String input) {
           sps.height >> shift,
         );
         check(
-          hash == _expected[frames][index],
+          hash == expected[frames][index],
           'H.264 frame $frames plane $index differs from FFmpeg: ${hash.toRadixString(16)}',
         );
       }
       frames++;
     }
-    check(frames == _expected.length, 'H.264 fixture frame count');
+    check(frames == expected.length, 'H.264 fixture frame count');
   } finally {
     handle.closeSync();
   }
@@ -86,8 +109,12 @@ int _checksum(Uint8List plane, int stride, int offset, int width, int height) {
 Future<void> main(List<String> arguments) async {
   const mkv = 'test/fixtures/cabac-idr.mkv';
   const mp4 = 'test/fixtures/cabac-idr.mp4';
-  _checkPlanes(mkv);
-  _checkPlanes(mp4);
+  const interMkv = 'test/fixtures/cabac-p.mkv';
+  const interMp4 = 'test/fixtures/cabac-p.mp4';
+  _checkPlanes(mkv, _idrPlanes);
+  _checkPlanes(mp4, _idrPlanes);
+  _checkPlanes(interMkv, _pPlanes, inter: true);
+  _checkPlanes(interMp4, _pPlanes, inter: true);
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -126,7 +153,7 @@ Future<void> main(List<String> arguments) async {
     }
 
     final output = '${directory.path}/frames';
-    await run(['extract', '-n1', '-t500ms', '--output-dir', output, mkv]);
+    await run(['extract', '-n1', '-t500ms', '--output-dir', output, interMkv]);
     final bmp = Directory(output).listSync().single as File;
     final frame = image.decodeBmp(bmp.readAsBytesSync())!;
     check(frame.width == 78 && frame.height == 50, 'H.264 extracted BMP');
@@ -141,7 +168,7 @@ Future<void> main(List<String> arguments) async {
       '-t500ms',
       '-o',
       avif.path,
-      mp4,
+      interMp4,
     ]);
     check(
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
