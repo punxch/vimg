@@ -29,6 +29,7 @@ import 'warp.dart';
 
 part 'inter_reconstruction.dart';
 part 'motion_field.dart';
+part 'restoration.dart';
 
 final class Av1Plane {
   Av1Plane(this.width, this.height, int paddedWidth, int paddedHeight)
@@ -184,11 +185,6 @@ _DecodedPicture _decodePicture(
       primary?.context ??
       Av1EntropyContext(header.parameters.quantization.base);
   var endCdfs = startCdfs;
-  final restoration = header.parameters.restoration;
-  if (restoration != null &&
-      restoration.types.any((t) => t != Av1RestorationType.none)) {
-    throw UnsupportedError('AV1 loop restoration syntax');
-  }
   final size = header.size, color = frame.sequence.color;
   if (size.width * size.height > 33554432) {
     throw UnsupportedError(
@@ -210,6 +206,7 @@ _DecodedPicture _decodePicture(
         ),
   ];
   final state = _FrameState(frame);
+  final restoration = _RestorationFrame(frame, planes);
   final field = header.motion.referenceMvs
       ? _MotionField(frame, references, state)
       : null;
@@ -224,6 +221,7 @@ _DecodedPicture _decodePicture(
       references,
       primary?.state,
       field,
+      restoration,
     ).decode();
     if (header.refreshContext && tile.index == header.tiles.contextTile)
       endCdfs = cdfs;
@@ -271,6 +269,7 @@ _DecodedPicture _decodePicture(
       );
     }
   }
+  restoration.saveBoundaries(planes);
   final strengths = parameters.cdef;
   if (cdef && strengths != null) {
     Av1CdefFilter(
@@ -287,6 +286,7 @@ _DecodedPicture _decodePicture(
       skip: (x, y) => state.block(x, y)?.skip ?? true,
     );
   }
+  restoration.apply(planes, color.depth);
   return (
     picture: Av1Picture(color, planes),
     state: state,
@@ -445,6 +445,7 @@ final class _PictureTile {
     this.references,
     this.prior,
     this.field,
+    _RestorationFrame restoration,
   ) {
     final columns = frame.header.tiles.columns;
     final rows = frame.header.tiles.rows;
@@ -455,6 +456,9 @@ final class _PictureTile {
     xEnd = columns[col + 1];
     yEnd = rows[row + 1];
     _width = xEnd - x0;
+    _restoration = restoration.planes.any((plane) => plane != null)
+        ? _RestorationTile(restoration, _reader, _context)
+        : null;
     _neighbors = [
       for (var p = 0; p < planes.length; p++)
         Av1CoefficientNeighbors(
@@ -470,6 +474,7 @@ final class _PictureTile {
   final _FrameState state;
   final _FrameState? prior;
   final _MotionField? field;
+  late final _RestorationTile? _restoration;
   final List<_DecodedPicture> references;
   final Av1EntropyContext _context;
   late final int x0, y0, xEnd, yEnd, _width;
@@ -527,6 +532,7 @@ final class _PictureTile {
   void decode() {
     for (var y = y0; y < yEnd; y += sb4) {
       for (var x = x0; x < xEnd; x += sb4) {
+        _restoration?.readSuperblock(x, y, sb4);
         _readDeltas = params.deltaQShift != null;
         _partition(x, y, sb4);
       }
