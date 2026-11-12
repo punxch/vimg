@@ -2,6 +2,8 @@ import 'dart:math' as math;
 
 import 'package:image/image.dart' as image;
 
+import 'grid_label.dart';
+
 image.Image resizeToFit(
   image.Image frame, {
   int? width,
@@ -44,78 +46,56 @@ image.Image resizeToFit(
   );
 }
 
-image.Image composeGrid(
-  List<image.Image> frames,
-  int columns,
-  List<String> labels,
-) {
-  if (frames.isEmpty)
-    throw const FormatException('At least one image is required');
-  if (columns < 0) throw const FormatException('Columns must be non-negative');
-  final width = frames.first.width;
-  final height = frames.first.height;
-  final count = columns == 0 ? frames.length : math.min(columns, frames.length);
-  final rows = (frames.length + count - 1) ~/ count;
-  if (width * height * count * rows > 100000000) {
-    throw const FormatException('Grid exceeds 100 million pixels');
+/// A grid's geometry and label coverage are shared by its animation frames.
+final class GridComposer {
+  GridComposer(
+    this.tileWidth,
+    this.tileHeight,
+    this.count,
+    int columns,
+    List<String> labels,
+  ) {
+    if (count < 1)
+      throw const FormatException('At least one image is required');
+    if (columns < 0)
+      throw const FormatException('Columns must be non-negative');
+    _columns = columns == 0 ? count : math.min(columns, count);
+    width = tileWidth * _columns;
+    height = tileHeight * ((count + _columns - 1) ~/ _columns);
+    if (width * height > 100000000) {
+      throw const FormatException('Grid exceeds 100 million pixels');
+    }
+    _labels = [
+      for (final label in labels.take(count))
+        GridLabel(tileWidth, tileHeight, label),
+    ];
   }
-  final grid = image.Image(width: width * count, height: height * rows);
-  for (var i = 0; i < frames.length; i++) {
-    final frame = frames[i];
-    if (frame.width != width || frame.height != height) {
-      throw const FormatException('Grid images must have the same dimensions');
-    }
-    final x = i % count * width;
-    final y = i ~/ count * height;
-    // Copy RGB directly so transparent input retains its RGB values.
-    for (final pixel in frame) {
-      grid.setPixelRgb(x + pixel.x, y + pixel.y, pixel.r, pixel.g, pixel.b);
-    }
-    if (i < labels.length && labels[i].isNotEmpty) {
-      _drawLabel(grid, x, y, width, height, labels[i]);
-    }
-  }
-  return grid;
-}
 
-void _drawLabel(
-  image.Image grid,
-  int x,
-  int y,
-  int width,
-  int height,
-  String label,
-) {
-  final minDimension = math.min(width, height);
-  final font = switch (minDimension) {
-    < 225 => image.arial14,
-    < 390 => image.arial24,
-    _ => image.arial48,
-  };
-  final margin = math.max(1, (minDimension * 0.01).round());
-  final labelWidth = label.runes.fold(
-    0,
-    (sum, rune) => sum + (font.characters[rune]?.xAdvance ?? 0),
-  );
-  final labelHeight = font.lineHeight;
-  final right = width - margin * 2;
-  final bottom = height - margin;
-  if (labelWidth == 0 || right <= 0 || bottom < labelHeight) return;
-  final left = math.max(0, right - labelWidth);
-  final top = bottom - labelHeight;
-  final overlay = image.Image(
-    width: right - left,
-    height: labelHeight,
-    numChannels: 4,
-  );
-  image.fill(overlay, color: image.ColorRgba8(0, 0, 0, 179));
-  image.drawString(
-    overlay,
-    label,
-    font: font,
-    x: right - left - labelWidth,
-    y: 0,
-    color: image.ColorRgb8(255, 255, 255),
-  );
-  image.compositeImage(grid, overlay, dstX: x + left, dstY: y + top);
+  final int tileWidth, tileHeight, count;
+  late final int width, height, _columns;
+  late final List<GridLabel> _labels;
+
+  image.Image compose(List<image.Image> frames, {bool sourceAlpha = false}) {
+    if (frames.length != count) {
+      throw const FormatException('Grid capture count changed');
+    }
+    final grid = image.Image(width: width, height: height);
+    for (var i = 0; i < frames.length; i++) {
+      final frame = frames[i];
+      if (frame.width != tileWidth || frame.height != tileHeight) {
+        throw const FormatException(
+          'Grid images must have the same dimensions',
+        );
+      }
+      final x = i % _columns * tileWidth;
+      final y = i ~/ _columns * tileHeight;
+      for (final pixel in frame) {
+        grid.setPixelRgb(x + pixel.x, y + pixel.y, pixel.r, pixel.g, pixel.b);
+      }
+      if (i < _labels.length) {
+        _labels[i].paint(grid, x, y, source: sourceAlpha ? frame : null);
+      }
+    }
+    return grid;
+  }
 }

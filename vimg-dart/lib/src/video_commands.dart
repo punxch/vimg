@@ -235,6 +235,7 @@ void writeContactSheet(
     final last = List<FramePacket?>.filled(selected.length, null);
     image.Image? animation, previousGrid;
     AvifEncoder? avif;
+    GridComposer? composer;
     for (var frame = 0; frame < options.frames; frame++) {
       var changed = false;
       for (var tile = 0; tile < tiles.length; tile++) {
@@ -252,24 +253,22 @@ void writeContactSheet(
         onGrid?.call(frame, previousGrid!, first.width, first.height);
         continue;
       }
-      final effectiveColumns = columns == 0
-          ? tiles.length
-          : math.min(columns, tiles.length);
-      final rows = (tiles.length + effectiveColumns - 1) ~/ effectiveColumns;
+      composer ??= GridComposer(
+        first.width,
+        first.height,
+        tiles.length,
+        columns,
+        labels,
+      );
       if (encoder != null &&
           frame == 0 &&
-          first.width *
-                  first.height *
-                  effectiveColumns *
-                  rows *
-                  options.frames *
-                  3 >
+          composer.width * composer.height * options.frames * 3 >
               _decodedFrameLimit) {
         throw const FormatException(
           'Contact sheet exceeds 256 MiB of decoded frames',
         );
       }
-      final grid = composeGrid(tiles.cast<image.Image>(), columns, labels);
+      final grid = composer.compose(tiles.cast<image.Image>());
       if (onGrid != null) {
         onGrid(frame, grid, first.width, first.height);
         previousGrid = grid;

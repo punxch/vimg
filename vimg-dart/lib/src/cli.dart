@@ -110,13 +110,22 @@ final class _Join extends VimgCommand {
         throw FormatException('Unsupported input image: $path');
       frames.add(
         resizeToFit(
-          decoded.convert(format: image.Format.uint8, numChannels: 3),
+          decoded.convert(
+            format: image.Format.uint8,
+            numChannels: decoded.hasAlpha ? 4 : 3,
+          ),
           width: width,
           height: height,
         ),
       );
     }
-    final grid = composeGrid(frames, columns, arguments.multiOption('label'));
+    final grid = GridComposer(
+      frames.first.width,
+      frames.first.height,
+      frames.length,
+      columns,
+      arguments.multiOption('label'),
+    ).compose(frames, sourceAlpha: true);
     if (avif) {
       final writer = AvifEncoder(grid.width, grid.height)..addFrame(grid);
       publishBytes(output, writer.finish());
