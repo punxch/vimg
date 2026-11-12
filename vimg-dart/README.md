@@ -41,7 +41,7 @@ formats depend on the Dart image library's encoders and decoders.
   script for the Dart CLI.
 
 Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
-unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit
+MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit
 BGR. Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
@@ -62,6 +62,13 @@ CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
 intra block copy for screen content.
 Film grain synthesis runs on AV1 display frames before RGB conversion.
 HEVC range extension tools and hardware capture backends remain pending.
+
+MP4/MOV files can contain conventional sample tables, movie fragments, or both.
+Fragmented files use a local initialization movie and local media data. Probe
+derives duration from the track runs when the initialization has zero duration.
+Capture uses the edited playback timeline and preserves raw container PTS in
+the authority manifest. Encrypted tracks, overlapping or out-of-order
+fragments, and changes of sample description are pending.
 
 `extract` and `vcs` accept a comma-separated `--vfilter` chain such as
 `--vfilter 'crop=iw/2:ih,transpose=clock,hflip'`. The Dart filters include
@@ -139,6 +146,7 @@ dart test/av1_coefficients_test.dart
 dart test/av1_transform_test.dart
 dart test/h264_test.dart
 dart test/hevc_test.dart
+dart test/iso_fragments_test.dart
 dart test/authority_test.dart
 dart compile exe bin/vimg.dart -o build/vimg
 dart compile exe test/fake_ya.dart -o build/fake-ya

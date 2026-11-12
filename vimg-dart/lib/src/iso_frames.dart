@@ -1,5 +1,4 @@
-import 'frame_packet.dart';
-import 'iso_media.dart';
+part of 'iso_media.dart';
 
 Iterable<FramePacket> isoCovers(IsoMedia media) sync* {
   final movie = media.movie();
@@ -36,14 +35,70 @@ Iterable<FramePacket> isoFrames(
     throw const FormatException('Missing video sample table or timescale');
   }
   final scale = trackTiming.scale;
-  final edit = _edit(media, movie, track, scale);
+  final fragments = media._fragments;
+  final fragmentTrack = fragments?.tracks[track];
+  final edit = fragmentTrack?.edit ?? _edit(media, movie, track, scale);
+  final samples = _tableSamples(
+    media,
+    table,
+    needSync: keyframes || onSample != null,
+  ).followedBy(fragmentTrack?.samples(media) ?? const []);
+  for (final sample in samples) {
+    if (sample.description != 1) {
+      throw const FormatException(
+        'Invalid or changing ISO media sample description',
+      );
+    }
+    final mediaSeconds = (sample.pts - (edit.start ?? 0)) / scale + edit.delay;
+    final packet = (
+      seconds:
+          mediaSeconds +
+          (fragmentTrack?.playbackShift ?? 0) -
+          (fragments?.start ?? 0),
+      offset: sample.offset,
+      size: sample.size,
+      timestamp: frameTimestamp(
+        sample.pts,
+        1,
+        scale,
+        duration: sample.duration,
+      ),
+    );
+    // A sample trimmed by an edit may still be needed for inter prediction.
+    onSample?.call(packet, sample.sync);
+    if ((!keyframes || sample.sync) &&
+        _inEdit(
+          edit,
+          sample.pts,
+          mediaSeconds,
+          fragmented: fragmentTrack != null,
+        )) {
+      yield packet;
+    }
+  }
+}
+
+typedef _IsoSample = ({
+  int dts,
+  int pts,
+  int offset,
+  int size,
+  int duration,
+  int description,
+  bool sync,
+});
+
+Iterable<_IsoSample> _tableSamples(
+  IsoMedia media,
+  MediaBox table, {
+  required bool needSync,
+}) sync* {
   final sizes = _SampleSizes(media, table);
+  if (sizes.count == 0) return;
   final chunkMap = _Table(media, table, 'stsc', 12);
   final durations = _Table(media, table, 'stts', 8);
   final composition = _Table.optional(media, table, 'ctts', 8);
-  final sync = keyframes || onSample != null
-      ? _Table.optional(media, table, 'stss', 4)
-      : null;
+  final sync = needSync ? _Table.optional(media, table, 'stss', 4) : null;
   final wideChunks = media.child(table, 'co64') != null;
   final chunks = _Table(
     media,
@@ -69,12 +124,9 @@ Iterable<FramePacket> isoFrames(
       mapRow++;
     }
     final perChunk = chunkMap.value(mapRow, 4);
-    if (perChunk == 0 ||
-        perChunk > sizes.count - sample ||
-        chunkMap.value(mapRow, 8) != 1) {
-      throw const FormatException(
-        'Invalid or changing ISO media sample description',
-      );
+    final description = chunkMap.value(mapRow, 8);
+    if (perChunk == 0 || perChunk > sizes.count - sample) {
+      throw const FormatException('Invalid ISO media chunk sample count');
     }
     var offset = chunks.value(chunk, 0, width: wideChunks ? 8 : 4);
     for (var inChunk = 0; inChunk < perChunk; inChunk++) {
@@ -90,7 +142,10 @@ Iterable<FramePacket> isoFrames(
           compositionUsed = 0;
         }
         final delta = composition.value(compositionRow, 4);
-        pts += composition.version == 1 ? _signed32(delta) : delta;
+        pts = _addTime(
+          timestamp,
+          composition.version == 1 ? _signed32(delta) : delta,
+        );
         compositionUsed++;
       }
       final size = sizes.at(sample);
@@ -101,21 +156,16 @@ Iterable<FramePacket> isoFrames(
           sync == null ||
           (syncRow < sync.count && sync.value(syncRow, 0) == sample + 1);
       if (isSync && sync != null) syncRow++;
-      final seconds = (pts - edit.start) / scale + edit.delay;
-      final packet = (
-        seconds: seconds,
+      yield (
+        dts: timestamp,
+        pts: pts,
         offset: offset,
         size: size,
-        timestamp: frameTimestamp(pts, 1, scale, duration: step),
+        duration: step,
+        description: description,
+        sync: isSync,
       );
-      // Samples trimmed by an edit may still be needed for inter prediction.
-      onSample?.call(packet, isSync);
-      if ((!keyframes || isSync) &&
-          pts >= edit.start &&
-          (edit.end == null || seconds < edit.end!)) {
-        yield packet;
-      }
-      timestamp += step;
+      timestamp = _addTime(timestamp, step);
       durationUsed++;
       offset += size;
       sample++;
@@ -127,14 +177,30 @@ Iterable<FramePacket> isoFrames(
 
 int _signed32(int value) => value >= 0x80000000 ? value - 0x100000000 : value;
 
-({int start, double delay, double? end}) _edit(
+typedef _TrackEdit = ({int? start, double delay, double? end});
+
+bool _inEdit(
+  _TrackEdit edit,
+  int pts,
+  double seconds, {
+  required bool fragmented,
+}) {
+  final start = edit.start;
+  if (start != null ? pts < start : !fragmented && pts < 0) return false;
+  final end = edit.end;
+  return end == null || seconds < end;
+}
+
+_TrackEdit _edit(
   IsoMedia media,
   MediaBox movie,
   MediaBox track,
-  int mediaScale,
-) {
+  int mediaScale, {
+  bool fragmented = false,
+}) {
   final list = _Table.optional(media, media.child(track, 'edts'), 'elst', 0);
-  if (list == null || list.count == 0) return (start: 0, delay: 0, end: null);
+  if (list == null || list.count == 0)
+    return (start: null, delay: 0, end: null);
   final movieScale =
       media.timing(media.child(movie, 'mvhd'))?.scale ?? mediaScale;
   final width = list.version == 1 ? 8 : 4;
@@ -155,7 +221,11 @@ int _signed32(int value) => value >= 0x80000000 ? value - 0x100000000 : value;
     if (row == 0 && start == -1 && list.count == 2) {
       delay = duration / movieScale;
     } else if (row == list.count - 1 && start >= 0) {
-      return (start: start, delay: delay, end: delay + duration / movieScale);
+      return (
+        start: start,
+        delay: delay,
+        end: fragmented && duration == 0 ? null : delay + duration / movieScale,
+      );
     } else {
       throw const FormatException('Unsupported ISO media edit list');
     }

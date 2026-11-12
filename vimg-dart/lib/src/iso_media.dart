@@ -1,14 +1,24 @@
+import 'dart:math' as math;
+
 import 'package:image/image.dart' as image;
 
 import 'binary_file.dart';
+import 'frame_packet.dart';
 import 'metadata.dart';
 
-typedef MediaBox = ({String type, int data, int end});
+part 'iso_fragments.dart';
+part 'iso_frames.dart';
+
+typedef MediaBox = ({String type, int start, int data, int end});
 
 final class IsoMedia {
   IsoMedia(this.file);
 
   final BinaryFile file;
+  late final MediaBox _movie =
+      boxes(0, file.length).where((box) => box.type == 'moov').firstOrNull ??
+      (throw const FormatException('Missing ISO media movie box'));
+  late final _MovieFragments? _fragments = _readMovieFragments(this);
 
   String tag(int offset) => String.fromCharCodes(file.read(offset, 4));
 
@@ -30,7 +40,12 @@ final class IsoMedia {
       if (length < headerSize || length > end - offset) {
         throw FormatException('Invalid size for box $type');
       }
-      yield (type: type, data: offset + headerSize, end: offset + length);
+      yield (
+        type: type,
+        start: offset,
+        data: offset + headerSize,
+        end: offset + length,
+      );
       offset += length;
     }
   }
@@ -70,9 +85,7 @@ final class IsoMedia {
     );
   }
 
-  MediaBox movie() =>
-      boxes(0, file.length).where((box) => box.type == 'moov').firstOrNull ??
-      (throw const FormatException('Missing ISO media movie box'));
+  MediaBox movie() => _movie;
 
   MediaBox? firstVideoTrack({MediaBox? moov}) =>
       children(moov ?? movie()).where((box) {
@@ -113,7 +126,10 @@ final class IsoMedia {
       }
     }
     return VideoMetadata(
-      ticks == null || ticks == 0 ? longestTrack : ticks / movieTiming!.scale,
+      _fragments?.duration ??
+          (ticks == null || ticks == 0
+              ? longestTrack
+              : ticks / movieTiming!.scale),
       streams,
     );
   }

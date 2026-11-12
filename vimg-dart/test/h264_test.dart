@@ -7,7 +7,6 @@ import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/h264/access_unit.dart';
 import 'package:vimg_dart/src/video_configuration.dart';
 import 'package:vimg_dart/src/h264/idr_picture.dart';
-import 'package:vimg_dart/src/iso_frames.dart';
 import 'package:vimg_dart/src/iso_media.dart';
 import 'package:vimg_dart/src/matroska.dart';
 import 'package:vimg_dart/src/matroska_frames.dart';

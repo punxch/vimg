@@ -7,7 +7,6 @@ import 'av1/access_units.dart';
 import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
-import 'iso_frames.dart';
 import 'iso_media.dart';
 
 /// AVIF animation sample table and the timing of one playback cycle.
