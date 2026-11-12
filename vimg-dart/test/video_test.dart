@@ -137,18 +137,10 @@ Future<void> main(List<String> arguments) async {
     );
 
     final avif = File('${temp.path}/grid.avif');
-    final unsupported = await run([
-      'vcs',
-      '-c2',
-      '-H24',
-      '-n2',
-      mkv.path,
-      '-o',
-      avif.path,
-    ], ok: false);
+    await run(['vcs', '-c2', '-H24', '-n2', '-f2', mkv.path, '-o', avif.path]);
     check(
-      (unsupported.stderr as String).contains('AVIF') && !avif.existsSync(),
-      'Explicit AVIF limitation',
+      ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
+      'Default VCS format is an AVIF image sequence',
     );
   } finally {
     temp.deleteSync(recursive: true);

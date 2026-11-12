@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:image/image.dart' as image;
 
+import 'avif_encoder.dart';
 import 'capture.dart';
 import 'frame_packet.dart';
 import 'grid.dart';
@@ -146,7 +147,7 @@ void writeContactSheet(
   void Function(String stage)? mark,
 }) {
   final extension = output.split('.').last.toLowerCase();
-  final image.Encoder encoder;
+  final image.Encoder? encoder;
   switch (extension) {
     case 'jpg' || 'jpeg':
       if (options.frames != 1)
@@ -155,7 +156,7 @@ void writeContactSheet(
     case 'webp':
       encoder = image.WebPEncoder(lossless: false, quality: webp, method: 1);
     case 'avif':
-      throw UnsupportedError('Pure Dart AVIF encoding is unavailable');
+      encoder = null;
     default:
       throw FormatException('Unsupported contact sheet output: $output');
   }
@@ -175,31 +176,49 @@ void writeContactSheet(
     final tiles = List<image.Image?>.filled(selected.length, null);
     final last = List<FramePacket?>.filled(selected.length, null);
     image.Image? animation;
+    AvifEncoder? avif;
     for (var frame = 0; frame < options.frames; frame++) {
+      var changed = false;
       for (var tile = 0; tile < tiles.length; tile++) {
         final packet = selected[tile][frame];
         if (last[tile] == packet) continue;
         final decoded = video.decode(packet);
         tiles[tile] = resizeToFit(decoded, width: width, height: height);
         last[tile] = packet;
+        changed = true;
+      }
+      if (!changed && avif != null) {
+        avif.repeatFrame();
+        continue;
       }
       final first = tiles.first!;
       final effectiveColumns = columns == 0
           ? tiles.length
           : math.min(columns, tiles.length);
       final rows = (tiles.length + effectiveColumns - 1) ~/ effectiveColumns;
-      if (first.width *
-              first.height *
-              effectiveColumns *
-              rows *
-              options.frames *
-              3 >
-          256 * 1024 * 1024) {
+      if (encoder != null &&
+          frame == 0 &&
+          first.width *
+                  first.height *
+                  effectiveColumns *
+                  rows *
+                  options.frames *
+                  3 >
+              256 * 1024 * 1024) {
         throw const FormatException(
           'Contact sheet exceeds 256 MiB of decoded frames',
         );
       }
       final grid = composeGrid(tiles.cast<image.Image>(), columns, labels);
+      if (encoder == null) {
+        avif ??= AvifEncoder(
+          grid.width,
+          grid.height,
+          fps: options.frames > 1 ? fps : null,
+        );
+        avif.addFrame(grid);
+        continue;
+      }
       // Round absolute endpoints so non-integer frame durations do not drift.
       grid.frameDuration =
           ((frame + 1) * 1000 / fps).round() - (frame * 1000 / fps).round();
@@ -209,8 +228,10 @@ void writeContactSheet(
         animation.addFrame(grid);
       }
     }
-    mark?.call('decode_and_compose');
-    final bytes = encoder.encode(animation!);
+    mark?.call(
+      avif == null ? 'decode_and_compose' : 'decode_compose_and_encode',
+    );
+    final bytes = avif?.finish() ?? encoder!.encode(animation!);
     mark?.call('encode');
     File(output).absolute.parent.createSync(recursive: true);
     publishBytes(output, bytes);

@@ -1,0 +1,6 @@
+The AV1 range writer in lib/src/av1/range_encoder.dart is based on the
+go-av1 od_ec range encoder (cf2eb172dac31e754243a1c6b756991e229dc1ff).
+See licenses/go-av1.txt for the BSD 2-Clause terms.
+
+The default CDFs used by the AV1 palette writer are defined by the Alliance
+for Open Media AV1 Bitstream & Decoding Process Specification, section 10.2.

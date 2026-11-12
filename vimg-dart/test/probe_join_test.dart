@@ -155,6 +155,20 @@ Future<void> testJoin(Directory temp) async {
     sheet.any((pixel) => pixel.x < 60 && pixel.y < 40 && pixel.r < 255),
     'Label overlay',
   );
+  final avif = '${temp.path}/grid.avif';
+  final joined = await Process.run(Platform.resolvedExecutable, [
+    'bin/vimg.dart',
+    'join',
+    '-c2',
+    '-o',
+    avif,
+    ...paths,
+  ]);
+  check(joined.exitCode == 0, 'AVIF join failed: ${joined.stderr}');
+  check(
+    ascii.decode(File(avif).readAsBytesSync().sublist(4, 12)) == 'ftypavif',
+    'Join produced an AVIF still image',
+  );
 }
 
 Future<void> main() async {

@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:args/command_runner.dart';
 import 'package:image/image.dart' as image;
 
+import 'avif_encoder.dart';
 import 'completions.dart';
 import 'grid.dart';
 import 'output.dart';
@@ -96,8 +97,9 @@ final class _Join extends VimgCommand {
     final width = integer('capture-width', min: 1, max: 16384);
     final height = integer('capture-height', min: 1, max: 16384);
     final output = arguments.option('output')!;
+    final avif = output.toLowerCase().endsWith('.avif');
     final encoder = image.findEncoderForNamedImage(output);
-    if (encoder == null) {
+    if (encoder == null && !avif) {
       throw FormatException('Unsupported output image format: $output');
     }
     final frames = <image.Image>[];
@@ -113,11 +115,12 @@ final class _Join extends VimgCommand {
         ),
       );
     }
-    publishBytes(
-      output,
-      encoder.encode(
-        composeGrid(frames, columns, arguments.multiOption('label')),
-      ),
-    );
+    final grid = composeGrid(frames, columns, arguments.multiOption('label'));
+    if (avif) {
+      final writer = AvifEncoder(grid.width, grid.height)..addFrame(grid);
+      publishBytes(output, writer.finish());
+    } else {
+      publishBytes(output, encoder!.encode(grid));
+    }
   }
 }

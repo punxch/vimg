@@ -29,18 +29,24 @@ depend on the library's encoders and decoders.
   returns the Yazi metadata response. It can read embedded cover art and VP8
   keyframes as well as the video codecs below.
 - `vimg extract -n3 --output-dir frames video.mkv` writes sampled BMP frames.
-- `vimg vcs -c3 -H160 -n9 --webp 1 video.mkv -o grid.webp` writes a still
-  or animated WebP. Choose a `.jpg` output for a still JPEG contact sheet.
+- `vimg vcs -c3 -H160 -n9 video.mkv -o grid.avif` writes an animated AVIF.
+  Pass `-f1` for a still, `--webp 1` for WebP or choose a `.jpg` output for JPEG.
 - `vimg print-completions [bash|zsh|fish|powershell|elvish]` prints a completion
   script for the Dart CLI.
 
 Extraction and contact sheets currently decode MJPEG and PNG tracks in
 Matroska, unfragmented MP4/MOV or AVI. AVI also supports uncompressed 24-bit
-and 32-bit BGR. AVIF output and decoding inter-frame formats
-such as H.264 and HEVC are pending. The bundled `sample/input.mkv` can be probed
+and 32-bit BGR. Decoding inter-frame formats such as H.264 and HEVC is pending. The bundled `sample/input.mkv` can be probed
 and requires an H.264 decoder for extraction and contact sheets. The Rust
 `authority` commands, FFmpeg filter expressions, and native hardware capture
 backends are also pending.
+
+The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses
+separate palettes for green samples and blue/red pairs. Blocks with up to
+eight entries per palette preserve those samples exactly. More complex blocks
+are quantized, and animation uses an independent keyframe for each frame.
+These choices differ from the Rust encoder's inter-frame compression and
+CRF settings. The current encoder supports one AV1 Level 5.1 tile.
 
 ## Yazi DDS
 
@@ -75,7 +81,11 @@ vimg send --yazi-id 123 video.mkv /path/to/cache.webp
 dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
+dart test/avif_test.dart
 dart compile exe bin/vimg.dart -o build/vimg
 dart compile exe test/fake_ya.dart -o build/fake-ya
 dart test/service_test.dart build/vimg build/fake-ya
 ```
+
+Pass an installed `dav1d` executable to `dart test/avif_test.dart` to compare
+the AV1 samples from the generated AVIFs against their input pixels.
