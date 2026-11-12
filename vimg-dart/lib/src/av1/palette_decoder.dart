@@ -3,105 +3,71 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'access_units.dart';
 import 'bitstream.dart';
+import 'frame_header.dart';
 import 'palette_cdf.dart';
 import 'range_decoder.dart';
 
 /// Decode the lossless, palette-predicted AV1 profile written by vimg.
 final class Av1PaletteDecoder {
-  _Sequence? _sequence;
+  final _units = Av1AccessUnits();
 
-  void configure(Uint8List config) {
-    for (final obu in readAv1Obus(config)) {
-      if (obu.type == 1) _sequence = _Sequence.read(obu.payload);
-    }
-  }
+  void configure(Uint8List config) => _units.configure(config);
 
   image.Image decode(Uint8List sample) {
-    image.Image? frame;
-    for (final obu in readAv1Obus(sample)) {
-      switch (obu.type) {
-        case 1:
-          _sequence = _Sequence.read(obu.payload);
-        case 2 || 5 || 15:
-          break; // Temporal delimiter, metadata, padding.
-        case 6:
-          if (frame != null)
-            throw UnsupportedError('Multiple AV1 frames in one sample');
-          final sequence = _sequence;
-          if (sequence == null)
-            throw const FormatException('Missing AV1 sequence header');
-          frame = sequence.decode(obu.payload);
-        default:
-          throw UnsupportedError('Unsupported AV1 OBU type ${obu.type}');
-      }
-    }
-    return frame ?? (throw const FormatException('Missing AV1 frame OBU'));
+    final coded = _units.readSample(sample).toList();
+    if (coded.length != 1)
+      throw const FormatException(
+        'Expected one AV1 palette frame in the sample',
+      );
+    return decodePaletteFrame(coded.single);
   }
 }
 
-final class _Sequence {
-  const _Sequence(this.width, this.height, this.reduced);
-
-  final int width, height;
-  final bool reduced;
-
-  factory _Sequence.read(Uint8List data) {
-    final bits = Av1Bits(data);
-    _expect(bits.read(3) == 1, 'color profile');
-    final still = bits.read(1) != 0;
-    final reduced = bits.read(1) != 0;
-    if (reduced && !still)
-      throw const FormatException('Invalid reduced AV1 sequence header');
-    if (!reduced) {
-      _expect(bits.read(2) == 0, 'sequence timing and display delay');
-      _expect(bits.read(5) == 0 && bits.read(12) == 0, 'operating points');
-    }
-    final level = bits.read(5);
-    if (!reduced && level > 7) bits.read(1); // seq_tier
-    final widthBits = bits.read(4) + 1, heightBits = bits.read(4) + 1;
-    final width = bits.read(widthBits) + 1, height = bits.read(heightBits) + 1;
-    if (width > 4096 ||
-        height > 2304 ||
-        width * height > 8912896 ||
-        ((width + 63) ~/ 64) * ((height + 63) ~/ 64) > 2304) {
-      throw UnsupportedError('AV1 dimensions exceed one Level 5.1 tile');
-    }
-    if (!reduced) _expect(bits.read(1) == 0, 'frame IDs');
-    _expect(bits.read(3) == 0, 'superblock size and intra filters');
-    if (!reduced) {
-      _expect(bits.read(5) == 0, 'inter prediction tools');
-      _expect(bits.read(4) == 5, 'screen content tools and motion precision');
-    }
-    _expect(bits.read(3) == 0, 'super-resolution and loop filters');
-    _expect(bits.read(2) == 1, 'bit depth and color description');
-    _expect(bits.read(24) == 0x010d00, 'non-identity color');
-    _expect(bits.read(2) == 0, 'separate chroma quantizers and film grain');
-    bits.trailing();
-    return _Sequence(width, height, reduced);
-  }
-
-  image.Image decode(Uint8List data) {
-    final bits = Av1Bits(data);
-    if (!reduced) _expect(bits.read(4) == 1, 'non-key or hidden picture');
-    _expect(bits.read(1) == 1, 'adaptive frame CDFs');
-    if (reduced) {
-      _expect(bits.read(1) == 1, 'screen content tools');
-      bits.read(1); // Integer precision is inferred for an intra picture.
-    } else {
-      _expect(bits.read(1) == 0, 'frame size override');
-    }
-    _expect(bits.read(2) == 0, 'render size and intra block copy');
-    _expect(bits.read(1) == 1, 'non-uniform tiles');
-    if (width > 64) _expect(bits.read(1) == 0, 'multiple tile columns');
-    if (height > 64) _expect(bits.read(1) == 0, 'multiple tile rows');
-    _expect(
-      bits.read(14) == 0,
-      'quantization, segmentation and transform sets',
-    );
-    bits.align();
-    return _PaletteTileDecoder(width, height, RangeDecoder(bits)).decode();
-  }
+image.Image decodePaletteFrame(Av1CodedFrame frame) {
+  final sequence = frame.sequence;
+  final color = sequence.color;
+  final header = frame.header;
+  final size = header.size;
+  _expect(
+    color.depth == 8 &&
+        color.fullRange &&
+        color.matrix == 0 &&
+        color.subsamplingX == 0 &&
+        color.subsamplingY == 0,
+    'color profile',
+  );
+  _expect(
+    header.type == Av1FrameType.key &&
+        header.showFrame &&
+        frame.syntax.existingSlot == null,
+    'non-key or hidden picture',
+  );
+  _expect(header.disableCdfUpdate, 'adaptive frame CDFs');
+  _expect(
+    header.screenContent && !header.intrabc && !sequence.tools.superblock128,
+    'superblock size and intra block copy',
+  );
+  _expect(
+    frame.tiles.length == 1 &&
+        header.parameters.codedLossless &&
+        !header.parameters.segmentation.enabled &&
+        header.parameters.quantization.matrix == null &&
+        header.parameters.filmGrain == null &&
+        size.superresDenominator == 8,
+    'tiles, quantization or post-processing',
+  );
+  final width = size.width, height = size.height;
+  _expect(
+    width <= 4096 && height <= 2304 && width * height <= 8912896,
+    'dimensions above the palette decoder limit',
+  );
+  return _PaletteTileDecoder(
+    width,
+    height,
+    RangeDecoder(Av1Bits(frame.tiles.single.payload)),
+  ).decode();
 }
 
 typedef _Colors = ({List<int> green, List<int> blue});

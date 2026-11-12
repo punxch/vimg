@@ -65,6 +65,29 @@ final class Av1Bits {
     return value;
   }
 
+  bool flag() => read(1) != 0;
+
+  int signed(int count) {
+    final value = read(count);
+    final sign = 1 << (count - 1);
+    return (value ^ sign) - sign;
+  }
+
+  int uvlc() {
+    var zeros = 0;
+    while (!flag()) {
+      if (++zeros == 32) return 0xffffffff;
+    }
+    return (1 << zeros) - 1 + read(zeros);
+  }
+
+  int uniform(int count) {
+    final width = count.bitLength;
+    final short = (1 << width) - count;
+    final value = read(width - 1);
+    return value < short ? value : 2 * value - short + read(1);
+  }
+
   void align() {
     if (read(-position & 7) != 0)
       throw const FormatException('Invalid AV1 alignment bits');
@@ -81,7 +104,7 @@ final class Av1Bits {
   }
 }
 
-typedef Av1Obu = ({int type, Uint8List payload});
+typedef Av1Obu = ({int type, int temporalId, int spatialId, Uint8List payload});
 
 /// OBU framing used in ISO media samples and low-overhead elementary streams.
 Iterable<Av1Obu> readAv1Obus(Uint8List data) sync* {
@@ -96,12 +119,10 @@ Iterable<Av1Obu> readAv1Obus(Uint8List data) sync* {
     if (header & 0x81 != 0)
       throw const FormatException('Invalid AV1 OBU header');
     final type = (header >> 3) & 15;
+    final extension = header & 4 != 0 ? byte() : 0;
     if (header & 4 != 0) {
-      final extension = byte();
       if (extension & 7 != 0)
         throw const FormatException('Invalid AV1 OBU extension');
-      if (extension != 0)
-        throw UnsupportedError('AV1 layered OBUs are unavailable');
     }
     var length = data.length - offset;
     if (header & 2 != 0) {
@@ -117,6 +138,8 @@ Iterable<Av1Obu> readAv1Obus(Uint8List data) sync* {
       throw const FormatException('AV1 OBU exceeds its sample');
     yield (
       type: type,
+      temporalId: extension >> 5,
+      spatialId: (extension >> 3) & 3,
       payload: Uint8List.sublistView(data, offset, offset + length),
     );
     offset += length;

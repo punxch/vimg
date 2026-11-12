@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'av1/access_units.dart';
 import 'av1/palette_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
@@ -45,16 +46,24 @@ final class AvifAnimation {
           throw const FormatException(
             'Invalid AVIF animation dimensions or duration',
           );
-        final packets = <FramePacket>[];
-        for (final packet in isoFrames(media, selectedTrack: track)) {
-          if (packets.length == 100000)
-            throw const FormatException(
-              'AVIF animation exceeds 100000 samples',
-            );
+        final samples = <FramePacket>[];
+        final packets = <FramePacket>{};
+        for (final packet in isoFrames(
+          media,
+          selectedTrack: track,
+          onSample: (packet, _) {
+            if (samples.length == 100000)
+              throw const FormatException(
+                'AVIF animation exceeds 100000 samples',
+              );
+            samples.add(packet);
+          },
+        )) {
           packets.add(packet);
         }
         if (packets.isEmpty || packets.length < (selected?.frameCount ?? 0))
           continue;
+        samples.length = samples.lastIndexWhere(packets.contains) + 1;
         final configuration = media
             .children(description, skip: 78)
             .where((box) => box.type == 'av1C')
@@ -72,6 +81,7 @@ final class AvifAnimation {
         selected = AvifAnimation._(
           handle,
           file,
+          samples,
           packets,
           config,
           width,
@@ -92,6 +102,7 @@ final class AvifAnimation {
   AvifAnimation._(
     this._handle,
     this._file,
+    this._samples,
     this._packets,
     this._config,
     this.width,
@@ -103,7 +114,8 @@ final class AvifAnimation {
 
   final RandomAccessFile _handle;
   final BinaryFile _file;
-  final List<FramePacket> _packets;
+  final List<FramePacket> _samples;
+  final Set<FramePacket> _packets;
   final Uint8List _config;
   final int width, height, _timescale, _duration, streamIndex;
 
@@ -116,17 +128,31 @@ final class AvifAnimation {
     return '${numerator ~/ common}/${_duration ~/ common}';
   }
 
-  Iterable<image.Image> decodeFrames() sync* {
-    final decoder = Av1PaletteDecoder()..configure(_config);
-    final packets = _packets.indexed.toList()
-      ..sort((a, b) {
-        final time = a.$2.seconds.compareTo(b.$2.seconds);
-        return time != 0 ? time : a.$1.compareTo(b.$1);
-      });
-    for (final (_, packet) in packets) {
+  /// Decode-order AV1 frames, including hidden frames and pre-roll trimmed by
+  /// the track edit. Only the shown frame of a visible sample is presented.
+  Iterable<({Av1CodedFrame frame, FramePacket packet, bool present})>
+  codedFrames() sync* {
+    final units = Av1AccessUnits()..configure(_config);
+    for (final packet in _samples) {
       if (packet.size > 64 * 1024 * 1024)
         throw const FormatException('Oversized AVIF animation sample');
-      final frame = decoder.decode(_file.read(packet.offset, packet.size));
+      final visible = _packets.contains(packet);
+      var displayed = 0;
+      for (final frame in units.readSample(
+        _file.read(packet.offset, packet.size),
+      )) {
+        if (frame.shown) displayed++;
+        yield (frame: frame, packet: packet, present: visible && frame.shown);
+      }
+      if (visible && displayed != 1)
+        throw const FormatException('AVIF sample must display one frame');
+    }
+  }
+
+  Iterable<image.Image> decodeFrames() sync* {
+    for (final sample in codedFrames()) {
+      final frame = decodePaletteFrame(sample.frame);
+      if (!sample.present) continue;
       if (frame.width != width || frame.height != height)
         throw const FormatException(
           'AVIF sample dimensions differ from its track',

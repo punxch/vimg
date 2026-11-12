@@ -20,3 +20,7 @@ The HEVC tiled PCM fixture remuxes r453-pcm-tiles-explicit-96x64.hevc
 from the same project.
 The HEVC inter fixtures remux r456-lowdelay-tiles-sl-rdoq-aq-qp29.hevc and
 r456-pyramid-rdoq-sdh-tu2-wp-wpp-qp30.hevc from that project.
+
+The AV1 header parser follows the AV1 Bitstream & Decoding Process
+Specification. The dav1d OBU parser was used as a reference
+(4e0a81d6273e849c248da9ce5185d025ce58bdec). See licenses/dav1d.txt.
