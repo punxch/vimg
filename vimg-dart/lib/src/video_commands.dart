@@ -156,6 +156,17 @@ void _publishCaptures(List<String> paths, image.Image frame) {
 }
 
 const _decodedFrameLimit = 256 * 1024 * 1024;
+const defaultAvifCrf = 30;
+
+int _avifQIndex(int crf) {
+  if (crf < 0 || crf > 63) {
+    throw const FormatException('AVIF CRF must be between 0 and 63');
+  }
+  // Keep fine steps around the Preview preset while covering coarse AV1
+  // quantizers at the high end of the CLI scale.
+  const maximum = 63 * 63 * 63;
+  return math.max(1, (224 * crf * crf * crf + maximum ~/ 2) ~/ maximum);
+}
 
 typedef GridFrameVisitor =
     void Function(int index, image.Image grid, int tileWidth, int tileHeight);
@@ -168,6 +179,7 @@ void writeContactSheet(
   int? width,
   int? height,
   double fps = 20,
+  int avifCrf = defaultAvifCrf,
   int webp = 75,
   String? captureDirectory,
   void Function(String stage)? mark,
@@ -278,6 +290,7 @@ void writeContactSheet(
           grid.width,
           grid.height,
           fps: options.frames > 1 ? fps : null,
+          qIndex: _avifQIndex(avifCrf),
         );
         avif.addFrame(grid);
         continue;

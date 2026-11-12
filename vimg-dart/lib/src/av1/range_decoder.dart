@@ -44,7 +44,7 @@ final class RangeDecoder {
 
   int adaptive(Av1Cdf cdf) {
     final value = symbol(cdf._values);
-    if (updateCdf) cdf._observe(value);
+    if (updateCdf) cdf.observe(value);
     return value;
   }
 
@@ -102,7 +102,7 @@ final class Av1Cdf {
   Av1Cdf copy({bool resetCount = false}) =>
       Av1Cdf._(Uint16List.fromList(_values), resetCount ? 0 : _observations);
 
-  void _observe(int symbol) {
+  void observe(int symbol) {
     final symbols = _values.length + 1;
     final rate = 3 + (symbols >= 4 ? 2 : 1) + (_observations >> 4);
     for (var i = 0; i < _values.length; i++) {

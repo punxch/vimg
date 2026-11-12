@@ -9,7 +9,7 @@ import 'preview_queue.dart';
 import 'video_commands.dart';
 
 String _profile(GridFormat format) => switch (format) {
-  GridFormat.avif => 'vimg-dart-avif-3x3-h160-n9-f30-palette-v1',
+  GridFormat.avif => 'vimg-dart-avif-3x3-h160-n9-f30-dct-v1',
   GridFormat.webp => 'vimg-dart-webp-3x3-h160-n9-f30-q75-v1',
 };
 

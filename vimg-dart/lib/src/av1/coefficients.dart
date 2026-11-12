@@ -3,7 +3,10 @@ import 'dart:typed_data';
 
 import 'coefficient_cdfs.dart';
 import 'range_decoder.dart';
+import 'range_encoder.dart';
 import 'transform.dart';
+
+part 'coefficient_encoder.dart';
 
 enum _Family { skip, eobPoint, eobExtra, baseEob, base, baseRange, dcSign }
 
@@ -170,56 +173,47 @@ final class Av1CoefficientDecoder {
     final scan = _scans[(width, height, txClass)]!;
     final stride = width + 4;
     _levels.fillRange(0, (height + 4) * stride, 0);
-    final offsets = switch (txClass) {
-      Av1TxClass.twoDimensional => (stride + 1, 2, 2 * stride),
-      Av1TxClass.horizontal => (2, 3, 4),
-      Av1TxClass.vertical => (2 * stride, 3 * stride, 4 * stride),
-    };
+    final offsets = _levelOffsets(stride, txClass);
     final brSize = math.min(sizeContext, 3);
     for (var i = eob - 1; i >= 0; i--) {
       final pos = scan[i];
       final row = pos ~/ width, col = pos % width;
       final p = row * stride + col;
-      final first = _levels[p + 1], second = _levels[p + stride];
-      final third = _levels[p + offsets.$1];
-      final int base;
-      if (i == eob - 1) {
-        final context = i == 0
-            ? 0
-            : i <= count >> 3
-            ? 1
-            : i <= count >> 2
-            ? 2
-            : 3;
-        base = 1 + _symbol(_Family.baseEob, sizeContext, plane, context);
-      } else {
-        final sum =
-            math.min<int>(first, 3) +
-            math.min<int>(second, 3) +
-            math.min<int>(third, 3) +
-            math.min<int>(_levels[p + offsets.$2], 3) +
-            math.min<int>(_levels[p + offsets.$3], 3);
-        final offset = _baseOffset(size, txClass, row, col);
-        final context = offset == 0
-            ? 0
-            : offset + math.min<int>((sum + 1) >> 1, 4);
-        base = _symbol(_Family.base, sizeContext, plane, context);
-      }
+      final base = i == eob - 1
+          ? 1 +
+                _symbol(
+                  _Family.baseEob,
+                  sizeContext,
+                  plane,
+                  _baseEobContext(i, count),
+                )
+          : _symbol(
+              _Family.base,
+              sizeContext,
+              plane,
+              _baseContext(
+                _levels,
+                p,
+                stride,
+                offsets,
+                size,
+                txClass,
+                row,
+                col,
+              ),
+            );
 
       var level = base;
       if (level == 3) {
-        final nearby = switch (txClass) {
-          Av1TxClass.twoDimensional => row < 2 && col < 2,
-          Av1TxClass.horizontal => col == 0,
-          Av1TxClass.vertical => row == 0,
-        };
-        final context =
-            math.min((first + second + third + 1) >> 1, 6) +
-            (pos == 0
-                ? 0
-                : nearby
-                ? 7
-                : 14);
+        final context = _rangeContext(
+          _levels,
+          p,
+          stride,
+          offsets.$1,
+          txClass,
+          row,
+          col,
+        );
         final table = _cdfs._table(_Family.baseRange, brSize, plane, context);
         for (var k = 0; k < 4; k++) {
           final increment = _reader.adaptive(table);
@@ -282,6 +276,61 @@ final class Av1CoefficientDecoder {
     }
     return (1 << zeros) + _reader.literal(zeros);
   }
+}
+
+(int, int, int) _levelOffsets(int stride, Av1TxClass txClass) =>
+    switch (txClass) {
+      Av1TxClass.twoDimensional => (stride + 1, 2, 2 * stride),
+      Av1TxClass.horizontal => (2, 3, 4),
+      Av1TxClass.vertical => (2 * stride, 3 * stride, 4 * stride),
+    };
+
+int _baseEobContext(int index, int count) => index == 0
+    ? 0
+    : index <= count >> 3
+    ? 1
+    : index <= count >> 2
+    ? 2
+    : 3;
+
+int _baseContext(
+  Uint8List levels,
+  int p,
+  int stride,
+  (int, int, int) offsets,
+  Av1TxSize size,
+  Av1TxClass txClass,
+  int row,
+  int col,
+) {
+  final offset = _baseOffset(size, txClass, row, col);
+  if (offset == 0) return 0;
+  final sum =
+      math.min<int>(levels[p + 1], 3) +
+      math.min<int>(levels[p + stride], 3) +
+      math.min<int>(levels[p + offsets.$1], 3) +
+      math.min<int>(levels[p + offsets.$2], 3) +
+      math.min<int>(levels[p + offsets.$3], 3);
+  return offset + math.min((sum + 1) >> 1, 4);
+}
+
+int _rangeContext(
+  Uint8List levels,
+  int p,
+  int stride,
+  int diagonal,
+  Av1TxClass txClass,
+  int row,
+  int col,
+) {
+  final sum = levels[p + 1] + levels[p + stride] + levels[p + diagonal];
+  if (row == 0 && col == 0) return math.min((sum + 1) >> 1, 6);
+  final nearby = switch (txClass) {
+    Av1TxClass.twoDimensional => row < 2 && col < 2,
+    Av1TxClass.horizontal => col == 0,
+    Av1TxClass.vertical => row == 0,
+  };
+  return math.min((sum + 1) >> 1, 6) + (nearby ? 7 : 14);
 }
 
 int _baseOffset(Av1TxSize size, Av1TxClass txClass, int row, int col) {

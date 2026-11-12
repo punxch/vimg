@@ -142,6 +142,24 @@ Future<void> main(List<String> arguments) async {
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
       'Default VCS format is an AVIF image sequence',
     );
+
+    final avifStill = File('${temp.path}/grid-still.avif');
+    await run([
+      'vcs',
+      '-c2',
+      '-H24',
+      '-n2',
+      '-f1',
+      '--avif-crf',
+      '42',
+      mkv.path,
+      '-o',
+      avifStill.path,
+    ]);
+    check(
+      ascii.decode(avifStill.readAsBytesSync().sublist(4, 12)) == 'ftypavif',
+      'VCS uses the AVIF still format with a custom CRF',
+    );
   } finally {
     temp.deleteSync(recursive: true);
   }

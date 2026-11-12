@@ -2,13 +2,19 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'av1/dct_encoder.dart';
 import 'av1/palette_encoder.dart';
 
 /// Writes an AVIF primary image and, for multiple frames, a repeating
-/// image sequence. Only the compressed AV1 samples are retained.
+/// image sequence. The transform encoder also retains its last reference.
 final class AvifEncoder {
-  AvifEncoder(this.width, this.height, {this.fps})
-    : _av1 = Av1PaletteEncoder(width, height, still: fps == null) {
+  AvifEncoder(this.width, this.height, {this.fps, int? qIndex})
+    : _palette = qIndex == null
+          ? Av1PaletteEncoder(width, height, still: fps == null)
+          : null,
+      _dct = qIndex == null
+          ? null
+          : Av1DctEncoder(width, height, still: fps == null, qIndex: qIndex) {
     final rate = fps;
     if (rate != null && (!rate.isFinite || rate < 0.001 || rate > 1000)) {
       throw const FormatException('Invalid AVIF frame rate');
@@ -18,35 +24,47 @@ final class AvifEncoder {
   final int width;
   final int height;
   final double? fps;
-  final Av1PaletteEncoder _av1;
+  final Av1DctEncoder? _dct;
+  final Av1PaletteEncoder? _palette;
   final _samples = <Uint8List>[];
+  final _syncSamples = <int>[];
   var _sampleBytes = 0;
+  bool get _inter => _syncSamples.length != _samples.length;
+  int get _depth => _dct == null ? 8 : Av1DctEncoder.depth;
 
   void addFrame(image.Image pixels) {
     if (fps == null && _samples.isNotEmpty) {
       throw StateError('An AVIF still image can contain one frame');
     }
-    final frame = _av1.frame(pixels);
-    final sequence = _av1.sequence;
+    final dct = _dct;
+    final keyframe = dct?.nextIsKeyframe ?? true;
+    final frame = dct == null ? _palette!.frame(pixels) : dct.frame(pixels);
+    if (!keyframe) {
+      _addSample(frame, sync: false);
+      return;
+    }
+    final sequence = dct == null ? _palette!.sequence : dct.sequence;
     final sample = Uint8List(sequence.length + frame.length)
       ..setAll(0, sequence)
       ..setAll(sequence.length, frame);
-    _addSample(sample);
+    _addSample(sample, sync: true);
   }
 
   void repeatFrame() {
     if (fps == null || _samples.isEmpty) {
       throw StateError('No animated AVIF frame to repeat');
     }
-    _addSample(_samples.last);
+    final dct = _dct;
+    _addSample(dct == null ? _samples.last : dct.repeat(), sync: dct == null);
   }
 
-  void _addSample(Uint8List sample) {
+  void _addSample(Uint8List sample, {required bool sync}) {
     _sampleBytes += sample.length;
     if (_sampleBytes > 512 * 1024 * 1024) {
       throw const FormatException('AVIF exceeds 512 MiB of compressed samples');
     }
     _samples.add(sample);
+    if (sync) _syncSamples.add(_samples.length);
   }
 
   Uint8List finish() {
@@ -59,12 +77,11 @@ final class AvifEncoder {
         ..tag('avif')
         ..tag('mif1')
         ..tag('miaf')
-        ..tag('MA1A');
+        ..tag(_dct == null ? 'MA1A' : 'MA1B');
       if (animated) {
-        box
-          ..tag('avis')
-          ..tag('avio')
-          ..tag('msf1');
+        box.tag('avis');
+        if (!_inter) box.tag('avio');
+        box.tag('msf1');
       }
     });
     // iloc and stco use fixed-width offsets, so a second pass preserves size.
@@ -129,7 +146,13 @@ final class AvifEncoder {
                         ..u32(height);
                     }),
                   )
-                  ..bytes(_fullBox('pixi', 0, (box) => box.bytes([3, 8, 8, 8])))
+                  ..bytes(
+                    _fullBox(
+                      'pixi',
+                      0,
+                      (box) => box.bytes([3, _depth, _depth, _depth]),
+                    ),
+                  )
                   ..bytes(_configuration())
                   ..bytes(_color());
               }),
@@ -228,7 +251,6 @@ final class AvifEncoder {
   }
 
   Uint8List _sampleTable(int sampleOffset, int delta) => _box('stbl', (box) {
-    // Every sample is a self-contained keyframe, so an stss box is unnecessary.
     box
       ..bytes(
         _fullBox('stsd', 0, (box) {
@@ -251,7 +273,13 @@ final class AvifEncoder {
                   ..u16(0xffff)
                   ..bytes(_configuration())
                   ..bytes(_color())
-                  ..bytes(_fullBox('ccst', 0, (box) => box.u32(0xc0000000)));
+                  ..bytes(
+                    _fullBox(
+                      'ccst',
+                      0,
+                      (box) => box.u32(_inter ? 0x44000000 : 0xc0000000),
+                    ),
+                  );
               }),
             );
         }),
@@ -290,13 +318,25 @@ final class AvifEncoder {
             ..u32(sampleOffset);
         }),
       );
+    if (_inter) {
+      box.bytes(
+        _fullBox('stss', 0, (box) {
+          box.u32(_syncSamples.length);
+          for (final index in _syncSamples) {
+            box.u32(index);
+          }
+        }),
+      );
+    }
   });
 
   Uint8List _configuration() => _box('av1C', (box) {
     box.bytes([
       0x81, // marker and version
-      (Av1PaletteEncoder.profile << 5) | Av1PaletteEncoder.level,
-      0, // 8-bit, 4:4:4, main tier
+      _dct == null
+          ? (Av1PaletteEncoder.profile << 5) | Av1PaletteEncoder.level
+          : (Av1DctEncoder.profile << 5) | Av1DctEncoder.level,
+      _dct == null ? 0 : 0x4c, // high bit depth, 4:2:0, main tier
       0, // no initial presentation delay
     ]);
   });
@@ -304,10 +344,10 @@ final class AvifEncoder {
   Uint8List _color() => _box('colr', (box) {
     box
       ..tag('nclx')
-      ..u16(1) // primaries
-      ..u16(13) // transfer
-      ..u16(0) // identity matrix
-      ..u8(0x80); // full range
+      ..u16(_dct == null ? 1 : 2) // primaries
+      ..u16(_dct == null ? 13 : 2) // transfer
+      ..u16(_dct == null ? 0 : Av1DctEncoder.matrix)
+      ..u8(_dct == null ? 0x80 : 0); // full-range flag
   });
 }
 

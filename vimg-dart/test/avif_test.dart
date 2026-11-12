@@ -5,9 +5,11 @@ import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/av1/access_units.dart';
 import 'package:vimg_dart/src/av1/picture_decoder.dart';
 import 'package:vimg_dart/src/av1/palette_decoder.dart';
+import 'package:vimg_dart/src/avif_animation.dart';
 import 'package:vimg_dart/src/avif_encoder.dart';
 import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/iso_media.dart';
+import 'package:vimg_dart/src/ssim.dart';
 
 import 'fixtures.dart';
 
@@ -22,8 +24,143 @@ Future<void> main(List<String> arguments) async {
     ]) {
       await _checkAvif(temp, width, height, frames, arguments.firstOrNull);
     }
+    await _checkTransformAnimation(temp, arguments.firstOrNull);
   } finally {
     temp.deleteSync(recursive: true);
+  }
+}
+
+Future<void> _checkTransformAnimation(Directory temp, String? dav1d) async {
+  const width = 97, height = 65, count = 34;
+  final encoder = AvifEncoder(width, height, fps: 20, qIndex: 24);
+  final source = <image.Image>[];
+  for (var i = 0; i < count; i++) {
+    if (i == 1 || (i >= 3 && i < 32)) {
+      encoder.repeatFrame();
+      source.add(source.last);
+      continue;
+    }
+    final pixels = image.Image(width: width, height: height);
+    for (final p in pixels) {
+      if (p.x >= 10 + i && p.x < 28 + i && p.y >= 16 && p.y < 36) {
+        p.setRgb(186, 91, 55);
+      } else {
+        p.setRgb(40 + p.x + p.y ~/ 2, 48 + p.x ~/ 2 + p.y, 62 + p.y);
+      }
+    }
+    encoder.addFrame(pixels);
+    source.add(pixels);
+  }
+  final encoded = encoder.finish();
+  final path = '${temp.path}/dct-animation.avif';
+  final container = File(path)..writeAsBytesSync(encoded);
+  final input = container.openSync();
+  final animation = AvifAnimation.open(path);
+  final elementary = BytesBuilder(copy: false);
+  final reconstructed = BytesBuilder(copy: false);
+  try {
+    final binary = BinaryFile(input), iso = IsoMedia(BinaryFile(input));
+    final track = iso.child(iso.movie(), 'trak');
+    final table = iso.sampleTable(iso.child(track, 'mdia')!)!;
+    final sync = iso.child(table, 'stss')!.data;
+    check(
+      binary.unsigned(sync + 4, 4) == 2 &&
+          binary.unsigned(sync + 8, 4) == 1 &&
+          binary.unsigned(sync + 12, 4) == 33,
+      'Only keyframes are AVIF sync samples',
+    );
+    check(
+      animation.frameCount == count && animation.frameRate == '20/1',
+      'DCT animation timing',
+    );
+    final decoder = Av1StreamDecoder();
+    var index = 0;
+    Av1Picture? previous;
+    for (final sample in animation.codedFrames()) {
+      final frame = sample.frame;
+      final expectedKey = index == 0 || index == 32;
+      check(frame.header.type.intra == expectedKey, 'AV1 frame type at $index');
+      check(
+        frame.sequence.color.depth == 10 &&
+            frame.sequence.color.subsamplingX == 1,
+        '10-bit 4:2:0 sequence',
+      );
+      final picture = decoder.decode(frame);
+      check(
+        frameSsim(source[index], picture.rgb()) > 0.95,
+        'Transform fidelity at $index',
+      );
+      if (index == 1) {
+        for (final (p, plane) in picture.planes.indexed) {
+          final prior = previous!.planes[p];
+          for (var y = 0; y < plane.height; y++) {
+            for (var x = 0; x < plane.width; x++) {
+              check(
+                plane.samples[y * plane.stride + x] ==
+                    prior.samples[y * prior.stride + x],
+                'Repeat following keyframe',
+              );
+            }
+          }
+        }
+      } else if (index >= 3 && index < 32) {
+        check(
+          frame.syntax.existingSlot == 0 && identical(picture, previous),
+          'Repeat reuses the previous reconstruction',
+        );
+        check(
+          sample.packet.size == 3,
+          'A show-existing sample takes three bytes',
+        );
+      }
+      if (dav1d != null) {
+        elementary
+          ..add([0x12, 0])
+          ..add(binary.read(sample.packet.offset, sample.packet.size));
+        for (final plane in picture.planes) {
+          final bytes = ByteData(plane.width * plane.height * 2);
+          for (var y = 0; y < plane.height; y++) {
+            for (var x = 0; x < plane.width; x++) {
+              bytes.setUint16(
+                (y * plane.width + x) * 2,
+                plane.samples[y * plane.stride + x],
+                Endian.little,
+              );
+            }
+          }
+          reconstructed.add(bytes.buffer.asUint8List());
+        }
+      }
+      previous = picture;
+      index++;
+    }
+    check(index == count, 'DCT animation frame count');
+  } finally {
+    animation.close();
+    input.closeSync();
+  }
+  if (dav1d == null) return;
+  final obuPath = '${temp.path}/dct.obu', yuvPath = '${temp.path}/dct.yuv';
+  File(obuPath).writeAsBytesSync(elementary.takeBytes());
+  final result = await Process.run(dav1d, [
+    '-q',
+    '-i',
+    obuPath,
+    '--muxer',
+    'yuv',
+    '-o',
+    yuvPath,
+  ]);
+  check(
+    result.exitCode == 0,
+    'dav1d transform decode failed: ${result.stderr}',
+  );
+  final expected = reconstructed.takeBytes();
+  final actual = File(yuvPath).readAsBytesSync();
+  check(expected.length == actual.length, 'External transform frame count');
+  for (var i = 0; i < actual.length; i++) {
+    if (actual[i] != expected[i])
+      throw StateError('Transform sample differs at byte $i');
   }
 }
 

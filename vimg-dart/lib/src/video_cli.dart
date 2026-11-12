@@ -146,6 +146,11 @@ final class VcsCommand extends _CaptureCommand {
       )
       ..addOption('avif-fps', defaultsTo: '20', help: 'Playback frame rate.')
       ..addOption(
+        'avif-crf',
+        defaultsTo: '$defaultAvifCrf',
+        help: 'AVIF quality from 0 (finest quantization) to 63.',
+      )
+      ..addOption(
         'capture-backend',
         defaultsTo: 'auto',
         allowed: ['auto', 'dart'],
@@ -186,6 +191,7 @@ final class VcsCommand extends _CaptureCommand {
     }
     final directory = args.option('output-dir')!;
     final webp = integer('webp', max: 255)!;
+    final avifCrf = integer('avif-crf', max: 63)!;
     final suffix = webp == 0 ? 'avif' : 'webp';
     final output =
         args.option('output') ??
@@ -211,6 +217,7 @@ final class VcsCommand extends _CaptureCommand {
           capture.start.value != 0 ||
           capture.end.value != 0 ||
           fps != 20 ||
+          avifCrf != defaultAvifCrf ||
           webp != 0) {
         usageException(
           'Authority recording requires the fixed Preview profile '
@@ -237,6 +244,7 @@ final class VcsCommand extends _CaptureCommand {
         width: width,
         height: height,
         fps: fps,
+        avifCrf: avifCrf,
         captureDirectory: captures,
         mark: timings?.mark,
       );

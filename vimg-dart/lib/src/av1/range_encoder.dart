@@ -1,6 +1,8 @@
 import 'dart:typed_data';
 
-/// AV1 Q15 entropy writer for tiles with CDF updates disabled. The carry
+import 'range_decoder.dart' show Av1Cdf;
+
+/// AV1 Q15 entropy writer. The carry
 /// handling is based on go-av1's BSD-licensed od_ec encoder (see NOTICE).
 final class RangeEncoder {
   static const _full = 32768;
@@ -42,6 +44,11 @@ final class RangeEncoder {
 
   int _boundary(int inverseCdf, int remaining) =>
       (((_range >> 8) * (inverseCdf >> 6)) >> 1) + 4 * remaining;
+
+  void adaptive(Av1Cdf cdf, int value) {
+    symbol(cdf.cumulative, value);
+    cdf.observe(value);
+  }
 
   void literal(int value, int bits) {
     assert(value >= 0 && value.bitLength <= bits);

@@ -22,8 +22,8 @@ On Windows, use `-o build/vimg.exe`.
 - `vimg join -c3 -H160 image1.png image2.png -o grid.png` resizes images and
   composes a contact sheet. Pass a repeated `--label` to label successive tiles.
 
-The grid uses the Dart image library's bitmap fonts. Supported image formats
-depend on the library's encoders and decoders.
+The grid renders labels with the embedded Cantarell font. Supported image
+formats depend on the Dart image library's encoders and decoders.
 
 - `vimg preview --output preview.jpg video.mov` writes a bounded JPEG and
   returns the Yazi metadata response. It can read embedded cover art and VP8
@@ -31,6 +31,7 @@ depend on the library's encoders and decoders.
 - `vimg extract -n3 --output-dir frames video.mkv` writes sampled BMP frames.
 - `vimg vcs -c3 -H160 -n9 video.mkv -o grid.avif` writes an animated AVIF.
   Pass `-f1` for a still, `--webp 1` for WebP or choose a `.jpg` output for JPEG.
+  `--avif-crf` runs from 0 (finest quantization) to 63 and defaults to 30.
 - `vimg authority record -c3 -H160 -n9 --output grid.avif --manifest grid.json video.mkv`
   records the fixed Preview profile, the selected source PTS and pre-encoder
   and decoded PNGs.
@@ -68,12 +69,11 @@ The authority manifest identifies the capture backend as
 in the presentation timeline used for Dart capture. The source PTS is
 stored as integer ticks with a rational time base, before applying playback edits.
 
-The pure Dart AVIF encoder uses 8-bit 4:4:4 keyframes. Each 8×8 block uses
-separate palettes for green samples and blue/red pairs. Blocks with up to
-eight entries per palette preserve those samples exactly. More complex blocks
-are quantized, and animation uses an independent keyframe for each frame.
-These choices differ from the Rust encoder's inter-frame compression and
-CRF settings. The current encoder supports one AV1 Level 5.1 tile.
+Contact sheet AVIFs use the pure Dart 10-bit 4:2:0 encoder with DCT residuals.
+Animated sheets predict from the preceding reconstructed frame at the same
+pixel positions and reuse reconstructed frames for repeats. Dart maps `--avif-crf`
+to its own AV1 quantizers. `join` uses the 8-bit 4:4:4 palette encoder for
+still AVIF images. Both encoders support one AV1 Level 5.1 tile.
 
 ## Yazi DDS
 
