@@ -3,18 +3,20 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'capture.dart';
+import 'dds.dart';
 import 'output.dart';
 import 'preview_queue.dart';
 import 'video_commands.dart';
 
-const _profile = 'vimg-dart-webp-3x3-h160-n9-f30-q75-v1';
+String _profile(GridFormat format) => switch (format) {
+  GridFormat.avif => 'vimg-dart-avif-3x3-h160-n9-f30-palette-v1',
+  GridFormat.webp => 'vimg-dart-webp-3x3-h160-n9-f30-q75-v1',
+};
 
 Future<bool> renderPreview(PreviewJob job) => Isolate.run(() => _render(job));
 
 bool _render(PreviewJob job) {
-  if (!job.cache.toLowerCase().endsWith('.webp')) {
-    throw UnsupportedError('Dart service requires a .webp cache path');
-  }
+  final format = GridFormat.fromCache(job.cache);
   final target = File(job.cache).absolute;
   final source = File(job.file).absolute;
   final snapshot = _source(source, job);
@@ -24,12 +26,12 @@ bool _render(PreviewJob job) {
   }
   final manifest =
       '${target.path}.${snapshot.size}-${snapshot.modifiedSeconds}.json';
-  if (!job.refresh && _current(target, manifest, snapshot)) return true;
+  if (!job.refresh && _current(target, manifest, snapshot, format)) return true;
 
   target.parent.createSync(recursive: true);
   final staging = target.parent.createTempSync('.vimg-preview-');
   try {
-    final staged = File.fromUri(staging.uri.resolve('preview.webp'));
+    final staged = File.fromUri(staging.uri.resolve('preview.${format.name}'));
     writeContactSheet(
       source.path,
       staged.path,
@@ -43,7 +45,7 @@ bool _render(PreviewJob job) {
     staged.renameSync(target.path);
     publishBytes(
       manifest,
-      utf8.encode(jsonEncode(_manifest(target, snapshot))),
+      utf8.encode(jsonEncode(_manifest(target, snapshot, format))),
     );
     return false;
   } finally {
@@ -77,10 +79,14 @@ _Snapshot _source(File file, PreviewJob job) {
   );
 }
 
-Map<String, Object> _manifest(File target, _Snapshot source) {
+Map<String, Object> _manifest(
+  File target,
+  _Snapshot source,
+  GridFormat format,
+) {
   final output = target.statSync();
   return {
-    'profile': _profile,
+    'profile': _profile(format),
     'source_path': source.path,
     'source_size': source.size,
     'source_modified_s': source.modifiedSeconds,
@@ -90,11 +96,16 @@ Map<String, Object> _manifest(File target, _Snapshot source) {
   };
 }
 
-bool _current(File target, String manifest, _Snapshot source) {
+bool _current(
+  File target,
+  String manifest,
+  _Snapshot source,
+  GridFormat format,
+) {
   try {
     final stored = jsonDecode(File(manifest).readAsStringSync());
     if (stored is! Map<String, Object?>) return false;
-    final expected = _manifest(target, source);
+    final expected = _manifest(target, source, format);
     if (stored.length != expected.length ||
         !expected.entries.every((field) => stored[field.key] == field.value)) {
       return false;
@@ -102,9 +113,13 @@ bool _current(File target, String manifest, _Snapshot source) {
     final file = target.openSync();
     try {
       final header = file.readSync(12);
-      return header.length == 12 &&
-          ascii.decode(header.sublist(0, 4), allowInvalid: true) == 'RIFF' &&
-          ascii.decode(header.sublist(8), allowInvalid: true) == 'WEBP';
+      if (header.length != 12) return false;
+      String tag(int offset) =>
+          ascii.decode(header.sublist(offset, offset + 4), allowInvalid: true);
+      return switch (format) {
+        GridFormat.avif => tag(4) == 'ftyp' && tag(8) == 'avis',
+        GridFormat.webp => tag(0) == 'RIFF' && tag(8) == 'WEBP',
+      };
     } finally {
       file.closeSync();
     }

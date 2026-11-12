@@ -1,4 +1,7 @@
--- Run from the repository root with luajit vimg-dart/test/gridthumb_webp.lua.
+-- Run from the repository root with luajit vimg-dart/test/gridthumb_dart.lua [avif|webp].
+local format = arg[1] or "avif"
+local request = format == "avif" and "vimg-gridthumb-request" or "vimg-gridthumb-webp-request"
+local cache = "cache." .. format
 local state, remote, sent, shown, emitted = {}, {}, {}, {}, {}
 local files = { ["video.mkv"] = { len = 100, mtime = 25 } }
 local jpeg = false
@@ -41,20 +44,19 @@ Command = function(executable)
 end
 
 local plugin = dofile("gridthumb.yazi/main.lua")
-plugin.setup(state, { grid_format = "webp", vimg = "vimg-dart", auto_start = false })
+plugin.setup(state, { grid_format = format, dart_media = true, vimg = "vimg-dart", auto_start = false })
 local job = { file = { url = "video.mkv" }, skip = 0 }
 metadata.preview_fallback = "codec unavailable"
 assert(plugin:peek(job) == "codec unavailable" and #shown == 0 and #sent == 0)
 
 jpeg = true
 plugin:peek(job)
-assert(shown[1] == "cache" and sent[1][1] == "vimg-gridthumb-webp-request")
-assert(sent[1][2].cache == "cache.webp" and sent[1][2].source_modified_s == 25)
-assert(remote["gridthumb-avif-ready"] == nil)
-files["cache.webp"] = { len = 10 }
-files["cache.webp.100-25.json"] = { len = 10 }
-remote["gridthumb-webp-ready"] { file = "video.mkv", cache = "cache.webp" }
+assert(shown[1] == "cache" and sent[1][1] == request)
+assert(sent[1][2].cache == cache and sent[1][2].source_modified_s == 25)
+files[cache] = { len = 10 }
+files[cache .. ".100-25.json"] = { len = 10 }
+remote["gridthumb-" .. format .. "-ready"] { file = "video.mkv", cache = cache }
 assert(emitted[1][1] == "peek" and emitted[1][2].force)
 plugin:peek(job)
-assert(shown[2] == "cache.webp" and #sent == 1)
-print("gridthumb WebP mode: Dart preview, DDS request, ready refresh, and cache display passed")
+assert(shown[2] == cache and #sent == 1)
+print("gridthumb " .. format .. " mode: Dart preview, DDS request, ready refresh, and cache display passed")

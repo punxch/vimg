@@ -50,29 +50,30 @@ CRF settings. The current encoder supports one AV1 Level 5.1 tile.
 
 ## Yazi DDS
 
-Use the `gridthumb.yazi` plugin in the repository root and select WebP in its
-setup. The service starts on demand using the configured executable and Yazi's
-matching `ya` client.
+Use the `gridthumb.yazi` plugin in the repository root. The service starts on
+demand using the configured Dart executable and Yazi's matching `ya` client.
 
 ```lua
 require("gridthumb"):setup {
     vimg = "/path/to/vimg-dart/build/vimg",
-    grid_format = "webp",
+    dart_media = true,
 }
 ```
 
 The service logs live status, shares duplicate requests, supports interactive
 cancellation, and caps running plus queued previews at ten. It runs one render
 at a time by default. Set `service_args = { "--jobs", "2" }` to allow two
-simultaneous renders. The Dart service uses WebP-specific DDS events and the
-plugin displays the WebP cache through Yazi. Manual use:
+simultaneous renders. AVIF uses the existing DDS events. Set
+`grid_format = "webp"` to request WebP on its dedicated events. Stop an already
+running Rust AVIF service before using the Dart service on the same AVIF
+topics. Manual use:
 
 ```sh
 vimg serve --ya /path/to/ya -j2
-vimg send --yazi-id 123 video.mkv /path/to/cache.webp
+vimg send --yazi-id 123 video.mkv /path/to/cache.avif
 ```
 
-`serve` uses OS CPU scheduling. The WebP mode in the plugin uses the Dart
+`serve` uses OS CPU scheduling. The plugin's Dart mode uses the Dart
 `preview` and `probe` commands for static images and metadata.
 
 ## Verification

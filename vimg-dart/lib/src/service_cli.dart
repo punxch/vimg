@@ -72,9 +72,7 @@ final class SendCommand extends VimgCommand {
         (duration == null || !duration.isFinite || duration <= 0)) {
       usageException('--duration-s must be positive.');
     }
-    final event = args.rest[1].toLowerCase().endsWith('.webp')
-        ? requestEvent
-        : avifRequestEvent;
+    final event = GridFormat.fromCache(args.rest[1]).topic(DdsEvent.request);
     return publishDds(args.option('ya')!, '0', event, {
       'file': args.rest[0],
       'cache': args.rest[1],

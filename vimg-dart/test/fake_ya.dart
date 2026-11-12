@@ -6,11 +6,13 @@ Future<void> main(List<String> args) async {
   switch (args.firstOrNull) {
     case 'sub':
       final input = File(environment['VIMG_TEST_DDS_INPUT']!);
+      final topics = args[1].split(',').toSet();
       var read = 0;
       while (true) {
         final lines = input.readAsStringSync().split('\n');
         for (; read < lines.length - 1; read++) {
-          stdout.writeln(lines[read]);
+          if (topics.contains(lines[read].split(',').first))
+            stdout.writeln(lines[read]);
         }
         await stdout.flush();
         await Future<void>.delayed(const Duration(milliseconds: 20));

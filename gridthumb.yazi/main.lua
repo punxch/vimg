@@ -3,6 +3,9 @@ local media_descriptors = {}
 local grid_format = ya.sync(function(state)
 	return state.grid_format or "avif"
 end)
+local dart_media = ya.sync(function(state)
+	return state.dart_media == true
+end)
 local function dds_event(format, kind)
 	return "vimg-gridthumb-" .. (format == "webp" and "webp-" or "") .. kind
 end
@@ -162,6 +165,7 @@ function M:setup(options)
 	self.vimg = options.vimg or "vimg"
 	self.ya = options.ya
 	self.grid_format = options.grid_format == "webp" and "webp" or "avif"
+	self.dart_media = options.dart_media == true or self.grid_format == "webp"
 	self.auto_start = options.auto_start ~= false
 	self.service_args = options.service_args or {}
 	self.preview_helper = options and options.preview_helper or nil
@@ -330,7 +334,7 @@ function M:preload(job)
 	-- method 1: ffmpeg single-frame cache (skip if exists)
 	local cha = file_stat(cache)
 	if not (cha and cha.len > 0) then
-		if format == "webp" then
+		if dart_media() then
 			return true, Err("%s", meta.preview_fallback or "Dart preview could not decode a frame")
 		end
 		-- A single keyframe does not amortize hardware-device initialization.
@@ -425,7 +429,7 @@ end
 
 function M:spot_base(job)
 	local meta, err
-	if grid_format() == "webp" then
+	if dart_media() then
 		meta, err = self.list_preview_meta(job.file.url)
 	else
 		meta, err = self.list_meta(job.file.url, "format=duration:stream=codec_name,codec_type,width,height")
@@ -476,7 +480,7 @@ function M.list_preview_meta(url)
 			return meta
 		end
 	end
-	if grid_format() == "webp" then
+	if dart_media() then
 		return nil, Err("Dart probe could not read preview metadata")
 	end
 	return M.list_meta(url, "format=duration:stream=codec_name,codec_type,width,height,time_base:stream_disposition=attached_pic")

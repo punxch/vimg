@@ -52,7 +52,7 @@ final class _Service {
       while (!_stop.isCompleted) {
         final child = await Process.start(ya, [
           'sub',
-          '$requestEvent,$cancelEvent,$pingEvent',
+          DdsMessage.topics.join(','),
         ]);
         _child = child;
         if (_stop.isCompleted) child.kill();
@@ -103,8 +103,8 @@ final class _Service {
   void _receive(String line) {
     try {
       final message = DdsMessage.parse(line);
-      switch (message.event) {
-        case pingEvent:
+      switch (message.kind) {
+        case DdsEvent.ping:
           final sender = message.requireSender();
           final token = message.body['token'];
           if (token is! int || token < 0)
@@ -113,21 +113,39 @@ final class _Service {
             _publish(sender, serviceReadyEvent, {
               'token': token,
               'pid': pid,
-              'formats': ['webp'],
+              'formats': GridFormat.values
+                  .map((format) => format.name)
+                  .toList(),
             }),
           );
-        case cancelEvent:
+        case DdsEvent.cancel:
           final cache = message.body['cache'];
           if (cache is! String || cache.isEmpty)
             throw const FormatException('Missing DDS cache');
           _queue.cancel(message.requireSender(), cache);
           _status('cancelled');
-        case requestEvent:
+        case DdsEvent.request:
           final job = PreviewJob.fromDds(message.body);
           final latest = message.body['latest'] == true;
           final recipient = latest
               ? message.requireSender()
               : batchRecipient(message);
+          if (!message.format.matchesCache(job.cache)) {
+            if (recipient != null) {
+              _track(
+                _publish(
+                  recipient,
+                  message.format.resultTopic(success: false),
+                  {
+                    'file': job.file,
+                    'cache': job.cache,
+                    'error': 'Cache extension must be .${message.format.name}',
+                  },
+                ),
+              );
+            }
+            return;
+          }
           final result = _queue.submit(
             job,
             recipient: recipient,
@@ -135,8 +153,6 @@ final class _Service {
           );
           _status(result.name);
           _startJobs();
-        default:
-          throw FormatException('Unexpected DDS event ${message.event}');
       }
     } on FormatException catch (error) {
       stderr.writeln('[serve] ${error.message}');
@@ -182,9 +198,11 @@ final class _Service {
       'cache': job.cache,
       if (error != null) 'error': error,
     };
+    final event = GridFormat.fromCache(
+      job.cache,
+    ).resultTopic(success: error == null);
     await Future.wait([
-      for (final recipient in recipients)
-        _publish(recipient, error == null ? readyEvent : failedEvent, body),
+      for (final recipient in recipients) _publish(recipient, event, body),
     ]);
   }
 

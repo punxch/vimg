@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:image/image.dart' as image;
+import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/dds.dart';
+import 'package:vimg_dart/src/iso_media.dart';
 import 'package:vimg_dart/src/preview_queue.dart';
 
 import 'fixtures.dart';
@@ -57,7 +59,9 @@ void testQueue() {
     'Refresh notified both viewers',
   );
 
-  final message = DdsMessage.parse('event,0,12,{"file":"a,b.mkv"}');
+  final message = DdsMessage.parse(
+    'vimg-gridthumb-request,0,12,{"file":"a,b.mkv"}',
+  );
   check(
     message.sender == '12' && message.body['file'] == 'a,b.mkv',
     'DDS JSON can contain commas',
@@ -78,7 +82,6 @@ Future<void> main(List<String> args) async {
     'VIMG_TEST_DDS_OUTPUT': output.path,
   };
   final video = matroskaFixture(temp);
-  final cache = '${temp.path}/cache, animé.webp';
   final service = await Process.start(args[0], [
     'serve',
     '--ya',
@@ -119,14 +122,15 @@ Future<void> main(List<String> args) async {
       .where((body) => body[0] == recipient && body[1] == event);
 
   try {
-    request(pingEvent, 123, {'token': 37});
+    request(GridFormat.avif.topic(DdsEvent.ping), 123, {'token': 37});
     await waitFor(
       () => replies(serviceReadyEvent, '123').isNotEmpty,
       'No readiness reply',
     );
     final ping = replies(serviceReadyEvent, '123').single[2] as Map;
     check(
-      ping['token'] == 37 && (ping['formats'] as List).contains('webp'),
+      ping['token'] == 37 &&
+          (ping['formats'] as List).toSet().containsAll(['avif', 'webp']),
       'DDS readiness fields',
     );
     final duplicate = await Process.run(args[0], [
@@ -140,60 +144,66 @@ Future<void> main(List<String> args) async {
       'Duplicate service lock',
     );
 
-    final body = {
-      'file': video.path,
-      'cache': cache,
-      'source_size': video.lengthSync(),
-    };
-    request(requestEvent, 123, body);
-    request(requestEvent, 456, body);
-    await waitFor(
-      () =>
-          replies(readyEvent, '123').isNotEmpty &&
-          replies(readyEvent, '456').isNotEmpty,
-      'No ready replies from the worker',
-    );
-    final sheet = image.WebPDecoder().startDecode(
-      File(cache).readAsBytesSync(),
-    )!;
-    check(
-      sheet.width == 639 && sheet.height == 480 && sheet.numFrames == 30,
-      'Service grid profile',
-    );
-    check(
-      logs.any((line) => line.contains('shared')),
-      'Service coalesced duplicate work',
-    );
+    for (final format in GridFormat.values) {
+      final requestTopic = format.topic(DdsEvent.request);
+      final ready = format.resultTopic(success: true);
+      final failed = format.resultTopic(success: false);
+      final outputPath = '${temp.path}/cache, animé.${format.name}';
+      final body = {
+        'file': video.path,
+        'cache': outputPath,
+        'source_size': video.lengthSync(),
+      };
+      request(requestTopic, 123, body);
+      request(requestTopic, 456, body);
+      await waitFor(
+        () =>
+            replies(ready, '123').isNotEmpty &&
+            replies(ready, '456').isNotEmpty,
+        'No ${format.name} ready replies from the worker',
+      );
+      _checkGrid(format, outputPath);
+      check(
+        logs.any((line) => line.contains('shared')),
+        'Service coalesced duplicate work',
+      );
 
-    request(requestEvent, 789, body);
-    await waitFor(
-      () => replies(readyEvent, '789').isNotEmpty,
-      'No cache hit reply',
-    );
-    check(logs.any((line) => line.contains('Cache hit')), 'Cache reuse logged');
+      request(requestTopic, 789, body);
+      await waitFor(
+        () => replies(ready, '789').isNotEmpty,
+        'No cache hit reply',
+      );
+      check(
+        logs.any((line) => line.contains('Cache hit $outputPath')),
+        'Cache reuse logged',
+      );
 
-    request(requestEvent, 901, {...body, 'source_size': 1});
-    await waitFor(
-      () => replies(failedEvent, '901').isNotEmpty,
-      'Stale source did not fail',
-    );
-    final error = replies(failedEvent, '901').single[2] as Map;
-    check('${error['error']}'.contains('source changed'), 'Stale source error');
+      request(requestTopic, 901, {...body, 'source_size': 1});
+      await waitFor(
+        () => replies(failed, '901').isNotEmpty,
+        'Stale source did not fail',
+      );
+      final error = replies(failed, '901').single[2] as Map;
+      check(
+        '${error['error']}'.contains('source changed'),
+        'Stale source error',
+      );
 
-    final sent = await Process.run(args[0], [
-      'send',
-      '--ya',
-      args[1],
-      '--yazi-id',
-      '123',
-      video.path,
-      cache,
-    ], environment: environment);
-    check(
-      sent.exitCode == 0 &&
-          replies(requestEvent, '0').single[2]['cache'] == cache,
-      'send publishes the original cache path',
-    );
+      final sent = await Process.run(args[0], [
+        'send',
+        '--ya',
+        args[1],
+        '--yazi-id',
+        '123',
+        video.path,
+        outputPath,
+      ], environment: environment);
+      check(
+        sent.exitCode == 0 &&
+            replies(requestTopic, '0').single[2]['cache'] == outputPath,
+        'send publishes the original cache path on the expected topic',
+      );
+    }
   } finally {
     service.kill(
       Platform.isWindows ? ProcessSignal.sigint : ProcessSignal.sigterm,
@@ -207,5 +217,37 @@ Future<void> main(List<String> args) async {
     await out.cancel();
     await err.cancel();
     temp.deleteSync(recursive: true);
+  }
+}
+
+void _checkGrid(GridFormat format, String path) {
+  if (format == GridFormat.webp) {
+    final sheet = image.WebPDecoder().startDecode(
+      File(path).readAsBytesSync(),
+    )!;
+    check(
+      sheet.width == 639 && sheet.height == 480 && sheet.numFrames == 30,
+      'Service WebP grid profile',
+    );
+    return;
+  }
+  final handle = File(path).openSync();
+  try {
+    final file = BinaryFile(handle);
+    final iso = IsoMedia(file);
+    check(iso.tag(8) == 'avis', 'Service AVIF sequence brand');
+    final movie = iso.movie();
+    final media = iso.child(iso.child(movie, 'trak'), 'mdia');
+    final table = iso.sampleTable(media);
+    final entry = iso.sampleDescription(table)!;
+    final samples = iso.child(table, 'stsz')!;
+    check(
+      file.unsigned(entry.data + 24, 2) == 639 &&
+          file.unsigned(entry.data + 26, 2) == 480 &&
+          file.unsigned(samples.data + 8, 4) == 30,
+      'Service AVIF grid profile',
+    );
+  } finally {
+    handle.closeSync();
   }
 }
