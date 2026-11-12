@@ -87,6 +87,7 @@ dart test/probe_join_test.dart
 dart test/video_test.dart
 dart test/avif_test.dart
 dart test/h264_test.dart
+dart test/hevc_test.dart
 dart compile exe bin/vimg.dart -o build/vimg
 dart compile exe test/fake_ya.dart -o build/fake-ya
 dart test/service_test.dart build/vimg build/fake-ya

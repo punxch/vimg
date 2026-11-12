@@ -7,7 +7,7 @@ import 'avi.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
-import 'h264/container.dart';
+import 'video_configuration.dart';
 import 'h264/idr_picture.dart';
 import 'iso_frames.dart';
 import 'iso_media.dart';
@@ -58,8 +58,8 @@ final class Video {
     final matroska = _matroska;
     final iso = _iso;
     final config = matroska != null
-        ? matroskaAvcConfiguration(matroska)
-        : (iso != null ? isoAvcConfiguration(iso) : null);
+        ? matroskaVideoConfiguration(matroska, 'h264')
+        : (iso != null ? isoVideoConfiguration(iso, 'h264') : null);
     if (config == null)
       throw UnsupportedError(
         'H.264 requires a Matroska or MP4 AVC configuration',

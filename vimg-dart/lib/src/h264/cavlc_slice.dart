@@ -11,9 +11,7 @@ final class CavlcSlice extends SliceData {
     final bits = header.bits;
     if ((_skipRun ?? 0) > 0 || bits.remaining > 8 || bits.hasMoreData)
       return false;
-    if (!bits.flag())
-      throw const FormatException('Missing H.264 RBSP stop bit');
-    bits.align(0);
+    bits.readStopBit();
     return true;
   }
 

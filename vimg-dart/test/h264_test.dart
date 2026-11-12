@@ -5,7 +5,7 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/h264/access_unit.dart';
-import 'package:vimg_dart/src/h264/container.dart';
+import 'package:vimg_dart/src/video_configuration.dart';
 import 'package:vimg_dart/src/h264/idr_picture.dart';
 import 'package:vimg_dart/src/iso_frames.dart';
 import 'package:vimg_dart/src/iso_media.dart';
@@ -137,8 +137,8 @@ void _checkPlanes(
     final matroska = isMatroska ? Matroska(file) : null;
     final iso = isMatroska ? null : IsoMedia(file);
     final config = matroska == null
-        ? isoAvcConfiguration(iso!)
-        : matroskaAvcConfiguration(matroska);
+        ? isoVideoConfiguration(iso!, 'h264')
+        : matroskaVideoConfiguration(matroska, 'h264');
     final packets =
         (matroska == null ? isoFrames(iso!) : matroskaFrames(matroska))
             .toList();

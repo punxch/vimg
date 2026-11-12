@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import 'parameters.dart';
-import 'rbsp.dart';
+import '../rbsp.dart';
 
 enum SliceKind { p, b, intra }
 

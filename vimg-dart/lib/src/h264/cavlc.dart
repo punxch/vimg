@@ -2,7 +2,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'cavlc_tables.dart';
-import 'rbsp.dart';
+import '../rbsp.dart';
 
 /// H.264 §9.2 coefficient levels in scan order. The stride interleaves the
 /// four CAVLC residual blocks of an 8×8 transform into its zigzag sequence.

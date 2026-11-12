@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'rbsp.dart';
+import '../rbsp.dart';
 
 const _extendedProfiles = {
   44,
