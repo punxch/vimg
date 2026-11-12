@@ -62,10 +62,12 @@ access units, preserves source PTS across 33-bit rollover and accounts for
 an earlier audio start in the same program. Capture workers read the
 selected GOPs directly from the source file.
 
-Matroska, MPEG-TS, MPEG-PS and elementary `.m1v`/`.m2v` streams support
-MPEG-1 and MPEG-2 I/P/B pictures. MPEG-2 supports progressive and interlaced
-frame pictures as well as separately coded top and bottom fields. Field
-pictures are paired in either field order and reconstructed into one frame.
+Matroska, MP4/MOV, MPEG-TS, MPEG-PS and elementary `.m1v`/`.m2v` streams
+support MPEG-1 and MPEG-2 I/P/B pictures. MP4/MOV can supply the sequence
+headers in the video samples, an `esds` descriptor or a QuickTime `glbl`
+box. Both conventional and fragmented MP4 files work. MPEG-2 supports
+progressive and interlaced frame pictures and separately coded top and bottom
+fields. The decoder pairs fields in either order and reconstructs one frame.
 Field motion compensation includes 16×8 and dual-prime prediction.
 Capture handles B-pictures that depend on an earlier GOP and selects
 I-frames, including I/P field pairs, for static previews. MPEG transport
@@ -197,6 +199,7 @@ dart test/av1_transform_test.dart
 dart test/h264_test.dart
 dart test/hevc_test.dart
 dart test/iso_fragments_test.dart
+dart test/iso_mpeg_test.dart
 dart test/transport_stream_test.dart
 dart test/mpeg_video_test.dart
 dart test/mpeg_fields_test.dart

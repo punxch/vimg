@@ -1,11 +1,14 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'metadata.dart';
+import 'mpeg12/syntax.dart';
 
+part 'iso_descriptors.dart';
 part 'iso_fragments.dart';
 part 'iso_frames.dart';
 
@@ -155,7 +158,10 @@ final class IsoMedia {
       'av01' => 'av1',
       'vp08' => 'vp8',
       'vp09' => 'vp9',
-      'mp4v' => 'mpeg4',
+      'mp4v' => _visualDescriptor(entry)?.codec ?? 'mpeg4',
+      'm1v ' || 'm1v1' || 'mpeg' || 'mp1v' => 'mpeg1video',
+      'm2v1' || 'mp2v' || 'AVmp' => 'mpeg2video',
+      _ when _mpeg2QuickTimeTags.hasMatch(entry.type) => 'mpeg2video',
       'jpeg' || 'mjpa' || 'mjpb' || 'mjpg' => 'mjpeg',
       'ap4h' || 'ap4x' || 'apch' || 'apcn' || 'apcs' || 'apco' => 'prores',
       'aprn' || 'aprh' => 'prores_raw',
@@ -169,6 +175,26 @@ final class IsoMedia {
       height: file.unsigned(entry.data + 26, 2),
       timeBase: '1/$scale',
     );
+  }
+
+  Uint8List? mpegVideoConfiguration() {
+    final track = firstVideoTrack();
+    final entry = sampleDescription(sampleTable(child(track, 'mdia')));
+    if (entry == null) return null;
+    final global = _visualBox(entry, 'glbl');
+    final extent =
+        _visualDescriptor(entry)?.specific ??
+        (global == null ? null : (data: global.data, end: global.end));
+    if (extent == null || extent.data == extent.end) return null;
+    final length = extent.end - extent.data;
+    if (length > 1024 * 1024) {
+      throw const FormatException('Oversized MPEG video configuration');
+    }
+    final bytes = file.read(extent.data, length);
+    // Some QuickTime entries carry vendor metadata in the global box.
+    return mpegStartCodes(bytes).any((unit) => unit.code == 0xb3)
+        ? bytes
+        : null;
   }
 
   Iterable<MediaBox> coverData(MediaBox? meta) sync* {
@@ -206,3 +232,8 @@ final class IsoMedia {
     }
   }
 }
+
+// QuickTime tags for MPEG-2 HDV, IMX and XDCAM.
+final _mpeg2QuickTimeTags = RegExp(
+  r'^(hdv[1-9a]|mx[345][np]|xd5[1459a-f]|xdv[1-9a-f]|xdh[d2])$',
+);

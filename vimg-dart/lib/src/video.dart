@@ -138,8 +138,10 @@ final class Video {
     if (isMpegVideo(codec)) {
       final indexed = _mpegTimeline;
       return preview
-          ? indexed.configurations.keys.map(
-              (i) => indexed.timeline.decodeOrder[i],
+          ? indexed.timeline.presentation.where(
+              (packet) => indexed.configurations.containsKey(
+                indexed.timeline.index[packet],
+              ),
             )
           : indexed.timeline.presentation;
     }
@@ -302,7 +304,7 @@ final class Video {
     final headers = MpegHeaders();
     final matroska = _matroska;
     final initial = matroska == null
-        ? null
+        ? _iso?.mpegVideoConfiguration()
         : matroskaVideoConfiguration(matroska, codec);
     if (initial != null) {
       for (final unit in mpegStartCodes(initial)) {
