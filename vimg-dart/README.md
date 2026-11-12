@@ -9,10 +9,10 @@ From this directory with Dart 3.11 or later:
 
 ```sh
 dart pub get
-dart compile exe bin/vimg.dart -o vimg
+dart compile exe bin/vimg.dart -o build/vimg
 ```
 
-On Windows, use `-o vimg.exe`.
+On Windows, use `-o build/vimg.exe`.
 
 ## Available commands
 
@@ -36,10 +36,40 @@ Matroska or unfragmented MP4/MOV. AVIF output and decoding inter-frame formats
 such as H.264 and HEVC are pending. The bundled `sample/input.mkv` can be probed
 and requires an H.264 decoder for extraction and contact sheets.
 
+## Yazi DDS
+
+Use the `gridthumb.yazi` plugin in the repository root and select WebP in its
+setup. The service starts on demand using the configured executable and Yazi's
+matching `ya` client.
+
+```lua
+require("gridthumb"):setup {
+    vimg = "/path/to/vimg-dart/build/vimg",
+    grid_format = "webp",
+}
+```
+
+The service logs live status, shares duplicate requests, supports interactive
+cancellation, and caps running plus queued previews at ten. It runs one render
+at a time by default. Set `service_args = { "--jobs", "2" }` to allow two
+simultaneous renders. The Dart service uses WebP-specific DDS events and the
+plugin displays the WebP cache through Yazi. Manual use:
+
+```sh
+vimg serve --ya /path/to/ya -j2
+vimg send --yazi-id 123 video.mkv /path/to/cache.webp
+```
+
+`serve` uses OS CPU scheduling. The WebP mode in the plugin uses the Dart
+`preview` and `probe` commands for static images and metadata.
+
 ## Verification
 
 ```sh
 dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
+dart compile exe bin/vimg.dart -o build/vimg
+dart compile exe test/fake_ya.dart -o build/fake-ya
+dart test/service_test.dart build/vimg build/fake-ya
 ```

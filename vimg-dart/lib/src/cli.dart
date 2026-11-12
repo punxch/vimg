@@ -7,6 +7,7 @@ import 'package:image/image.dart' as image;
 import 'grid.dart';
 import 'output.dart';
 import 'probe.dart';
+import 'service_cli.dart';
 import 'video_cli.dart';
 
 CommandRunner<void> createRunner() =>
@@ -16,7 +17,9 @@ CommandRunner<void> createRunner() =>
       ..addCommand(_Join())
       ..addCommand(ExtractCommand())
       ..addCommand(PreviewCommand())
-      ..addCommand(VcsCommand());
+      ..addCommand(VcsCommand())
+      ..addCommand(ServeCommand())
+      ..addCommand(SendCommand());
 
 Future<void> runCli(List<String> arguments) async {
   final runner = createRunner();
@@ -35,6 +38,9 @@ Future<void> runCli(List<String> arguments) async {
     exitCode = 1;
   } on UnsupportedError catch (error) {
     stderr.writeln('vimg: ${error.message}');
+    exitCode = 1;
+  } on ProcessException catch (error) {
+    stderr.writeln('vimg: $error');
     exitCode = 1;
   } on FileSystemException catch (error) {
     stderr.writeln('vimg: $error');
