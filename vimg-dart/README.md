@@ -52,8 +52,13 @@ a quick static image.
 Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in 4:2:0
 or monochrome, up to 12 bits. `preview` selects an HEVC random-access
 picture. `extract` and `vcs` decode from the preceding random-access point
-and handle leading pictures that depend on an earlier GOP. HEVC range
-extension tools, general AV1 decoding for Rust-produced authority AVIFs,
+and handle leading pictures that depend on an earlier GOP.
+
+`preview` also decodes AV1 keyframes from Matroska and MP4. The AVIF
+animation reader decodes independently coded AV1 frames, including
+lossless residuals, palette prediction, deblocking and CDEF. AV1
+inter prediction, intra block copy, loop restoration, super-resolution
+and film grain synthesis are pending. HEVC range extension tools,
 FFmpeg filter expressions and hardware capture backends are pending.
 
 The authority manifest identifies the capture backend as
@@ -104,6 +109,7 @@ dart test/probe_join_test.dart
 dart test/video_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart
+dart test/av1_intra_test.dart
 dart test/av1_coefficients_test.dart
 dart test/av1_transform_test.dart
 dart test/h264_test.dart

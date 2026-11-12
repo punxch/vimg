@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import 'av1/access_units.dart';
-import 'av1/palette_decoder.dart';
+import 'av1/intra_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'iso_frames.dart';
@@ -151,7 +151,7 @@ final class AvifAnimation {
 
   Iterable<image.Image> decodeFrames() sync* {
     for (final sample in codedFrames()) {
-      final frame = decodePaletteFrame(sample.frame);
+      final frame = decodeAv1IntraImage(sample.frame);
       if (!sample.present) continue;
       if (frame.width != width || frame.height != height)
         throw const FormatException(

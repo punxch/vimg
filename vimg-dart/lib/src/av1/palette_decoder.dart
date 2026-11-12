@@ -7,6 +7,7 @@ import 'access_units.dart';
 import 'bitstream.dart';
 import 'frame_header.dart';
 import 'palette_cdf.dart';
+import 'palette_reader.dart';
 import 'range_decoder.dart';
 
 /// Decode the lossless, palette-predicted AV1 profile written by vimg.
@@ -66,7 +67,7 @@ image.Image decodePaletteFrame(Av1CodedFrame frame) {
   return _PaletteTileDecoder(
     width,
     height,
-    RangeDecoder(Av1Bits(frame.tiles.single.payload)),
+    RangeDecoder(Av1Bits(frame.tiles.single.payload), updateCdf: false),
   ).decode();
 }
 
@@ -84,7 +85,7 @@ final class _PaletteTileDecoder {
     null,
   );
   late final _pixels = Uint8List(width * height * 3);
-  final _scores = Uint8List(8);
+  late final _palette = Av1PaletteReader(_range, 8);
   final _greenMap = Uint8List(64);
   final _chromaMap = Uint8List(64);
 
@@ -142,22 +143,38 @@ final class _PaletteTileDecoder {
       _range.symbol(paletteLumaModeCdf[context]) == 1,
       'luma palette mode',
     );
-    final green = _colors(
+    final green = _palette.colors(
       _range.symbol(paletteLumaSizeCdf) + 2,
       above?.green,
       left?.green,
-      minDelta: 1,
+      chroma: false,
     );
     _expect(_range.symbol(paletteChromaModeCdf) == 1, 'chroma palette mode');
-    final blue = _colors(
+    final blue = _palette.colors(
       _range.symbol(paletteChromaSizeCdf) + 2,
       above?.blue,
       left?.blue,
-      minDelta: 0,
+      chroma: true,
     );
-    final red = _red(blue.length);
-    _map(_greenMap, green.length, paletteLumaMapCdf[green.length - 2]);
-    _map(_chromaMap, blue.length, paletteChromaMapCdf[blue.length - 2]);
+    final red = _palette.vColors(blue.length);
+    _palette.readMap(
+      _greenMap,
+      green.length,
+      8,
+      8,
+      visibleWidth: 8,
+      visibleHeight: 8,
+      chroma: false,
+    );
+    _palette.readMap(
+      _chromaMap,
+      blue.length,
+      8,
+      8,
+      visibleWidth: 8,
+      visibleHeight: 8,
+      chroma: true,
+    );
     _neighbors[offset] = (green: green, blue: blue);
 
     final x = col * 8, y = row * 8;
@@ -170,80 +187,6 @@ final class _PaletteTileDecoder {
         _pixels[destination++] = red[uv];
         _pixels[destination++] = green[_greenMap[i]];
         _pixels[destination++] = blue[uv];
-      }
-    }
-  }
-
-  List<int> _colors(
-    int count,
-    List<int>? above,
-    List<int>? left, {
-    required int minDelta,
-  }) {
-    final result = <int>[];
-    if (above != null || left != null) {
-      final cache = <int>{...?above, ...?left}.toList()..sort();
-      for (final color in cache) {
-        if (_range.literal(1) != 0) {
-          result.add(color);
-          if (result.length == count) return result;
-        }
-      }
-    }
-    var previous = _range.literal(8);
-    result.add(previous);
-    if (result.length < count) {
-      var bits = 5 + _range.literal(2);
-      while (result.length < count) {
-        previous = math.min(255, previous + minDelta + _range.literal(bits));
-        result.add(previous);
-        bits = math.min(bits, (255 - previous - minDelta).bitLength);
-      }
-    }
-    return result..sort();
-  }
-
-  List<int> _red(int count) {
-    if (_range.literal(1) == 0)
-      return List.generate(count, (_) => _range.literal(8));
-    final bits = 4 + _range.literal(2);
-    var previous = _range.literal(8);
-    return [
-      previous,
-      for (var i = 1; i < count; i++)
-        (() {
-          final delta = _range.literal(bits);
-          final signed = delta != 0 && _range.literal(1) != 0 ? -delta : delta;
-          return previous = (previous + signed) & 255;
-        })(),
-    ];
-  }
-
-  void _map(Uint8List map, int count, List<List<int>> contexts) {
-    map[0] = _range.uniform(count);
-    for (var diagonal = 1; diagonal < 15; diagonal++) {
-      for (var x = math.min(diagonal, 7); x >= math.max(0, diagonal - 7); x--) {
-        final y = diagonal - x;
-        final index = y * 8 + x;
-        _scores.fillRange(0, count, 0);
-        if (x > 0) _scores[map[index - 1]] += 2;
-        if (y > 0) _scores[map[index - 8]] += 2;
-        if (x > 0 && y > 0) _scores[map[index - 9]]++;
-        var maximum = 0, sum = 0;
-        for (var i = 0; i < count; i++) {
-          maximum = math.max(maximum, _scores[i]);
-          sum += _scores[i];
-        }
-        final context = paletteColorContexts[2 * sum - maximum];
-        var rank = _range.symbol(contexts[context]);
-        for (var score = maximum; score >= 0 && rank >= 0; score--) {
-          for (var i = 0; i < count; i++) {
-            if (_scores[i] == score && rank-- == 0) {
-              map[index] = i;
-              break;
-            }
-          }
-        }
       }
     }
   }

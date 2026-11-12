@@ -17,12 +17,16 @@ Uint8List? matroskaVideoConfiguration(Matroska media, String codec) {
       ? config.data + 40
       : config.data;
   final length = config.end - start;
-  if (length < (codec == 'hevc' ? 23 : 7) || length > 1024 * 1024) return null;
+  if (length < _minimumSize(codec) || length > 1024 * 1024) return null;
   return media.file.read(start, length);
 }
 
 Uint8List? isoVideoConfiguration(IsoMedia media, String codec) {
-  final boxType = codec == 'hevc' ? 'hvcC' : 'avcC';
+  final boxType = switch (codec) {
+    'hevc' => 'hvcC',
+    'av1' => 'av1C',
+    _ => 'avcC',
+  };
   final track = media.firstVideoTrack();
   final entry = media.sampleDescription(
     media.sampleTable(media.child(track, 'mdia')),
@@ -34,6 +38,12 @@ Uint8List? isoVideoConfiguration(IsoMedia media, String codec) {
       .firstOrNull;
   if (configuration == null) return null;
   final size = configuration.end - configuration.data;
-  if (size < (codec == 'hevc' ? 23 : 7) || size > 1024 * 1024) return null;
+  if (size < _minimumSize(codec) || size > 1024 * 1024) return null;
   return media.file.read(configuration.data, size);
 }
+
+int _minimumSize(String codec) => switch (codec) {
+  'hevc' => 23,
+  'av1' => 4,
+  _ => 7,
+};

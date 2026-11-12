@@ -30,7 +30,7 @@ final class HevcPicture {
   final HevcPlane? cb, cr;
   final HevcMotionField? motion;
 
-  image.Image rgb() => yuv420Image(
+  image.Image rgb() => yuvImage(
     y: luma.samples,
     cb: cb?.samples ?? const [],
     cr: cr?.samples ?? const [],

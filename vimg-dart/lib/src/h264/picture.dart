@@ -23,7 +23,7 @@ final class H264Picture {
   MotionField? motionL0;
   MotionField? motionL1;
 
-  image.Image rgb() => yuv420Image(
+  image.Image rgb() => yuvImage(
     y: y,
     cb: cb,
     cr: cr,

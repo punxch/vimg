@@ -2,6 +2,8 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
+import 'package:vimg_dart/src/av1/access_units.dart';
+import 'package:vimg_dart/src/av1/intra_decoder.dart';
 import 'package:vimg_dart/src/av1/palette_decoder.dart';
 import 'package:vimg_dart/src/avif_encoder.dart';
 import 'package:vimg_dart/src/binary_file.dart';
@@ -57,13 +59,22 @@ Future<void> _checkAvif(
   final input = File(path).openSync();
   final elementary = BytesBuilder(copy: false);
   final decoder = Av1PaletteDecoder();
+  final units = Av1AccessUnits();
   final source = expected.takeBytes();
   void checkSample(Uint8List sample, int frame) {
     final decoded = decoder.decode(sample);
+    final general = decodeAv1IntraImage(units.readSample(sample).single);
     check(decoded.width == width && decoded.height == height, 'AV1 frame size');
     final start = (frame < frameCount ? frame : frameCount - 1) * planeSize * 3;
     for (final pixel in decoded) {
       final i = start + pixel.y * width + pixel.x;
+      final generalPixel = general.getPixel(pixel.x, pixel.y);
+      check(
+        generalPixel.r == pixel.r &&
+            generalPixel.g == pixel.g &&
+            generalPixel.b == pixel.b,
+        'General AV1 intra decoder palette round trip',
+      );
       check(
         pixel.g == source[i] &&
             pixel.b == source[i + planeSize] &&

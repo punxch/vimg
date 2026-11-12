@@ -1,7 +1,7 @@
 import 'package:image/image.dart' as image;
 
-/// Convert cropped 4:2:0 or monochrome samples to an 8-bit RGB image.
-image.Image yuv420Image({
+/// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.
+image.Image yuvImage({
   required List<int> y,
   required List<int> cb,
   required List<int> cr,
@@ -15,6 +15,8 @@ image.Image yuv420Image({
   required bool fullRange,
   int lumaDepth = 8,
   int chromaDepth = 8,
+  int subsamplingX = 1,
+  int subsamplingY = 1,
 }) {
   final pixels = image.Image(width: width, height: height);
   final (rv, gu, gv, bu) = switch (matrix) {
@@ -40,7 +42,16 @@ image.Image yuv420Image({
     final x = cropLeft + pixel.x;
     final row = cropTop + pixel.y;
     final luma = (y[row * stride + x] - bias) * yScale + (precision >> 1);
-    final offset = (row >> 1) * chromaStride + (x >> 1);
+    final offset = (row >> subsamplingY) * chromaStride + (x >> subsamplingX);
+    if (matrix == 0 && cb.isNotEmpty) {
+      final rounding = precision >> 1;
+      pixel.setRgb(
+        (((cr[offset] - bias) * yScale + rounding) >> 14).clamp(0, 255),
+        (luma >> 14).clamp(0, 255),
+        (((cb[offset] - bias) * yScale + rounding) >> 14).clamp(0, 255),
+      );
+      continue;
+    }
     final u = cb.isEmpty ? 0 : cb[offset] - midpoint;
     final v = cr.isEmpty ? 0 : cr[offset] - midpoint;
     pixel.setRgb(

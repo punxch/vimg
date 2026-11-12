@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import 'avi.dart';
+import 'av1/access_units.dart';
+import 'av1/intra_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
@@ -63,6 +65,20 @@ final class Video {
   late final HevcIntraDecoder _hevc = HevcIntraDecoder(
     HevcConfiguration(_hevcConfig),
   );
+  late final Uint8List _av1Config = _av1Configuration();
+
+  Uint8List _av1Configuration() {
+    final matroska = _matroska;
+    final iso = _iso;
+    final config = matroska != null
+        ? matroskaVideoConfiguration(matroska, 'av1')
+        : (iso == null ? null : isoVideoConfiguration(iso, 'av1'));
+    if (config == null) return Uint8List(0);
+    if (config.first != 0x81) {
+      throw const FormatException('Invalid AV1 codec configuration');
+    }
+    return Uint8List.sublistView(config, 4);
+  }
 
   Uint8List _configuration(String codec) {
     final matroska = _matroska;
@@ -96,6 +112,7 @@ final class Video {
       }
       return _timeline.presentation;
     }
+    if (codec == 'av1' && preview) return _containerPackets(true);
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
     final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
@@ -253,6 +270,15 @@ final class Video {
     if (codec == 'hevc') {
       return _hevc.decode(bytes)?.rgb() ??
           decodeSelected([packet]).single.frame;
+    }
+    if (codec == 'av1') {
+      final decoder = Av1AccessUnits()..configure(_av1Config);
+      for (final frame in decoder.readSample(bytes)) {
+        if (frame.header.type.intra && frame.shown) {
+          return decodeAv1IntraImage(frame);
+        }
+      }
+      throw const FormatException('No independently decodable AV1 picture');
     }
     final frame = switch (codec) {
       'mjpeg' => image.decodeJpg(bytes),
