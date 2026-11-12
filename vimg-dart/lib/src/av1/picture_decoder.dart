@@ -30,6 +30,7 @@ import 'warp.dart';
 part 'inter_reconstruction.dart';
 part 'motion_field.dart';
 part 'restoration.dart';
+part 'superres.dart';
 
 final class Av1Plane {
   Av1Plane(this.width, this.height, int paddedWidth, int paddedHeight)
@@ -59,7 +60,7 @@ final class Av1Plane {
   }
 }
 
-/// Reconstructed AV1 planes at the coded resolution.
+/// Reconstructed reference planes at the upscaled frame dimensions.
 final class Av1Picture {
   Av1Picture(this.color, this.planes);
 
@@ -91,9 +92,6 @@ image.Image decodeAv1IntraImage(Av1CodedFrame frame) {
 }
 
 void _requireDisplayTools(Av1CodedFrame frame) {
-  if (frame.header.size.superresDenominator != 8) {
-    throw UnsupportedError('AV1 super-resolution');
-  }
   if (frame.header.parameters.filmGrain != null) {
     throw UnsupportedError('AV1 film grain synthesis');
   }
@@ -141,9 +139,6 @@ final class Av1StreamDecoder {
       }
       result = slot;
     } else {
-      if (frame.header.size.superresDenominator != 8) {
-        throw UnsupportedError('AV1 super-resolution');
-      }
       result = _decodePicture(frame, _slots, deblock, cdef);
     }
     for (var i = 0; i < 8; i++) {
@@ -186,7 +181,7 @@ _DecodedPicture _decodePicture(
       Av1EntropyContext(header.parameters.quantization.base);
   var endCdfs = startCdfs;
   final size = header.size, color = frame.sequence.color;
-  if (size.width * size.height > 33554432) {
+  if (size.upscaledWidth * size.height > 33554432) {
     throw UnsupportedError(
       'AV1 picture exceeds the 32 megapixel decoder limit',
     );
@@ -269,7 +264,17 @@ _DecodedPicture _decodePicture(
       );
     }
   }
-  restoration.saveBoundaries(planes);
+  final upscalers = size.width == size.upscaledWidth
+      ? null
+      : [
+          for (final (p, plane) in planes.indexed)
+            _SuperresPlane.forPlane(
+              plane,
+              size,
+              p == 0 ? 0 : color.subsamplingX,
+            ),
+        ];
+  restoration.saveBoundaries(planes, upscalers, color.depth);
   final strengths = parameters.cdef;
   if (cdef && strengths != null) {
     Av1CdefFilter(
@@ -286,9 +291,15 @@ _DecodedPicture _decodePicture(
       skip: (x, y) => state.block(x, y)?.skip ?? true,
     );
   }
-  restoration.apply(planes, color.depth);
+  final output = upscalers == null
+      ? planes
+      : [
+          for (final (p, plane) in planes.indexed)
+            upscalers[p]?.upscale(plane, color.depth) ?? plane,
+        ];
+  restoration.apply(output, color.depth);
   return (
-    picture: Av1Picture(color, planes),
+    picture: Av1Picture(color, output),
     state: state,
     context: endCdfs,
     header: header,

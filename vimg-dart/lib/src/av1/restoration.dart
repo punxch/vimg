@@ -65,7 +65,7 @@ final class _RestorationPlane {
   late final stripeOffset = 8 >> subY;
   Uint16List? boundaries;
 
-  void saveBoundaries(Av1Plane plane) {
+  void saveBoundaries(Av1Plane plane, _SuperresPlane? upscaler, int depth) {
     if (units.every((unit) => unit == null)) return;
     final count = (height + stripeOffset - 1) ~/ stripeHeight;
     final saved = boundaries = Uint16List(count * 4 * width);
@@ -74,7 +74,11 @@ final class _RestorationPlane {
       for (var row = 0; row < 4; row++) {
         final source = (edge + row - 2).clamp(0, height - 1) * plane.stride;
         final target = ((stripe - 1) * 4 + row) * width;
-        saved.setRange(target, target + width, plane.samples, source);
+        if (upscaler == null) {
+          saved.setRange(target, target + width, plane.samples, source);
+        } else {
+          upscaler.upscaleRow(plane.samples, source, saved, target, depth);
+        }
       }
     }
   }
@@ -124,10 +128,12 @@ final class _RestorationPlane {
 
 final class _RestorationFrame {
   _RestorationFrame(Av1CodedFrame frame, List<Av1Plane> picture)
-    : planes = [
+    : denominator = frame.header.size.superresDenominator,
+      planes = [
         for (final (i, plane) in picture.indexed) _plane(frame, plane, i),
       ];
 
+  final int denominator;
   final List<_RestorationPlane?> planes;
 
   static _RestorationPlane? _plane(
@@ -140,19 +146,24 @@ final class _RestorationFrame {
       return null;
     }
     final color = frame.sequence.color;
+    final subX = index == 0 ? 0 : color.subsamplingX;
     return _RestorationPlane(
       config.types[index],
       index == 0 ? config.lumaUnit : config.chromaUnit,
-      index == 0 ? 0 : color.subsamplingX,
+      subX,
       index == 0 ? 0 : color.subsamplingY,
-      plane.width,
+      (frame.header.size.upscaledWidth + subX) >> subX,
       plane.height,
     );
   }
 
-  void saveBoundaries(List<Av1Plane> picture) {
+  void saveBoundaries(
+    List<Av1Plane> picture,
+    List<_SuperresPlane?>? upscalers,
+    int depth,
+  ) {
     for (final (i, plane) in planes.indexed) {
-      plane?.saveBoundaries(picture[i]);
+      plane?.saveBoundaries(picture[i], upscalers?[i], depth);
     }
   }
 
@@ -185,11 +196,13 @@ final class _RestorationTile {
     for (final (i, plane) in frame.planes.indexed) {
       if (plane == null) continue;
       final step = plane.unitSize;
-      final xShift = 2 - plane.subX, yShift = 2 - plane.subY;
-      final firstX = ((x << xShift) + step - 1) ~/ step;
+      final xStep = (4 >> plane.subX) * frame.denominator;
+      final xUnit = step * 8;
+      final yShift = 2 - plane.subY;
+      final firstX = (x * xStep + xUnit - 1) ~/ xUnit;
       final lastX = math.min(
         plane.columns,
-        (((x + size) << xShift) + step - 1) ~/ step,
+        ((x + size) * xStep + xUnit - 1) ~/ xUnit,
       );
       final firstY = ((y << yShift) + step - 1) ~/ step;
       final lastY = math.min(
