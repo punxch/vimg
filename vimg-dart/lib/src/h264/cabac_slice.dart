@@ -1,39 +1,4 @@
-import 'dart:math' as math;
-import 'dart:typed_data';
-
-import 'b_motion.dart';
-import 'cabac.dart';
-import 'motion.dart';
-import 'reference.dart';
-import 'slice_header.dart';
-
-part 'b_slice.dart';
-part 'p_slice.dart';
-
-int blockX(int block) => (block & 1) | ((block >> 1) & 2);
-int blockY(int block) => ((block >> 1) & 1) | ((block >> 2) & 2);
-int blockIndex(int x, int y) =>
-    ((y & 2) << 2) | ((x & 2) << 1) | ((y & 1) << 1) | (x & 1);
-
-final class Macroblock {
-  Macroblock(this.slice, this.type);
-
-  final SliceHeader slice;
-  final int type;
-  bool get intra => type >= 0;
-  bool get pcm => type == 25;
-  bool get nxn => type == 0;
-  bool get intra16 => type > 0 && type < 25;
-
-  var transform8x8 = false;
-  var skipped = false, direct = false;
-  var lumaPattern = 0, chromaPattern = 0;
-  var chromaMode = 0, qp = 0;
-  var codedLuma = 0, codedChroma = 0, codedDc = 0;
-  Uint8List? modes;
-
-  int predictionMode(int x, int y) => modes?[y * 4 + x] ?? 2;
-}
+part of 'slice_data.dart';
 
 enum _Residual {
   lumaDc(85, 105, 166, 227),
@@ -48,52 +13,107 @@ enum _Residual {
   final int coded, significant, last, level;
 }
 
-/// Coefficients remain in zigzag order here. The reconstruction stage maps
-/// them to the transform matrix. These buffers belong to one slice reader
-/// and are reused immediately after reconstructing a macroblock.
-final class MacroblockCoefficients {
-  final luma = Int32List(256);
-  final lumaDc = Int32List(16);
-  final chroma = Int32List(128);
-  final chromaDc = Int32List(8);
-  final pcm = Uint8List(384);
-}
-
-final class CabacSlice {
-  CabacSlice(this.header)
+final class CabacSlice extends SliceData {
+  CabacSlice(SliceHeader header)
     : _cabac = Cabac(
         header.bits,
         header.qp,
         interInit: header.kind == SliceKind.intra ? null : header.cabacInit,
       ),
-      _qp = header.qp;
+      super(header);
 
-  final SliceHeader header;
   final Cabac _cabac;
-  final coefficients = MacroblockCoefficients();
   final _positions = Uint8List(64);
-  var _previousQpDelta = false;
-  int _qp;
 
+  @override
   bool endOfSlice() => _cabac.terminate();
 
-  void _interResiduals(
-    Macroblock block,
-    Macroblock? left,
-    Macroblock? top,
-    bool allow8x8,
-  ) {
-    _patterns(block, left, top);
-    if (header.pps.transform8x8 && block.lumaPattern != 0 && allow8x8) {
-      final context = _count(
-        left?.transform8x8 == true,
-        top?.transform8x8 == true,
-      );
-      block.transform8x8 = _cabac.decision(399 + context) != 0;
-    }
-    _readQuantizerAndResiduals(block, left, top);
+  @override
+  void _restartAfterPcm() => _cabac.restart();
+
+  @override
+  bool _skip(Macroblock? left, Macroblock? top) {
+    final base = header.kind == SliceKind.b ? 24 : 11;
+    return _cabac.decision(
+          base +
+              _count(
+                left != null && !left.skipped,
+                top != null && !top.skipped,
+              ),
+        ) !=
+        0;
   }
 
+  @override
+  int _pType() {
+    if (_cabac.decision(14) != 0) return 5;
+    return _cabac.decision(15) == 0
+        ? 3 * _cabac.decision(16)
+        : 2 - _cabac.decision(17);
+  }
+
+  @override
+  bool _transformFlag(Macroblock? left, Macroblock? top) =>
+      _cabac.decision(
+        399 + _count(left?.transform8x8 == true, top?.transform8x8 == true),
+      ) !=
+      0;
+
+  @override
+  int? _intraRemainder() {
+    if (_cabac.decision(68) != 0) return null;
+    return _cabac.decision(69) |
+        (_cabac.decision(69) << 1) |
+        (_cabac.decision(69) << 2);
+  }
+
+  @override
+  (int, int) _motionDelta(MotionField field, MotionPartition part, int owner) {
+    final left = field.differenceAt(part.x - 1, part.y, owner);
+    final top = field.differenceAt(part.x, part.y - 1, owner);
+    return (
+      _motionDifference(40, left.x.abs() + top.x.abs()),
+      _motionDifference(47, left.y.abs() + top.y.abs()),
+    );
+  }
+
+  @override
+  int _pSubType() {
+    if (_cabac.decision(21) != 0) return 0;
+    if (_cabac.decision(22) == 0) return 1;
+    return _cabac.decision(23) != 0 ? 2 : 3;
+  }
+
+  @override
+  int _bType(int context) {
+    if (_cabac.decision(27 + context) == 0) return 0;
+    if (_cabac.decision(30) == 0) return 1 + _cabac.decision(32);
+    var prefix = _cabac.decision(31);
+    for (var i = 0; i < 3; i++) {
+      prefix = (prefix << 1) | _cabac.decision(32);
+    }
+    return switch (prefix) {
+      < 8 => prefix + 3,
+      13 => 23,
+      14 => 11,
+      15 => 22,
+      _ => (prefix << 1) + _cabac.decision(32) - 4,
+    };
+  }
+
+  @override
+  int _bSubType() {
+    if (_cabac.decision(36) == 0) return 0;
+    if (_cabac.decision(37) == 0) return 1 + _cabac.decision(39);
+    var offset = 3;
+    if (_cabac.decision(38) != 0) {
+      if (_cabac.decision(39) != 0) return 11 + _cabac.decision(39);
+      offset = 7;
+    }
+    return offset + 2 * _cabac.decision(39) + _cabac.decision(39);
+  }
+
+  @override
   int _referenceIndex(int context, int active) {
     if (active == 1) return 0;
     var index = 0;
@@ -104,24 +124,6 @@ final class CabacSlice {
       context = (context >> 2) + 4;
     }
     return index;
-  }
-
-  void _readVector(
-    MotionField field,
-    MotionPartition part,
-    int owner,
-    int ref,
-  ) {
-    final left = field.differenceAt(part.x - 1, part.y, owner);
-    final top = field.differenceAt(part.x, part.y - 1, owner);
-    final dx = _motionDifference(40, left.x.abs() + top.x.abs());
-    final dy = _motionDifference(47, left.y.abs() + top.y.abs());
-    final predicted = field.predict(part, owner, ref);
-    final vector = (
-      x: signedMotion(predicted.x + dx),
-      y: signedMotion(predicted.y + dy),
-    );
-    field.setVector(part, vector, (x: dx, y: dy));
   }
 
   int _motionDifference(int base, int difference) {
@@ -150,40 +152,7 @@ final class CabacSlice {
     return _cabac.bypass() == 0 ? magnitude : -magnitude;
   }
 
-  Macroblock readIntra(Macroblock? left, Macroblock? top) {
-    final block = Macroblock(header, _type(left, top));
-    if (block.pcm) {
-      final bits = _cabac.bits;
-      bits.align(0);
-      final count = header.pps.sps.chromaFormat == 0 ? 256 : 384;
-      for (var i = 0; i < count; i++) {
-        coefficients.pcm[i] = bits.read(8);
-      }
-      _cabac.restart();
-      _previousQpDelta = false;
-      return block;
-    }
-    if (block.nxn) {
-      if (header.pps.transform8x8) {
-        final neighbors = _count(
-          left?.transform8x8 == true,
-          top?.transform8x8 == true,
-        );
-        block.transform8x8 = _cabac.decision(399 + neighbors) != 0;
-      }
-      _predictionModes(block, left, top);
-    } else {
-      block.lumaPattern = block.type >= 13 ? 15 : 0;
-      block.chromaPattern = ((block.type - 1) ~/ 4) % 3;
-    }
-    if (header.pps.sps.chromaFormat == 1) {
-      block.chromaMode = _chromaMode(left, top);
-    }
-    if (block.nxn) _patterns(block, left, top);
-    _readQuantizerAndResiduals(block, left, top);
-    return block;
-  }
-
+  @override
   void _readQuantizerAndResiduals(
     Macroblock block,
     Macroblock? left,
@@ -199,7 +168,8 @@ final class CabacSlice {
     _residuals(block, left, top);
   }
 
-  int _type(Macroblock? left, Macroblock? top) {
+  @override
+  int _intraType(Macroblock? left, Macroblock? top, int? type) {
     final intraSlice = header.kind == SliceKind.intra;
     final base = switch (header.kind) {
       SliceKind.intra => 3,
@@ -222,38 +192,7 @@ final class CabacSlice {
     return 1 + 12 * luma + 4 * chroma + prediction;
   }
 
-  void _predictionModes(Macroblock block, Macroblock? left, Macroblock? top) {
-    block.modes = Uint8List(16);
-    final step = block.transform8x8 ? 2 : 1;
-    final count = step == 2 ? 4 : 16;
-    for (var index = 0; index < count; index++) {
-      final x = blockX(index * step * step);
-      final y = blockY(index * step * step);
-      var a = x == 0 ? left : block;
-      var b = y == 0 ? top : block;
-      if (header.pps.constrainedIntra) {
-        if (a?.intra == false) a = null;
-        if (b?.intra == false) b = null;
-      }
-      var mode = a == null || b == null
-          ? 2
-          : math.min(
-              a.predictionMode((x - 1) & 3, y),
-              b.predictionMode(x, (y - 1) & 3),
-            );
-      if (_cabac.decision(68) == 0) {
-        final remainder =
-            _cabac.decision(69) |
-            (_cabac.decision(69) << 1) |
-            (_cabac.decision(69) << 2);
-        mode = remainder < mode ? remainder : remainder + 1;
-      }
-      for (var dy = 0; dy < step; dy++) {
-        block.modes!.fillRange((y + dy) * 4 + x, (y + dy) * 4 + x + step, mode);
-      }
-    }
-  }
-
+  @override
   int _chromaMode(Macroblock? left, Macroblock? top) {
     final neighbors = _count(
       (left?.chromaMode ?? 0) > 0,
@@ -264,6 +203,7 @@ final class CabacSlice {
     return 2 + _cabac.decision(67);
   }
 
+  @override
   void _patterns(Macroblock block, Macroblock? left, Macroblock? top) {
     for (var i = 0; i < 4; i++) {
       final x = i & 1;
@@ -297,10 +237,7 @@ final class CabacSlice {
   }
 
   void _residuals(Macroblock block, Macroblock? left, Macroblock? top) {
-    coefficients.luma.fillRange(0, 256, 0);
-    coefficients.lumaDc.fillRange(0, 16, 0);
-    coefficients.chroma.fillRange(0, 128, 0);
-    coefficients.chromaDc.fillRange(0, 8, 0);
+    coefficients.clearResiduals();
     if (block.intra16 &&
         _decode(
           _Residual.lumaDc,

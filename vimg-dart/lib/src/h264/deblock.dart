@@ -2,7 +2,7 @@ import 'dart:typed_data';
 
 import 'deblock_tables.dart';
 import 'motion.dart';
-import 'cabac_slice.dart';
+import 'slice_data.dart';
 import 'transforms.dart';
 
 /// H.264 deblocking (§8.7) in macroblock order. Inter edges use per-4×4

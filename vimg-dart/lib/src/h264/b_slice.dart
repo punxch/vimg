@@ -1,4 +1,4 @@
-part of 'cabac_slice.dart';
+part of 'slice_data.dart';
 
 // Prediction-list bit masks for the partition pairs in H.264 Table 7-14.
 const _pairLists = [
@@ -16,7 +16,7 @@ const _pairLists = [
 // B_8×8 submacroblock list masks in H.264 Table 7-17.
 const _subLists = [0, 1, 2, 3, 1, 1, 2, 2, 3, 3, 1, 2, 3];
 
-extension BidirectionalCabacSlice on CabacSlice {
+extension BidirectionalSlice on SliceData {
   Macroblock readB(
     Macroblock? left,
     Macroblock? top,
@@ -27,12 +27,8 @@ extension BidirectionalCabacSlice on CabacSlice {
     final owner = header.firstMb + 1;
     final x = mbX * 4, y = mbY * 4;
     final whole = (x: x, y: y, width: 4, height: 4);
-    final skipContext = _count(
-      left != null && !left.skipped,
-      top != null && !top.skipped,
-    );
     final block = Macroblock(header, -1);
-    if (_cabac.decision(24 + skipContext) != 0) {
+    if (_skip(left, top)) {
       motion.derive(whole, [whole], owner);
       _previousQpDelta = false;
       return block
@@ -44,8 +40,8 @@ extension BidirectionalCabacSlice on CabacSlice {
     final type = _bType(
       _count(left != null && !left.direct, top != null && !top.direct),
     );
-    if (type == 23) {
-      final intra = readIntra(left, top);
+    if (type >= 23) {
+      final intra = readIntra(left, top, type - 23);
       motion.l0.setUnused(whole, owner);
       motion.l1.setUnused(whole, owner);
       return intra;
@@ -149,32 +145,5 @@ extension BidirectionalCabacSlice on CabacSlice {
     );
     _interResiduals(block, left, top, allow8x8);
     return block;
-  }
-
-  int _bType(int context) {
-    if (_cabac.decision(27 + context) == 0) return 0;
-    if (_cabac.decision(30) == 0) return 1 + _cabac.decision(32);
-    var prefix = _cabac.decision(31);
-    for (var i = 0; i < 3; i++) {
-      prefix = (prefix << 1) | _cabac.decision(32);
-    }
-    return switch (prefix) {
-      < 8 => prefix + 3,
-      13 => 23,
-      14 => 11,
-      15 => 22,
-      _ => (prefix << 1) + _cabac.decision(32) - 4,
-    };
-  }
-
-  int _bSubType() {
-    if (_cabac.decision(36) == 0) return 0;
-    if (_cabac.decision(37) == 0) return 1 + _cabac.decision(39);
-    var offset = 3;
-    if (_cabac.decision(38) != 0) {
-      if (_cabac.decision(39) != 0) return 11 + _cabac.decision(39);
-      offset = 7;
-    }
-    return offset + 2 * _cabac.decision(39) + _cabac.decision(39);
   }
 }

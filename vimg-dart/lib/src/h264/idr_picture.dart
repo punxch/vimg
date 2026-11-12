@@ -3,13 +3,13 @@ import 'dart:typed_data';
 import 'access_unit.dart';
 import 'b_motion.dart';
 import 'deblock.dart';
-import 'cabac_slice.dart';
 import 'intra_prediction.dart';
 import 'motion.dart';
 import 'motion_compensation.dart';
+import 'parameters.dart';
 import 'picture.dart';
 import 'reference.dart';
-import 'parameters.dart';
+import 'slice_data.dart';
 import 'slice_header.dart';
 import 'transforms.dart';
 
@@ -93,8 +93,6 @@ H264Picture _decodePicture(
         'H.264 sample contains more than one picture',
       );
     }
-    if (!slice.pps.cabac)
-      throw UnsupportedError('H.264 CAVLC slices are unavailable');
     decoder.decode(slice, pending);
   }
   if (decoder.decoded != decoder.blocks.length) {
@@ -130,7 +128,9 @@ final class _Reconstruction {
   var decoded = 0;
 
   void decode(SliceHeader slice, PendingPicture? pending) {
-    final reader = CabacSlice(slice);
+    final SliceData reader = slice.pps.cabac
+        ? CabacSlice(slice)
+        : CavlcSlice(slice);
     final motion = picture.motionL0;
     final motion1 = picture.motionL1;
     final references = switch (slice.kind) {

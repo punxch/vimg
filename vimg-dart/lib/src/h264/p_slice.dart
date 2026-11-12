@@ -1,6 +1,6 @@
-part of 'cabac_slice.dart';
+part of 'slice_data.dart';
 
-extension PredictiveCabacSlice on CabacSlice {
+extension PredictiveSlice on SliceData {
   Macroblock readP(
     Macroblock? left,
     Macroblock? top,
@@ -12,11 +12,7 @@ extension PredictiveCabacSlice on CabacSlice {
     final owner = header.firstMb + 1;
     final x = mbX * 4, y = mbY * 4;
     final whole = (x: x, y: y, width: 4, height: 4);
-    final skipContext = _count(
-      left != null && !left.skipped,
-      top != null && !top.skipped,
-    );
-    if (_cabac.decision(11 + skipContext) != 0) {
+    if (_skip(left, top)) {
       final block = Macroblock(header, -1)
         ..skipped = true
         ..qp = _qp;
@@ -32,14 +28,12 @@ extension PredictiveCabacSlice on CabacSlice {
       return block;
     }
 
-    if (_cabac.decision(14) != 0) {
-      final block = readIntra(left, top);
+    final type = _pType();
+    if (type >= 5) {
+      final block = readIntra(left, top, type - 5);
       motion.setUnused(whole, owner);
       return block;
     }
-    final type = _cabac.decision(15) == 0
-        ? 3 * _cabac.decision(16)
-        : 2 - _cabac.decision(17);
     final partitions = switch (type) {
       0 => [whole],
       1 => [
@@ -55,15 +49,15 @@ extension PredictiveCabacSlice on CabacSlice {
           (x: x + (i & 1) * 2, y: y + (i >> 1) * 2, width: 2, height: 2),
       ],
     };
-    final subTypes = type == 3
-        ? List.generate(4, (_) => _subType())
+    final subTypes = type >= 3
+        ? List.generate(4, (_) => _pSubType())
         : const <int>[];
     for (final partition in partitions) {
       final context = _pair(
         motion.referenceAt(partition.x - 1, partition.y, owner) > 0,
         motion.referenceAt(partition.x, partition.y - 1, owner) > 0,
       );
-      final index = _referenceIndex(context, header.activeL0);
+      final index = type == 4 ? 0 : _referenceIndex(context, header.activeL0);
       motion.setReference(
         partition,
         owner,
@@ -74,7 +68,7 @@ extension PredictiveCabacSlice on CabacSlice {
     for (var i = 0; i < partitions.length; i++) {
       final partition = partitions[i];
       final ref = motion.referenceAt(partition.x, partition.y, owner);
-      final sub = type == 3 ? subTypes[i] : 0;
+      final sub = type >= 3 ? subTypes[i] : 0;
       final width = sub == 2 || sub == 3 ? 1 : partition.width;
       final height = sub == 1 || sub == 3 ? 1 : partition.height;
       for (var row = 0; row < partition.height; row += height) {
@@ -92,11 +86,5 @@ extension PredictiveCabacSlice on CabacSlice {
     final block = Macroblock(header, -1);
     _interResiduals(block, left, top, subTypes.every((type) => type == 0));
     return block;
-  }
-
-  int _subType() {
-    if (_cabac.decision(21) != 0) return 0;
-    if (_cabac.decision(22) == 0) return 1;
-    return _cabac.decision(23) != 0 ? 2 : 3;
   }
 }

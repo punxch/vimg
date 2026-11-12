@@ -80,10 +80,54 @@ const _temporalBPlanes = [
   [0xeff7cd2e, 0xc5d312c6, 0xc104e449],
 ];
 
+// Baseline I/P with two slices and multiple reference pictures.
+const _cavlcBaselinePlanes = [
+  [0x10cbd312, 0x50f12dd2, 0x807a7f4f],
+  [0x4c03e113, 0x0eb332ae, 0x7c617f94],
+  [0x47fbc934, 0x1a4987c0, 0xf5ee9455],
+  [0xb1c64ee1, 0x047adb3b, 0x7fc2bf15],
+  [0xc36ea976, 0xd030b7dc, 0x60685890],
+  [0x5fa23879, 0x1a8c707d, 0x36801772],
+  [0x8b844433, 0x23f965b3, 0x7962f9d4],
+  [0xfc7c04a0, 0x7aa69598, 0xb0569c85],
+  [0x5f9a7aba, 0x9396c075, 0xe68fc870],
+  [0x7ca03dad, 0x0445eb52, 0xf1f81a92],
+  [0xf7cb8561, 0x6d2021cf, 0x730fdc11],
+  [0x317a9073, 0x4bc34d9c, 0xf0a33e51],
+  [0x32921e1e, 0x292b9e13, 0xf390d681],
+  [0xffdf8dc6, 0xbee2e104, 0x0ba8411d],
+  [0x330e1594, 0x4a28b8e3, 0x60491e63],
+  [0xa89c5b77, 0x4cbc38bc, 0x9940fa4c],
+  [0x4120a30e, 0xe371215a, 0xaeed232b],
+];
+
+// High Profile I/P/B with 8×8 transforms, two slices and reference B pictures.
+const _cavlcHighPlanes = [
+  [0x19dadf59, 0x990a7386, 0xcc5fae9f],
+  [0xf966bb60, 0x7d05e55b, 0x5f239a97],
+  [0x3f4675cf, 0xc97ab978, 0xfcf81f21],
+  [0xaafab400, 0xbfdbf354, 0xb67de6e7],
+  [0x71b5e73a, 0x88ebd7c6, 0x2558bf67],
+  [0xf4017d3f, 0xc780e07b, 0xa0e01471],
+  [0xeabeff43, 0xd7f7c93e, 0x47e095a3],
+  [0x7b6726fe, 0x1f367434, 0x7cb5c348],
+  [0x6f699b21, 0x92955d69, 0xe83e60f8],
+  [0x22ffcbd3, 0x137be89e, 0x29cbe22b],
+  [0x61de7875, 0x321ba124, 0x36d05f58],
+  [0x88888c0b, 0x6e46572b, 0x78e8b1af],
+  [0x77a469b2, 0x97523f20, 0x3432c6d8],
+  [0x0c91b004, 0xf6d91a23, 0xba3a5238],
+  [0xfafcedd3, 0x9c11855a, 0x3d2490ba],
+  [0x910dfcc7, 0x342e2d04, 0xb0d3b433],
+  [0x2e581ec3, 0xa76e0486, 0xc17aa016],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
   bool inter = false,
+  bool cabac = true,
+  int profile = 100,
   (int, int) dimensions = (78, 50),
 }) {
   final handle = File(input).openSync();
@@ -103,6 +147,10 @@ void _checkPlanes(
     final indexes = {for (var i = 0; i < display.length; i++) display[i]: i};
     check(indexes.length == expected.length, 'H.264 fixture frame count');
     final avc = AvcConfiguration(config!);
+    check(
+      avc.pictures.values.every((pps) => pps.cabac == cabac),
+      'H.264 fixture entropy mode',
+    );
     final decode = inter
         ? H264StreamDecoder(avc).decode
         : H264IdrDecoder(avc).decode;
@@ -111,7 +159,7 @@ void _checkPlanes(
       final picture = decode(file.read(packet.offset, packet.size))!;
       final sps = picture.sps;
       check(
-        sps.profile == 100 && (sps.width, sps.height) == dimensions,
+        sps.profile == profile && (sps.width, sps.height) == dimensions,
         'H.264 dimensions and profile',
       );
       for (final (index, plane) in [
@@ -157,12 +205,29 @@ Future<void> main(List<String> arguments) async {
   const interMp4 = 'test/fixtures/cabac-p.mp4';
   const spatial = 'test/fixtures/cabac-b-spatial.mkv';
   const temporal = 'test/fixtures/cabac-b-temporal.mp4';
+  const cavlcBaseline = 'test/fixtures/cavlc-baseline.mp4';
+  const cavlcHigh = 'test/fixtures/cavlc-high.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
   _checkPlanes(interMp4, _pPlanes, inter: true);
   _checkPlanes(spatial, _spatialBPlanes, inter: true, dimensions: (166, 110));
   _checkPlanes(temporal, _temporalBPlanes, inter: true, dimensions: (166, 110));
+  _checkPlanes(
+    cavlcBaseline,
+    _cavlcBaselinePlanes,
+    inter: true,
+    cabac: false,
+    profile: 66,
+    dimensions: (166, 110),
+  );
+  _checkPlanes(
+    cavlcHigh,
+    _cavlcHighPlanes,
+    inter: true,
+    cabac: false,
+    dimensions: (166, 110),
+  );
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -176,7 +241,11 @@ Future<void> main(List<String> arguments) async {
 
   try {
     final jpeg = File('${directory.path}/preview.jpg');
-    for (final input in [mkv, mp4]) {
+    for (final (input, width, height) in [
+      (mkv, 39, 25),
+      (mp4, 39, 25),
+      (cavlcBaseline, 83, 55),
+    ]) {
       final response =
           jsonDecode(
                 await run([
@@ -184,7 +253,7 @@ Future<void> main(List<String> arguments) async {
                   '--output',
                   jpeg.path,
                   '--max-width',
-                  '39',
+                  '$width',
                   input,
                 ]),
               )
@@ -195,41 +264,51 @@ Future<void> main(List<String> arguments) async {
       );
       final decoded = image.decodeJpg(jpeg.readAsBytesSync())!;
       check(
-        decoded.width == 39 && decoded.height == 25,
+        decoded.width == width && decoded.height == height,
         'H.264 JPEG preview dimensions',
       );
     }
 
-    final output = '${directory.path}/frames';
-    await run(['extract', '-n1', '-t500ms', '--output-dir', output, interMkv]);
-    final bmp = Directory(output).listSync().single as File;
-    final frame = image.decodeBmp(bmp.readAsBytesSync())!;
-    check(frame.width == 78 && frame.height == 50, 'H.264 extracted BMP');
+    for (final (input, width, height) in [
+      (interMkv, 78, 50),
+      (cavlcBaseline, 166, 110),
+    ]) {
+      final output = '${directory.path}/frames-$width';
+      await run(['extract', '-n1', '-t500ms', '--output-dir', output, input]);
+      final bmp = Directory(output).listSync().single as File;
+      final frame = image.decodeBmp(bmp.readAsBytesSync())!;
+      check(
+        frame.width == width && frame.height == height,
+        'H.264 extracted BMP',
+      );
+    }
 
-    final avif = File('${directory.path}/grid.avif');
-    final kept = '${directory.path}/kept';
-    await run([
-      'vcs',
-      '-c2',
-      '-n2',
-      '-H24',
-      '-f3',
-      '-t500ms',
-      '--keep',
-      '--output-dir',
-      kept,
-      '-o',
-      avif.path,
-      temporal,
-    ]);
-    check(
-      ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
-      'H.264 animated contact sheet',
-    );
-    check(
-      Directory(kept).listSync().length == 6,
-      'H.264 kept B-frame captures',
-    );
+    for (final (mode, input) in [('cabac', temporal), ('cavlc', cavlcHigh)]) {
+      final avif = File('${directory.path}/grid-$mode.avif');
+      final kept = '${directory.path}/kept-$mode';
+      await run([
+        'vcs',
+        '-c2',
+        '-n2',
+        '-H24',
+        '-f3',
+        '-t500ms',
+        '--keep',
+        '--output-dir',
+        kept,
+        '-o',
+        avif.path,
+        input,
+      ]);
+      check(
+        ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
+        'H.264 animated contact sheet',
+      );
+      check(
+        Directory(kept).listSync().length == 6,
+        'H.264 kept B-frame captures',
+      );
+    }
   } finally {
     directory.deleteSync(recursive: true);
   }

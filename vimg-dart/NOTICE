@@ -9,6 +9,6 @@ The H.264 CABAC intra decoder is based on Eyevinn hi264
 (76f3e392076aaf47faf64e3f0d0904115494e2b1). See licenses/hi264.txt for
 the MIT terms. The probability and scan tables are defined by ITU-T H.264.
 
-The H.264 CABAC inter macroblock parser uses Rui Carmo's go-264 as a
-reference (cecca3835cbdf52167c9d892caacfa8eda6eb406). See
+The H.264 inter macroblock parser and CAVLC tables use Rui Carmo's go-264
+as a reference (cecca3835cbdf52167c9d892caacfa8eda6eb406). See
 licenses/go-264.txt for the MIT terms.
