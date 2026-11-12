@@ -3,8 +3,10 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'filter_expression.dart';
 import 'grid.dart';
 
+part 'video_filters.dart';
 part 'yuv_scaler.dart';
 
 /// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.
@@ -26,13 +28,40 @@ image.Image yuvImage({
   int subsamplingY = 1,
   YuvImageScaler? scaler,
 }) {
-  if (scaler != null) {
-    final (scaledWidth, scaledHeight) = fitDimensions(
-      width,
-      height,
-      width: scaler.width,
-      height: scaler.height,
+  if (scaler != null && scaler.filters != null) {
+    final sx = cb.isEmpty ? 0 : subsamplingX;
+    final sy = cb.isEmpty ? 0 : subsamplingY;
+    final chromaWidth = _subSize(width, sx);
+    final chromaHeight = _subSize(height, sy);
+    final chromaOffset = (cropTop >> sy) * chromaStride + (cropLeft >> sx);
+    final planes = _VideoPlanes(
+      [
+        _FilterPlane(
+          y,
+          width,
+          height,
+          lumaDepth,
+          rowStep: stride,
+          offset: cropTop * stride + cropLeft,
+        ),
+        if (cb.isNotEmpty)
+          for (final samples in [cb, cr])
+            _FilterPlane(
+              samples,
+              chromaWidth,
+              chromaHeight,
+              chromaDepth,
+              rowStep: chromaStride,
+              offset: chromaOffset,
+            ),
+      ],
+      sx,
+      sy,
     );
+    return scaler._renderFiltered(planes, matrix: matrix, fullRange: fullRange);
+  }
+  if (scaler != null) {
+    final (scaledWidth, scaledHeight) = scaler._dimensions(width, height);
     if (scaledWidth != width || scaledHeight != height) {
       return scaler._resize(
         y: y,

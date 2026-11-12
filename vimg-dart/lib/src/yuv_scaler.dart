@@ -12,14 +12,100 @@ typedef _YuvGeometry = ({
 
 /// Resize video samples before RGB conversion. Reuse filter taps across frames.
 final class YuvImageScaler {
-  YuvImageScaler({this.width, this.height});
+  YuvImageScaler({this.width, this.height, this.filters})
+    : _exact = false,
+      _nearest = false;
+
+  YuvImageScaler._fixed(int this.width, int this.height, this._nearest)
+    : _exact = true,
+      filters = null;
 
   final int? width, height;
+  final VideoFilterChain? filters;
+  final bool _exact, _nearest;
+  YuvImageScaler? _outputScale;
+  late final YuvImageScaler? unscaled = filters == null
+      ? null
+      : width == null && height == null
+      ? this
+      : YuvImageScaler(filters: filters);
   _YuvGeometry? _geometry;
   late _PlaneScaler _luma;
   _PlaneScaler? _chroma;
   ({int matrix, bool fullRange})? _tableColor;
   late _RgbTable _table;
+
+  image.Image filterRgb(image.Image frame) {
+    if (filters == null) return frame;
+    _checkFilterSize(frame.width, frame.height);
+    final green = Uint8List(frame.width * frame.height);
+    final blue = Uint8List(green.length);
+    final red = Uint8List(green.length);
+    var i = 0;
+    for (final pixel in frame) {
+      green[i] = pixel.g.toInt();
+      blue[i] = pixel.b.toInt();
+      red[i++] = pixel.r.toInt();
+    }
+    final planes = _VideoPlanes(
+      [
+        for (final samples in [green, blue, red])
+          _FilterPlane(
+            samples,
+            frame.width,
+            frame.height,
+            8,
+            rowStep: frame.width,
+          ),
+      ],
+      0,
+      0,
+    );
+    return _renderFiltered(planes, matrix: 0, fullRange: true);
+  }
+
+  image.Image _renderFiltered(
+    _VideoPlanes source, {
+    required int matrix,
+    required bool fullRange,
+  }) {
+    final scale = width == null && height == null ? filters!._finalScale : null;
+    final frame = filters!._apply(source, deferScale: scale != null);
+    if (scale != null) {
+      // The terminal scale can upsample chroma while converting to RGB.
+      final (w, h) = scale.dimensions(frame);
+      if (_outputScale?.width != w || _outputScale?.height != h) {
+        _outputScale = YuvImageScaler._fixed(w, h, scale.nearest);
+      }
+    } else if (width != null || height != null) {
+      _outputScale ??= YuvImageScaler(width: width, height: height);
+    }
+    final planes = frame.planes.map((plane) => plane.atOrigin).toList();
+    final y = planes.first;
+    final cb = planes.length == 3 ? planes[1] : null;
+    return yuvImage(
+      y: y.samples,
+      cb: cb?.samples ?? const [],
+      cr: cb == null ? const [] : planes[2].samples,
+      stride: y.rowStep,
+      chromaStride: cb?.rowStep ?? 0,
+      width: y.width,
+      height: y.height,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: matrix,
+      fullRange: fullRange,
+      lumaDepth: y.depth,
+      chromaDepth: cb?.depth ?? y.depth,
+      subsamplingX: frame.subX,
+      subsamplingY: frame.subY,
+      scaler: _outputScale,
+    );
+  }
+
+  (int, int) _dimensions(int sourceWidth, int sourceHeight) => _exact
+      ? (width!, height!)
+      : fitDimensions(sourceWidth, sourceHeight, width: width, height: height);
 
   image.Image _resize({
     required List<int> y,
@@ -43,6 +129,11 @@ final class YuvImageScaler {
     if (width * height > 100000000) {
       throw const FormatException('Grid exceeds 100 million pixels');
     }
+    if (width * sourceHeight > 100000000) {
+      throw const FormatException(
+        'Video scaling exceeds 100 million intermediate samples',
+      );
+    }
     final gbr = matrix == 0 && cb.isNotEmpty;
     // RGB24 contact sheets use one chroma sample per horizontal pixel pair
     // at even widths. Odd widths and GBR use a sample at every pixel.
@@ -57,7 +148,13 @@ final class YuvImageScaler {
       outputChromaWidth: cb.isEmpty ? 0 : (halfChroma ? width >> 1 : width),
     );
     if (geometry != _geometry) {
-      _luma = _PlaneScaler(sourceWidth, sourceHeight, width, height);
+      _luma = _PlaneScaler(
+        sourceWidth,
+        sourceHeight,
+        width,
+        height,
+        nearest: _nearest,
+      );
       _chroma = cb.isEmpty
           ? null
           : _PlaneScaler(
@@ -65,6 +162,7 @@ final class YuvImageScaler {
               geometry.chromaHeight,
               geometry.outputChromaWidth,
               height,
+              nearest: _nearest,
             );
       _geometry = geometry;
     }
@@ -120,10 +218,15 @@ final class YuvImageScaler {
 }
 
 final class _PlaneScaler {
-  _PlaneScaler(int sourceWidth, int sourceHeight, this.width, int height)
-    : horizontal = _axisTaps(sourceWidth, width, 14),
-      vertical = _axisTaps(sourceHeight, height, 12),
-      intermediate = Int16List(sourceHeight * width);
+  _PlaneScaler(
+    int sourceWidth,
+    int sourceHeight,
+    this.width,
+    int height, {
+    bool nearest = false,
+  }) : horizontal = _axisTaps(sourceWidth, width, 14, nearest),
+       vertical = _axisTaps(sourceHeight, height, 12, nearest),
+       intermediate = Int16List(sourceHeight * width);
 
   final int width;
   final List<({int start, Int16List weights})> horizontal, vertical;
@@ -169,17 +272,27 @@ final class _PlaneScaler {
   }
 }
 
-List<({int start, Int16List weights})> _axisTaps(int from, int to, int bits) {
+int _scaleStep(int from, int to) => ((from << 16) + (to >> 1)) ~/ to;
+
+int _nearestIndex(int index, int step, int size) =>
+    math.min(size - 1, ((2 * index + 1) * step) >> 17);
+
+List<({int start, Int16List weights})> _axisTaps(
+  int from,
+  int to,
+  int bits,
+  bool nearest,
+) {
   final unit = 1 << bits;
-  if (from == to || from == 1) {
+  final step = _scaleStep(from, to);
+  if (from == to || from == 1 || nearest) {
     final identity = Int16List.fromList([unit]);
     return List.generate(
       to,
-      (x) => (start: from == 1 ? 0 : x, weights: identity),
+      (x) => (start: _nearestIndex(x, step, from), weights: identity),
     );
   }
   final scale = math.min(1.0, to / from);
-  final step = ((from << 16) + (to >> 1)) ~/ to;
   final count = math.min(math.max(1, from - 2), 1 + (4 / scale).ceil());
   return List.generate(to, (x) {
     // A pixel center is at x + 0.5. Widen the cubic kernel when shrinking.

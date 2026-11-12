@@ -61,8 +61,20 @@ references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
 intra block copy for screen content.
 Film grain synthesis runs on AV1 display frames before RGB conversion.
-HEVC range extension tools, FFmpeg filter expressions and hardware capture
-backends remain pending.
+HEVC range extension tools and hardware capture backends remain pending.
+
+`extract` and `vcs` accept a comma-separated `--vfilter` chain such as
+`--vfilter 'crop=iw/2:ih,transpose=clock,hflip'`. The Dart filters include
+`crop`, `scale`, `hflip`, `vflip`, `transpose` and `null`. Crop and scale
+accept static dimension expressions with arithmetic and functions such as
+`min`, `max` and `trunc`. Scale supports `flags=bicubic` (default) and
+`flags=neighbor`. Crop aligns to chroma samples by default and accepts
+`exact=1` for odd coordinates and dimensions. Temporal filters, expressions
+using timestamps or sample aspect ratios, and branched graphs are pending.
+
+`vcs` applies the requested tile size after the filter chain and lays out the
+grid using the resulting tile dimensions. With `--keep`, it saves the filtered
+BMPs before tile resizing. Authority recording uses the fixed Preview profile.
 
 The authority manifest identifies the capture backend as
 `production-dart-capture`. Its `input_frame_index` is the zero-based index
@@ -113,6 +125,7 @@ vimg send --yazi-id 123 video.mkv /path/to/cache.avif
 dart analyze
 dart test/probe_join_test.dart
 dart test/video_test.dart
+dart test/video_filters_test.dart
 dart test/capture_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart

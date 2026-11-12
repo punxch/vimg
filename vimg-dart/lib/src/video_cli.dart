@@ -6,6 +6,7 @@ import 'package:args/command_runner.dart';
 import 'authority.dart';
 import 'capture.dart';
 import 'video_commands.dart';
+import 'yuv_image.dart';
 
 abstract class VimgCommand extends Command<void> {
   int? integer(String option, {int min = 0, int? max}) {
@@ -91,6 +92,11 @@ abstract class _CaptureCommand extends VimgCommand {
         help: 'Duration per capture.',
       )
       ..addOption(
+        'vfilter',
+        help:
+            'Video filter chain (crop, scale, hflip, vflip, transpose, null).',
+      )
+      ..addOption(
         'threads',
         abbr: 'T',
         defaultsTo: '$defaultCaptureThreads',
@@ -101,6 +107,11 @@ abstract class _CaptureCommand extends VimgCommand {
         defaultsTo: '.',
         help: 'Directory for generated files.',
       );
+  }
+
+  VideoFilterChain? get filters {
+    final source = argResults!.option('vfilter');
+    return source == null ? null : VideoFilterChain.parse(source);
   }
 
   CaptureOptions options(int defaultFrames) {
@@ -127,6 +138,7 @@ final class ExtractCommand extends _CaptureCommand {
     argResults!.option('output-dir')!,
     options(1),
     threads: integer('threads')!,
+    filters: filters,
   );
 }
 
@@ -227,12 +239,13 @@ final class VcsCommand extends _CaptureCommand {
           capture.window != 1.5 ||
           capture.start.value != 0 ||
           capture.end.value != 0 ||
+          args.option('vfilter') != null ||
           fps != 20 ||
           avifCrf != defaultAvifCrf ||
           webp != 0) {
         usageException(
           'Authority recording requires the fixed Preview profile '
-          '(-c3 -H160 -n9, 30 frames/1.5s, 20fps, no offsets).',
+          '(-c3 -H160 -n9, 30 frames/1.5s, 20fps, no offsets or filters).',
         );
       }
       await recordAuthority(
@@ -258,6 +271,7 @@ final class VcsCommand extends _CaptureCommand {
         fps: fps,
         avifCrf: avifCrf,
         threads: threads,
+        filters: filters,
         captureDirectory: captures,
         mark: timings?.mark,
       );

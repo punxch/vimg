@@ -102,6 +102,7 @@ Future<void> extractFrames(
   String directory,
   CaptureOptions options, {
   int threads = defaultCaptureThreads,
+  VideoFilterChain? filters,
 }) async {
   final video = Video(input);
   VideoCaptureDecoder? decoder;
@@ -110,7 +111,11 @@ Future<void> extractFrames(
     final selected = plan.select(video.packets());
     Directory(directory).createSync(recursive: true);
     final paths = _capturePaths(input, directory, plan, selected);
-    decoder = VideoCaptureDecoder(video, threads: threads);
+    decoder = VideoCaptureDecoder(
+      video,
+      threads: threads,
+      scaler: filters == null ? null : YuvImageScaler(filters: filters),
+    );
     await for (final decoded in decoder.decode(paths.keys)) {
       _publishCaptures(paths[decoded.packet]!, decoded.frame);
     }
@@ -184,6 +189,7 @@ Future<void> writeContactSheet(
   int avifCrf = defaultAvifCrf,
   int webp = 75,
   int threads = defaultCaptureThreads,
+  VideoFilterChain? filters,
   String? captureDirectory,
   void Function(String stage)? mark,
   CaptureSelection? onSelect,
@@ -219,10 +225,10 @@ Future<void> writeContactSheet(
     decoder = VideoCaptureDecoder(
       video,
       threads: threads,
-      scaler: inter && (width != null || height != null)
-          ? YuvImageScaler(width: width, height: height)
+      scaler: filters != null || inter && (width != null || height != null)
+          ? YuvImageScaler(width: width, height: height, filters: filters)
           : null,
-      includeOriginal: inter && paths != null,
+      includeOriginal: paths != null && (inter || filters != null),
     );
     final cached = <FramePacket, image.Image>{};
     if (inter) {
@@ -268,8 +274,12 @@ Future<void> writeContactSheet(
       if (missing.isNotEmpty) {
         await for (final result in decoder.decode(missing.keys)) {
           final captures = paths?.remove(result.packet);
-          if (captures != null) _publishCaptures(captures, result.frame);
-          final tile = resizeToFit(result.frame, width: width, height: height);
+          if (captures != null) {
+            _publishCaptures(captures, result.original ?? result.frame);
+          }
+          final tile = filters == null
+              ? resizeToFit(result.frame, width: width, height: height)
+              : result.frame;
           for (final index in missing[result.packet]!) {
             tiles[index] = tile;
           }

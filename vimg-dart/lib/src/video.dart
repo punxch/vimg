@@ -312,11 +312,17 @@ final class Video {
   ) sync* {
     if (!usesReferencePictures) {
       final packet = run.packets.single;
-      final frame = decode(packet);
+      final source = decode(packet);
+      final frame = scaler?.filterRgb(source) ?? source;
+      final unscaled = scaler?.unscaled;
       yield (
         packet: packet,
         frame: frame,
-        original: includeOriginal ? frame : null,
+        original: !includeOriginal
+            ? null
+            : identical(unscaled, scaler)
+            ? frame
+            : unscaled?.filterRgb(source) ?? source,
       );
       return;
     }
@@ -334,8 +340,9 @@ final class Video {
         );
       }
       final frame = render(scaler: scaler);
+      final unscaled = scaler?.unscaled;
       final original = includeOriginal
-          ? (scaler == null ? frame : render())
+          ? (identical(unscaled, scaler) ? frame : render(scaler: unscaled))
           : null;
       yield (packet: packet, frame: frame, original: original);
       target++;

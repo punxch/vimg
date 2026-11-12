@@ -99,6 +99,7 @@ final class VideoCaptureDecoder {
             path: File(_video.path).absolute.path,
             width: _scaler?.width,
             height: _scaler?.height,
+            filters: _scaler?.filters?.source,
             original: _includeOriginal,
             index: index,
             events: port,
@@ -166,6 +167,7 @@ typedef _WorkerInput = ({
   String path,
   int? width,
   int? height,
+  String? filters,
   bool original,
   int index,
   SendPort events,
@@ -184,9 +186,15 @@ Future<void> _decodeWorker(_WorkerInput input) async {
   Video? video;
   try {
     video = Video(input.path);
-    final scaler = input.width == null && input.height == null
+    final filters = input.filters;
+    final scaler =
+        input.width == null && input.height == null && filters == null
         ? null
-        : YuvImageScaler(width: input.width, height: input.height);
+        : YuvImageScaler(
+            width: input.width,
+            height: input.height,
+            filters: filters == null ? null : VideoFilterChain.parse(filters),
+          );
     input.events.send(commands.sendPort);
     Iterator<_SelectedFrame>? cursor;
     await for (final command in commands) {
