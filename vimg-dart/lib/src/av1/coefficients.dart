@@ -25,9 +25,11 @@ final class Av1CoefficientCdfs {
   final int _qContext;
   final Map<(_Family, int, int, int), Av1Cdf> _adapted;
 
-  Av1CoefficientCdfs copy() => Av1CoefficientCdfs._(_qContext, {
-    for (final entry in _adapted.entries) entry.key: entry.value.copy(),
-  });
+  Av1CoefficientCdfs copy({bool resetCount = false}) =>
+      Av1CoefficientCdfs._(_qContext, {
+        for (final entry in _adapted.entries)
+          entry.key: entry.value.copy(resetCount: resetCount),
+      });
 
   Av1Cdf _table(_Family family, int size, int plane, int context) =>
       _adapted.putIfAbsent((family, size, plane, context), () {

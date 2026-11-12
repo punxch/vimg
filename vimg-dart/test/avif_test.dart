@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/av1/access_units.dart';
-import 'package:vimg_dart/src/av1/intra_decoder.dart';
+import 'package:vimg_dart/src/av1/picture_decoder.dart';
 import 'package:vimg_dart/src/av1/palette_decoder.dart';
 import 'package:vimg_dart/src/avif_encoder.dart';
 import 'package:vimg_dart/src/binary_file.dart';

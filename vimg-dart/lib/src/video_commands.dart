@@ -91,7 +91,7 @@ image.Image _previewFrame(Video video, int seconds) {
     if (packet.seconds >= seconds) break;
   }
   if (last == null) throw const FormatException('No video frames');
-  return video.decode(last);
+  return video.decode(last, preview: true);
 }
 
 void extractFrames(String input, String directory, CaptureOptions options) {

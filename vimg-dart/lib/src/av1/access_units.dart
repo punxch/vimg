@@ -38,6 +38,11 @@ final class Av1AccessUnits {
   Uint8List? _sequencePayload;
   int _idc = 0;
 
+  Uint8List? get sequenceConfiguration {
+    final payload = _sequencePayload;
+    return payload == null ? null : obu(1, payload);
+  }
+
   void configure(Uint8List config) {
     for (final obu in readAv1Obus(config)) {
       if (obu.type == 1) {

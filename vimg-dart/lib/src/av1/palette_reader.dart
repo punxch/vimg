@@ -1,17 +1,19 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'entropy_context.dart';
 import 'palette_cdf.dart';
 import 'range_decoder.dart';
 
 /// The palette cache, delta-coded colors and token maps in §5.11.46/49.
 final class Av1PaletteReader {
-  Av1PaletteReader(this.range, this.depth);
+  Av1PaletteReader(this.range, this.depth, {Av1EntropyContext? context})
+    : _context = context ?? Av1EntropyContext(0);
 
   final RangeDecoder range;
   final int depth;
   final _scores = Uint8List(8);
-  final _mapCdfs = <(bool, int, int), Av1Cdf>{};
+  final Av1EntropyContext _context;
 
   List<int> colors(
     int count,
@@ -84,11 +86,7 @@ final class Av1PaletteReader {
           sum += _scores[i];
         }
         final ctx = paletteColorContexts[2 * sum - maximum];
-        final cdf = _mapCdfs.putIfAbsent((
-          chroma,
-          count,
-          ctx,
-        ), () => Av1Cdf(tables[count - 2][ctx]));
+        final cdf = _context.cdf((chroma, count, ctx), tables[count - 2][ctx]);
         var rank = range.adaptive(cdf);
         for (var score = maximum; score >= 0 && rank >= 0; score--) {
           for (var i = 0; i < count; i++) {

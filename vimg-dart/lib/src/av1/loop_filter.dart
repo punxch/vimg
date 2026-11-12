@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'transform.dart';
 
-/// AV1 §7.14 for intra pictures. The transform grid is stored at stride/4,
+/// AV1 §7.14. The transform grid is stored at stride/4,
 /// with zero for uncoded cells and one plus the transform-size ordinal.
 void av1DeblockPlane(
   Uint16List pixels,
@@ -15,6 +15,7 @@ void av1DeblockPlane(
   int sharpness, {
   required bool chroma,
   required int Function(int x4, int y4, int pass) levelAt,
+  bool Function(int x4, int y4, int pass)? filterEdge,
 }) {
   final width4 = (width + 3) >> 2, height4 = (height + 3) >> 2;
   final paddedW = (width + 7) & -8, paddedH = (height + 7) & -8;
@@ -28,6 +29,7 @@ void av1DeblockPlane(
     for (var y = 0; y < height4; y++) {
       for (var x = 0; x < width4; x++) {
         if (vertical ? x == 0 : y == 0) continue;
+        if (filterEdge != null && !filterEdge(x, y, pass)) continue;
         final current = transforms[y * gridStride + x];
         if (current == 0) continue;
         final tx = Av1TxSize.values[current - 1];

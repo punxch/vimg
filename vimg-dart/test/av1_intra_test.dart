@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:vimg_dart/src/av1/intra_decoder.dart';
+import 'package:vimg_dart/src/av1/picture_decoder.dart';
 import 'package:vimg_dart/src/avif_animation.dart';
 import 'package:vimg_dart/src/video_commands.dart';
 
@@ -72,7 +72,7 @@ void main() {
   }
 }
 
-void _checkPlanes(Av1IntraPicture picture, List<int> expected) {
+void _checkPlanes(Av1Picture picture, List<int> expected) {
   check(picture.planes.length == expected.length, 'AV1 plane count');
   for (final (p, plane) in picture.planes.indexed) {
     var checksum = 0;

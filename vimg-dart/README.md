@@ -54,12 +54,13 @@ or monochrome, up to 12 bits. `preview` selects an HEVC random-access
 picture. `extract` and `vcs` decode from the preceding random-access point
 and handle leading pictures that depend on an earlier GOP.
 
-`preview` also decodes AV1 keyframes from Matroska and MP4. The AVIF
-animation reader decodes independently coded AV1 frames, including
-lossless residuals, palette prediction, deblocking and CDEF. AV1
-inter prediction, intra block copy, loop restoration, super-resolution
-and film grain synthesis are pending. HEVC range extension tools,
-FFmpeg filter expressions and hardware capture backends are pending.
+`preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
+AVIF animation reader handles intra and inter pictures, including hidden
+references, reused pictures, compound prediction, warped motion,
+deblocking and CDEF. AV1 intra block copy, loop restoration,
+super-resolution and film grain synthesis remain pending. HEVC range
+extension tools, FFmpeg filter expressions and hardware capture
+backends remain pending.
 
 The authority manifest identifies the capture backend as
 `production-dart-capture`. Its `input_frame_index` is the zero-based index
@@ -110,6 +111,7 @@ dart test/video_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart
 dart test/av1_intra_test.dart
+dart test/av1_inter_test.dart
 dart test/av1_coefficients_test.dart
 dart test/av1_transform_test.dart
 dart test/h264_test.dart

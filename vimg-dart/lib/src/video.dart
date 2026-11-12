@@ -5,7 +5,8 @@ import 'package:image/image.dart' as image;
 
 import 'avi.dart';
 import 'av1/access_units.dart';
-import 'av1/intra_decoder.dart';
+import 'av1/frame_header.dart';
+import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
@@ -52,7 +53,8 @@ final class Video {
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
       (throw const FormatException('No video stream'));
 
-  bool get usesReferencePictures => codec == 'h264' || codec == 'hevc';
+  bool get usesReferencePictures =>
+      codec == 'h264' || codec == 'hevc' || codec == 'av1';
 
   void close() => _input.closeSync();
 
@@ -66,6 +68,7 @@ final class Video {
     HevcConfiguration(_hevcConfig),
   );
   late final Uint8List _av1Config = _av1Configuration();
+  late final _av1Timeline = _indexAv1();
 
   Uint8List _av1Configuration() {
     final matroska = _matroska;
@@ -112,7 +115,11 @@ final class Video {
       }
       return _timeline.presentation;
     }
-    if (codec == 'av1' && preview) return _containerPackets(true);
+    if (codec == 'av1') {
+      return preview
+          ? _containerPackets(true)
+          : _av1Timeline.timeline.presentation;
+    }
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
     final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
@@ -141,6 +148,95 @@ final class Video {
     return _containerPackets(
       true,
     ).where((packet) => _isIdr(configuration, packet));
+  }
+
+  ({_VideoTimeline timeline, Map<int, Uint8List> configurations}) _indexAv1() {
+    final units = Av1AccessUnits()..configure(_av1Config);
+    final decodeOrder = <FramePacket>[], startPositions = <int>[];
+    final shown = <FramePacket>{};
+    final index = <FramePacket, int>{};
+    final configurations = <int, Uint8List>{};
+    var start = -1;
+    final presentation =
+        _containerPackets(
+          false,
+          onSample: (packet, _) {
+            final position = decodeOrder.length;
+            var first = true, displays = 0;
+            for (final frame in units.readSample(_read(packet))) {
+              if (first &&
+                  frame.header.type == Av1FrameType.key &&
+                  frame.shown &&
+                  frame.syntax.existingSlot == null) {
+                start = position;
+                configurations[start] =
+                    units.sequenceConfiguration ?? _av1Config;
+              }
+              first = false;
+              if (frame.shown) displays++;
+            }
+            if (displays > 1)
+              throw const FormatException(
+                'Multiple AV1 display frames in a sample',
+              );
+            if (displays == 1 && start >= 0) shown.add(packet);
+            index[packet] = position;
+            decodeOrder.add(packet);
+            startPositions.add(start);
+          },
+        ).where(shown.contains).toList()..sort((a, b) {
+          final byTime = a.seconds.compareTo(b.seconds);
+          return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+        });
+    return (
+      timeline: (
+        decodeOrder: decodeOrder,
+        presentation: presentation,
+        index: index,
+        gopStart: startPositions,
+      ),
+      configurations: configurations,
+    );
+  }
+
+  Iterable<({FramePacket packet, image.Image frame})> _decodeAv1Selected(
+    Iterable<FramePacket> selected,
+  ) sync* {
+    final (timeline: timeline, configurations: configurations) = _av1Timeline;
+    final targets = {
+      for (final packet in selected)
+        timeline.index[packet] ??
+            (throw const FormatException('Unknown AV1 video packet')),
+    }.toList()..sort();
+    var group = -1, next = 0;
+    Av1AccessUnits? units;
+    Av1StreamDecoder? decoder;
+    for (final target in targets) {
+      final start = timeline.gopStart[target];
+      if (start < 0)
+        throw const FormatException('AV1 picture has no preceding keyframe');
+      if (group != start) {
+        units = Av1AccessUnits()..configure(configurations[start]!);
+        decoder = Av1StreamDecoder();
+        group = start;
+        next = start;
+      }
+      while (next <= target) {
+        final packet = timeline.decodeOrder[next++];
+        image.Image? displayed;
+        for (final frame in units!.readSample(_read(packet))) {
+          final picture = decoder!.decode(frame);
+          if (frame.shown && next - 1 == target) {
+            displayed = decoder.display(frame, picture);
+          }
+        }
+        if (next - 1 == target) {
+          if (displayed == null)
+            throw const FormatException('AV1 sample has no display picture');
+          yield (packet: packet, frame: displayed);
+        }
+      }
+    }
   }
 
   _VideoTimeline _indexVideo() {
@@ -188,6 +284,10 @@ final class Video {
   Iterable<({FramePacket packet, image.Image frame})> decodeSelected(
     Iterable<FramePacket> selected,
   ) sync* {
+    if (codec == 'av1') {
+      yield* _decodeAv1Selected(selected);
+      return;
+    }
     if (!usesReferencePictures) {
       for (final packet in selected) {
         yield (packet: packet, frame: decode(packet));
@@ -261,7 +361,9 @@ final class Video {
     return file.read(packet.offset, packet.size);
   }
 
-  image.Image decode(FramePacket packet) {
+  image.Image decode(FramePacket packet, {bool preview = false}) {
+    if (codec == 'av1' && !preview)
+      return _decodeAv1Selected([packet]).single.frame;
     final bytes = _read(packet);
     if (codec == 'h264') {
       return _h264.decode(bytes)?.rgb() ??

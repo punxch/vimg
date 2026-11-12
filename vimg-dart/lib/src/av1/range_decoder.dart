@@ -99,7 +99,8 @@ final class Av1Cdf {
 
   int get observations => _observations;
 
-  Av1Cdf copy() => Av1Cdf._(Uint16List.fromList(_values), _observations);
+  Av1Cdf copy({bool resetCount = false}) =>
+      Av1Cdf._(Uint16List.fromList(_values), resetCount ? 0 : _observations);
 
   void _observe(int symbol) {
     final symbols = _values.length + 1;

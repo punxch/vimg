@@ -4,7 +4,7 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import 'av1/access_units.dart';
-import 'av1/intra_decoder.dart';
+import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'iso_frames.dart';
@@ -150,9 +150,11 @@ final class AvifAnimation {
   }
 
   Iterable<image.Image> decodeFrames() sync* {
+    final decoder = Av1StreamDecoder();
     for (final sample in codedFrames()) {
-      final frame = decodeAv1IntraImage(sample.frame);
+      final picture = decoder.decode(sample.frame);
       if (!sample.present) continue;
+      final frame = decoder.display(sample.frame, picture);
       if (frame.width != width || frame.height != height)
         throw const FormatException(
           'AVIF sample dimensions differ from its track',

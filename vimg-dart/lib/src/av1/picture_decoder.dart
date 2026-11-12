@@ -8,17 +8,27 @@ import 'access_units.dart';
 import 'bitstream.dart';
 import 'cdef.dart';
 import 'coefficients.dart';
+import 'entropy_context.dart';
 import 'frame_header.dart';
 import 'frame_parameters.dart';
+import 'inter_cdfs.dart';
+import 'inter_prediction.dart';
+import 'inter_prediction_tables.dart' show av1IiWeights1D;
+import 'inter_syntax.dart';
 import 'intra_cdfs.dart';
 import 'intra_prediction.dart';
 import 'loop_filter.dart';
+import 'motion_vectors.dart';
 import 'palette_reader.dart';
 import 'quantizer.dart';
 import 'range_decoder.dart';
 import 'sequence_header.dart';
 import 'tile_group.dart';
 import 'transform.dart';
+import 'warp.dart';
+
+part 'inter_reconstruction.dart';
+part 'motion_field.dart';
 
 final class Av1Plane {
   Av1Plane(this.width, this.height, int paddedWidth, int paddedHeight)
@@ -49,8 +59,8 @@ final class Av1Plane {
 }
 
 /// Reconstructed AV1 planes at the coded resolution.
-final class Av1IntraPicture {
-  Av1IntraPicture(this.color, this.planes);
+final class Av1Picture {
+  Av1Picture(this.color, this.planes);
 
   final Av1ColorConfig color;
   final List<Av1Plane> planes;
@@ -75,27 +85,105 @@ final class Av1IntraPicture {
 }
 
 image.Image decodeAv1IntraImage(Av1CodedFrame frame) {
+  _requireDisplayTools(frame);
+  return decodeAv1Intra(frame).rgb();
+}
+
+void _requireDisplayTools(Av1CodedFrame frame) {
   if (frame.header.size.superresDenominator != 8) {
     throw UnsupportedError('AV1 super-resolution');
   }
   if (frame.header.parameters.filmGrain != null) {
     throw UnsupportedError('AV1 film grain synthesis');
   }
-  return decodeAv1Intra(frame).rgb();
 }
 
-Av1IntraPicture decodeAv1Intra(
+Av1Picture decodeAv1Intra(
   Av1CodedFrame frame, {
   bool deblock = true,
   bool cdef = true,
 }) {
+  if (!frame.header.type.intra || frame.syntax.existingSlot != null) {
+    throw const FormatException('Expected a coded AV1 intra picture');
+  }
+  return _decodePicture(frame, const [], deblock, cdef).picture;
+}
+
+typedef _DecodedPicture = ({
+  Av1Picture picture,
+  _FrameState state,
+  Av1EntropyContext context,
+  Av1FrameHeader header,
+  List<int> referenceHints,
+});
+
+/// Decode-order picture buffers and probability state for AV1 references.
+final class Av1StreamDecoder {
+  Av1StreamDecoder({this.deblock = true, this.cdef = true});
+
+  final bool deblock, cdef;
+  final _slots = List<_DecodedPicture?>.filled(8, null);
+  Av1SequenceHeader? _sequence;
+
+  Av1Picture decode(Av1CodedFrame frame) {
+    final sequence = _sequence;
+    if (sequence != null && !frame.sequence.sameCodedSequence(sequence)) {
+      _slots.fillRange(0, 8, null);
+    }
+    _sequence = frame.sequence;
+    final existing = frame.syntax.existingSlot;
+    final _DecodedPicture result;
+    if (existing != null) {
+      final slot = _slots[existing];
+      if (slot == null || !identical(slot.header, frame.header)) {
+        throw const FormatException('Missing decoded AV1 reference picture');
+      }
+      result = slot;
+    } else {
+      if (frame.header.size.superresDenominator != 8) {
+        throw UnsupportedError('AV1 super-resolution');
+      }
+      result = _decodePicture(frame, _slots, deblock, cdef);
+    }
+    for (var i = 0; i < 8; i++) {
+      if (frame.refreshFlags & (1 << i) != 0) {
+        _slots[i] = result;
+      } else if (existing == null &&
+          frame.header.invalidatedSlots & (1 << i) != 0) {
+        _slots[i] = null;
+      }
+    }
+    return result.picture;
+  }
+
+  image.Image display(Av1CodedFrame frame, Av1Picture picture) {
+    _requireDisplayTools(frame);
+    return picture.rgb();
+  }
+}
+
+_DecodedPicture _decodePicture(
+  Av1CodedFrame frame,
+  List<_DecodedPicture?> slots,
+  bool deblock,
+  bool cdef,
+) {
   final header = frame.header;
-  if (!header.type.intra || frame.syntax.existingSlot != null) {
-    throw UnsupportedError('AV1 inter and reference pictures');
+  final primary = header.primaryReference == null
+      ? null
+      : slots[header.primaryReference!];
+  if (header.primaryReference != null && primary == null) {
+    throw const FormatException('Missing AV1 primary reference context');
   }
-  if (header.primaryReference != null) {
-    throw UnsupportedError('AV1 inherited intra contexts');
-  }
+  final references = [
+    for (final slot in header.references)
+      slots[slot] ??
+          (throw const FormatException('Missing AV1 reference picture')),
+  ];
+  final startCdfs =
+      primary?.context ??
+      Av1EntropyContext(header.parameters.quantization.base);
+  var endCdfs = startCdfs;
   final restoration = header.parameters.restoration;
   if (restoration != null &&
       restoration.types.any((t) => t != Av1RestorationType.none)) {
@@ -122,8 +210,23 @@ Av1IntraPicture decodeAv1Intra(
         ),
   ];
   final state = _FrameState(frame);
+  final field = header.motion.referenceMvs
+      ? _MotionField(frame, references, state)
+      : null;
   for (final tile in frame.tiles) {
-    _IntraTile(frame, tile, planes, state).decode();
+    final cdfs = startCdfs.copy(resetCount: true);
+    _PictureTile(
+      frame,
+      tile,
+      planes,
+      state,
+      cdfs,
+      references,
+      primary?.state,
+      field,
+    ).decode();
+    if (header.refreshContext && tile.index == header.tiles.contextTile)
+      endCdfs = cdfs;
   }
   final parameters = header.parameters;
   final filter = parameters.loopFilter;
@@ -140,6 +243,22 @@ Av1IntraPicture decodeAv1Intra(
         color.depth,
         filter.sharpness,
         chroma: i != 0,
+        filterEdge: header.type.intra
+            ? null
+            : (x, y, pass) {
+                final block = state.block(
+                  i == 0 ? x : (x << sx) | sx,
+                  i == 0 ? y : (y << sy) | sy,
+                );
+                if (block?.skip != true || block?.motion == null) return true;
+                final sub = i == 0
+                    ? 0
+                    : pass == 0
+                    ? sx
+                    : sy;
+                final span = pass == 0 ? block!.width : block!.height;
+                return (pass == 0 ? x : y) % math.max(1, span >> sub) == 0;
+              },
         levelAt: (x, y, pass) {
           final block = state.block(
             i == 0 ? x : (x << sx) | sx,
@@ -168,7 +287,15 @@ Av1IntraPicture decodeAv1Intra(
       skip: (x, y) => state.block(x, y)?.skip ?? true,
     );
   }
-  return Av1IntraPicture(color, planes);
+  return (
+    picture: Av1Picture(color, planes),
+    state: state,
+    context: endCdfs,
+    header: header,
+    referenceHints: [
+      for (final reference in references) reference.header.orderHint,
+    ],
+  );
 }
 
 // AV1 block-size ordinals index the mode and transform syntax tables.
@@ -267,6 +394,12 @@ enum _Family {
   paletteUv,
   paletteYSize,
   paletteUvSize,
+  inter,
+  interLuma,
+  skipMode,
+  segmentPred,
+  interTx,
+  txSplit,
 }
 
 typedef _Block = ({
@@ -280,6 +413,9 @@ typedef _Block = ({
   List<int> filterLevels,
   List<int>? paletteY,
   List<int>? paletteU,
+  Av1InterMotion? motion,
+  bool skipMode,
+  bool segmentPredicted,
 });
 
 typedef _Palette = ({Uint8List map, List<int> colors, int offset});
@@ -291,6 +427,7 @@ final class _FrameState {
 
   final int columns, rows;
   late final blocks = List<_Block?>.filled(columns * rows, null);
+  late final txTypes = Uint8List(columns * rows);
   late final cdefStride = (columns + 15) >> 4;
   late final cdef = Int8List(cdefStride * ((rows + 15) >> 4))
     ..fillRange(0, cdefStride * ((rows + 15) >> 4), -1);
@@ -298,8 +435,17 @@ final class _FrameState {
   _Block? block(int x, int y) => blocks[y * columns + x];
 }
 
-final class _IntraTile {
-  _IntraTile(this.frame, this.tile, this.planes, this.state) {
+final class _PictureTile {
+  _PictureTile(
+    this.frame,
+    this.tile,
+    this.planes,
+    this.state,
+    this._context,
+    this.references,
+    this.prior,
+    this.field,
+  ) {
     final columns = frame.header.tiles.columns;
     final rows = frame.header.tiles.rows;
     final count = columns.length - 1;
@@ -322,6 +468,10 @@ final class _IntraTile {
   final Av1Tile tile;
   final List<Av1Plane> planes;
   final _FrameState state;
+  final _FrameState? prior;
+  final _MotionField? field;
+  final List<_DecodedPicture> references;
+  final Av1EntropyContext _context;
   late final int x0, y0, xEnd, yEnd, _width;
   late final _reader = RangeDecoder(
     Av1Bits(tile.payload),
@@ -329,18 +479,29 @@ final class _IntraTile {
   );
   late final _coefficientDecoder = Av1CoefficientDecoder(
     _reader,
-    Av1CoefficientCdfs(params.quantization.base),
+    _context.coefficients,
   );
   late final _quantizer = Av1Quantizer(params.quantization, color.depth);
   final _predictor = Av1IntraPredictor();
-  late final _palette = Av1PaletteReader(_reader, color.depth);
+  late final _palette = Av1PaletteReader(
+    _reader,
+    color.depth,
+    context: _context,
+  );
+  late final _motionSyntax = Av1InterSyntax(
+    _reader,
+    _context,
+    frame.header,
+    frame.sequence.tools,
+  );
+  late final _inter = Av1InterPredictor();
+  late final _warp = Av1WarpPredictor();
   final _yMap = Uint8List(64 * 64);
   final _uvMap = Uint8List(64 * 64);
   final _inverse = Av1InverseTransform();
   final _quantized = Int32List(1024);
   final _residual = Int32List(4096);
   late final List<Av1CoefficientNeighbors> _neighbors;
-  final _cdfs = <(_Family, int, int, int), Av1Cdf>{};
   late final sb4 = frame.sequence.tools.superblock128 ? 32 : 16;
   late final _segPreSkip = params.segmentation.features.any(
     (features) => features.skip(5).any((feature) => feature != null),
@@ -382,7 +543,7 @@ final class _IntraTile {
     int a = 0,
     int b = 0,
     int c = 0,
-  ]) => _cdfs.putIfAbsent((family, a, b, c), () => Av1Cdf(initial));
+  ]) => _context.cdf((family, a, b, c), initial);
 
   int _symbol(
     _Family family,
@@ -469,13 +630,50 @@ final class _IntraTile {
     final above = _at(x, y - 1), left = _at(x - 1, y);
     final skipContext =
         (above?.skip == true ? 1 : 0) + (left?.skip == true ? 1 : 0);
-    var segment = _segPreSkip ? _readSegment(x, y, above, left, false) : 0;
-    final skip =
-        (_segPreSkip && params.segmentation.features[segment][6] != null) ||
-        _symbol(_Family.skip, skipCdf[skipContext], skipContext) != 0;
-    if (!_segPreSkip && params.segmentation.enabled) {
-      segment = _readSegment(x, y, above, left, skip);
+    final intraFrame = frame.header.type.intra;
+    var segment = 0;
+    var predictedSegment = false;
+    final segmentation = params.segmentation;
+    void readSegment(bool skip) {
+      if (!segmentation.enabled) return;
+      if (intraFrame) {
+        segment = _readSegment(x, y, above, left, skip);
+        return;
+      }
+      if (segmentation.temporal && !skip) {
+        final ctx =
+            (above?.segmentPredicted == true ? 1 : 0) +
+            (left?.segmentPredicted == true ? 1 : 0);
+        predictedSegment =
+            _symbol(
+              _Family.segmentPred,
+              interSegmentIdPredictedCdf[ctx],
+              ctx,
+            ) !=
+            0;
+      }
+      segment = predictedSegment || !segmentation.updateMap
+          ? _previousSegment(x, y, w4, h4)
+          : _readSegment(x, y, above, left, skip);
     }
+
+    if (_segPreSkip || !segmentation.updateMap) readSegment(false);
+    final earlyFeatures = segmentation.features[segment];
+    final skipCtx =
+        (above?.skipMode == true ? 1 : 0) + (left?.skipMode == true ? 1 : 0);
+    final skipMode =
+        frame.header.motion.skipMode != null &&
+        w4 >= 2 &&
+        h4 >= 2 &&
+        earlyFeatures[5] == null &&
+        earlyFeatures[6] == null &&
+        earlyFeatures[7] == null &&
+        _symbol(_Family.skipMode, interSkipModeCdf[skipCtx], skipCtx) != 0;
+    final skip =
+        skipMode ||
+        (_segPreSkip && earlyFeatures[6] != null) ||
+        _symbol(_Family.skip, skipCdf[skipContext], skipContext) != 0;
+    if (!_segPreSkip && segmentation.updateMap) readSegment(skip);
     _readCdef(x, y, w4, h4, skip);
     _readBlockDeltas(w4, h4, skip);
     if (frame.header.intrabc && _symbol(_Family.intrabc, const [30531]) != 0) {
@@ -483,16 +681,38 @@ final class _IntraTile {
     }
 
     final lossless = params.losslessSegments[segment];
-    const modeContext = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
-    final am = modeContext[(above?.yMode ?? Av1IntraMode.dc).index];
-    final lm = modeContext[(left?.yMode ?? Av1IntraMode.dc).index];
-    final ym = Av1IntraMode
-        .values[_symbol(_Family.luma, intraLumaCdfs[am][lm], am, lm)];
-    final ya = _angle(ym, blockSize);
     final hasChroma =
         !color.monochrome &&
         !(sx != 0 && w4 == 1 && x.isEven) &&
         !(sy != 0 && h4 == 1 && y.isEven);
+    final features = segmentation.features[segment];
+    if (!intraFrame && _isInter(above, left, features, skipMode)) {
+      this._interBlock(
+        x,
+        y,
+        w4,
+        h4,
+        blockSize,
+        segment,
+        predictedSegment,
+        skip,
+        skipMode,
+        lossless,
+        hasChroma,
+        features,
+      );
+      return;
+    }
+
+    const modeContext = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+    final am = modeContext[(above?.yMode ?? Av1IntraMode.dc).index];
+    final lm = modeContext[(left?.yMode ?? Av1IntraMode.dc).index];
+    final group = (math.min(w4, h4).bitLength - 1).clamp(0, 3);
+    final ym =
+        Av1IntraMode.values[intraFrame
+            ? _symbol(_Family.luma, intraLumaCdfs[am][lm], am, lm)
+            : _symbol(_Family.interLuma, interYModeCdf[group], group)];
+    final ya = _angle(ym, blockSize);
     final uvW = math.max(4, w >> sx), uvH = math.max(4, h >> sy);
     var um = Av1IntraMode.dc;
     var ua = 0, alphaU = 0, alphaV = 0;
@@ -602,11 +822,11 @@ final class _IntraTile {
       filterLevels: _filterLevels(segment),
       paletteY: paletteY,
       paletteU: paletteU,
+      motion: null,
+      skipMode: false,
+      segmentPredicted: predictedSegment,
     );
-    for (var r = y; r < math.min(y + h4, yEnd); r++) {
-      final start = r * state.columns + x;
-      state.blocks.fillRange(start, start + math.min(w4, xEnd - x), block);
-    }
+    _stampBlock(x, y, block);
 
     final blockAbove = [above != null, y - (sy != 0 && h4 == 1 ? 2 : 1) >= y0];
     final blockLeft = [left != null, x - (sx != 0 && w4 == 1 ? 2 : 1) >= x0];
@@ -693,6 +913,57 @@ final class _IntraTile {
     }
   }
 
+  bool _inside(int x, int y) => x >= x0 && x < xEnd && y >= y0 && y < yEnd;
+
+  Av1InterNeighbor? _motionNeighbor(int x, int y) {
+    final block = _at(x, y);
+    return block == null
+        ? null
+        : (width4: block.width, height4: block.height, motion: block.motion);
+  }
+
+  bool _isInter(
+    _Block? above,
+    _Block? left,
+    List<int?> features,
+    bool skipMode,
+  ) {
+    if (skipMode || features[7] != null) return true;
+    if (features[5] case final reference?) return reference != 0;
+    final available = (above == null ? 0 : 1) + (left == null ? 0 : 1);
+    final intra =
+        (above != null && above.motion == null ? 1 : 0) +
+        (left != null && left.motion == null ? 1 : 0);
+    final ctx = available == 2 ? (intra == 2 ? 3 : intra) : intra * 2;
+    return _symbol(_Family.inter, interIsInterCdf[ctx], ctx) != 0;
+  }
+
+  int _previousSegment(int x, int y, int w4, int h4) {
+    final previous = prior;
+    if (previous == null ||
+        previous.rows != state.rows ||
+        previous.columns != state.columns)
+      return 0;
+    var segment = 7;
+    for (var r = y; r < math.min(y + h4, yEnd); r++) {
+      for (var c = x; c < math.min(x + w4, xEnd); c++) {
+        segment = math.min(segment, previous.block(c, r)?.segment ?? 0);
+      }
+    }
+    return segment;
+  }
+
+  void _stampBlock(int x, int y, _Block block) {
+    for (var r = y; r < math.min(y + block.height, yEnd); r++) {
+      final start = r * state.columns + x;
+      state.blocks.fillRange(
+        start,
+        start + math.min(block.width, xEnd - x),
+        block,
+      );
+    }
+  }
+
   int _readSegment(int x, int y, _Block? above, _Block? left, bool skip) {
     final u = above?.segment ?? -1, l = left?.segment ?? -1;
     final ul = _at(x - 1, y - 1)?.segment ?? -1;
@@ -756,17 +1027,24 @@ final class _IntraTile {
     }
   }
 
-  List<int> _filterLevels(int segment) {
+  List<int> _filterLevels(int segment, [Av1InterMotion? motion]) {
     final filter = params.loopFilter;
     if (filter.levels[0] == 0 && filter.levels[1] == 0) {
       return const [0, 0, 0, 0];
     }
+    final reference = motion?.ref0 ?? 0;
+    final moving =
+        motion != null &&
+        (motion.mode0 != Av1MvMode.global ||
+            (motion.ref1 > 0 && motion.mode1 != Av1MvMode.global));
     final key =
         segment |
         ((_deltaLf[0] + 63) << 3) |
         ((_deltaLf[1] + 63) << 10) |
         ((_deltaLf[2] + 63) << 17) |
-        ((_deltaLf[3] + 63) << 24);
+        ((_deltaLf[3] + 63) << 24) |
+        (reference << 31) |
+        (moving ? 1 << 34 : 0);
     return _lfLevels.putIfAbsent(key, () {
       final features = params.segmentation.features[segment];
       final multi = params.deltaFilter?.multi == true;
@@ -774,7 +1052,14 @@ final class _IntraTile {
         var level = (filter.levels[i] + _deltaLf[multi ? i : 0]).clamp(0, 63);
         level = (level + (features[i + 1] ?? 0)).clamp(0, 63);
         if (filter.enabled) {
-          level = (level + (filter.references[0] << (level >> 5))).clamp(0, 63);
+          level =
+              (level +
+                      ((filter.references[reference] +
+                              (reference == 0
+                                  ? 0
+                                  : filter.modes[moving ? 1 : 0])) <<
+                          (level >> 5)))
+                  .clamp(0, 63);
         }
         return level;
       });
@@ -814,9 +1099,18 @@ final class _IntraTile {
     if (params.transformMode == Av1TransformMode.select &&
         size != Av1TxSize.tx4x4) {
       final depth = size.squareUp - 1;
+      final aboveW = above == null
+          ? 0
+          : above.motion == null
+          ? above.txSize.width
+          : above.width * 4;
+      final leftH = left == null
+          ? 0
+          : left.motion == null
+          ? left.txSize.height
+          : left.height * 4;
       final ctx =
-          ((above?.txSize.width ?? 0) >= size.width ? 1 : 0) +
-          ((left?.txSize.height ?? 0) >= size.height ? 1 : 0);
+          (aboveW >= size.width ? 1 : 0) + (leftH >= size.height ? 1 : 0);
       final split = _symbol(
         _Family.txSize,
         intraTxSizeCdfs[depth][ctx],
