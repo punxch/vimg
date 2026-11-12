@@ -1,0 +1,263 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:image/image.dart' as image;
+
+import 'binary_file.dart';
+import 'metadata.dart';
+
+const _ebml = 0x1a45dfa3;
+const _segment = 0x18538067;
+const _cluster = 0x1f43b675;
+
+const _codecs = {
+  'V_AV1': 'av1',
+  'V_MPEG4/ISO/AVC': 'h264',
+  'V_MPEGH/ISO/HEVC': 'hevc',
+  'V_MPEGI/ISO/VVC': 'vvc',
+  'V_MPEG4/ISO/ASP': 'mpeg4',
+  'V_MPEG4/ISO/SP': 'mpeg4',
+  'V_MPEG2': 'mpeg2video',
+  'V_MPEG1': 'mpeg1video',
+  'V_VP8': 'vp8',
+  'V_VP9': 'vp9',
+  'V_MJPEG': 'mjpeg',
+  'V_FFV1': 'ffv1',
+  'V_PRORES': 'prores',
+  'V_THEORA': 'theora',
+  'V_UNCOMPRESSED': 'rawvideo',
+};
+
+typedef EbmlElement = ({int id, int data, int end, bool unknownSize});
+
+final class Matroska {
+  Matroska(this.file);
+
+  final BinaryFile file;
+
+  ({int value, int width}) vint(int offset, int end, {bool id = false}) {
+    if (offset >= end) throw const FormatException('Missing EBML integer');
+    final first = file.unsigned(offset, 1);
+    if (first == 0) throw const FormatException('Invalid EBML integer');
+    final width = 9 - first.bitLength;
+    if ((id && width > 4) || offset + width > end) {
+      throw const FormatException('Invalid EBML integer width');
+    }
+    final marker = 1 << (8 - width);
+    var value = id ? first : first ^ marker;
+    for (final byte in file.read(offset + 1, width - 1)) {
+      value = (value << 8) | byte;
+    }
+    return (value: value, width: width);
+  }
+
+  EbmlElement element(int offset, int end) {
+    final id = vint(offset, end, id: true);
+    final size = vint(offset + id.width, end);
+    final data = offset + id.width + size.width;
+    final unknownSize = size.value == (1 << (7 * size.width)) - 1;
+    if (!unknownSize && size.value > end - data) {
+      throw const FormatException('EBML element exceeds its parent');
+    }
+    return (
+      id: id.value,
+      data: data,
+      end: unknownSize ? end : data + size.value,
+      unknownSize: unknownSize,
+    );
+  }
+
+  Iterable<EbmlElement> elements(int offset, int end) sync* {
+    while (offset < end) {
+      final next = element(offset, end);
+      yield next;
+      offset = next.end;
+    }
+  }
+
+  Iterable<EbmlElement> segmentElements() sync* {
+    final header = element(0, file.length);
+    if (header.id != _ebml || header.unknownSize) {
+      throw const FormatException('Invalid Matroska header');
+    }
+    final type = text(fields(header)[0x4282]);
+    if (type != 'matroska' && type != 'webm') {
+      throw FormatException('Unsupported EBML document type: $type');
+    }
+    for (final root in elements(header.end, file.length)) {
+      if (root.id != _segment) continue;
+      var offset = root.data;
+      while (offset < root.end) {
+        var child = element(offset, root.end);
+        if (child.id == _cluster && child.unknownSize) {
+          // A live muxer may omit the cluster size. The next Segment-level
+          // element closes it.
+          var boundary = child.data;
+          while (boundary < root.end) {
+            final next = element(boundary, root.end);
+            if (_segmentIds.contains(next.id)) break;
+            if (next.unknownSize) {
+              throw const FormatException(
+                'Unknown size within Matroska cluster',
+              );
+            }
+            boundary = next.end;
+          }
+          child = (
+            id: child.id,
+            data: child.data,
+            end: boundary,
+            unknownSize: true,
+          );
+        }
+        yield child;
+        offset = child.end;
+      }
+      return;
+    }
+    throw const FormatException('Missing Matroska segment');
+  }
+
+  static const _segmentIds = {
+    _cluster,
+    0x114d9b74,
+    0x1549a966,
+    0x1654ae6b,
+    0x1c53bb6b,
+    0x1941a469,
+    0x1043a770,
+    0x1254c367,
+  };
+
+  Map<int, EbmlElement> fields(EbmlElement parent) => {
+    for (final child in elements(parent.data, parent.end)) child.id: child,
+  };
+
+  int? number(EbmlElement? field) =>
+      field == null ? null : file.unsigned(field.data, field.end - field.data);
+
+  String? text(EbmlElement? field) {
+    if (field == null) return null;
+    final length = field.end - field.data;
+    if (length > 4096) throw const FormatException('Oversized EBML string');
+    return utf8
+        .decode(file.read(field.data, length), allowMalformed: true)
+        .split('\x00')
+        .first;
+  }
+
+  double? floating(EbmlElement? field) {
+    if (field == null) return null;
+    final length = field.end - field.data;
+    final bytes = ByteData.sublistView(
+      file.read(field.data, length.clamp(0, 8)),
+    );
+    return switch (length) {
+      4 => bytes.getFloat32(0),
+      8 => bytes.getFloat64(0),
+      _ => throw const FormatException('Invalid EBML float width'),
+    };
+  }
+
+  VideoMetadata metadata() {
+    var scale = 1000000;
+    double? durationTicks;
+    final tracks = <({String codec, int width, int height})>[];
+    final attachments = <VideoStream>[];
+    for (final child in segmentElements()) {
+      switch (child.id) {
+        case 0x1549a966:
+          final info = fields(child);
+          scale = number(info[0x2ad7b1]) ?? scale;
+          if (scale <= 0)
+            throw const FormatException('Invalid Matroska timestamp scale');
+          durationTicks = floating(info[0x4489]);
+        case 0x1654ae6b:
+          for (final entry in elements(child.data, child.end)) {
+            if (entry.id != 0xae) continue;
+            final track = fields(entry);
+            if (number(track[0x83]) != 1 || !track.containsKey(0xe0)) continue;
+            final video = fields(track[0xe0]!);
+            tracks.add((
+              codec: _codec(track),
+              width: number(video[0xb0]) ?? 0,
+              height: number(video[0xba]) ?? 0,
+            ));
+          }
+        case 0x1941a469:
+          for (final entry in elements(child.data, child.end)) {
+            if (entry.id != 0x61a7) continue;
+            final attached = _attachment(fields(entry));
+            if (attached != null) attachments.add(attached);
+          }
+      }
+    }
+    final duration = durationTicks == null ? null : durationTicks * scale / 1e9;
+    final base = timeBase(scale, 1000000000);
+    return VideoMetadata(
+      duration != null && duration.isFinite && duration >= 0 ? duration : null,
+      [
+        for (final track in tracks)
+          VideoStream(
+            codec: track.codec,
+            width: track.width,
+            height: track.height,
+            timeBase: base,
+          ),
+        ...attachments,
+      ],
+    );
+  }
+
+  String _codec(Map<int, EbmlElement> track) {
+    final codec = text(track[0x86]);
+    final config = track[0x63a2];
+    if (codec == 'V_MS/VFW/FOURCC' &&
+        config != null &&
+        config.end - config.data >= 20) {
+      final tag = ascii.decode(
+        file.read(config.data + 16, 4),
+        allowInvalid: true,
+      );
+      return switch (tag.toUpperCase()) {
+        'MJPG' || 'JPEG' => 'mjpeg',
+        'H264' || 'X264' || 'AVC1' => 'h264',
+        'HEVC' || 'H265' => 'hevc',
+        'XVID' || 'DIVX' || 'DX50' => 'mpeg4',
+        'FFV1' => 'ffv1',
+        'HFYU' => 'huffyuv',
+        _ => 'unknown',
+      };
+    }
+    return _codecs[codec] ?? 'unknown';
+  }
+
+  VideoStream? _attachment(Map<int, EbmlElement> entry) {
+    final mime = text(entry[0x4660]);
+    final data = entry[0x465c];
+    final codec = switch (mime) {
+      'image/jpeg' => 'mjpeg',
+      'image/png' => 'png',
+      'image/bmp' => 'bmp',
+      'image/gif' => 'gif',
+      'image/tiff' => 'tiff',
+      'image/webp' => 'webp',
+      _ => null,
+    };
+    if (data == null ||
+        codec == null ||
+        data.end - data.data > 32 * 1024 * 1024) {
+      return null;
+    }
+    final bytes = file.read(data.data, data.end - data.data);
+    final info = image.findDecoderForData(bytes)?.startDecode(bytes);
+    if (info == null) return null;
+    return VideoStream(
+      codec: codec,
+      width: info.width,
+      height: info.height,
+      timeBase: '1/90000',
+      attached: true,
+    );
+  }
+}
