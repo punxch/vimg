@@ -94,7 +94,7 @@ final class MpegSequence {
 final class MpegPictureHeader {
   MpegPictureHeader(Uint8List header) {
     final bits = mpegBits(header);
-    bits.skip(10); // temporal reference
+    temporalReference = bits.read(10);
     type = bits.read(3);
     if (type < 1 || type > 3) {
       throw UnsupportedError('MPEG picture coding type $type is unavailable');
@@ -112,13 +112,16 @@ final class MpegPictureHeader {
     }
   }
 
-  late final int type;
+  late final int type, temporalReference;
   final motionCode = [(0, 0), (0, 0)];
   final fullPel = [false, false];
   int precision = 0, structure = 3;
   bool codingExtension = false, framePrediction = true, topFirst = false;
   bool concealment = false, nonlinear = false, alternateVlc = false;
   bool alternateScan = false;
+
+  /// Field parity in the reconstructed frame, with top at row zero.
+  int? get field => structure == 3 ? null : structure - 1;
 
   void extension(Uint8List payload) {
     final bits = mpegBits(payload)..skip(4);
@@ -129,6 +132,9 @@ final class MpegPictureHeader {
     }
     precision = bits.read(2);
     structure = bits.read(2);
+    if (structure == 0) {
+      throw const FormatException('Invalid MPEG picture structure');
+    }
     topFirst = bits.flag();
     framePrediction = bits.flag();
     concealment = bits.flag();
@@ -144,6 +150,9 @@ typedef MpegPictureInfo = ({
   bool closedGop,
   bool brokenLink,
 });
+
+bool mpegFieldTypesPair(int first, int second) =>
+    first == second || (first == 1 && second == 2);
 
 MpegPictureInfo mpegPictureInfo(Uint8List header, int gopFlags) {
   if (header.length < 2) {

@@ -8,6 +8,7 @@ import 'package:vimg_dart/src/video.dart';
 import 'package:vimg_dart/src/video_configuration.dart';
 
 import 'fixtures.dart';
+import 'mpeg_checks.dart';
 
 // testsrc2 at 25 fps, -g 7 or 8 -bf 2 -q:v 4. Checksums are from
 // FFmpeg -idct simple, over cropped Y, Cb and Cr in presentation order.
@@ -158,7 +159,7 @@ Future<void> _compare(
       );
       check(packet.timestamp!.duration == period, 'MPEG frame duration');
       check(
-        _yuvHash(frame) == hashes[index],
+        mpegYuvHash(frame) == hashes[index],
         '$path MPEG YUV for frame $index',
       );
       rgb[index] = _hash(frame.rgb().getBytes());
@@ -194,24 +195,6 @@ Future<void> _compare(
     await workers.close();
     video.close();
   }
-}
-
-int _yuvHash(MpegPicture picture) {
-  var hash = 2166136261;
-  for (final (component, plane) in picture.planes.indexed) {
-    final sx = component == 0 ? 0 : picture.subsamplingX;
-    final sy = component == 0 ? 0 : picture.subsamplingY;
-    final stride = picture.stride >> sx;
-    final width = (picture.width + sx) >> sx;
-    final height = (picture.height + sy) >> sy;
-    for (var y = 0; y < height; y++) {
-      final row = y * stride;
-      for (var x = 0; x < width; x++) {
-        hash = ((hash ^ plane[row + x]) * 16777619) & 0xffffffff;
-      }
-    }
-  }
-  return hash;
 }
 
 int _hash(List<int> bytes) {

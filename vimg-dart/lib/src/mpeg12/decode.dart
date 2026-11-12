@@ -10,7 +10,8 @@ part 'motion.dart';
 part 'tables.dart';
 part 'transform.dart';
 
-/// Sequential MPEG video decoder. Each sample is supplied in coding order.
+/// Sequential MPEG video decoder. Each sample is one coded frame, consisting
+/// of a frame picture or two field pictures, in coding order.
 final class MpegStreamDecoder {
   MpegStreamDecoder([Uint8List? configuration]) {
     if (configuration != null) _read(configuration, headersOnly: true);
@@ -33,12 +34,15 @@ final class MpegStreamDecoder {
     bool skipB = false,
   }) {
     MpegPictureHeader? header;
+    MpegPictureHeader? firstField;
+    MpegPicture? firstPixels;
     _PictureSlices? slices;
+    var hasSlices = false;
     for (final unit in mpegStartCodes(bytes)) {
       final code = unit.code;
       final payload = Uint8List.sublistView(bytes, unit.data, unit.end);
       if (code == 0xb3) {
-        if (slices != null)
+        if (hasSlices || firstField != null)
           throw const FormatException('Unexpected MPEG sequence header');
         _sequence = MpegSequence(payload);
       } else if (code == 0xb5) {
@@ -46,7 +50,7 @@ final class MpegStreamDecoder {
           throw const FormatException('Missing MPEG extension type');
         if (payload[0] >> 4 == 8) {
           if (headersOnly) continue;
-          if (header == null || slices != null) {
+          if (header == null || hasSlices) {
             throw const FormatException(
               'Unexpected MPEG picture coding extension',
             );
@@ -56,8 +60,18 @@ final class MpegStreamDecoder {
           _sequence?.extension(payload);
         }
       } else if (code == 0 && !headersOnly) {
-        if (header != null)
-          throw UnsupportedError('Multiple MPEG pictures in one sample');
+        final previous = header;
+        if (previous != null) {
+          if (firstField != null || previous.field == null || !hasSlices) {
+            throw const FormatException(
+              'Unexpected MPEG picture in coded frame',
+            );
+          }
+          firstField = previous;
+          firstPixels = slices?.finish();
+          slices = null;
+          hasSlices = false;
+        }
         header = MpegPictureHeader(payload);
       } else if (code >= 1 && code <= 0xaf && !headersOnly) {
         final sequence = _sequence;
@@ -66,28 +80,48 @@ final class MpegStreamDecoder {
             'MPEG slice lacks sequence or picture headers',
           );
         }
-        if (skipB && header.type == 3) continue;
         if (sequence.mpeg2 != header.codingExtension) {
           throw const FormatException(
             'Missing or misplaced MPEG picture coding extension',
           );
         }
-        if (header.structure != 3) {
-          throw UnsupportedError(
-            'Separate MPEG field pictures are unavailable',
-          );
+        final field = header.field;
+        if (!hasSlices) {
+          if (field != null &&
+              (sequence.progressive || header.framePrediction)) {
+            throw const FormatException('Invalid MPEG field picture flags');
+          }
+          if (firstField != null &&
+              (field == null ||
+                  field == firstField.field ||
+                  header.temporalReference != firstField.temporalReference ||
+                  !mpegFieldTypesPair(firstField.type, header.type))) {
+            throw const FormatException('Invalid complementary MPEG field');
+          }
+          hasSlices = true;
         }
+        if (skipB && header.type == 3) continue;
         slices ??= _PictureSlices(
           sequence,
           header,
           _transform,
-          forward: header.type == 3 ? _older : _newer,
+          picture: firstPixels ?? MpegPicture._(sequence),
+          forward: header.type == 3
+              ? _older
+              : firstField?.type == 1
+              ? null
+              : _newer,
           backward: header.type == 3 ? _newer : null,
+          previousField: header.type == 2 ? firstField?.field : null,
         );
         slices.decode(code, payload);
       }
     }
     if (headersOnly) return null;
+    if (header?.field != null && firstField == null) {
+      throw const FormatException('Missing complementary MPEG field');
+    }
+    if (!hasSlices) throw const FormatException('Missing MPEG picture slices');
     final picture = slices?.finish();
     if (picture != null && header!.type != 3) {
       _older = _newer;
@@ -148,9 +182,11 @@ final class _PictureSlices {
     this.sequence,
     this.header,
     this.transform, {
+    required this.picture,
     required this.forward,
     required this.backward,
-  }) : picture = MpegPicture._(sequence) {
+    required this.previousField,
+  }) {
     coded = Uint8List(columns * rows);
   }
 
@@ -159,6 +195,7 @@ final class _PictureSlices {
   final _Transform transform;
   final MpegPicture? forward, backward;
   final MpegPicture picture;
+  final int? previousField;
   late final Uint8List coded;
   final _coefficients = Int16List(64);
   final _dc = [0, 0, 0];
@@ -167,7 +204,7 @@ final class _PictureSlices {
   var _quantizer = 0;
 
   int get columns => picture.stride >> 4;
-  int get rows => picture.paddedHeight >> 4;
+  int get rows => picture.paddedHeight >> (header.field == null ? 4 : 5);
 
   void decode(int code, Uint8List payload) {
     final bits = mpegBits(payload);
@@ -235,9 +272,9 @@ final class _PictureSlices {
     _resetDc();
     if (header.type == 2) {
       _motion.reset();
-      _predict(address, const [_Prediction(0, 0, 0)], 2);
+      _predictZero(address);
     } else if (header.type == 3 && _lastDirections != 0) {
-      _predict(address, _motion.implied(_lastDirections, header), 2);
+      _predict(address, _motion.implied(_lastDirections, header));
     } else {
       throw const FormatException('Invalid skipped MPEG macroblock');
     }
@@ -254,15 +291,21 @@ final class _PictureSlices {
     final intra = type & _intra != 0;
     final codedPattern = type & _coded != 0;
     final directions = type & (_forward | _backward);
+    final field = header.field;
     final motionType = directions != 0 && !header.framePrediction
         ? bits.read(2)
-        : 2;
+        : field == null
+        ? 2
+        : 1;
     final fieldDct =
-        !header.framePrediction && (intra || codedPattern) && bits.flag();
+        field == null &&
+        !header.framePrediction &&
+        (intra || codedPattern) &&
+        bits.flag();
     if (type & _quant != 0) _readQuantizer(bits);
     if (intra) {
       if (header.concealment) {
-        _motion.read(bits, header, _forward, 2);
+        _motion.read(bits, header, _forward, field == null ? 2 : 1);
         mpegMarker(bits);
       } else {
         _motion.reset();
@@ -272,10 +315,10 @@ final class _PictureSlices {
       _resetDc();
       if (directions == 0) {
         _motion.reset();
-        _predict(address, const [_Prediction(0, 0, 0)], 2);
+        _predictZero(address);
       } else {
         final predictions = _motion.read(bits, header, directions, motionType);
-        _predict(address, predictions, motionType);
+        _predict(address, predictions);
       }
       _lastDirections = directions;
     }
@@ -302,10 +345,12 @@ final class _PictureSlices {
       final sy = component == 0 ? 0 : picture.subsamplingY;
       final column = i < 4 ? index & 1 : index >> 1;
       final row = i < 4 ? index >> 1 : index & 1;
-      final step = fieldDct && sy == 0 ? 2 : 1;
+      final fieldBlock = fieldDct && sy == 0;
+      final step = field != null || fieldBlock ? 2 : 1;
       final stride = picture.stride >> sx;
       final x = (mbX * 16 >> sx) + column * 8;
-      final y = (mbY * 16 >> sy) + row * (step == 2 ? 1 : 8);
+      var y = (mbY * 16 >> sy) + row * (fieldBlock ? 1 : 8);
+      if (field != null) y = 2 * y + field;
       _block(bits, component, intra);
       transform.write(
         picture.planes[component],
@@ -385,7 +430,14 @@ final class _PictureSlices {
     if (isMpeg2 && mismatch.isEven) coefficients[63] ^= 1;
   }
 
-  void _predict(int address, List<_Prediction> predictions, int motionType) {
+  void _predictZero(int address) {
+    final field = header.field;
+    _predict(address, [
+      _Prediction(0, 0, 0, sourceField: field, destField: field),
+    ]);
+  }
+
+  void _predict(int address, List<_Prediction> predictions) {
     _motionCompensate(
       picture,
       address % columns,
@@ -393,7 +445,8 @@ final class _PictureSlices {
       forward,
       backward,
       predictions,
-      motionType,
+      fieldPicture: header.field != null,
+      previousField: previousField,
     );
   }
 }

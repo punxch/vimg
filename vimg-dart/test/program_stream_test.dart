@@ -7,6 +7,7 @@ import 'package:vimg_dart/src/mpeg_systems.dart';
 import 'package:vimg_dart/src/video.dart';
 
 import 'fixtures.dart';
+import 'mpeg_checks.dart';
 
 const _mpeg = 'test/fixtures/mpeg1-mp2.mpg';
 const _vob = 'test/fixtures/dvd-ac3.vob';
@@ -123,7 +124,7 @@ Future<void> _compare(
     for (final packet in systems.packets(false)) {
       final picture = decoder.decode(systems.read(packet));
       final i = positions[packet]!;
-      check(_yuvHash(picture) == reference[i], '$path YUV of frame $i');
+      check(mpegYuvHash(picture) == reference[i], '$path YUV of frame $i');
       rgb[i] = picture.rgb().getBytes();
     }
 
@@ -306,23 +307,6 @@ Future<void> _checkCommands(String executable, Directory temp) async {
   check(File(preview).lengthSync() > 0, 'DVD JPEG preview');
   check(Directory(captures).listSync().length == 3, 'MPEG BMP captures');
   check(File(sheet).lengthSync() > 0, 'VOB animated AVIF');
-}
-
-int _yuvHash(MpegPicture picture) {
-  var hash = 2166136261;
-  for (final (component, plane) in picture.planes.indexed) {
-    final sx = component == 0 ? 0 : picture.subsamplingX;
-    final sy = component == 0 ? 0 : picture.subsamplingY;
-    final stride = picture.stride >> sx;
-    final width = (picture.width + sx) >> sx;
-    final height = (picture.height + sy) >> sy;
-    for (var y = 0; y < height; y++) {
-      for (var x = 0; x < width; x++) {
-        hash = ((hash ^ plane[y * stride + x]) * 16777619) & 0xffffffff;
-      }
-    }
-  }
-  return hash;
 }
 
 void _equal(Uint8List pixels, Uint8List reference) {

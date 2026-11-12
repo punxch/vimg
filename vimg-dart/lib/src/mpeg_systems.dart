@@ -134,7 +134,12 @@ final class MpegSystemsVideo {
       final tail = !elementary && video.bitstreamCodec == 'mpeg1video'
           ? duration ~/ 2
           : duration;
-      end = math.max(end, pts[i] + tail);
+      final field = frame.secondFieldPts;
+      // The container duration estimate includes every explicitly timed PES.
+      final last = field == null
+          ? pts[i]
+          : math.max(pts[i], _unwrapTimestamp(field, pts[i]));
+      end = math.max(end, last + tail);
     }
     for (final track in audio) {
       final first = track.first;
@@ -389,6 +394,7 @@ typedef _AccessUnit = ({
   int type,
   int fields,
   (int, int)? time,
+  int? secondFieldPts,
   (int, int)? mpegOrder,
 });
 
@@ -401,8 +407,10 @@ final class _AccessUnits {
   final MpegHeaders? _mpeg;
   var _gopFlags = 0;
   var _mpegGroup = 0, _fields = 2;
+  var _mpegStructure = 3;
+  var _secondField = false;
+  int? _secondFieldPts;
   int? _mpegReference;
-  (int, int)? _mpegOrder;
   final frames = <_AccessUnit>[];
   final configurations = <int, Uint8List>{};
   final mpegPictures = <int, MpegPictureInfo>{};
@@ -514,6 +522,26 @@ final class _AccessUnits {
 
   void _mpegUnit(MpegHeaders headers, Uint8List bytes) {
     final code = bytes[0];
+    final payload = Uint8List.sublistView(bytes, 1);
+    final info = code == 0 ? mpegPictureInfo(payload, _gopFlags) : null;
+    if (info != null && _mpegStructure != 3 && !_secondField) {
+      final first = mpegPictures[_framePosition]!;
+      if (info.temporalReference == first.temporalReference &&
+          mpegFieldTypesPair(first.type, info.type)) {
+        _secondField = true;
+        final time = _takeTime(_nalStart);
+        _secondFieldPts = time?.$1;
+        final period = headers.sequence?.timing;
+        if (_frameTime == null && time != null && period != null) {
+          final half = (period.$1 * _mpegClock / (2 * period.$2)).round();
+          _frameTime = (
+            (time.$1 - half) % _ptsWrap,
+            (time.$2 - half) % _ptsWrap,
+          );
+        }
+        return;
+      }
+    }
     if (_frameType != null && (code == 0 || code == 0xb3 || code == 0xb8)) {
       _frame(_nalStart);
     }
@@ -521,18 +549,15 @@ final class _AccessUnits {
     // sequence prefix can begin the first complete access unit.
     if (_frameStart < 0 && code != 0 && code != 0xb3 && code != 0xb8) return;
     _beginUnit();
-    final payload = Uint8List.sublistView(bytes, 1);
     if (code == 0xb3 || code == 0xb8) {
       _mpegGroup++;
       _mpegReference = null;
     }
     if (code == 0xb8 && payload.length >= 4) {
       _gopFlags = payload[3];
-    } else if (code == 0) {
-      final info = mpegPictureInfo(payload, _gopFlags);
+    } else if (info != null) {
       _gopFlags = 0;
       _beginPicture(info.type, timestampPosition: _nalStart);
-      _mpegOrder = (_mpegGroup, _pictureOrder(info));
       mpegPictures[_framePosition] = info;
       final sequence = headers.sequence;
       if (sequence != null) {
@@ -544,6 +569,16 @@ final class _AccessUnits {
       if (info.type == 1)
         configurations[_framePosition] = headers.configuration();
     } else if (code == 0xb5 && payload.length >= 5 && payload[0] >> 4 == 8) {
+      final structure = payload[2] & 3;
+      if (structure == 0 || (_secondField && structure != 3 - _mpegStructure)) {
+        throw const FormatException('Invalid MPEG field picture structure');
+      }
+      if (_secondField) {
+        _mpegStructure = 3; // the two fields constitute one coded frame
+        return;
+      }
+      _mpegStructure = structure;
+      if (structure != 3) return;
       final flags = payload[3];
       if (flags & 2 != 0) {
         if (headers.sequence?.progressive == true) {
@@ -582,10 +617,15 @@ final class _AccessUnits {
     _frameType = type;
     // A PES timestamp applies to its first new access unit. A continuation
     // may start a PES without starting a picture.
-    final position = timestampPosition ?? _frameStart;
+    _frameTime = _takeTime(timestampPosition ?? _frameStart);
+  }
+
+  (int, int)? _takeTime(int position) {
+    (int, int)? time;
     while (_timestamps.isNotEmpty && _timestamps.first.$1 <= position) {
-      _frameTime = _timestamps.removeFirst().$2;
+      time = _timestamps.removeFirst().$2;
     }
+    return time;
   }
 
   void _parameterSet(Uint8List bytes) {
@@ -629,19 +669,44 @@ final class _AccessUnits {
   void _frame(int end) {
     final type = _frameType;
     if (type == null) return;
-    frames.add((
-      offset: _framePosition,
-      size: end - _frameStart,
-      type: type,
-      fields: _fields,
-      time: _frameTime,
-      mpegOrder: _mpegOrder,
-    ));
+    if (_mpegStructure == 3) {
+      final info = mpegPictures[_framePosition];
+      frames.add((
+        offset: _framePosition,
+        size: end - _frameStart,
+        type: type,
+        fields: _fields,
+        time: _frameTime,
+        secondFieldPts: _secondFieldPts,
+        mpegOrder: info == null ? null : (_mpegGroup, _pictureOrder(info)),
+      ));
+    } else {
+      // A recording can start or end on a single field of a coded frame.
+      _discardPicture();
+    }
+    _clearPicture();
+  }
+
+  void _discardPicture() {
+    mpegPictures.remove(_framePosition);
+    configurations.remove(_framePosition);
+  }
+
+  void _clearPicture() {
     _frameType = null;
     _frameTime = null;
     _fields = 2;
-    _mpegOrder = null;
+    _mpegStructure = 3;
+    _secondField = false;
+    _secondFieldPts = null;
     _frameStart = -1;
+  }
+
+  /// Keep indexed frames when the final transport PES ends prematurely.
+  void discardTail() {
+    if (_frameType != null) _discardPicture();
+    _clearPicture();
+    _prefix.clear();
   }
 
   void finish() {

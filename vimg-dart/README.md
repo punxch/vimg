@@ -63,10 +63,14 @@ an earlier audio start in the same program. Capture workers read the
 selected GOPs directly from the source file.
 
 Matroska, MPEG-TS, MPEG-PS and elementary `.m1v`/`.m2v` streams support
-MPEG-1 and MPEG-2 I/P/B pictures. MPEG-2
-supports progressive and interlaced frame pictures, including field-based
-motion prediction and field DCT. Capture handles B-pictures that depend on
-an earlier GOP and selects I-pictures for static previews. When MPEG-1 or
+MPEG-1 and MPEG-2 I/P/B pictures. MPEG-2 supports progressive and interlaced
+frame pictures as well as separately coded top and bottom fields. Field
+pictures are paired in either field order and reconstructed into one frame.
+Field motion compensation includes 16×8 and dual-prime prediction.
+Capture handles B-pictures that depend on an earlier GOP and selects
+I-frames, including I/P field pairs, for static previews. MPEG transport
+streams can retain complete pictures before a truncated final video PES.
+When MPEG-1 or
 MPEG-2 PES packets omit some picture timestamps, capture reconstructs
 presentation order from the GOP and picture headers. Elementary streams
 start at zero and use sequence timing, including signalled repeated fields.
@@ -74,8 +78,8 @@ start at zero and use sequence timing, including signalled repeated fields.
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS
 and LPCM tracks. A program stream map can also identify H.264 or HEVC.
-Separate MPEG field pictures, scalable MPEG-2, DVD title navigation and
-reordered H.264 or HEVC pictures without usable timestamps remain pending.
+Scalable MPEG-2, DVD title navigation and reordered H.264 or HEVC pictures
+without usable timestamps remain pending.
 
 `preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
 AVIF animation reader handles intra and inter pictures, including hidden
@@ -185,6 +189,7 @@ dart test/hevc_test.dart
 dart test/iso_fragments_test.dart
 dart test/transport_stream_test.dart
 dart test/mpeg_video_test.dart
+dart test/mpeg_fields_test.dart
 dart test/program_stream_test.dart
 dart test/prores_test.dart
 dart test/authority_test.dart

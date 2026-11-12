@@ -104,7 +104,11 @@ final class _TransportInput implements _PacketSource {
         audio[packet.pid]?.add(packet);
       }
     }
-    pes.finish();
+    if (pes.incomplete && isMpegVideo(program.codec)) {
+      video.discardTail();
+    } else {
+      pes.finish();
+    }
     return audio.values.map((track) => track.clock);
   }
 
@@ -313,6 +317,7 @@ final class _PesReader {
   var _headerBytes = 0, _headerSize = 9;
   var _reading = false, _inHeader = false;
   int? _remaining;
+  bool get incomplete => _inHeader || (_remaining ?? 0) > 0;
 
   void resume(_TransportPacket packet, int start) {
     _reading = true;
@@ -380,7 +385,7 @@ final class _PesReader {
   }
 
   void finish() {
-    if (_inHeader || (_remaining ?? 0) > 0) {
+    if (incomplete) {
       throw const FormatException('Truncated MPEG-TS PES packet');
     }
   }
