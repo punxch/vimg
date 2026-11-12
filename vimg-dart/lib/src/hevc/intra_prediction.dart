@@ -16,6 +16,7 @@ final class HevcIntraPrediction {
     int log2,
     int mode, {
     required bool luma,
+    required bool filterReferences,
     required bool strongSmoothing,
     required bool Function(int, int) available,
     Int32List? residual,
@@ -41,7 +42,7 @@ final class HevcIntraPrediction {
     }
 
     var reference = _reference;
-    if (luma &&
+    if (filterReferences &&
         mode != 1 &&
         n > 4 &&
         math.min((mode - 10).abs(), (mode - 26).abs()) >
@@ -54,6 +55,7 @@ final class HevcIntraPrediction {
       final limit = 1 << (plane.depth - 5);
       final strong =
           n == 32 &&
+          luma &&
           strongSmoothing &&
           (_reference[0] + middle - 2 * _reference[n]).abs() < limit &&
           (_reference[end] + middle - 2 * _reference[3 * n]).abs() < limit;

@@ -50,10 +50,10 @@ Rust CLI's constant-frame-rate selection rules. `sample/input.mkv`
 can be used with `preview`, `extract` and `vcs`. `preview` selects an IDR for
 a quick static image.
 
-Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in 4:2:0
-or monochrome, up to 12 bits. `preview` selects an HEVC random-access
-picture. `extract` and `vcs` decode from the preceding random-access point
-and handle leading pictures that depend on an earlier GOP.
+Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in
+monochrome, 4:2:0, 4:2:2 and 4:4:4, up to 12 bits. `preview` selects an
+HEVC random-access picture. `extract` and `vcs` decode from the preceding
+random-access point and handle leading pictures that depend on an earlier GOP.
 
 MPEG-TS supports H.264, HEVC, MPEG-1 Video and MPEG-2 Video in 188-byte TS,
 192-byte M2TS and 204-byte transport packets. Capture uses the first
@@ -89,7 +89,9 @@ references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
 intra block copy for screen content.
 Film grain synthesis runs on AV1 display frames before RGB conversion.
-HEVC range extension tools and hardware capture backends remain pending.
+HEVC separate colour planes, residual DPCM, cross-component prediction and
+other advanced range extension tools remain pending, as do hardware capture
+backends.
 
 MP4/MOV and Matroska support Apple ProRes 422 and 4444, including Proxy,
 LT, HQ and XQ. The decoder handles progressive frames and both interlaced

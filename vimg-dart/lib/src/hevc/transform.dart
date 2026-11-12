@@ -76,9 +76,10 @@ final class HevcTransform {
 
 /// Expand scaling lists to raster factors once per slice configuration.
 final class HevcScalingFactors {
-  HevcScalingFactors(this.lists);
+  HevcScalingFactors(this.lists, {this.fullChroma = false});
 
   final HevcScalingLists? lists;
+  final bool fullChroma;
   final _cache = <(int, int), Uint8List>{};
 
   Uint8List? weights(int log2, int matrixId) {
@@ -88,7 +89,10 @@ final class HevcScalingFactors {
       final size = 1 << log2;
       final baseLog2 = math.min(3, log2);
       final positions = hevcScans[HevcScan.diagonal.index][baseLog2];
-      final matrix = values.matrix(log2 - 2, matrixId);
+      final sizeId = log2 == 5 && fullChroma && matrixId % 3 != 0
+          ? 2
+          : log2 - 2;
+      final matrix = values.matrix(sizeId, matrixId);
       final base = Uint8List(positions.length);
       for (var i = 0; i < positions.length; i++) {
         base[positions[i]] = matrix.coefficients[i];

@@ -21,10 +21,11 @@ final class HevcInterPrediction {
     final m0 = motion.l0, m1 = motion.l1;
     final p0 = m0 == null ? null : references.l0[m0.index].picture;
     final p1 = m1 == null ? null : references.l1[m1.index].picture;
-    _plane(picture.luma, p0?.luma, p1?.luma, block, motion, weights, 0);
+    _plane(picture.luma, p0?.luma, p1?.luma, block, motion, weights, 0, 0, 0);
     if (picture.cb != null) {
-      _plane(picture.cb!, p0?.cb, p1?.cb, block, motion, weights, 1);
-      _plane(picture.cr!, p0?.cr, p1?.cr, block, motion, weights, 2);
+      final sx = picture.sps.chromaShiftX, sy = picture.sps.chromaShiftY;
+      _plane(picture.cb!, p0?.cb, p1?.cb, block, motion, weights, 1, sx, sy);
+      _plane(picture.cr!, p0?.cr, p1?.cr, block, motion, weights, 2, sx, sy);
     }
   }
 
@@ -36,14 +37,17 @@ final class HevcInterPrediction {
     HevcMotionPair motion,
     HevcWeights? weights,
     int component,
+    int sx,
+    int sy,
   ) {
     final chroma = component != 0;
-    final scale = chroma ? 1 : 0;
-    final x = b.x >> scale, y = b.y >> scale;
-    final w = b.width >> scale, h = b.height >> scale;
+    final x = b.x >> sx, y = b.y >> sy;
+    final w = b.width >> sx, h = b.height >> sy;
     final m0 = motion.l0, m1 = motion.l1;
-    if (m0 != null) _interpolate(plane0!, _l0, x, y, w, h, m0.vector, chroma);
-    if (m1 != null) _interpolate(plane1!, _l1, x, y, w, h, m1.vector, chroma);
+    if (m0 != null)
+      _interpolate(plane0!, _l0, x, y, w, h, m0.vector, chroma, sx, sy);
+    if (m1 != null)
+      _interpolate(plane1!, _l1, x, y, w, h, m1.vector, chroma, sx, sy);
     final bi = m0 != null && m1 != null;
     final shift =
         14 -
@@ -82,11 +86,15 @@ final class HevcInterPrediction {
     int h,
     HevcVector vector,
     bool chroma,
+    int shiftX,
+    int shiftY,
   ) {
-    final precision = chroma ? 3 : 2;
-    final mask = (1 << precision) - 1;
-    final fx = vector.x & mask, fy = vector.y & mask;
-    final sx = x + (vector.x >> precision), sy = y + (vector.y >> precision);
+    final precisionX = 2 + shiftX, precisionY = 2 + shiftY;
+    final sx = x + (vector.x >> precisionX), sy = y + (vector.y >> precisionY);
+    final fx =
+        (vector.x & ((1 << precisionX) - 1)) << (chroma ? 1 - shiftX : 0);
+    final fy =
+        (vector.y & ((1 << precisionY) - 1)) << (chroma ? 1 - shiftY : 0);
     final source = plane.samples, stride = plane.width;
     final lastX = stride - 1, lastY = plane.height - 1;
     final depthShift = plane.depth - 8;

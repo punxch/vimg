@@ -66,6 +66,8 @@ const _main = 'test/fixtures/hevc-main.mkv';
 const _main10 = 'test/fixtures/hevc-main10.mp4';
 const _allIntra = 'test/fixtures/hevc-all-intra.mkv';
 const _pcmTiles = 'test/fixtures/hevc-pcm-tiles.mkv';
+const _main422 = 'test/fixtures/hevc-422-10.mkv';
+const _main444 = 'test/fixtures/hevc-444-12.mp4';
 
 // FFmpeg's cropped YUV planes, with all signalled loop filters applied.
 const _mainPixels = [
@@ -130,6 +132,54 @@ Future<void> main(List<String> arguments) async {
     [0xea6420d4, 0x4b5d5892, 0x7a6fa18f],
     [0x2b913e92, 0xdd80d4bf, 0xf5b301be],
   ]);
+  // Two closed GOPs with I/P/B pictures, SAO, deblocking and a cropped CTU
+  // boundary. Plane hashes use FFmpeg's decoded samples in presentation order.
+  _checkInterClip(
+    _main422,
+    [
+      [0xfa39ea15, 0xa51f714d, 0xa51f714d],
+      [0x3ff5eec5, 0xdeb9b78e, 0x33dddf14],
+      [0x4a8af374, 0x40b05f9f, 0x30a478f7],
+      [0x82998cb9, 0x0b6157eb, 0x1e90595b],
+      [0x02c6cf59, 0x4ae72c39, 0x2c8b4d60],
+      [0xa94304c9, 0xc6ab24db, 0xd9a40f21],
+      [0xc032f741, 0x9511f98a, 0x1f7e2ed6],
+      [0x6c9cbaad, 0x52fa47a9, 0xe0179e48],
+      [0x43892d51, 0x0f75fbd9, 0xad117ae4],
+      [0x41b588ba, 0xf8d2b559, 0xab8702d9],
+      [0x43ad4010, 0x9a0a4ebc, 0x4a5b36d9],
+      [0x94a0cbea, 0xc2a8a3bf, 0x200df3e5],
+      [0x7b05cab6, 0xc57fd107, 0x7d35367c],
+      [0xf156590a, 0x656610dc, 0x46ad8736],
+      [0x7cbc763b, 0xccbbb949, 0x0b1a6b65],
+      [0xda9a2e09, 0xcab375f4, 0x2b02a818],
+    ],
+    format: 2,
+    depth: 10,
+  );
+  _checkInterClip(
+    _main444,
+    [
+      [0x11043139, 0xa781c015, 0xa781c015],
+      [0x537c3e0d, 0x3ad6f109, 0x05f021fd],
+      [0x6448a965, 0x032144be, 0xc001a187],
+      [0x90e2d128, 0x0ec98754, 0x99072b34],
+      [0xe8c58867, 0x1bb75d99, 0xce13c8f5],
+      [0x83da50b0, 0xceef8629, 0xbecff2cc],
+      [0xbbd2f362, 0x0df7ab7f, 0x9bfb1e47],
+      [0xd3f09456, 0x9b0a81b5, 0x0aafa6ce],
+      [0x8ccd7124, 0x158dd996, 0x868cc623],
+      [0x67fe5817, 0x9fa267dc, 0xba1e9a1c],
+      [0x8a4a038c, 0x481dbca0, 0x4f9c982f],
+      [0xbc7383ea, 0x83ef9edf, 0x31e15c68],
+      [0xfe074175, 0xf23a3796, 0x3d6712f3],
+      [0x627ae710, 0x3044b8b4, 0xe0406ff6],
+      [0x502c0db2, 0x45451ef5, 0x7afef9bc],
+      [0x5755ec86, 0x1207b95a, 0x7955a1a9],
+    ],
+    format: 3,
+    depth: 12,
+  );
   await _checkCli(arguments);
 }
 
@@ -325,19 +375,33 @@ void _checkIntraClip(String path, List<List<int>> expected) {
   }
 }
 
-void _checkInterClip(String path, List<List<int>> expected) {
+void _checkInterClip(
+  String path,
+  List<List<int>> expected, {
+  int format = 1,
+  int depth = 8,
+}) {
   final handle = File(path).openSync();
   try {
     final file = BinaryFile(handle);
-    final mkv = Matroska(file);
-    final decoder = HevcStreamDecoder(
-      HevcConfiguration(matroskaVideoConfiguration(mkv, 'hevc')!),
-    );
+    final mkv = path.endsWith('.mkv') ? Matroska(file) : null;
+    final iso = mkv == null ? IsoMedia(file) : null;
+    final configuration = mkv == null
+        ? isoVideoConfiguration(iso!, 'hevc')!
+        : matroskaVideoConfiguration(mkv, 'hevc')!;
+    final decoder = HevcStreamDecoder(HevcConfiguration(configuration));
+    final packets = mkv == null ? isoFrames(iso!) : matroskaFrames(mkv);
     final seen = <int>{};
-    for (final packet in matroskaFrames(mkv)) {
+    for (final packet in packets) {
       final index = (packet.seconds * 8).round();
       check(seen.add(index), 'HEVC fixture PTS must be unique');
       final picture = decoder.decode(file.read(packet.offset, packet.size))!;
+      final sps = picture.sps;
+      check(
+        (sps.chromaArrayType, sps.lumaDepth, sps.chromaDepth) ==
+            (format, depth, depth),
+        'HEVC sample format and bit depth',
+      );
       _checkPixels(picture, expected[index], '$path picture $index');
     }
     check(seen.length == expected.length, 'HEVC inter fixture frame count');
@@ -353,9 +417,10 @@ void _checkPixels(HevcPicture picture, List<int> expected, String name) {
     picture.cb!,
     picture.cr!,
   ].indexed) {
-    final shift = index == 0 ? 0 : 1;
-    final width = sps.width >> shift, height = sps.height >> shift;
-    final top = sps.crop.top >> shift, left = sps.crop.left >> shift;
+    final sx = index == 0 ? 0 : sps.chromaShiftX;
+    final sy = index == 0 ? 0 : sps.chromaShiftY;
+    final width = sps.width >> sx, height = sps.height >> sy;
+    final top = sps.crop.top >> sy, left = sps.crop.left >> sx;
     var hash = 0x811c9dc5;
     for (var row = 0; row < height; row++) {
       final start = (top + row) * plane.width + left;
@@ -382,7 +447,13 @@ Future<void> _checkCli(List<String> arguments) async {
   }
 
   try {
-    for (final (input, skip) in [(_main, 0), (_main, 50), (_main10, 0)]) {
+    for (final (input, skip, height) in [
+      (_main, 0, 55),
+      (_main, 50, 55),
+      (_main10, 0, 55),
+      (_main422, 50, 63),
+      (_main444, 50, 63),
+    ]) {
       final jpeg = File('${directory.path}/preview.jpg');
       final response =
           jsonDecode(
@@ -401,18 +472,27 @@ Future<void> _checkCli(List<String> arguments) async {
       check(response['preview_written'] == true, 'HEVC preview response');
       final decoded = image.decodeJpg(jpeg.readAsBytesSync())!;
       check(
-        (decoded.width, decoded.height) == (83, 55),
+        (decoded.width, decoded.height) == (83, height),
         'HEVC JPEG dimensions',
       );
     }
-    for (final (index, input) in [_allIntra, _main, _main10].indexed) {
+    for (final (index, (input, width, height)) in [
+      (_allIntra, 166, 110),
+      (_main, 166, 110),
+      (_main10, 166, 110),
+      (_main422, 130, 98),
+      (_main444, 130, 98),
+    ].indexed) {
       final output = '${directory.path}/frames-$index';
       await run(['extract', '-n2', '-t200ms', '--output-dir', output, input]);
       final files = Directory(output).listSync().cast<File>();
       check(files.length == 2, 'HEVC BMP count');
       for (final file in files) {
         final bmp = image.decodeBmp(file.readAsBytesSync())!;
-        check((bmp.width, bmp.height) == (166, 110), 'HEVC BMP dimensions');
+        check(
+          (bmp.width, bmp.height) == (width, height),
+          'HEVC BMP dimensions',
+        );
       }
     }
     final avif = File('${directory.path}/grid.avif');
@@ -425,7 +505,7 @@ Future<void> _checkCli(List<String> arguments) async {
       '-t400ms',
       '-o',
       avif.path,
-      _main,
+      _main444,
     ]);
     check(
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',

@@ -18,9 +18,10 @@ final class HevcResidual {
     int log2,
     int mode, {
     required bool chroma,
+    required bool directionalScan,
     required bool hideSign,
   }) {
-    final scan = log2 == 2 || (log2 == 3 && !chroma)
+    final scan = directionalScan
         ? (mode >= 6 && mode <= 14
               ? HevcScan.vertical
               : mode >= 22 && mode <= 30

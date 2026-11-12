@@ -232,6 +232,10 @@ final class HevcSps {
   int get ctbWidth => (codedWidth + (1 << ctbLog2) - 1) >> ctbLog2;
   int get ctbHeight => (codedHeight + (1 << ctbLog2) - 1) >> ctbLog2;
   int get chromaArrayType => separateColourPlane ? 0 : chromaFormat;
+  int get chromaShiftX => chromaArrayType == 1 || chromaArrayType == 2 ? 1 : 0;
+  int get chromaShiftY => chromaArrayType == 1 ? 1 : 0;
+  bool get intraSmoothingDisabled => rangeExtension & 8 != 0;
+  bool get hasUnsupportedRangeTools => rangeExtension & ~8 != 0;
 }
 
 typedef HevcTiles = ({List<int> columns, List<int> rows, bool filterAcross});

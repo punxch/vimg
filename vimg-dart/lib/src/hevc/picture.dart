@@ -12,15 +12,15 @@ final class HevcPicture {
       cb = sps.chromaArrayType == 0
           ? null
           : HevcPlane(
-              sps.codedWidth >> 1,
-              sps.codedHeight >> 1,
+              sps.codedWidth >> sps.chromaShiftX,
+              sps.codedHeight >> sps.chromaShiftY,
               sps.chromaDepth,
             ),
       cr = sps.chromaArrayType == 0
           ? null
           : HevcPlane(
-              sps.codedWidth >> 1,
-              sps.codedHeight >> 1,
+              sps.codedWidth >> sps.chromaShiftX,
+              sps.codedHeight >> sps.chromaShiftY,
               sps.chromaDepth,
             ),
       motion = inter ? HevcMotionField(sps.codedWidth, sps.codedHeight) : null;
@@ -44,6 +44,8 @@ final class HevcPicture {
     fullRange: sps.colour.fullRange,
     lumaDepth: sps.lumaDepth,
     chromaDepth: sps.chromaDepth,
+    subsamplingX: sps.chromaShiftX,
+    subsamplingY: sps.chromaShiftY,
     sampleAspect: sps.sampleAspect,
     scaler: scaler,
   );
@@ -66,10 +68,10 @@ final class HevcPlane {
   bool reconstructed(int x, int y) =>
       contains(x, y) && _reconstructed[_cell(x, y)] != 0;
 
-  void mark(int x, int y, int size) {
-    for (var row = y; row < y + size; row += 4) {
+  void mark(int x, int y, int width, [int? height]) {
+    for (var row = y; row < y + (height ?? width); row += 4) {
       final start = _cell(x, row);
-      _reconstructed.fillRange(start, start + (size >> 2), 1);
+      _reconstructed.fillRange(start, start + (width >> 2), 1);
     }
   }
 }

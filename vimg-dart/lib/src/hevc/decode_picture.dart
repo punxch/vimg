@@ -61,15 +61,16 @@ HevcPicture _reconstruct(
   int poc = 0,
 }) {
   final first = slices.first, sps = first.sps;
+  final range = first.pps.rangeExtension;
   if (sps.fieldSequence ||
-      sps.chromaArrayType > 1 ||
       sps.separateColourPlane ||
       sps.lumaDepth > 12 ||
       sps.chromaDepth > 12 ||
-      sps.rangeExtension != 0 ||
-      first.pps.rangeExtension != null) {
+      sps.hasUnsupportedRangeTools ||
+      range?.crossComponent == true ||
+      range?.chromaOffsetDepth != null) {
     throw UnsupportedError(
-      'HEVC decoding requires progressive monochrome or 4:2:0 samples up to 12 bits without range extension tools',
+      'Unsupported HEVC field, separate plane, bit depth or range extension tools',
     );
   }
   if (sps.codedWidth * sps.codedHeight > 36 * 1024 * 1024) {
@@ -94,6 +95,7 @@ final class _Reconstruction {
   ) : layout = HevcCtuLayout(first.sps, first.pps.tiles),
       _scaling = HevcScalingFactors(
         first.pps.scalingLists ?? first.sps.scalingLists,
+        fullChroma: first.sps.chromaArrayType == 3,
       ),
       _cellsWide = first.sps.codedWidth >> 2 {
     final count = layout.order.length;
@@ -104,6 +106,7 @@ final class _Reconstruction {
     _synchronized = List.filled(count, null);
     _depth = Int8List(cells)..fillRange(0, cells, -1);
     _mode = Uint8List(cells)..fillRange(0, cells, 1);
+    if (first.sps.chromaArrayType == 3) _chromaMode = Uint8List(cells);
     _qp = Int8List(cells);
     _filterEdges = Uint8List(cells);
     _filterDisabled = Uint8List(cells);
@@ -129,6 +132,7 @@ final class _Reconstruction {
   late final List<Uint8List?> _synchronized;
   late final Int8List _depth, _qp;
   late final Uint8List _mode,
+      _chromaMode,
       _filterEdges,
       _filterDisabled,
       _skip,
@@ -313,15 +317,24 @@ final class _Reconstruction {
       final mode = _readIntraMode(px, py, flags[i]);
       _fill(_mode, px, py, part, mode);
     }
-    final luma = _mode[_cell(x, y)];
-    var chroma = luma;
-    if (picture.cb != null &&
-        _cabac.decode(HevcContext.intraChromaPredMode) != 0) {
-      chroma = const [0, 26, 10, 1][_cabac.bypassBits(2)];
-      if (chroma == luma) chroma = 34;
+    var chroma = -1;
+    if (sps.chromaArrayType == 3) {
+      for (var i = 0; i < count; i++) {
+        final px = x + (i & 1) * part, py = y + (i >> 1) * part;
+        _fill(_chromaMode, px, py, part, _readChromaMode(_mode[_cell(px, py)]));
+      }
+    } else if (picture.cb != null) {
+      chroma = _readChromaMode(_mode[_cell(x, y)]);
+      if (sps.chromaArrayType == 2) chroma = _chroma422Modes[chroma];
     }
     _transformTree(x, y, log2, 0, 0, 0, split, chroma, bypass, intra: true);
     _storeCu(x, y, size, depth, bypass);
+  }
+
+  int _readChromaMode(int luma) {
+    if (_cabac.decode(HevcContext.intraChromaPredMode) == 0) return luma;
+    final mode = const [0, 26, 10, 1][_cabac.bypassBits(2)];
+    return mode == luma ? 34 : mode;
   }
 
   void _interCu(int x, int y, int log2, int depth, bool bypass, bool skip) {
@@ -358,8 +371,9 @@ final class _Reconstruction {
     // The CU boundary is also a transform boundary for zero-residual CUs.
     _edges(x, y, size, size, transform: true);
     picture.luma.mark(x, y, size);
-    picture.cb?.mark(x >> 1, y >> 1, size >> 1);
-    picture.cr?.mark(x >> 1, y >> 1, size >> 1);
+    final sx = sps.chromaShiftX, sy = sps.chromaShiftY;
+    picture.cb?.mark(x >> sx, y >> sy, size >> sx, size >> sy);
+    picture.cr?.mark(x >> sx, y >> sy, size >> sx, size >> sy);
     if (skip) {
       _fill(_skip, x, y, size, 1);
     } else if ((partition == HevcPartition.whole && merge) ||
@@ -420,13 +434,18 @@ final class _Reconstruction {
         (log2 > sps.minTbLog2 &&
             depth < maxDepth &&
             _cabac.decode(HevcContext.splitTransformFlag, 5 - log2) != 0);
+    final format = sps.chromaArrayType;
     var chroma = inherited;
-    if (log2 > 2 && picture.cb != null) {
-      chroma = 0;
-      for (var i = 0; i < 2; i++) {
-        if ((depth == 0 || inherited & (1 << i) != 0) &&
-            _cabac.decode(HevcContext.cbfChroma, depth) != 0) {
-          chroma |= 1 << i;
+    if (format != 0 && (log2 > 2 || format == 3)) {
+      // For 4:2:2 each component can have a second square below the first.
+      for (final flag in const [1, 4]) {
+        if (depth != 0 && inherited & flag == 0) continue;
+        chroma &= ~flag;
+        if (_cabac.decode(HevcContext.cbfChroma, depth) != 0) chroma |= flag;
+        if (format == 2 && (!split || log2 == 3)) {
+          final lower = flag << 1;
+          chroma &= ~lower;
+          if (_cabac.decode(HevcContext.cbfChroma, depth) != 0) chroma |= lower;
         }
       }
     }
@@ -452,7 +471,8 @@ final class _Reconstruction {
         (!intra && depth == 0 && chroma == 0) ||
         _cabac.decode(HevcContext.cbfLuma, depth == 0 ? 1 : 0) != 0;
     // The last 4×4 luma child carries its parent's shared chroma block.
-    final writeChroma = picture.cb != null && (log2 > 2 || child == 3);
+    final shared = log2 == 2 && format != 3;
+    final writeChroma = format != 0 && (!shared || child == 3);
     if ((lumaCoded || chroma != 0) &&
         !_deltaRead &&
         _slice.pps.qpDeltaDepth != null)
@@ -463,11 +483,29 @@ final class _Reconstruction {
     final mode = intra ? _mode[_cell(x, y)] : -1;
     _block(picture.luma, x, y, log2, mode, 0, lumaCoded, bypass);
     if (writeChroma) {
-      final cx = (log2 == 2 ? x & ~7 : x) >> 1,
-          cy = (log2 == 2 ? y & ~7 : y) >> 1;
-      final size = log2 == 2 ? 2 : log2 - 1;
-      _block(picture.cb!, cx, cy, size, chromaMode, 1, chroma & 1 != 0, bypass);
-      _block(picture.cr!, cx, cy, size, chromaMode, 2, chroma & 2 != 0, bypass);
+      final cx = (shared ? x & ~7 : x) >> sps.chromaShiftX;
+      final cy = (shared ? y & ~7 : y) >> sps.chromaShiftY;
+      final log2Chroma = shared ? 2 : log2 - sps.chromaShiftX;
+      final prediction = intra && format == 3
+          ? _chromaMode[_cell(x, y)]
+          : chromaMode;
+      final blocks = format == 2 ? 2 : 1;
+      for (var component = 1; component <= 2; component++) {
+        final plane = component == 1 ? picture.cb! : picture.cr!;
+        for (var i = 0; i < blocks; i++) {
+          final flag = 1 << ((component - 1) * 2 + i);
+          _block(
+            plane,
+            cx,
+            cy + (i << log2Chroma),
+            log2Chroma,
+            prediction,
+            component,
+            chroma & flag != 0,
+            bypass,
+          );
+        }
+      }
     }
   }
 
@@ -487,22 +525,26 @@ final class _Reconstruction {
       final skip =
           !bypass &&
           _slice.pps.transformSkip &&
-          log2 == 2 &&
+          log2 <= (_slice.pps.rangeExtension?.maxTransformSkipLog2 ?? 2) &&
           _cabac.decode(HevcContext.transformSkipFlag, chroma ? 1 : 0) != 0;
       final levels = _coefficients.read(
         _cabac,
         log2,
         mode,
         chroma: chroma,
+        directionalScan:
+            log2 == 2 ||
+            (log2 == 3 && (!chroma || picture.sps.chromaArrayType == 3)),
         hideSign: !bypass && _slice.pps.signHiding,
       );
       final offset = 6 * (plane.depth - 8);
       var qp = _currentQp;
       if (chroma) {
         final offsets = _slice.parameters.chromaOffsets;
-        qp = hevcChromaQp420(
-          (qp + (component == 1 ? offsets.cb : offsets.cr)).clamp(-offset, 57),
-        );
+        final qpi = qp + (component == 1 ? offsets.cb : offsets.cr);
+        qp = picture.sps.chromaArrayType == 1
+            ? hevcChromaQp420(qpi.clamp(-offset, 57))
+            : qpi.clamp(-offset, 51);
       }
       residual = _transform.apply(
         levels,
@@ -512,7 +554,9 @@ final class _Reconstruction {
         lumaIntra: intra && !chroma,
         skip: skip,
         bypass: bypass,
-        weights: _scaling.weights(log2, component + (intra ? 0 : 3)),
+        weights: skip && log2 > 2
+            ? null
+            : _scaling.weights(log2, component + (intra ? 0 : 3)),
       );
     }
     if (!intra) {
@@ -539,8 +583,16 @@ final class _Reconstruction {
       log2,
       mode,
       luma: !chroma,
+      filterReferences:
+          !picture.sps.intraSmoothingDisabled &&
+          (!chroma || picture.sps.chromaArrayType == 3),
       strongSmoothing: picture.sps.strongIntraSmoothing,
-      available: chroma ? (x, y) => available(2 * x, 2 * y) : available,
+      available: chroma
+          ? (x, y) => available(
+              x << picture.sps.chromaShiftX,
+              y << picture.sps.chromaShiftY,
+            )
+          : available,
       residual: residual,
     );
   }
@@ -614,22 +666,23 @@ final class _Reconstruction {
 
   void _readPcm(int x, int y, int size, int lumaDepth, int chromaDepth) {
     _cabac.bits.align(0);
-    void copy(HevcPlane plane, int x, int y, int n, int depth) {
+    void copy(HevcPlane plane, int x, int y, int w, int h, int depth) {
       if (depth > plane.depth)
         throw const FormatException('Invalid HEVC PCM depth');
       final shift = plane.depth - depth;
-      for (var row = 0; row < n; row++) {
+      for (var row = 0; row < h; row++) {
         final start = (y + row) * plane.width + x;
-        for (var col = 0; col < n; col++)
+        for (var col = 0; col < w; col++)
           plane.samples[start + col] = _cabac.bits.read(depth) << shift;
       }
-      plane.mark(x, y, n);
+      plane.mark(x, y, w, h);
     }
 
-    copy(picture.luma, x, y, size, lumaDepth);
+    copy(picture.luma, x, y, size, size, lumaDepth);
     if (picture.cb != null) {
-      copy(picture.cb!, x >> 1, y >> 1, size >> 1, chromaDepth);
-      copy(picture.cr!, x >> 1, y >> 1, size >> 1, chromaDepth);
+      final sx = picture.sps.chromaShiftX, sy = picture.sps.chromaShiftY;
+      copy(picture.cb!, x >> sx, y >> sy, size >> sx, size >> sy, chromaDepth);
+      copy(picture.cr!, x >> sx, y >> sy, size >> sx, size >> sy, chromaDepth);
     }
     _cabac.restart();
   }
@@ -647,3 +700,42 @@ final class _Reconstruction {
     _sao,
   ).apply();
 }
+
+// H.265 Table 8-3 maps prediction angles to the 4:2:2 sample grid.
+const _chroma422Modes = [
+  0,
+  1,
+  2,
+  2,
+  2,
+  2,
+  3,
+  5,
+  7,
+  8,
+  10,
+  12,
+  13,
+  15,
+  17,
+  18,
+  19,
+  20,
+  21,
+  22,
+  23,
+  23,
+  24,
+  24,
+  25,
+  25,
+  26,
+  27,
+  27,
+  28,
+  28,
+  29,
+  29,
+  30,
+  31,
+];

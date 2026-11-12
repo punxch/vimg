@@ -54,6 +54,11 @@ HevcSao readHevcSao(
       values[3] = -values[3];
       position = c == 2 ? result[1].position : cabac.bypassBits(2);
     }
+    final range = slice.pps.rangeExtension;
+    final shift = (c == 0 ? range?.saoLumaScale : range?.saoChromaScale) ?? 0;
+    for (var i = 0; i < values.length; i++) {
+      values[i] <<= shift;
+    }
     result.add((type: type, position: position, offsets: values));
   }
   return result;

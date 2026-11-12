@@ -56,6 +56,10 @@ final class HevcLoopFilter {
   void _deblock(bool vertical) {
     final flag = vertical ? 1 : 2;
     final luma = picture.luma;
+    final sps = picture.sps;
+    final sx = sps.chromaShiftX, sy = sps.chromaShiftY;
+    final acrossMask = (8 << (vertical ? sx : sy)) - 1;
+    final alongMask = (4 << (vertical ? sy : sx)) - 1;
     for (var y = 0; y < luma.height; y += vertical ? 4 : 8) {
       for (var x = 0; x < luma.width; x += vertical ? 8 : 4) {
         final qCell = _cell(x, y);
@@ -90,27 +94,29 @@ final class HevcLoopFilter {
           _luma(luma, x, y, vertical, beta, tc, keepP, keepQ);
         if (strength != 2 ||
             picture.cb == null ||
-            (vertical ? x : y) & 15 != 0 ||
-            (vertical ? y : x) & 7 != 0)
+            (vertical ? x : y) & acrossMask != 0 ||
+            (vertical ? y : x) & alongMask != 0)
           continue;
         final offsets = header.pps.chromaOffsets;
         _chroma(
           picture.cb!,
-          x >> 1,
-          y >> 1,
+          x >> sx,
+          y >> sy,
           vertical,
           average + offsets.cb,
           parameters.tc,
+          sps.chromaArrayType == 1,
           keepP,
           keepQ,
         );
         _chroma(
           picture.cr!,
-          x >> 1,
-          y >> 1,
+          x >> sx,
+          y >> sy,
           vertical,
           average + offsets.cr,
           parameters.tc,
+          sps.chromaArrayType == 1,
           keepP,
           keepQ,
         );
@@ -121,20 +127,23 @@ final class HevcLoopFilter {
   void _offset(HevcPlane plane, int component) {
     if (sao.every((entry) => entry[component].type == 0)) return;
     final source = Uint16List.fromList(plane.samples);
-    final shift = component == 0 ? 0 : 1;
-    final log2 = picture.sps.ctbLog2 - shift;
-    final size = 1 << log2;
-    final columns = picture.sps.ctbWidth;
+    final sps = picture.sps;
+    final sx = component == 0 ? 0 : sps.chromaShiftX;
+    final sy = component == 0 ? 0 : sps.chromaShiftY;
+    final width = 1 << (sps.ctbLog2 - sx);
+    final height = 1 << (sps.ctbLog2 - sy);
+    final columns = sps.ctbWidth;
     for (var address = 0; address < sao.length; address++) {
       final filter = sao[address][component];
       if (filter.type == 0) continue;
-      final x0 = (address % columns) << log2, y0 = (address ~/ columns) << log2;
-      final endX = math.min(plane.width, x0 + size),
-          endY = math.min(plane.height, y0 + size);
+      final x0 = (address % columns) * width,
+          y0 = (address ~/ columns) * height;
+      final endX = math.min(plane.width, x0 + width),
+          endY = math.min(plane.height, y0 + height);
       final (dx, dy) = _edgeDirections[filter.type == 2 ? filter.position : 0];
       for (var y = y0; y < endY; y++) {
         for (var x = x0; x < endX; x++) {
-          if (disabled[_cell(x << shift, y << shift)] != 0) continue;
+          if (disabled[_cell(x << sx, y << sy)] != 0) continue;
           final index = y * plane.width + x;
           final current = source[index];
           final int category;
@@ -144,8 +153,8 @@ final class HevcLoopFilter {
           } else {
             final ax = x - dx, ay = y - dy, bx = x + dx, by = y + dy;
             if (!plane.contains(ax, ay) || !plane.contains(bx, by)) continue;
-            if (!_across(address, layout.atSample(ax << shift, ay << shift)) ||
-                !_across(address, layout.atSample(bx << shift, by << shift)))
+            if (!_across(address, layout.atSample(ax << sx, ay << sy)) ||
+                !_across(address, layout.atSample(bx << sx, by << sy)))
               continue;
             final first = source[ay * plane.width + ax];
             final second = source[by * plane.width + bx];
@@ -268,12 +277,12 @@ void _chroma(
   bool vertical,
   int qp,
   int tcOffset,
+  bool is420,
   bool keepP,
   bool keepQ,
 ) {
-  final tc =
-      _tc[(hevcChromaQp420(qp) + 2 + tcOffset).clamp(0, 53)] <<
-      (plane.depth - 8);
+  final chromaQp = is420 ? hevcChromaQp420(qp.clamp(0, 57)) : qp.clamp(0, 51);
+  final tc = _tc[(chromaQp + 2 + tcOffset).clamp(0, 53)] << (plane.depth - 8);
   if (tc == 0) return;
   final across = vertical ? 1 : plane.width;
   final along = vertical ? plane.width : 1;
