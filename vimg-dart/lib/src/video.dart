@@ -102,6 +102,20 @@ final class Video {
 
   void close() => _input.closeSync();
 
+  late final _orientation = _iso?.videoOrientation();
+  late final _previewScaler = _orientedScaler(null);
+  late final _orientedCaptureScalers = Expando<YuvImageScaler>();
+
+  YuvImageScaler? _orientedScaler(YuvImageScaler? scaler) {
+    final orientation = _orientation;
+    if (orientation == null) return scaler;
+    if (scaler == null) return YuvImageScaler.oriented(orientation, null);
+    return _orientedCaptureScalers[scaler] ??= YuvImageScaler.oriented(
+      orientation,
+      scaler,
+    );
+  }
+
   late final _nalTimeline = _indexNalVideo();
   final _previewNalConfigurations = <FramePacket, _NalConfiguration>{};
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
@@ -881,9 +895,12 @@ final class Video {
 
   Iterable<_SelectedFrame> _decodeRun(
     _DecodeRun run,
-    YuvImageScaler? scaler,
+    YuvImageScaler? requestedScaler,
     bool includeOriginal,
   ) sync* {
+    final scaler = requestedScaler == null
+        ? _previewScaler
+        : _orientedScaler(requestedScaler);
     final name = run.codec;
     if (!_usesReferences(name)) {
       final packet = run.packets.single;
@@ -1125,11 +1142,11 @@ final class Video {
     if (_mixedIsoCodecs) {
       final section = _isoSectionByPacket[packet];
       if (section == null) throw const FormatException('Unknown video packet');
-      if (!_usesReferences(section.codec)) {
+      if (!_usesReferences(section.codec) && _orientation == null) {
         return _decodeIndependent(packet, section.codec, preview: preview);
       }
       final frame = decodeSelected([packet]).single.frame;
-      return preview && section.codec == 'qtrle' ? _rgb(frame) : frame;
+      return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
     if (_isDeltaBitmapCodec(codec)) {
       final frame = decodeSelected([packet]).single.frame;
@@ -1146,12 +1163,14 @@ final class Video {
     }
     if (codec == 'h264') {
       final config = _avcDecoderConfig(_previewNalConfigurations[packet]!);
-      return H264IdrDecoder(config).decode(_read(packet))?.rgb() ??
+      final picture = H264IdrDecoder(config).decode(_read(packet));
+      return picture?.rgb(scaler: _previewScaler) ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'hevc') {
       final config = _hevcDecoderConfig(_previewNalConfigurations[packet]!);
-      return HevcIntraDecoder(config).decode(_read(packet))?.rgb() ??
+      final picture = HevcIntraDecoder(config).decode(_read(packet));
+      return picture?.rgb(scaler: _previewScaler) ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'av1') {
@@ -1159,10 +1178,14 @@ final class Video {
         ..configure(_previewAv1Configurations[packet]!);
       for (final frame in decoder.readSample(_read(packet))) {
         if (frame.header.type.intra && frame.shown) {
-          return decodeAv1IntraImage(frame);
+          return decodeAv1IntraImage(frame, scaler: _previewScaler);
         }
       }
       throw const FormatException('No independently decodable AV1 picture');
+    }
+    if (_orientation != null) {
+      final frame = decodeSelected([packet]).single.frame;
+      return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
     return _decodeIndependent(packet, codec, preview: preview);
   }

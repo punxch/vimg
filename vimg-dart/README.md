@@ -145,6 +145,10 @@ field orders. BMP extraction, including `vcs --keep`, retains 8-bit or 16-bit
 source alpha as an 8-bit BMP alpha channel. ProRes RAW remains pending.
 
 MP4/MOV files can contain conventional sample tables, movie fragments, or both.
+Preview, extraction, and contact sheets apply the selected track and movie
+display matrices before user filters and tile sizing. Quarter turns and mirrors
+keep the decoded sample values. Other angles use a fixed-size canvas with
+bilinear interpolation and black fill.
 Fragmented files use a local initialization movie and local media data. Probe
 derives duration from the track runs when the initialization has zero duration.
 Capture uses the edited playback timeline and preserves raw container PTS in

@@ -91,10 +91,13 @@ final class Av1Picture {
       );
 }
 
-image.Image decodeAv1IntraImage(Av1CodedFrame frame) => applyAv1FilmGrain(
+image.Image decodeAv1IntraImage(
+  Av1CodedFrame frame, {
+  YuvImageScaler? scaler,
+}) => applyAv1FilmGrain(
   decodeAv1Intra(frame),
   frame.header.parameters.filmGrain,
-).rgb();
+).rgb(scaler: scaler);
 
 Av1Picture decodeAv1Intra(
   Av1CodedFrame frame, {

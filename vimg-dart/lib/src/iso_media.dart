@@ -13,6 +13,7 @@ part 'iso_fragments.dart';
 part 'iso_frames.dart';
 
 typedef MediaBox = ({String type, int start, int data, int end});
+typedef VideoOrientation = ({int degrees, bool horizontal, bool vertical});
 
 final class IsoMedia {
   IsoMedia(this.file);
@@ -98,6 +99,57 @@ final class IsoMedia {
         requireBytes(handler, 12);
         return tag(handler.data + 8) == 'vide';
       }).firstOrNull;
+
+  /// Display orientation of the selected video track, composed with the movie
+  /// matrix. Translation and scale do not change the capture orientation.
+  VideoOrientation? videoOrientation() {
+    final moov = movie();
+    final track = child(firstVideoTrack(moov: moov), 'tkhd');
+    final header = child(moov, 'mvhd');
+    final local = _displayMatrix(track, narrow: 40, wide: 52);
+    final global = _displayMatrix(header, narrow: 36, wide: 48);
+    if (local == null && global == null) return null;
+    double element(int row, int column) {
+      if (local == null) return global![row * 3 + column];
+      if (global == null) return local[row * 3 + column];
+      return local[row * 3] * global[column] +
+          local[row * 3 + 1] * global[3 + column] +
+          local[row * 3 + 2] * global[6 + column];
+    }
+
+    final a = element(0, 0), b = element(0, 1);
+    final c = element(1, 0), d = element(1, 1);
+    final sx = math.sqrt(a * a + c * c), sy = math.sqrt(b * b + d * d);
+    if (sx == 0 || sy == 0) return null;
+    final angle = (math.atan2(b / sy, a / sx) * 180 / math.pi).round() % 360;
+    // The sign of the other matrix axis distinguishes mirrors from rotations.
+    return switch (angle) {
+      0 => d < 0 ? (degrees: 0, horizontal: false, vertical: true) : null,
+      90 => (degrees: 90, horizontal: c > 0, vertical: false),
+      180 => (degrees: 0, horizontal: a < 0, vertical: d < 0),
+      270 => (degrees: 270, horizontal: c < 0, vertical: false),
+      _ => (degrees: angle, horizontal: false, vertical: false),
+    };
+  }
+
+  List<double>? _displayMatrix(
+    MediaBox? box, {
+    required int narrow,
+    required int wide,
+  }) {
+    if (box == null || box.data == box.end) return null;
+    final offset = switch (file.unsigned(box.data, 1)) {
+      0 => narrow,
+      1 => wide,
+      _ => box.end - box.data,
+    };
+    if (box.end - box.data < offset + 36) return null;
+    final data = ByteData.sublistView(file.read(box.data + offset, 36));
+    return [
+      for (var i = 0; i < 9; i++)
+        data.getInt32(i * 4) / (1 << (i % 3 == 2 ? 30 : 16)),
+    ];
+  }
 
   VideoMetadata metadata() {
     final moov = movie();

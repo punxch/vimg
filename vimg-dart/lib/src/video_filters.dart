@@ -52,6 +52,22 @@ final class VideoFilterChain {
   final List<_SpatialFilter> _filters;
   final List<_TimingFilter> _timing;
 
+  static VideoFilterChain _orient(
+    VideoOrientation orientation,
+    VideoFilterChain? next,
+  ) {
+    final (:degrees, :horizontal, :vertical) = orientation;
+    return VideoFilterChain._(next?.source ?? '', [
+      if (degrees == 90 || degrees == 270)
+        _Transpose._(degrees == 90 ? 1 : 2, 0)
+      else if (degrees != 0)
+        _Rotate(degrees),
+      if (horizontal) _Flip.horizontal,
+      if (vertical) _Flip.vertical,
+      ...?next?._filters,
+    ], next?._timing ?? const []);
+  }
+
   bool get hasSpatialFilters => _filters.isNotEmpty;
   bool get hasTimingFilters => _timing.isNotEmpty;
 
@@ -322,6 +338,56 @@ final class _Transpose implements _SpatialFilter {
         vertical: direction >= 2,
       ),
     );
+  }
+}
+
+/// Fixed-canvas bilinear rotation for display matrices at other angles.
+final class _Rotate implements _SpatialFilter {
+  _Rotate(int degrees)
+    : _cos = math.cos(degrees * math.pi / 180),
+      _sin = math.sin(degrees * math.pi / 180);
+
+  final double _cos, _sin;
+
+  @override
+  _VideoPlanes apply(_VideoPlanes frame) {
+    return frame.mapComponents((plane, _, _, component) {
+      final width = plane.width, height = plane.height;
+      final middleX = (width - 1) / 2, middleY = (height - 1) / 2;
+      final fill = switch (component) {
+        3 => (1 << plane.depth) - 1,
+        _ when frame.rgb => 0,
+        1 || 2 => 1 << (plane.depth - 1),
+        _ => frame.fullRange ? 0 : 16 << (plane.depth - 8),
+      };
+      final samples = _paintSamples(plane.depth, width * height);
+      for (var y = 0; y < height; y++) {
+        final dy = y - middleY;
+        var sx = middleX - middleX * _cos + dy * _sin;
+        var sy = middleY + middleX * _sin + dy * _cos;
+        for (var x = 0; x < width; x++, sx += _cos, sy -= _sin) {
+          final destination = y * width + x;
+          if (sx < -0.5 || sx > width - 0.5 || sy < -0.5 || sy > height - 0.5) {
+            samples[destination] = fill;
+            continue;
+          }
+          final u = sx.clamp(0.0, width - 1.0);
+          final v = sy.clamp(0.0, height - 1.0);
+          final left = u.floor(), top = v.floor();
+          final fx = u - left, fy = v - top;
+          final at =
+              plane.offset + top * plane.rowStep + left * plane.columnStep;
+          final dx = left + 1 < width ? plane.columnStep : 0;
+          final dy = top + 1 < height ? plane.rowStep : 0;
+          final a = plane.samples[at] * (1 - fx) + plane.samples[at + dx] * fx;
+          final b =
+              plane.samples[at + dy] * (1 - fx) +
+              plane.samples[at + dy + dx] * fx;
+          samples[destination] = (a * (1 - fy) + b * fy).round();
+        }
+      }
+      return _FilterPlane(samples, width, height, plane.depth, rowStep: width);
+    });
   }
 }
 

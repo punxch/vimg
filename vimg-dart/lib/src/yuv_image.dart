@@ -6,6 +6,7 @@ import 'package:image/image.dart' as image;
 import 'capture_timeline.dart';
 import 'filter_expression.dart';
 import 'grid.dart';
+import 'iso_media.dart' show VideoOrientation;
 
 part 'video_filters.dart';
 part 'video_filter_colors.dart';

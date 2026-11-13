@@ -20,6 +20,15 @@ final class YuvImageScaler {
     : _exact = true,
       filters = null;
 
+  factory YuvImageScaler.oriented(
+    VideoOrientation orientation,
+    YuvImageScaler? scaler,
+  ) => YuvImageScaler(
+    width: scaler?.width,
+    height: scaler?.height,
+    filters: VideoFilterChain._orient(orientation, scaler?.filters),
+  );
+
   final int? width, height;
   final VideoFilterChain? filters;
   final bool _exact, _nearest;
