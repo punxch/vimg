@@ -127,6 +127,7 @@ final class Avi {
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
         'FFVH' => 'ffvhuff',
+        'HYMT' => 'hymt',
         'CVID' => 'cinepak',
         'MSVC' || 'CRAM' || 'WHAM' => 'msvideo1',
         '\x01\x00\x00\x00' ||
@@ -179,7 +180,7 @@ final class Avi {
             : null,
         rle: rle,
         video1: video1,
-        huffFormat: codec == 'huffyuv' || codec == 'ffvhuff' ? format : null,
+        huffFormat: isHuffYuvCodec(codec) ? format : null,
         palette:
             rle != null ||
                 video1?.indexed == true ||

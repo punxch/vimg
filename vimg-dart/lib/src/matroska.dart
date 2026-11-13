@@ -242,6 +242,7 @@ final class Matroska {
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
         'FFVH' => 'ffvhuff',
+        'HYMT' => 'hymt',
         'MSVC' || 'CRAM' || 'WHAM' => 'msvideo1',
         _ => 'unknown',
       };

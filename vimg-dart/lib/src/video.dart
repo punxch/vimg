@@ -13,6 +13,7 @@ import 'binary_file.dart';
 import 'cinepak.dart';
 import 'frame_packet.dart';
 import 'grid.dart' show resizeToFit;
+import 'huffyuv.dart' show isHuffYuvCodec;
 import 'h264/access_unit.dart';
 import 'h264/idr_picture.dart';
 import 'hevc/access_unit.dart';
@@ -96,7 +97,7 @@ final class Video {
                   isQuickTimeRawCodec(section.codec),
             )
           : codec == 'prores' ||
-                _isHuffYuv(codec) ||
+                isHuffYuvCodec(codec) ||
                 (_iso != null && isQuickTimeRawCodec(codec)));
 
   void close() => _input.closeSync();
@@ -398,7 +399,7 @@ final class Video {
     if (name == 'mjpeg' ||
         name == 'png' ||
         name == 'prores' ||
-        _isHuffYuv(name) ||
+        isHuffYuvCodec(name) ||
         (_iso != null && isQuickTimeRawCodec(name)) ||
         (preview && name == 'vp8') ||
         (name == 'rawvideo' && _avi?.supportsBitmap == true)) {
@@ -908,7 +909,7 @@ final class Video {
             includeAlpha: scaler?.width == null && scaler?.height == null,
           );
         }
-      } else if (_isHuffYuv(name)) {
+      } else if (isHuffYuvCodec(name)) {
         final picture = _huffYuv.decode(_read(packet));
         render = ({scaler}) => picture.rgb(
           scaler: scaler,
@@ -1176,7 +1177,7 @@ final class Video {
       return _proRes(packet, preserveAlpha: !preview).rgb();
     }
     final bytes = _read(packet);
-    if (_isHuffYuv(name)) {
+    if (isHuffYuvCodec(name)) {
       return _huffYuv.decode(bytes).rgb(includeAlpha: !preview);
     }
     if (_quickTimeFormat(packet, name) case final raw?) {
@@ -1243,8 +1244,6 @@ typedef _DecodeRun = ({
   QuickTimeRawFormat? rawFormat,
   Map<int, List<int>>? aviPalettes,
 });
-
-bool _isHuffYuv(String codec) => codec == 'huffyuv' || codec == 'ffvhuff';
 
 bool _usesReferences(String codec) =>
     codec == 'h264' ||

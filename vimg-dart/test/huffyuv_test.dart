@@ -33,6 +33,17 @@ const _hashes = {
   'yuv-median-fields.avi': [0x99044125, 0xb46e6331, 0x22f427e1, 0x6e803cc1],
   'yuv-median.avi': [0x99044125, 0xb46e6331, 0x22f427e1, 0x6e803cc1],
   'yuv-plane.mkv': [0x99044125, 0xb46e6331, 0x22f427e1, 0x6e803cc1],
+  'mt-alpha-sliced.avi': [0xc531e081, 0x4e80e5b5, 0x60837a45, 0xc467ef85],
+  'mt-no-dir.avi': [0x3ccd3cde, 0xeddab431, 0xa9c36844, 0xb72ff0af],
+  'mt-rgb-partial.avi': [0xe66cd7aa, 0xd9be6e25, 0xd3780bb1, 0x4c4ceeb9],
+  'mt-rgb-sliced.avi': [0xec8c4cea, 0xb120ffe5, 0x91c71e71, 0x863ec179],
+  'mt-rgb-sliced.mkv': [0xec8c4cea, 0xb120ffe5, 0x91c71e71, 0x863ec179],
+  'mt-single-dir.avi': [0xb245ce75, 0xe8202319, 0x297e4fa1, 0x9974e299],
+  'mt-yuv-plane.avi': [0x21f4eab6, 0x30dd1644, 0x7f6efa6a, 0x3d4a880a],
+  // Assemble the independently decoded bands for median prediction.
+  'mt-yuv-median.avi': [0x21f4eab6, 0x30dd1644, 0x7f6efa6a, 0x3d4a880a],
+  // These reference planes come from the generator's sample values.
+  'mt-context.avi': [0x599f2c05, 0x98288325, 0xd7a165c5, 0x33a5a325],
 };
 
 Future<void> main(List<String> arguments) async {
@@ -40,6 +51,7 @@ Future<void> main(List<String> arguments) async {
     await _checkVideo(entry.key, entry.value);
   }
   _checkMalformed();
+  _checkMalformedSlices();
   await _checkCli(arguments.firstOrNull);
 }
 
@@ -50,10 +62,11 @@ Future<void> _checkVideo(String name, List<int> hashes) async {
   final workers = VideoCaptureDecoder(video, threads: 3, includeOriginal: true);
   try {
     final container = BinaryFile(input);
-    final codec =
-        name.startsWith('ff-') ||
-            name.startsWith('rand16') ||
-            name.startsWith('odd')
+    final codec = name.startsWith('mt-')
+        ? 'hymt'
+        : (name.startsWith('ff-') ||
+              name.startsWith('rand16') ||
+              name.startsWith('odd'))
         ? 'ffvhuff'
         : 'huffyuv';
     check(video.codec == codec, '$name codec');
@@ -72,7 +85,10 @@ Future<void> _checkVideo(String name, List<int> hashes) async {
       final picture = decoder.decode(
         container.read(packet.offset, packet.size),
       );
-      final packed = name.startsWith('rgb-') || name.startsWith('alpha');
+      final packed =
+          name.contains('rgb-') ||
+          name.contains('alpha') ||
+          name.startsWith('mt-single-dir');
       final raw = packed ? picture.rgb().getBytes() : _planes(picture);
       check(_hash(raw) == hashes[i], '$name native samples at frame $i');
       final rgb = video.decode(packet);
@@ -137,21 +153,21 @@ int _hash(Iterable<int> bytes) {
   return hash;
 }
 
-void _checkMalformed() {
-  void rejects(void Function() read, String reason) {
-    try {
-      read();
-      throw StateError('Accepted malformed HuffYUV: $reason');
-    } on FormatException catch (error) {
-      check(error.message == reason, reason);
-    }
+void _rejects(void Function() read, String reason) {
+  try {
+    read();
+    throw StateError('Accepted malformed HuffYUV: $reason');
+  } on FormatException catch (error) {
+    check(error.message == reason, reason);
   }
+}
 
-  rejects(
+void _checkMalformed() {
+  _rejects(
     () => HuffYuvDecoder(4, 4, 16, Uint8List.fromList([0, 16, 32, 0, 8, 0])),
     'Invalid HuffYUV Huffman table run',
   );
-  rejects(
+  _rejects(
     () => HuffYuvDecoder(
       4,
       4,
@@ -161,11 +177,49 @@ void _checkMalformed() {
     'Invalid HuffYUV Huffman lengths',
   );
   final decoder = HuffYuvDecoder(4, 4, 16, Uint8List(0));
-  rejects(() => decoder.decode(Uint8List(3)), 'Invalid HuffYUV frame size');
-  rejects(
+  _rejects(() => decoder.decode(Uint8List(3)), 'Invalid HuffYUV frame size');
+  _rejects(
     () => decoder.decode(Uint8List(4)),
     'Truncated HuffYUV residual data',
   );
+}
+
+void _checkMalformedSlices() {
+  const path = 'test/fixtures/huffyuv-mt-rgb-sliced.avi';
+  final input = File(path).openSync();
+  try {
+    final file = BinaryFile(input);
+    final avi = Avi(file);
+    final decoder = avi.huffYuvDecoder()!;
+    final packet = avi.packets().first;
+    final original = file.read(packet.offset, packet.size);
+    final size = original.length;
+    final originalData = ByteData.sublistView(original);
+    final directory = originalData.getUint32(size - 4, Endian.little);
+    final firstSlice = originalData.getUint32(directory, Endian.little);
+    final expected = _hashes['mt-rgb-sliced.avi']!.first;
+
+    for (final (offset, value, message) in [
+      (size - 12, 0, 'Invalid HuffYUV MT slice table'),
+      (size - 8, 0, 'Invalid HuffYUV MT slice table'),
+      (size - 4, size - 12, 'Invalid HuffYUV MT slice table'),
+      (directory, firstSlice + 1, 'Invalid HuffYUV MT slice range'),
+      (directory + 4, 0, 'Invalid HuffYUV MT slice range'),
+      (directory + 4, directory + 4, 'Invalid HuffYUV MT slice range'),
+      (directory + 8, firstSlice, 'Overlapping HuffYUV MT slices'),
+      (directory + 4, 4, 'Truncated HuffYUV residual data'),
+    ]) {
+      final copy = Uint8List.fromList(original);
+      ByteData.sublistView(copy).setUint32(offset, value, Endian.little);
+      _rejects(() => decoder.decode(copy), message);
+      check(
+        _hash(decoder.decode(original).rgb().getBytes()) == expected,
+        'A rejected slice leaves later decodes intact',
+      );
+    }
+  } finally {
+    input.closeSync();
+  }
 }
 
 Future<void> _checkCli(String? executable) async {
@@ -184,7 +238,7 @@ Future<void> _checkCli(String? executable) async {
       'preview',
       '--output',
       preview,
-      'test/fixtures/huffyuv-alpha.avi',
+      'test/fixtures/huffyuv-mt-alpha-sliced.avi',
     ]);
     check(
       image.decodeJpg(File(preview).readAsBytesSync())?.width == 20,
@@ -197,13 +251,14 @@ Future<void> _checkCli(String? executable) async {
       '-n1',
       '--output-dir',
       frames.path,
-      'test/fixtures/huffyuv-alpha.avi',
+      'test/fixtures/huffyuv-mt-alpha-sliced.avi',
     ]);
     final bmp = image.decodeBmp(
       frames.listSync().whereType<File>().first.readAsBytesSync(),
     )!;
     check(
-      bmp.hasAlpha && _hash(bmp.getBytes()) == _hashes['alpha.avi']!.first,
+      bmp.hasAlpha &&
+          _hash(bmp.getBytes()) == _hashes['mt-alpha-sliced.avi']!.first,
       'HuffYUV BMP alpha',
     );
 
@@ -218,11 +273,11 @@ Future<void> _checkCli(String? executable) async {
       '-T3',
       '-o',
       sheet,
-      'test/fixtures/huffyuv-ff-yuv10.mkv',
+      'test/fixtures/huffyuv-mt-rgb-sliced.mkv',
     ]);
     check(
       ascii.decode(File(sheet).readAsBytesSync().sublist(4, 12)) == 'ftypavis',
-      'FFVHUFF animated AVIF',
+      'HuffYUV MT animated AVIF',
     );
   } finally {
     directory.deleteSync(recursive: true);

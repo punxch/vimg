@@ -8,6 +8,9 @@ import 'yuv_image.dart';
 
 enum _Prediction { left, plane, median }
 
+bool isHuffYuvCodec(String codec) =>
+    codec == 'huffyuv' || codec == 'ffvhuff' || codec == 'hymt';
+
 HuffYuvDecoder readHuffYuvFormat(BinaryFile file, int start, int end) {
   if (end - start < 40 || end - start > 1024 * 1024) {
     throw const FormatException('Invalid HuffYUV bitmap header');
@@ -22,11 +25,19 @@ HuffYuvDecoder readHuffYuvFormat(BinaryFile file, int start, int end) {
     header.getInt32(8, Endian.little).abs(),
     header.getUint16(14, Endian.little),
     file.read(start + 40, end - start - 40),
+    multithreaded:
+        String.fromCharCodes(file.read(start + 16, 4)).toUpperCase() == 'HYMT',
   );
 }
 
 final class HuffYuvDecoder {
-  HuffYuvDecoder(this.width, this.height, int bitmapBits, Uint8List extra) {
+  HuffYuvDecoder(
+    this.width,
+    this.height,
+    int bitmapBits,
+    Uint8List extra, {
+    this.multithreaded = false,
+  }) {
     if (width <= 0 || height <= 0 || width * height > 36 * 1024 * 1024) {
       throw const FormatException('Invalid HuffYUV picture dimensions');
     }
@@ -96,6 +107,7 @@ final class HuffYuvDecoder {
   }
 
   final int width, height;
+  final bool multithreaded;
   var _bpp = 0, _depth = 8, _sx = 0, _sy = 0, _fieldRows = 1;
   var _planar = false, _context = false, _yuv = false;
   var _chroma = true, _alpha = false;
@@ -115,17 +127,36 @@ final class HuffYuvDecoder {
       throw const FormatException('Invalid HuffYUV frame size');
     }
     final data = ByteData.sublistView(packet);
+    final slices = _slices(data);
     final reordered = Uint8List(packet.length);
     final words = ByteData.sublistView(reordered);
     for (var i = 0; i < packet.length; i += 4) {
       words.setUint32(i, data.getUint32(i, Endian.little));
     }
-    final header = _TableBytes(reordered, 0);
+    final firstEnd = slices.reduce((a, b) => a.start < b.start ? a : b).end;
+    final header = _TableBytes(
+      Uint8List.sublistView(reordered, 0, firstEnd),
+      0,
+    );
     final tables = _context ? _readTables(header) : _tables;
-    final bits = _HuffBits(reordered, header.offset);
-    final planes = _planar
-        ? _decodePlanar(bits, tables)
-        : (_yuv ? _decodeYuv(bits, tables) : _decodeRgb(bits, tables));
+    final planes = _allocatePlanes();
+    for (final slice in slices) {
+      final start = slice.start + header.offset;
+      if (start >= slice.end) {
+        throw const FormatException('Truncated HuffYUV slice data');
+      }
+      final bits = _HuffBits(
+        Uint8List.sublistView(reordered, start, slice.end),
+        0,
+      );
+      if (_planar) {
+        _decodePlanar(bits, tables, planes, slice.top, slice.rows);
+      } else if (_yuv) {
+        _decodeYuv(bits, tables, planes, slice.top, slice.rows);
+      } else {
+        _decodeRgb(bits, tables, planes, slice.top, slice.rows);
+      }
+    }
     return HuffYuvPicture._(
       width,
       height,
@@ -139,19 +170,85 @@ final class HuffYuvDecoder {
     );
   }
 
-  List<List<int>> _decodeRgb(_HuffBits bits, List<_HuffTable> tables) {
-    final count = _alpha ? 4 : 3;
-    final channels = [
-      for (var i = 0; i < count; i++) Uint8List(width * height),
-    ];
+  List<_HuffSlice> _slices(ByteData packet) {
+    final size = packet.lengthInBytes;
+    final footer = size - 16;
+    if (!multithreaded ||
+        size <= 32 ||
+        packet.getUint32(footer, Endian.little) != 0) {
+      return [(start: 0, end: size, top: 0, rows: height)];
+    }
+    final count = packet.getUint32(footer + 4, Endian.little);
+    final rows = packet.getUint32(footer + 8, Endian.little);
+    final table = packet.getUint32(footer + 12, Endian.little);
+    if (count == 0 ||
+        rows == 0 ||
+        count > height ~/ rows ||
+        table > footer ||
+        count > (footer - table) ~/ 8 ||
+        _sy != 0) {
+      throw const FormatException('Invalid HuffYUV MT slice table');
+    }
+
+    final slices = <_HuffSlice>[];
+    for (var i = 0; i < count; i++) {
+      final entry = table + i * 8;
+      final start = packet.getUint32(entry, Endian.little);
+      final length = packet.getUint32(entry + 4, Endian.little);
+      if (start & 3 != 0 ||
+          length < 4 ||
+          length & 3 != 0 ||
+          start > table ||
+          length > table - start) {
+        throw const FormatException('Invalid HuffYUV MT slice range');
+      }
+      // The first directory entry describes the bottom band of the frame.
+      slices.add((
+        start: start,
+        end: start + length,
+        top: height - (i + 1) * rows,
+        rows: rows,
+      ));
+    }
+    final byOffset = [...slices]..sort((a, b) => a.start.compareTo(b.start));
+    for (var i = 1; i < byOffset.length; i++) {
+      if (byOffset[i - 1].end > byOffset[i].start) {
+        throw const FormatException('Overlapping HuffYUV MT slices');
+      }
+    }
+    return slices;
+  }
+
+  bool _isChromaPlane(int c) => _chroma && (c == 1 || c == 2);
+
+  List<List<int>> _allocatePlanes() => [
+    for (var c = 0; c < 1 + (_chroma ? 2 : 0) + (_alpha ? 1 : 0); c++)
+      _planeSamples(
+        _isChromaPlane(c)
+            ? _chromaSize(width, _sx) * _chromaSize(height, _sy)
+            : width * height,
+      ),
+  ];
+
+  List<int> _planeSamples(int size) =>
+      _depth <= 8 ? Uint8List(size) : Uint16List(size);
+
+  void _decodeRgb(
+    _HuffBits bits,
+    List<_HuffTable> tables,
+    List<List<int>> channels,
+    int top,
+    int rows,
+  ) {
+    final count = channels.length;
     final left = Uint8List(count);
     if (_alpha) left[3] = bits.read(8);
     for (final c in [2, 0, 1]) {
       left[c] = bits.read(8);
     }
     if (!_alpha) bits.read(8);
-    for (var row = 0; row < height; row++) {
-      final start = (height - 1 - row) * width;
+    for (var row = 0; row < rows; row++) {
+      final start = (top + rows - 1 - row) * width;
       for (var x = 0; x < width; x++) {
         if (row != 0 || x != 0) {
           if (_decorrelate) {
@@ -175,27 +272,32 @@ final class HuffYuvDecoder {
         }
       }
     }
-    return channels;
   }
 
-  List<List<int>> _decodeYuv(_HuffBits bits, List<_HuffTable> tables) {
+  void _decodeYuv(
+    _HuffBits bits,
+    List<_HuffTable> tables,
+    List<List<int>> planes,
+    int top,
+    int rows,
+  ) {
     final widths = [width, width >> 1, width >> 1];
-    final chromaRows = height >> _sy;
-    final planes = [
-      Uint8List(width * height),
-      Uint8List((width >> 1) * chromaRows),
-      Uint8List((width >> 1) * chromaRows),
+    final chromaRows = rows >> _sy;
+    final base = [
+      top * width,
+      (top >> _sy) * widths[1],
+      (top >> _sy) * widths[2],
     ];
     final left = Uint8List(3);
     final aboveLeft = Uint8List(3);
-    planes[2][0] = left[2] = bits.read(8);
-    planes[0][1] = left[0] = bits.read(8);
-    planes[1][0] = left[1] = bits.read(8);
-    planes[0][0] = bits.read(8);
+    planes[2][base[2]] = left[2] = bits.read(8);
+    planes[0][base[0] + 1] = left[0] = bits.read(8);
+    planes[1][base[1]] = left[1] = bits.read(8);
+    planes[0][base[0]] = bits.read(8);
 
     void put(int c, int row, int x, {bool gradient = true}) {
       final plane = planes[c], stride = widths[c];
-      final at = row * stride + x;
+      final at = base[c] + row * stride + x;
       final residual = tables[c].read(bits);
       if (row >= _fieldRows) {
         final above = plane[at - _fieldRows * stride];
@@ -203,7 +305,7 @@ final class HuffYuvDecoder {
           final prefix = c == 0 ? 4 : 2;
           if (row > _fieldRows || x >= prefix) {
             if (row == _fieldRows && x == prefix) {
-              aboveLeft[c] = plane[x - 1];
+              aboveLeft[c] = plane[base[c] + x - 1];
             }
             left[c] = _median(left[c], above, aboveLeft[c], 255) + residual;
             aboveLeft[c] = above;
@@ -220,7 +322,7 @@ final class HuffYuvDecoder {
     }
 
     var chromaRow = 0;
-    for (var row = 0; row < height; row++) {
+    for (var row = 0; row < rows; row++) {
       final warmup = _prediction == _Prediction.median && row <= _fieldRows;
       final hasChroma =
           chromaRow < chromaRows &&
@@ -235,54 +337,57 @@ final class HuffYuvDecoder {
       if (_prediction == _Prediction.median &&
           row == _fieldRows &&
           width == 4) {
-        aboveLeft[0] = planes[0][3];
+        aboveLeft[0] = planes[0][base[0] + 3];
         if (hasChroma && chromaRow == _fieldRows) {
-          aboveLeft[1] = planes[1][1];
-          aboveLeft[2] = planes[2][1];
+          aboveLeft[1] = planes[1][base[1] + 1];
+          aboveLeft[2] = planes[2][base[2] + 1];
         }
       }
       if (hasChroma) chromaRow++;
     }
-    return planes;
   }
 
-  List<List<int>> _decodePlanar(_HuffBits bits, List<_HuffTable> tables) {
+  void _decodePlanar(
+    _HuffBits bits,
+    List<_HuffTable> tables,
+    List<List<int>> planes,
+    int top,
+    int rows,
+  ) {
     final mask = (1 << _depth) - 1;
-    return [
-      for (var c = 0; c < _tableCount; c++)
-        _decodePlane(
-          bits,
-          tables[c],
-          _chroma && (c == 1 || c == 2) ? width >> _sx : width,
-          _chroma && (c == 1 || c == 2) ? height >> _sy : height,
-          _chroma && (c == 1 || c == 2) ? _chromaSize(width, _sx) : width,
-          _chroma && (c == 1 || c == 2) ? _chromaSize(height, _sy) : height,
-          mask,
-        ),
-    ];
+    for (var c = 0; c < planes.length; c++) {
+      final sx = _isChromaPlane(c) ? _sx : 0;
+      final sy = _isChromaPlane(c) ? _sy : 0;
+      _decodePlane(
+        bits,
+        tables[c],
+        planes[c],
+        width >> sx,
+        rows >> sy,
+        _chromaSize(width, sx),
+        top >> sy,
+        mask,
+      );
+    }
   }
 
-  List<int> _decodePlane(
+  void _decodePlane(
     _HuffBits bits,
     _HuffTable table,
+    List<int> plane,
     int w,
     int h,
     int stride,
-    int rows,
+    int top,
     int mask,
   ) {
-    // The planar bitstream rounds subsampled dimensions down. The displayed
-    // planes still include any uncoded right or bottom edge samples.
-    final plane = _depth <= 8
-        ? Uint8List(stride * rows)
-        : Uint16List(stride * rows);
     final lowBits = math.max(0, _depth - 14);
     var left = 0, aboveLeft = 0;
     for (var row = 0; row < h; row++) {
-      final start = row * stride;
+      final start = (top + row) * stride;
       final median = _prediction == _Prediction.median && row >= _fieldRows;
       final gradient = _prediction == _Prediction.plane && row >= _fieldRows;
-      if (median && row == _fieldRows) aboveLeft = plane[0] & 255;
+      if (median && row == _fieldRows) aboveLeft = plane[top * stride] & 255;
       for (var x = 0; x < w; x++) {
         final at = start + x;
         final residual = (table.read(bits) << lowBits) | bits.read(lowBits);
@@ -299,7 +404,6 @@ final class HuffYuvDecoder {
         }
       }
     }
-    return plane;
   }
 
   static int _median(int left, int above, int aboveLeft, int mask) =>
@@ -308,6 +412,8 @@ final class HuffYuvDecoder {
         math.max(left, above),
       );
 }
+
+typedef _HuffSlice = ({int start, int end, int top, int rows});
 
 int _chromaSize(int value, int shift) => (value + (1 << shift) - 1) >> shift;
 
