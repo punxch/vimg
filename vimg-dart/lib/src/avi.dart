@@ -9,6 +9,7 @@ import 'huffyuv.dart';
 import 'metadata.dart';
 import 'msrle.dart';
 import 'msvideo1.dart';
+import 'raw_video.dart';
 
 typedef _Chunk = ({String id, int data, int end});
 typedef _ColorMasks = ({int r, int g, int b});
@@ -26,6 +27,7 @@ typedef _Track = ({
   int scale,
   int rate,
   _Bitmap? bitmap,
+  RawVideoFormat? raw,
   Uint8List? cinepakDescription,
   MsRleFormat? rle,
   MsVideo1Format? video1,
@@ -117,7 +119,8 @@ final class Avi {
       final bits = _u16(format.data + 14);
       if (width <= 0 || height <= 0)
         throw const FormatException('Invalid AVI video dimensions');
-      final compression = _tag(format.data + 16).toUpperCase();
+      final tag = _tag(format.data + 16);
+      final compression = tag.toUpperCase();
       final codec = switch (compression) {
         'MJPG' || 'JPEG' => 'mjpeg',
         'PNG ' || 'MPNG' => 'png',
@@ -137,12 +140,14 @@ final class Avi {
         'RLE4' ||
         'RLE8' => 'msrle',
         '\x00\x00\x00\x00' || '\x03\x00\x00\x00' => 'rawvideo',
+        _ when RawVideoFormat.recognizes(tag) => 'rawvideo',
         _ => 'unknown',
       };
       final bitfields = compression == '\x03\x00\x00\x00';
-      final bitmap = codec != 'rawvideo'
-          ? null
-          : _bitmap(format, width, signedHeight, bits, bitfields: bitfields);
+      final dib = bitfields || compression == '\x00\x00\x00\x00';
+      final bitmap = dib
+          ? _bitmap(format, width, signedHeight, bits, bitfields: bitfields)
+          : null;
       final MsRleFormat? rle;
       if (codec == 'msrle') {
         final depth = switch (compression) {
@@ -175,6 +180,9 @@ final class Avi {
           nominalFrameRate: rate / scale,
         ),
         bitmap: bitmap,
+        raw: codec == 'rawvideo' && !dib
+            ? RawVideoFormat(tag, width, height)
+            : null,
         cinepakDescription: codec == 'cinepak'
             ? _cinepakDescription(width, height, bits)
             : null,
@@ -199,6 +207,7 @@ final class Avi {
   );
 
   bool get supportsBitmap => _header.tracks.firstOrNull?.bitmap != null;
+  RawVideoFormat? get rawFormat => _header.tracks.firstOrNull?.raw;
   Uint8List? get cinepakDescription =>
       _header.tracks.firstOrNull?.cinepakDescription;
   MsRleFormat? get rleFormat => _header.tracks.firstOrNull?.rle;

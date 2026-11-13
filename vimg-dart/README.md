@@ -54,6 +54,10 @@ formats depend on the Dart image library's encoders and decoders.
 Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
 MP4/MOV or AVI. AVI also supports uncompressed indexed 1-, 4- and 8-bit
 video, RGB555, 24- and 32-bit BGR and 16- and 32-bit RGB bitfields.
+Matroska `V_UNCOMPRESSED`, Matroska VFW FourCC and AVI FourCC tracks
+support planar YUV, grayscale and GBR, NV12/NV21, packed YUV 4:2:2
+including YUY2, UYVY, Y210 and Y216, and packed RGB/BGR and RGBA.
+Filters work at source sample depth. BMP capture keeps alpha where present.
 QuickTime supports uncompressed RGB555, RGB24, ARGB32 and packed YCbCr
 (`2vuy`, `yuv2`, `v210`, `v216`, `v308`, `v408` and `v410`).
 Packed YCbCr keeps its component depth through filtering and scaling.

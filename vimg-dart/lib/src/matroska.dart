@@ -5,6 +5,7 @@ import 'package:image/image.dart' as image;
 
 import 'binary_file.dart';
 import 'metadata.dart';
+import 'raw_video.dart';
 
 const _ebml = 0x1a45dfa3;
 const _segment = 0x18538067;
@@ -316,6 +317,7 @@ final class Matroska {
         'FFVH' => 'ffvhuff',
         'HYMT' => 'hymt',
         'MSVC' || 'CRAM' || 'WHAM' => 'msvideo1',
+        _ when RawVideoFormat.recognizes(tag) => 'rawvideo',
         _ => 'unknown',
       };
     }

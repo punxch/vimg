@@ -5,6 +5,38 @@ import 'huffyuv.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
 import 'msvideo1.dart';
+import 'raw_video.dart';
+
+RawVideoFormat? matroskaRawVideoConfiguration(Matroska media) {
+  final track = _firstVideoTrack(media, 'rawvideo');
+  if (track == null) return null;
+  final video = media.fields(track[0xe0]!);
+  final width = media.number(video[0xb0]) ?? 0;
+  final height = media.number(video[0xba]) ?? 0;
+  final vfw = media.text(track[0x86]) == 'V_MS/VFW/FOURCC';
+  final box = vfw ? track[0x63a2] : video[0x2eb524];
+  final offset = vfw ? 16 : 0;
+  if (box == null ||
+      box.end - box.data < offset + 4 ||
+      (!vfw && box.end - box.data != 4)) {
+    throw const FormatException('Missing or invalid Matroska raw video FourCC');
+  }
+  final colorBox = video[0x55b0];
+  final color = colorBox == null ? null : media.fields(colorBox);
+  final matrix = media.number(color?[0x55b1]);
+  final range = media.number(color?[0x55b9]);
+  return RawVideoFormat(
+    String.fromCharCodes(media.file.read(box.data + offset, 4)),
+    width,
+    height,
+    matrix: matrix,
+    fullRange: switch (range) {
+      1 => false,
+      2 => true,
+      _ => null,
+    },
+  );
+}
 
 ({MsVideo1Format format, List<int>? palette}) matroskaVideo1Configuration(
   Matroska media,

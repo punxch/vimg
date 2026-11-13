@@ -98,11 +98,15 @@ final class Video {
             )
           : codec == 'prores' ||
                 isHuffYuvCodec(codec) ||
+                (codec == 'rawvideo' && _rawVideoFormat != null) ||
                 (_iso != null && isQuickTimeRawCodec(codec)));
 
   void close() => _input.closeSync();
 
   late final _matroskaPresentation = _matroska?.videoPresentation();
+  late final _rawVideoFormat =
+      _avi?.rawFormat ??
+      (_matroska == null ? null : matroskaRawVideoConfiguration(_matroska!));
   late final _orientation =
       _iso?.videoOrientation() ?? _matroskaPresentation?.orientation;
   late final _crop = _matroskaPresentation?.crop;
@@ -445,7 +449,8 @@ final class Video {
         isHuffYuvCodec(name) ||
         (_iso != null && isQuickTimeRawCodec(name)) ||
         (preview && name == 'vp8') ||
-        (name == 'rawvideo' && _avi?.supportsBitmap == true)) {
+        (name == 'rawvideo' &&
+            (_avi?.supportsBitmap == true || _rawVideoFormat != null))) {
       return;
     }
     throw UnsupportedError('Pure Dart decoding for $name is unavailable');
@@ -988,6 +993,17 @@ final class Video {
             includeAlpha: scaler?.width == null && scaler?.height == null,
           );
         }
+      } else if (name == 'rawvideo' && _rawVideoFormat != null) {
+        final picture = _rawVideoFormat.decode(
+          _read(packet),
+          includeAlpha:
+              includeOriginal ||
+              (scaler?.width == null && scaler?.height == null),
+        );
+        render = ({scaler}) => picture.rgb(
+          scaler: scaler,
+          includeAlpha: scaler?.width == null && scaler?.height == null,
+        );
       } else if (isHuffYuvCodec(name)) {
         final picture = _huffYuv.decode(_read(packet));
         render = ({scaler}) => picture.rgb(
@@ -1268,6 +1284,9 @@ final class Video {
     }
     if (_quickTimeFormat(packet, name) case final raw?) {
       return raw.decode(bytes, includeAlpha: !preview);
+    }
+    if (name == 'rawvideo' && _rawVideoFormat != null) {
+      return _rawVideoFormat.decode(bytes, includeAlpha: !preview).rgb();
     }
     final frame = switch (name) {
       'mjpeg' => image.decodeJpg(bytes),
