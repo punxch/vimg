@@ -7,6 +7,10 @@ import 'slice_header.dart';
 /// HEVCDecoderConfigurationRecord (hvcC) and its length-prefixed samples.
 final class HevcConfiguration {
   HevcConfiguration.inBand(Uint8List parameterSets) : lengthBytes = 4 {
+    applyParameterSets(parameterSets);
+  }
+
+  void applyParameterSets(Uint8List parameterSets) {
     final units = nals(parameterSets).toList();
     for (final type in [32, 33, 34]) {
       for (final nal in units) {
@@ -69,19 +73,24 @@ final class HevcConfiguration {
   final sequences = <int, HevcSps>{};
   final pictures = <int, HevcPps>{};
 
-  void store(HevcNal nal) {
-    if (nal.header.layer != 0) return;
-    switch (nal.header.type) {
+  (int, int)? store(HevcNal nal) {
+    if (nal.header.layer != 0) return null;
+    final type = nal.header.type;
+    switch (type) {
       case 32:
         final vps = HevcVps.parse(nal);
         videos[vps.id] = vps;
+        return (type, vps.id);
       case 33:
         final sps = HevcSps.parse(nal);
         sequences[sps.id] = sps;
+        return (type, sps.id);
       case 34:
         final pps = HevcPps.parse(nal, sequences);
         pictures[pps.id] = pps;
+        return (type, pps.id);
     }
+    return null;
   }
 
   List<HevcSliceHeader> slices(Uint8List sample) {
@@ -136,11 +145,16 @@ final class HevcConfiguration {
   HevcNalHeader? pictureHeader(
     int start,
     int length,
-    int Function(int, int) read,
-  ) {
+    int Function(int, int) read, {
+    void Function(int start, int length)? onParameterSet,
+  }) {
     for (final extent in _extents(start, length, read)) {
       final header = readHevcNalHeader(read(extent.start, 2));
-      if (header.layer != 0 || !header.codedSlice) continue;
+      if (header.layer != 0) continue;
+      if (header.type >= 32 && header.type <= 34) {
+        onParameterSet?.call(extent.start, extent.end - extent.start);
+      }
+      if (!header.codedSlice) continue;
       if (extent.end - extent.start < 3)
         throw const FormatException('Missing HEVC slice payload');
       if (read(extent.start + 2, 1) & 0x80 == 0)

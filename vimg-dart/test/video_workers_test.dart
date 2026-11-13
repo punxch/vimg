@@ -18,6 +18,16 @@ Future<void> main() async {
   ]) {
     await _checkReferences('test/fixtures/$file');
   }
+  await _checkParameterChanges(
+    'avc3-parameter-change.mp4',
+    ['cabac-idr.mp4', 'cavlc-baseline.mp4'],
+    [0, 1, 0],
+  );
+  await _checkParameterChanges(
+    'hevc-parameter-change.mkv',
+    ['hevc-fields-tff-b.mp4', 'hevc-main10.mp4'],
+    [0, 8, 0],
+  );
   final temp = Directory.systemTemp.createTempSync('vimg-workers-');
   try {
     final input = matroskaFixture(temp);
@@ -25,6 +35,69 @@ Future<void> main() async {
     await _checkCancellation(input.path);
   } finally {
     temp.deleteSync(recursive: true);
+  }
+}
+
+Future<void> _checkParameterChanges(
+  String fixture,
+  List<String> sources,
+  List<int> firstSequence,
+) async {
+  const root = 'test/fixtures';
+  final video = Video('$root/$fixture');
+  final first = Video('$root/${sources[0]}');
+  final second = Video('$root/${sources[1]}');
+  final workers = VideoCaptureDecoder(video, threads: 3);
+  try {
+    // Reuse the same parameter IDs at different sizes. Each update is in a
+    // parameter-only sample, before the GOP that needs it. The AVC samples
+    // use two-byte NAL lengths, while the source clips use four bytes.
+    final firstPackets = first.packets().toList();
+    final secondPackets = second.packets().take(3).toList();
+    final expected = [
+      for (final index in firstSequence.take(2))
+        first.decode(firstPackets[index]),
+      for (final packet in secondPackets) second.decode(packet),
+      first.decode(firstPackets[firstSequence.last]),
+    ];
+    final packets = video.packets().toList();
+    check(packets.length == expected.length, 'Exclude parameter-only samples');
+    for (final (i, time) in [0, 0.25, 0.75, 1, 1.25, 1.75].indexed) {
+      check(packets[i].seconds == time, 'Preserve video sample timestamps');
+    }
+
+    final keys = video.packets(preview: true).toList();
+    const keyIndexes = [0, 1, 2, 5];
+    check(keys.length == keyIndexes.length, 'Parameter update preview count');
+    for (final (i, key) in keys.indexed.toList().reversed) {
+      final index = keyIndexes[i];
+      check(key == packets[index], 'Parameter update preview identity');
+      final decoded = video.decode(key, preview: true);
+      _sameBytes(decoded.getBytes(), expected[index].getBytes(), fixture);
+    }
+    _sameBytes(
+      video.decode(packets[4]).getBytes(),
+      expected[4].getBytes(),
+      'Independent seek into updated GOP',
+    );
+    final positions = {for (final (i, packet) in packets.indexed) packet: i};
+    final selected = [packets[4], packets.last, packets.first];
+    final result = await workers.decode(selected).toList().timeout(_timeout);
+    check(result.length == selected.length, 'Parallel parameter update count');
+    for (final item in result) {
+      final reference = expected[positions[item.packet]!];
+      check(
+        (item.frame.width, item.frame.height) ==
+            (reference.width, reference.height),
+        'Use updated sequence dimensions in workers',
+      );
+      _sameBytes(item.frame.getBytes(), reference.getBytes(), fixture);
+    }
+  } finally {
+    await workers.close();
+    second.close();
+    first.close();
+    video.close();
   }
 }
 

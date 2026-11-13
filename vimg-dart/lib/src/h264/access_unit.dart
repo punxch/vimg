@@ -7,6 +7,10 @@ import 'parameters.dart';
 /// the sets stored in the container.
 final class AvcConfiguration {
   AvcConfiguration.inBand(Uint8List parameterSets) : lengthBytes = 4 {
+    applyParameterSets(parameterSets);
+  }
+
+  void applyParameterSets(Uint8List parameterSets) {
     final units = nals(parameterSets).toList();
     for (final type in [7, 8]) {
       for (final nal in units) {
@@ -54,16 +58,20 @@ final class AvcConfiguration {
   final sequences = <int, H264Sps>{};
   final pictures = <int, H264Pps>{};
 
-  void store(Uint8List nal) {
+  (int, int)? store(Uint8List nal) {
     if (nal.isEmpty) throw const FormatException('Empty H.264 NAL unit');
-    switch (nal[0] & 31) {
+    final type = nal[0] & 31;
+    switch (type) {
       case 7:
         final sps = H264Sps.parse(nal);
         sequences[sps.id] = sps;
+        return (type, sps.id);
       case 8:
         final pps = H264Pps.parse(nal, sequences);
         pictures[pps.id] = pps;
+        return (type, pps.id);
     }
+    return null;
   }
 
   Iterable<Uint8List> nals(Uint8List sample) sync* {
@@ -80,11 +88,22 @@ final class AvcConfiguration {
     }
   }
 
-  bool containsIdr(
+  int? pictureType(
     int start,
     int length,
-    int Function(int offset, int width) read,
-  ) => _extents(start, length, read).any((nal) => nal.type == 5);
+    int Function(int offset, int width) read, {
+    void Function(int start, int length)? onParameterSet,
+  }) {
+    for (final nal in _extents(start, length, read)) {
+      switch (nal.type) {
+        case 7 || 8:
+          onParameterSet?.call(nal.start, nal.end - nal.start);
+        case 1 || 2 || 5:
+          return nal.type;
+      }
+    }
+    return null;
+  }
 
   Iterable<({int start, int end, int type})> _extents(
     int offset,

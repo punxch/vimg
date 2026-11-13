@@ -56,6 +56,8 @@ HEVC random-access picture. `extract` and `vcs` decode from the preceding
 random-access point and handle leading pictures that depend on an earlier GOP.
 HEVC field sequences are decoded in either field order. Each field keeps its
 own height and presentation timestamp, including in MPEG transport streams.
+H.264 and HEVC tracks can update their parameter sets in band. Preview and
+parallel capture restore the sets available at each random-access point.
 The decoder also handles range extension streams with residual DPCM,
 transform-skip rotation and CABAC contexts, persistent Rice adaptation,
 cross-component prediction, coding-unit chroma QP adjustments and

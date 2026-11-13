@@ -9,6 +9,7 @@ import 'hevc/nal.dart';
 import 'hevc/parameters.dart';
 import 'metadata.dart';
 import 'mpeg12/syntax.dart';
+import 'nal_parameter_sets.dart';
 import 'rbsp.dart';
 
 part 'program_stream.dart';
@@ -414,8 +415,7 @@ final class _AccessUnits {
   final frames = <_AccessUnit>[];
   final configurations = <int, Uint8List>{};
   final mpegPictures = <int, MpegPictureInfo>{};
-  final _parameters = <(int, int), Uint8List>{};
-  Uint8List? _configuration;
+  final _parameters = NalParameterSets();
   String? bitstreamCodec;
   (int, int)? dimensions;
   (int, int)? timing;
@@ -513,9 +513,7 @@ final class _AccessUnits {
     if (slice && _frameType == null) {
       _beginPicture(type);
       if ((_hevc && type >= 16 && type <= 21) || (!_hevc && type == 5)) {
-        configurations[_framePosition] = _configuration ??= _prefixNals(
-          _parameters.values,
-        );
+        configurations[_framePosition] = _parameters.snapshot() ?? Uint8List(0);
       }
     }
   }
@@ -660,10 +658,7 @@ final class _AccessUnits {
         id = Rbsp.fromNal(nal).ue(255);
       }
     }
-    final previous = _parameters[(type, id)];
-    if (previous != null && _sameBytes(previous, nal)) return;
-    _parameters[(type, id)] = nal;
-    _configuration = null;
+    _parameters.update((type, id), nal);
   }
 
   void _frame(int end) {
@@ -715,14 +710,6 @@ final class _AccessUnits {
   }
 }
 
-bool _sameBytes(Uint8List a, Uint8List b) {
-  if (a.length != b.length) return false;
-  for (var i = 0; i < a.length; i++) {
-    if (a[i] != b[i]) return false;
-  }
-  return true;
-}
-
 Uint8List _lengthPrefix(Uint8List bytes) {
   final nals = <Uint8List>[];
   var start = -1, zeros = 0;
@@ -744,18 +731,5 @@ Uint8List _lengthPrefix(Uint8List bytes) {
     nals.add(Uint8List.sublistView(bytes, start, bytes.length - zeros));
   }
   if (nals.isEmpty) throw const FormatException('Missing MPEG-TS NAL units');
-  return _prefixNals(nals);
-}
-
-Uint8List _prefixNals(Iterable<Uint8List> nals) {
-  final buffer = Uint8List(nals.fold(0, (size, nal) => size + 4 + nal.length));
-  final data = ByteData.sublistView(buffer);
-  var offset = 0;
-  for (final nal in nals) {
-    data.setUint32(offset, nal.length);
-    offset += 4;
-    buffer.setRange(offset, offset + nal.length, nal);
-    offset += nal.length;
-  }
-  return buffer;
+  return lengthPrefixNals(nals);
 }

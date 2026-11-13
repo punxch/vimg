@@ -15,6 +15,7 @@ import 'h264/access_unit.dart';
 import 'h264/idr_picture.dart';
 import 'hevc/access_unit.dart';
 import 'hevc/decode_picture.dart';
+import 'hevc/nal.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
 import 'matroska_frames.dart';
@@ -22,6 +23,7 @@ import 'metadata.dart';
 import 'mpeg12/decode.dart';
 import 'mpeg12/syntax.dart';
 import 'mpeg_systems.dart';
+import 'nal_parameter_sets.dart';
 import 'prores.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
@@ -87,14 +89,9 @@ final class Video {
   void close() => _input.closeSync();
 
   late final Uint8List _avcConfig = _configuration('h264');
-  late final H264IdrDecoder _h264 = H264IdrDecoder(
-    AvcConfiguration(_avcConfig),
-  );
-  late final _VideoTimeline _timeline = _indexVideo();
   late final Uint8List _hevcConfig = _configuration('hevc');
-  late final HevcIntraDecoder _hevc = HevcIntraDecoder(
-    HevcConfiguration(_hevcConfig),
-  );
+  late final _nalTimeline = _indexNalVideo();
+  final _previewParameterSets = <FramePacket, Uint8List?>{};
   late final Uint8List _av1Config = _av1Configuration();
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
@@ -132,7 +129,9 @@ final class Video {
     if (systems != null) {
       return preview
           ? systems.packets(true)
-          : (isMpegVideo(codec) ? _mpegTimeline.timeline : _timeline)
+          : (isMpegVideo(codec)
+                    ? _mpegTimeline.timeline
+                    : _nalTimeline.timeline)
                 .presentation;
     }
     if (isMpegVideo(codec)) {
@@ -145,21 +144,10 @@ final class Video {
             )
           : indexed.timeline.presentation;
     }
-    if (codec == 'h264') {
-      return preview ? _h264Keyframes() : _timeline.presentation;
-    }
-    if (codec == 'hevc') {
-      final configuration = _hevc.configuration;
-      if (preview) {
-        return _containerPackets(true).where(
-          (packet) => configuration.containsRandomAccess(
-            packet.offset,
-            packet.size,
-            file.unsigned,
-          ),
-        );
-      }
-      return _timeline.presentation;
+    if (codec == 'h264' || codec == 'hevc') {
+      return preview
+          ? _nalPackets(preview: true)
+          : _nalTimeline.timeline.presentation;
     }
     if (codec == 'av1') {
       return preview
@@ -190,16 +178,6 @@ final class Video {
     return matroska == null
         ? isoFrames(_iso!, keyframes: keyframes, onSample: onSample)
         : matroskaFrames(matroska, keyframes: keyframes, onSample: onSample);
-  }
-
-  bool _isIdr(AvcConfiguration configuration, FramePacket packet) =>
-      configuration.containsIdr(packet.offset, packet.size, file.unsigned);
-
-  Iterable<FramePacket> _h264Keyframes() {
-    final configuration = _h264.configuration;
-    return _containerPackets(
-      true,
-    ).where((packet) => _isIdr(configuration, packet));
   }
 
   ({_VideoTimeline timeline, Map<int, Uint8List> configurations}) _indexAv1() {
@@ -251,33 +229,89 @@ final class Video {
     );
   }
 
-  _VideoTimeline _indexVideo() {
+  /// A sample may introduce parameters used only by a later picture.
+  /// Keep the parameters already available before each random-access sample
+  /// so the decoder can then read that sample's own NALs in their original order.
+  Iterable<FramePacket> _nalPackets({
+    bool preview = false,
+    void Function(FramePacket, int?, bool, Uint8List?)? onSample,
+  }) sync* {
     final systems = _systems;
     final isHevc = codec == 'hevc';
-    final hevc = systems == null && isHevc ? _hevc.configuration : null;
-    final avc = systems == null && !isHevc ? _h264.configuration : null;
-    final decodeOrder = <FramePacket>[];
-    final index = <FramePacket, int>{};
-    final gopStart = <int>[];
-    var start = -1, previous = -1;
-    final presentation = _containerPackets(
+    final hevc = systems == null && isHevc
+        ? HevcConfiguration(_hevcConfig)
+        : null;
+    final avc = systems == null && !isHevc
+        ? AvcConfiguration(_avcConfig)
+        : null;
+    final lengthBytes = hevc?.lengthBytes ?? avc?.lengthBytes ?? 4;
+    final parameters = NalParameterSets(lengthBytes: lengthBytes);
+    void parameterSet(int start, int length) {
+      final nal = file.read(start, length);
+      final key = hevc == null ? avc!.store(nal) : hevc.store(HevcNal(nal));
+      parameters.update(key!, nal);
+    }
+
+    int? type;
+    var keyframe = false;
+    Uint8List? configuration;
+    for (final packet in _containerPackets(
       false,
       onSample: (packet, sync) {
-        final position = decodeOrder.length;
+        final before = parameters.snapshot();
         final header = hevc?.pictureHeader(
           packet.offset,
           packet.size,
           file.unsigned,
+          onParameterSet: parameterSet,
         );
-        final type = systems?.nalType(packet) ?? header?.type;
-        final randomAccess = systems != null
+        type =
+            systems?.nalType(packet) ??
+            header?.type ??
+            avc?.pictureType(
+              packet.offset,
+              packet.size,
+              file.unsigned,
+              onParameterSet: parameterSet,
+            );
+        final random = systems != null
             ? sync
-            : header?.randomAccess == true ||
-                  (avc != null && sync && _isIdr(avc, packet));
+            : isHevc
+            ? header?.randomAccess == true
+            : sync && type == 5;
+        keyframe = sync && random;
+        configuration = random
+            ? systems?.configurationAt(packet) ?? before
+            : null;
+        onSample?.call(packet, type, random, configuration);
+      },
+    )) {
+      if (preview) {
+        if (!keyframe) continue;
+        _previewParameterSets[packet] = configuration;
+      } else if (type == null) {
+        continue;
+      }
+      yield packet;
+    }
+  }
+
+  ({_VideoTimeline timeline, Map<int, Uint8List> configurations})
+  _indexNalVideo() {
+    final isHevc = codec == 'hevc';
+    final decodeOrder = <FramePacket>[];
+    final index = <FramePacket, int>{};
+    final gopStart = <int>[];
+    final configurations = <int, Uint8List>{};
+    var start = -1, previous = -1;
+    final presentation = _nalPackets(
+      onSample: (packet, type, randomAccess, configuration) {
+        final position = decodeOrder.length;
         if (randomAccess) {
           // RASL pictures following a CRA can still refer across it.
           previous = isHevc && type == 21 ? start : -1;
           start = position;
+          if (configuration != null) configurations[start] = configuration;
         }
         index[packet] = position;
         decodeOrder.add(packet);
@@ -292,10 +326,13 @@ final class Video {
       return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
     });
     return (
-      decodeOrder: decodeOrder,
-      presentation: presentation,
-      index: index,
-      gopStart: gopStart,
+      timeline: (
+        decodeOrder: decodeOrder,
+        presentation: presentation,
+        index: index,
+        gopStart: gopStart,
+      ),
+      configurations: configurations,
     );
   }
 
@@ -414,7 +451,7 @@ final class Video {
         ? _av1Timeline.timeline
         : mpeg
         ? _mpegTimeline.timeline
-        : _timeline;
+        : _nalTimeline.timeline;
     final targets = {
       for (final packet in selected)
         timeline.index[packet] ??
@@ -429,7 +466,7 @@ final class Video {
           ? _av1Timeline.configurations[start]!
           : mpeg
           ? _mpegTimeline.configurations[start]!
-          : _systems?.configurationAt(timeline.decodeOrder[start]),
+          : _nalTimeline.configurations[start],
     );
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
@@ -530,11 +567,7 @@ final class Video {
           return displayed?.rgb;
         };
       case 'hevc':
-        final decoder = HevcStreamDecoder(
-          configuration == null
-              ? HevcConfiguration(_hevcConfig)
-              : HevcConfiguration.inBand(configuration),
-        );
+        final decoder = HevcStreamDecoder(_hevcDecoderConfig(configuration));
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
@@ -547,16 +580,26 @@ final class Video {
           return null;
         };
       default:
-        final decoder = H264StreamDecoder(
-          configuration == null
-              ? AvcConfiguration(_avcConfig)
-              : AvcConfiguration.inBand(configuration),
-        );
+        final decoder = H264StreamDecoder(_avcDecoderConfig(configuration));
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
     }
+  }
+
+  HevcConfiguration _hevcDecoderConfig(Uint8List? parameterSets) {
+    if (_systems != null) return HevcConfiguration.inBand(parameterSets!);
+    final config = HevcConfiguration(_hevcConfig);
+    if (parameterSets != null) config.applyParameterSets(parameterSets);
+    return config;
+  }
+
+  AvcConfiguration _avcDecoderConfig(Uint8List? parameterSets) {
+    if (_systems != null) return AvcConfiguration.inBand(parameterSets!);
+    final config = AvcConfiguration(_avcConfig);
+    if (parameterSets != null) config.applyParameterSets(parameterSets);
+    return config;
   }
 
   image.Image? cover() {
@@ -581,18 +624,25 @@ final class Video {
   }
 
   image.Image decode(FramePacket packet, {bool preview = false}) {
-    if (_systems != null || isMpegVideo(codec) || (codec == 'av1' && !preview))
+    if (usesReferencePictures &&
+        (_systems != null ||
+            !preview ||
+            isMpegVideo(codec) ||
+            (codec != 'av1' && !_previewParameterSets.containsKey(packet)))) {
       return decodeSelected([packet]).single.frame;
+    }
     if (codec == 'prores') {
       return _proRes(packet, preserveAlpha: !preview).rgb();
     }
     final bytes = _read(packet);
     if (codec == 'h264') {
-      return _h264.decode(bytes)?.rgb() ??
+      final config = _avcDecoderConfig(_previewParameterSets[packet]);
+      return H264IdrDecoder(config).decode(bytes)?.rgb() ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'hevc') {
-      return _hevc.decode(bytes)?.rgb() ??
+      final config = _hevcDecoderConfig(_previewParameterSets[packet]);
+      return HevcIntraDecoder(config).decode(bytes)?.rgb() ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'av1') {
