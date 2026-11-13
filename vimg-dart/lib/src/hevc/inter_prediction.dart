@@ -1,4 +1,5 @@
 import 'dart:typed_data';
+import 'dart:math' as math;
 
 import 'decoded_pictures.dart';
 import 'motion_field.dart';
@@ -50,8 +51,7 @@ final class HevcInterPrediction {
       _interpolate(plane1!, _l1, x, y, w, h, m1.vector, chroma, sx, sy);
     final bi = m0 != null && m1 != null;
     final shift =
-        14 -
-        destination.depth +
+        _headroom(destination.depth) +
         (weights == null
             ? 0
             : chroma
@@ -97,13 +97,13 @@ final class HevcInterPrediction {
         (vector.y & ((1 << precisionY) - 1)) << (chroma ? 1 - shiftY : 0);
     final source = plane.samples, stride = plane.width;
     final lastX = stride - 1, lastY = plane.height - 1;
-    final depthShift = plane.depth - 8;
+    final headroom = _headroom(plane.depth);
+    final depthShift = 6 - headroom;
     if (fx == 0 && fy == 0) {
-      final shift = 14 - plane.depth;
       for (var row = 0; row < h; row++) {
         final src = (sy + row).clamp(0, lastY) * stride, dst = row * w;
         for (var col = 0; col < w; col++) {
-          out[dst + col] = source[src + (sx + col).clamp(0, lastX)] << shift;
+          out[dst + col] = source[src + (sx + col).clamp(0, lastX)] << headroom;
         }
       }
       return;
@@ -154,6 +154,8 @@ final class HevcInterPrediction {
     }
   }
 }
+
+int _headroom(int depth) => math.max(2, 14 - depth);
 
 const _luma = [
   [0, 0, 0, 64, 0, 0, 0, 0],

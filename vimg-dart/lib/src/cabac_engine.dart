@@ -53,6 +53,11 @@ base class CabacEngine {
     return 1;
   }
 
+  /// Set the arithmetic range before decoding an aligned run of bypass bins.
+  void alignBypass() {
+    _range = 256;
+  }
+
   bool terminate() {
     _range -= 2;
     if (_offset >= _range) return true;

@@ -21,6 +21,9 @@ final class HevcResidual {
     required bool directionalScan,
     required bool hideSign,
     required bool transformSkipContext,
+    required bool alignBypass,
+    required bool limitedPrefix,
+    required int dynamicRange,
     int? riceClass,
   }) {
     final scan = directionalScan
@@ -31,6 +34,8 @@ final class HevcResidual {
               : HevcScan.diagonal)
         : HevcScan.diagonal;
     final size = 1 << log2, subSize = size >> 2;
+    final coefficientLimit = 1 << dynamicRange;
+    final maxPrefix = limitedPrefix ? 32 - dynamicRange : 24;
     final scans = hevcScans[scan.index];
     final localScan = scans[2];
     final groupScan = scans[log2 - 2];
@@ -102,6 +107,7 @@ final class HevcResidual {
           (chroma || group == 0 ? 0 : 2) + (greaterContext == 0 ? 1 : 0);
       greaterContext = 1;
       var firstGreater = -1;
+      var hasEscape = count > 8;
       _magnitudes.fillRange(0, count, 1);
       for (var i = 0; i < math.min(count, 8); i++) {
         final greater = cabac.decode(
@@ -111,7 +117,11 @@ final class HevcResidual {
         if (greater != 0) {
           greaterContext = 0;
           _magnitudes[i] = 2;
-          if (firstGreater < 0) firstGreater = i;
+          if (firstGreater < 0) {
+            firstGreater = i;
+          } else {
+            hasEscape = true;
+          }
         } else if (greaterContext > 0 && greaterContext < 3) {
           greaterContext++;
         }
@@ -121,7 +131,9 @@ final class HevcResidual {
           HevcContext.coeffAbsLevelGreater2Flag,
           (chroma ? 4 : 0) + contextSet,
         );
+        hasEscape |= _magnitudes[firstGreater] == 3;
       }
+      if (alignBypass && hasEscape) cabac.alignBypass();
       final hidden = hideSign && _positions.first - _positions[count - 1] >= 4;
       final explicitSigns = count - (hidden ? 1 : 0);
       for (var i = 0; i < explicitSigns; i++) _signs[i] = cabac.bypass();
@@ -136,7 +148,12 @@ final class HevcResidual {
             ? 3
             : 2;
         if (magnitude == threshold) {
-          final remaining = _remaining(cabac, rice);
+          final remaining = _remaining(
+            cabac,
+            rice,
+            maxPrefix,
+            limitedPrefix ? dynamicRange : null,
+          );
           magnitude += remaining;
           if (magnitude > 3 << rice && (riceClass != null || rice < 4)) rice++;
           if (updateRice) {
@@ -149,10 +166,12 @@ final class HevcResidual {
             updateRice = false;
           }
         }
-        if (magnitude > 32768)
-          throw const FormatException('HEVC coefficient out of range');
         sum += magnitude;
         final sign = i == explicitSigns ? sum & 1 : _signs[i];
+        if (magnitude > coefficientLimit ||
+            magnitude == coefficientLimit && sign == 0) {
+          throw const FormatException('HEVC coefficient out of range');
+        }
         final position = localScan[_positions[i]];
         _levels[(4 * sy + (position >> 2)) * size + 4 * sx + (position & 3)] =
             sign == 0 ? magnitude : -magnitude;
@@ -180,11 +199,15 @@ int _last(HevcCabac cabac, int prefix) {
   return ((2 + (prefix & 1)) << bits) + cabac.bypassBits(bits);
 }
 
-int _remaining(HevcCabac cabac, int rice) {
+int _remaining(HevcCabac cabac, int rice, int maxPrefix, int? dynamicRange) {
   var prefix = 0;
-  while (prefix < 4 && cabac.bypass() != 0) prefix++;
-  return (prefix << rice) +
-      (prefix == 4 ? cabac.bypassGolomb(rice + 1) : cabac.bypassBits(rice));
+  while (prefix < maxPrefix && cabac.bypass() != 0) prefix++;
+  if (prefix < 3) return (prefix << rice) + cabac.bypassBits(rice);
+  if (prefix == maxPrefix && dynamicRange == null) {
+    throw const FormatException('Oversized HEVC coefficient escape');
+  }
+  final suffix = prefix == maxPrefix ? dynamicRange! : prefix - 3 + rice;
+  return (((1 << (prefix - 3)) + 2) << rice) + cabac.bypassBits(suffix);
 }
 
 int _significantContext(

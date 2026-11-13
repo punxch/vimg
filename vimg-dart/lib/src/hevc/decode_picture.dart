@@ -65,13 +65,9 @@ HevcPicture _reconstruct(
   int poc = 0,
 }) {
   final first = slices.first, sps = first.sps;
-  if (sps.fieldSequence ||
-      sps.separateColourPlane ||
-      sps.lumaDepth > 12 ||
-      sps.chromaDepth > 12 ||
-      sps.hasUnsupportedRangeTools) {
+  if (sps.fieldSequence || sps.separateColourPlane) {
     throw UnsupportedError(
-      'Unsupported HEVC field, separate plane, bit depth or range extension tools',
+      'Unsupported HEVC field sequence or separate colour plane',
     );
   }
   if (sps.codedWidth * sps.codedHeight > 36 * 1024 * 1024) {
@@ -589,6 +585,9 @@ final class _Reconstruction {
           }
         }
       }
+      final dynamicRange = sps.extendedPrecision && plane.depth > 9
+          ? plane.depth + 6
+          : 15;
       final levels = _coefficients.read(
         _cabac,
         log2,
@@ -599,6 +598,9 @@ final class _Reconstruction {
             (log2 == 3 && (!chroma || picture.sps.chromaArrayType == 3)),
         hideSign: !bypass && rdpcm == HevcRdpcm.off && _slice.pps.signHiding,
         transformSkipContext: untransformed && sps.transformSkipContext,
+        alignBypass: sps.bypassAlignment,
+        limitedPrefix: sps.extendedPrecision,
+        dynamicRange: dynamicRange,
         riceClass: sps.persistentRice
             ? (chroma ? 2 : 0) + (untransformed ? 1 : 0)
             : null,
@@ -625,6 +627,8 @@ final class _Reconstruction {
         lumaIntra: intra && !chroma,
         skip: skip,
         bypass: bypass,
+        dynamicRange: dynamicRange,
+        extendedPrecision: sps.extendedPrecision,
         rotate: untransformed && intra && log2 == 2 && sps.rotateTransformSkip,
         rdpcm: rdpcm,
         weights: skip && log2 > 2

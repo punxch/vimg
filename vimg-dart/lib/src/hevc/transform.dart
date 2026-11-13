@@ -21,6 +21,8 @@ final class HevcTransform {
     required bool lumaIntra,
     required bool skip,
     required bool bypass,
+    required int dynamicRange,
+    required bool extendedPrecision,
     bool rotate = false,
     HevcRdpcm rdpcm = HevcRdpcm.off,
     Uint8List? weights,
@@ -35,15 +37,20 @@ final class HevcTransform {
       return _inverseRdpcm(size, rdpcm);
     }
     final scale = _levelScale[qp % 6] << (qp ~/ 6);
-    final shift = depth + log2 - 5;
-    final round = 1 << (shift - 1);
+    final limit = 1 << dynamicRange;
+    final transformShift = dynamicRange - depth - log2;
+    final skipShift = extendedPrecision
+        ? math.max(0, transformShift)
+        : transformShift;
+    final shift = 10 - (skip ? skipShift : transformShift);
     var maxX = 0, maxY = 0;
     for (var y = 0; y < size; y++) {
       for (var x = 0; x < size; x++) {
         final index = y * size + x;
-        final value =
-            ((levels[index] * (weights?[index] ?? 16) * scale + round) >> shift)
-                .clamp(-32768, 32767);
+        final value = _roundShift(
+          levels[index] * (weights?[index] ?? 16) * scale,
+          shift,
+        ).clamp(-limit, limit - 1);
         _dequantized[index] = value;
         if (value != 0) {
           maxX = math.max(x, maxX);
@@ -52,13 +59,10 @@ final class HevcTransform {
       }
     }
 
-    final outputShift = 20 - depth;
-    final outputRound = 1 << (outputShift - 1);
     if (skip) {
       for (var i = 0; i < count; i++) {
         final coefficient = _dequantized[rotate ? count - 1 - i : i];
-        _residual[i] =
-            ((coefficient << (5 + log2)) + outputRound) >> outputShift;
+        _residual[i] = _roundShift(coefficient, skipShift);
       }
       return _inverseRdpcm(size, rdpcm);
     }
@@ -70,7 +74,7 @@ final class HevcTransform {
         var value = 0;
         for (var k = 0; k <= maxY; k++)
           value += row[k] * _dequantized[k * size + x];
-        _vertical[y * size + x] = ((value + 64) >> 7).clamp(-32768, 32767);
+        _vertical[y * size + x] = ((value + 64) >> 7).clamp(-limit, limit - 1);
       }
     }
     for (var y = 0; y < size; y++) {
@@ -79,7 +83,7 @@ final class HevcTransform {
         final row = basis[x];
         var value = 0;
         for (var k = 0; k <= maxX; k++) value += row[k] * _vertical[start + k];
-        _residual[start + x] = (value + outputRound) >> outputShift;
+        _residual[start + x] = _roundShift(value, dynamicRange + 5 - depth);
       }
     }
     return _residual;
@@ -103,6 +107,9 @@ final class HevcTransform {
     return _residual;
   }
 }
+
+int _roundShift(int value, int shift) =>
+    shift > 0 ? (value + (1 << (shift - 1))) >> shift : value << -shift;
 
 /// Expand scaling lists to raster factors once per slice configuration.
 final class HevcScalingFactors {

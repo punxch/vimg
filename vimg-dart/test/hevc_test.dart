@@ -69,6 +69,8 @@ const _pcmTiles = 'test/fixtures/hevc-pcm-tiles.mkv';
 const _main422 = 'test/fixtures/hevc-422-10.mkv';
 const _main444 = 'test/fixtures/hevc-444-12.mp4';
 const _rext = 'test/fixtures/hevc-rext-wpp.mkv';
+const _highThroughput = 'test/fixtures/hevc-high-throughput-16.mkv';
+const _extendedPrecision = 'test/fixtures/hevc-extended-precision-16.mkv';
 
 // FFmpeg's cropped YUV planes, with all signalled loop filters applied.
 const _mainPixels = [
@@ -239,6 +241,53 @@ Future<void> main(List<String> arguments) async {
     ],
     format: 2,
     depth: 10,
+  );
+  // HM 16.8 reference reconstructions for 16-bit 4:4:4 with extended
+  // precision. The all-intra stream uses aligned CABAC bypass groups.
+  _checkInterClip(
+    _highThroughput,
+    [
+      [0x1f747f12, 0x12ade13c, 0x9d4ba37c],
+      [0xf58f4a87, 0x9af1965c, 0xefffd2aa],
+      [0x5733273d, 0x5e716085, 0x7dd53da1],
+      [0xe807684a, 0x3f20f4bc, 0xb15a774a],
+      [0x07644ce6, 0x9434e61b, 0x9efd3e24],
+      [0x4e31a0b2, 0x90be484b, 0xc93c562f],
+      [0xc64f1060, 0xf096bea8, 0xeb190e1e],
+      [0xf8517edd, 0x0061662a, 0xc4ad1dba],
+    ],
+    format: 3,
+    depth: 16,
+    extendedPrecision: true,
+    bypassAlignment: true,
+  );
+  // HM permits this 16-bit inter configuration for decoder development.
+  _checkInterClip(
+    _extendedPrecision,
+    [
+      [0xf93e42c9, 0x33c8ea8d, 0x6467782b],
+      [0x3058b734, 0x994cd5af, 0x5cadec5f],
+      [0x9faa29b3, 0xa3caf05a, 0xe02b8ea6],
+      [0x42f5146f, 0xdad39719, 0xf44b915e],
+      [0x3ed967fe, 0x1bb58bee, 0xb2226e60],
+      [0x94869094, 0x781d1297, 0x1d3058f1],
+      [0x17a93fcd, 0x408362ae, 0x9f84636b],
+      [0x24238b77, 0x202d3fa7, 0xefc9c037],
+    ],
+    format: 3,
+    depth: 16,
+    extendedPrecision: true,
+  );
+  // Lossless 0/65535 checkerboard forces the saturated coefficient prefix.
+  _checkInterClip(
+    'test/fixtures/hevc-extended-escape-16.mkv',
+    [
+      [0xa6c2fdc5, 0xc421fdc5, 0xa6c2fdc5],
+    ],
+    format: 3,
+    depth: 16,
+    extendedPrecision: true,
+    bypassAlignment: true,
   );
   await _checkCli(arguments);
 }
@@ -440,6 +489,8 @@ void _checkInterClip(
   List<List<int>> expected, {
   int format = 1,
   int depth = 8,
+  bool extendedPrecision = false,
+  bool bypassAlignment = false,
 }) {
   final handle = File(path).openSync();
   try {
@@ -461,6 +512,11 @@ void _checkInterClip(
         (sps.chromaArrayType, sps.lumaDepth, sps.chromaDepth) ==
             (format, depth, depth),
         'HEVC sample format and bit depth',
+      );
+      check(
+        sps.extendedPrecision == extendedPrecision &&
+            sps.bypassAlignment == bypassAlignment,
+        'HEVC precision and bypass flags',
       );
       _checkPixels(picture, expected[index], '$path picture $index');
     }
@@ -514,6 +570,7 @@ Future<void> _checkCli(List<String> arguments) async {
       (_main422, 50, 63),
       (_main444, 50, 63),
       (_rext, 0, 55),
+      (_highThroughput, 50, 63),
     ]) {
       final jpeg = File('${directory.path}/preview.jpg');
       final response =
@@ -544,6 +601,7 @@ Future<void> _checkCli(List<String> arguments) async {
       (_main422, 130, 98),
       (_main444, 130, 98),
       (_rext, 192, 128),
+      (_highThroughput, 130, 98),
     ].indexed) {
       final output = '${directory.path}/frames-$index';
       await run(['extract', '-n2', '-t200ms', '--output-dir', output, input]);
@@ -567,7 +625,7 @@ Future<void> _checkCli(List<String> arguments) async {
       '-t400ms',
       '-o',
       avif.path,
-      _rext,
+      _extendedPrecision,
     ]);
     check(
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',

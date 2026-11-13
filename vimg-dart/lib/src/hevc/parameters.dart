@@ -241,7 +241,8 @@ final class HevcSps {
   bool get explicitRdpcm => rangeExtension & 0x20 != 0;
   bool get persistentRice => rangeExtension & 2 != 0;
   bool get highPrecisionOffsets => rangeExtension & 4 != 0;
-  bool get hasUnsupportedRangeTools => rangeExtension & 0x11 != 0;
+  bool get extendedPrecision => rangeExtension & 16 != 0;
+  bool get bypassAlignment => rangeExtension & 1 != 0;
 }
 
 typedef HevcTiles = ({List<int> columns, List<int> rows, bool filterAcross});
