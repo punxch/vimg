@@ -26,6 +26,7 @@ import 'mpeg12/syntax.dart';
 import 'mpeg_systems.dart';
 import 'nal_parameter_sets.dart';
 import 'prores.dart';
+import 'quicktime_animation.dart';
 import 'quicktime_raw.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
@@ -98,6 +99,7 @@ final class Video {
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
+  late final _animationTimeline = _indexAnimation();
   late final bool _mixedIsoCodecs = _hasMixedIsoCodecs();
   late final List<_IsoSection> _isoSections = _readIsoSections();
   late final Map<FramePacket, _IsoSection> _isoSectionByPacket = {
@@ -154,9 +156,61 @@ final class Video {
 
   _IndexedVideo _indexIsoSection(_IsoSection section) {
     final name = section.codec;
+    if (name == 'qtrle') return _indexAnimation(section: section);
     if (name == 'av1') return _indexAv1(section: section);
     if (isMpegVideo(name)) return _indexMpeg(section: section);
     return _indexNalVideo(section: section);
+  }
+
+  _IndexedVideo _indexAnimation({_IsoSection? section}) {
+    final decodeOrder = <FramePacket>[];
+    final index = <FramePacket, int>{};
+    final gopStart = <int>[];
+    final configurations = <int, _RunConfiguration>{};
+    final sections = <int, int>{};
+    var start = -1, sectionStart = 0;
+    late Uint8List description;
+    final presentation =
+        _containerPackets(
+            false,
+            section: section,
+            onDescription: (entry) {
+              _iso!.requireBytes(entry, 78);
+              if (entry.end - entry.data > 1024 * 1024) {
+                throw const FormatException(
+                  'Oversized QuickTime Animation description',
+                );
+              }
+              description = file.read(entry.data, entry.end - entry.data);
+              start = -1;
+              sectionStart = decodeOrder.length;
+            },
+            onSample: (packet, sync) {
+              final position = decodeOrder.length;
+              if (sync) {
+                start = position;
+                configurations[start] = (bytes: description, nal: null);
+                sections[start] = sectionStart;
+              }
+              index[packet] = position;
+              decodeOrder.add(packet);
+              gopStart.add(start);
+            },
+          ).where((packet) => gopStart[index[packet]!] >= 0).toList()
+          ..sort((a, b) {
+            final byTime = a.seconds.compareTo(b.seconds);
+            return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+          });
+    return (
+      timeline: (
+        decodeOrder: decodeOrder,
+        presentation: presentation,
+        index: index,
+        gopStart: gopStart,
+      ),
+      configurations: configurations,
+      sections: sections,
+    );
   }
 
   Uint8List _av1Configuration([MediaBox? description]) {
@@ -221,6 +275,14 @@ final class Video {
       return preview
           ? _av1PreviewPackets()
           : _av1Timeline.timeline.presentation;
+    }
+    if (codec == 'qtrle') {
+      final indexed = _animationTimeline;
+      return indexed.timeline.presentation.where(
+        (packet) =>
+            !preview ||
+            indexed.configurations.containsKey(indexed.timeline.index[packet]),
+      );
     }
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
@@ -681,6 +743,7 @@ final class Video {
     final indexed = switch (name) {
       'av1' => _av1Timeline,
       'h264' || 'hevc' => _nalTimeline,
+      'qtrle' => _animationTimeline,
       _ when isMpegVideo(name) => _mpegTimeline,
       _ => null,
     };
@@ -833,6 +896,26 @@ final class Video {
   _RenderPicture? Function(Uint8List, bool) _pictureReader(_DecodeRun run) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'qtrle':
+        final decoder = QuickTimeAnimationDecoder(configuration.bytes!);
+        return (bytes, selected) {
+          decoder.advance(bytes);
+          if (!selected) return null;
+          final source = decoder.rgb();
+          return ({scaler}) {
+            if (scaler == null) return source;
+            final frame = scaler.width == null && scaler.height == null
+                ? source
+                : _rgb(source);
+            return scaler.filters != null
+                ? scaler.filterRgb(frame)
+                : resizeToFit(
+                    frame,
+                    width: scaler.width,
+                    height: scaler.height,
+                  );
+          };
+        };
       case 'av1':
         final units = Av1AccessUnits()..configure(configuration.bytes!);
         final decoder = Av1StreamDecoder();
@@ -916,9 +999,15 @@ final class Video {
     if (_mixedIsoCodecs) {
       final section = _isoSectionByPacket[packet];
       if (section == null) throw const FormatException('Unknown video packet');
-      return _usesReferences(section.codec)
-          ? decodeSelected([packet]).single.frame
-          : _decodeIndependent(packet, section.codec, preview: preview);
+      if (!_usesReferences(section.codec)) {
+        return _decodeIndependent(packet, section.codec, preview: preview);
+      }
+      final frame = decodeSelected([packet]).single.frame;
+      return preview && section.codec == 'qtrle' ? _rgb(frame) : frame;
+    }
+    if (codec == 'qtrle') {
+      final frame = decodeSelected([packet]).single.frame;
+      return preview ? _rgb(frame) : frame;
     }
     if (usesReferencePictures &&
         (_systems != null ||
@@ -1023,7 +1112,11 @@ typedef _DecodeRun = ({
 });
 
 bool _usesReferences(String codec) =>
-    codec == 'h264' || codec == 'hevc' || codec == 'av1' || isMpegVideo(codec);
+    codec == 'h264' ||
+    codec == 'hevc' ||
+    codec == 'av1' ||
+    codec == 'qtrle' ||
+    isMpegVideo(codec);
 
 final class _IsoSection {
   _IsoSection(this.codec, this.description, this.restart);

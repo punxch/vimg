@@ -46,6 +46,10 @@ QuickTime supports uncompressed RGB555, RGB24, ARGB32 and packed YCbCr
 (`2vuy`, `yuv2`, `v210`, `v216`, `v308`, `v408` and `v410`).
 Packed YCbCr keeps its component depth through filtering and scaling.
 ARGB and `v408` retain alpha in BMP extraction.
+QuickTime Animation (`rle `) supports RGB555, RGB24, ARGB32 and 1-, 2-,
+4- and 8-bit indexed or grayscale frames. Extraction restores partial
+updates and repeated frames from the preceding sync sample and keeps ARGB
+alpha in BMPs.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the

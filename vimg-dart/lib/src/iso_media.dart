@@ -195,6 +195,7 @@ final class IsoMedia {
     'ap4h' || 'ap4x' || 'apch' || 'apcn' || 'apcs' || 'apco' => 'prores',
     'aprn' || 'aprh' => 'prores_raw',
     'png ' => 'png',
+    'rle ' => 'qtrle',
     'raw ' ||
     'yuv2' ||
     '2vuy' ||
