@@ -21,16 +21,21 @@ Uint8List? matroskaVideoConfiguration(Matroska media, String codec) {
   return media.file.read(start, length);
 }
 
-Uint8List? isoVideoConfiguration(IsoMedia media, String codec) {
+Uint8List? isoVideoConfiguration(
+  IsoMedia media,
+  String codec, {
+  MediaBox? description,
+}) {
   final boxType = switch (codec) {
     'hevc' => 'hvcC',
     'av1' => 'av1C',
     _ => 'avcC',
   };
-  final track = media.firstVideoTrack();
-  final entry = media.sampleDescription(
-    media.sampleTable(media.child(track, 'mdia')),
-  );
+  final entry =
+      description ??
+      media.sampleDescription(
+        media.sampleTable(media.child(media.firstVideoTrack(), 'mdia')),
+      );
   if (entry == null) return null;
   final configuration = media
       .children(entry, skip: 78)

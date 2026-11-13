@@ -23,6 +23,7 @@ Iterable<FramePacket> isoFrames(
   IsoMedia media, {
   bool keyframes = false,
   FrameVisitor? onSample,
+  void Function(MediaBox description)? onDescription,
   MediaBox? selectedTrack,
 }) sync* {
   final movie = media.movie();
@@ -43,11 +44,22 @@ Iterable<FramePacket> isoFrames(
     table,
     needSync: keyframes || onSample != null,
   ).followedBy(fragmentTrack?.samples(media) ?? const []);
+  final descriptions = media.sampleDescriptions(table).toList();
+  int? description;
   for (final sample in samples) {
-    if (sample.description != 1) {
-      throw const FormatException(
-        'Invalid or changing ISO media sample description',
-      );
+    if (sample.description != description) {
+      if (sample.description <= 0 || sample.description > descriptions.length) {
+        throw const FormatException(
+          'Invalid ISO media sample description index',
+        );
+      }
+      if (onDescription == null && sample.description != 1) {
+        throw const FormatException(
+          'Changing ISO media sample descriptions are unsupported',
+        );
+      }
+      description = sample.description;
+      onDescription?.call(descriptions[description - 1]);
     }
     final mediaSeconds = (sample.pts - (edit.start ?? 0)) / scale + edit.delay;
     final packet = (

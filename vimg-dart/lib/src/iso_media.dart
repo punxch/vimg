@@ -120,7 +120,7 @@ final class IsoMedia {
           if (handler == null) continue;
           requireBytes(handler, 12);
           if (tag(handler.data + 8) != 'vide') continue;
-          final stream = _stream(media, mediaTiming?.scale);
+          final stream = _stream(box, media, mediaTiming?.scale);
           if (stream != null) streams.add(stream);
         case 'udta':
           streams.addAll(_coverStreams(child(box, 'meta')));
@@ -139,47 +139,70 @@ final class IsoMedia {
 
   MediaBox? sampleTable(MediaBox? media) => child(child(media, 'minf'), 'stbl');
 
-  MediaBox? sampleDescription(MediaBox? table) {
+  Iterable<MediaBox> sampleDescriptions(MediaBox? table) sync* {
     final descriptions = child(table, 'stsd');
-    if (descriptions == null) return null;
+    if (descriptions == null) return;
     requireBytes(descriptions, 8);
-    if (file.unsigned(descriptions.data + 4, 4) == 0) return null;
-    return children(descriptions, skip: 8).firstOrNull;
+    final count = file.unsigned(descriptions.data + 4, 4);
+    final entries = children(descriptions, skip: 8).iterator;
+    for (var i = 0; i < count; i++) {
+      if (!entries.moveNext()) {
+        throw const FormatException('Incomplete ISO media sample descriptions');
+      }
+      yield entries.current;
+    }
   }
 
-  VideoStream? _stream(MediaBox? media, int? scale) {
-    final entry = sampleDescription(sampleTable(media));
-    if (entry == null || scale == null) return null;
+  MediaBox? sampleDescription(MediaBox? table) =>
+      sampleDescriptions(table).firstOrNull;
+
+  VideoStream? _stream(MediaBox track, MediaBox? media, int? scale) {
+    if (scale == null) return null;
+    final table = sampleTable(media);
+    if (table == null) return null;
+    final chunks = _Table.optional(this, table, 'stsc', 12);
+    final index = chunks != null && chunks.count > 0
+        ? chunks.value(0, 8)
+        : _fragments?.tracks[track]?.runs.firstOrNull?.defaults.description ??
+              1;
+    final entries = sampleDescriptions(table);
+    final entry = index > 0 ? entries.skip(index - 1).firstOrNull : null;
+    if (entry == null) {
+      if (index == 1 && entries.isEmpty) return null;
+      throw const FormatException('Invalid ISO media sample description index');
+    }
     requireBytes(entry, 28);
-    final codec = switch (entry.type) {
-      'avc1' || 'avc2' || 'avc3' || 'avc4' || 'dva1' || 'dvav' => 'h264',
-      'hvc1' || 'hev1' || 'dvhe' || 'dvh1' => 'hevc',
-      'vvc1' || 'vvi1' => 'vvc',
-      'av01' => 'av1',
-      'vp08' => 'vp8',
-      'vp09' => 'vp9',
-      'mp4v' => _visualDescriptor(entry)?.codec ?? 'mpeg4',
-      'm1v ' || 'm1v1' || 'mpeg' || 'mp1v' => 'mpeg1video',
-      'm2v1' || 'mp2v' || 'AVmp' => 'mpeg2video',
-      _ when _mpeg2QuickTimeTags.hasMatch(entry.type) => 'mpeg2video',
-      'jpeg' || 'mjpa' || 'mjpb' || 'mjpg' => 'mjpeg',
-      'ap4h' || 'ap4x' || 'apch' || 'apcn' || 'apcs' || 'apco' => 'prores',
-      'aprn' || 'aprh' => 'prores_raw',
-      'png ' => 'png',
-      'raw ' || 'yuv2' || '2vuy' => 'rawvideo',
-      _ => 'unknown',
-    };
     return VideoStream(
-      codec: codec,
+      codec: videoCodec(entry),
       width: file.unsigned(entry.data + 24, 2),
       height: file.unsigned(entry.data + 26, 2),
       timeBase: '1/$scale',
     );
   }
 
-  Uint8List? mpegVideoConfiguration() {
-    final track = firstVideoTrack();
-    final entry = sampleDescription(sampleTable(child(track, 'mdia')));
+  String videoCodec(MediaBox entry) => switch (entry.type) {
+    'avc1' || 'avc2' || 'avc3' || 'avc4' || 'dva1' || 'dvav' => 'h264',
+    'hvc1' || 'hev1' || 'dvhe' || 'dvh1' => 'hevc',
+    'vvc1' || 'vvi1' => 'vvc',
+    'av01' => 'av1',
+    'vp08' => 'vp8',
+    'vp09' => 'vp9',
+    'mp4v' => _visualDescriptor(entry)?.codec ?? 'mpeg4',
+    'm1v ' || 'm1v1' || 'mpeg' || 'mp1v' => 'mpeg1video',
+    'm2v1' || 'mp2v' || 'AVmp' => 'mpeg2video',
+    _ when _mpeg2QuickTimeTags.hasMatch(entry.type) => 'mpeg2video',
+    'jpeg' || 'mjpa' || 'mjpb' || 'mjpg' => 'mjpeg',
+    'ap4h' || 'ap4x' || 'apch' || 'apcn' || 'apcs' || 'apco' => 'prores',
+    'aprn' || 'aprh' => 'prores_raw',
+    'png ' => 'png',
+    'raw ' || 'yuv2' || '2vuy' => 'rawvideo',
+    _ => 'unknown',
+  };
+
+  Uint8List? mpegVideoConfiguration({MediaBox? description}) {
+    final entry =
+        description ??
+        sampleDescription(sampleTable(child(firstVideoTrack(), 'mdia')));
     if (entry == null) return null;
     final global = _visualBox(entry, 'glbl');
     final extent =

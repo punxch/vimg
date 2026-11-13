@@ -109,8 +109,11 @@ MP4/MOV files can contain conventional sample tables, movie fragments, or both.
 Fragmented files use a local initialization movie and local media data. Probe
 derives duration from the track runs when the initialization has zero duration.
 Capture uses the edited playback timeline and preserves raw container PTS in
-the authority manifest. Encrypted tracks, overlapping or out-of-order
-fragments, and changes of sample description are pending.
+the authority manifest. For H.264, HEVC, AV1 and MPEG video, preview and
+capture can switch sample descriptions within the same codec at random-access
+pictures. Probe reports the dimensions of the first description in use.
+Encrypted tracks, codec changes within a track, and overlapping or
+out-of-order fragments remain pending.
 
 `extract` and `vcs` accept a comma-separated `--vfilter` chain such as
 `--vfilter 'crop=iw/2:ih,transpose=clock,hflip'`. The Dart filters include
