@@ -1,8 +1,12 @@
 import 'dart:io';
 
+import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/binary_file.dart';
+import 'package:vimg_dart/src/capture.dart';
+import 'package:vimg_dart/src/grid.dart';
 import 'package:vimg_dart/src/iso_media.dart';
 import 'package:vimg_dart/src/video.dart';
+import 'package:vimg_dart/src/video_commands.dart';
 
 import 'fixtures.dart';
 
@@ -40,6 +44,120 @@ Future<void> main() async {
     [0, 3, 4],
   );
   _checkInvalidDescription();
+  final expected = <image.Image>[
+    _color(14, 62, 190),
+    _color(53, 180, 74),
+    ..._sourcePictures('cabac-p.mp4', 3),
+    ..._sourcePictures('hevc-main10.mp4', 3),
+    ..._sourcePictures('av1-intra.mp4', 2),
+    ..._sourcePictures('mpeg2-fields.mov', 1),
+    _color(53, 180, 74),
+    ..._sourcePictures('cabac-p.mp4', 2),
+  ];
+  for (final name in ['mixed-codecs.mov', 'mixed-codecs-fragmented.mp4']) {
+    await _checkMixedCodecs('test/fixtures/$name', expected);
+  }
+  final portrait = image.Image(width: 10, height: 20)
+    ..clear(image.ColorRgb8(128, 64, 32));
+  final grid = GridComposer(
+    20,
+    20,
+    1,
+    1,
+    const [],
+  ).compose([portrait], fitTiles: true);
+  check(
+    grid.getPixel(4, 10).r == 0 &&
+        grid.getPixel(5, 10).r == 128 &&
+        grid.getPixel(14, 10).r == 128 &&
+        grid.getPixel(15, 10).r == 0,
+    'Fit portrait tiles without stretching and center them in the grid',
+  );
+}
+
+image.Image _color(int r, int g, int b) =>
+    image.Image(width: 78, height: 50)..clear(image.ColorRgb8(r, g, b));
+
+List<image.Image> _sourcePictures(String name, int count) {
+  final video = Video('test/fixtures/$name');
+  try {
+    return video.packets().take(count).map(video.decode).toList();
+  } finally {
+    video.close();
+  }
+}
+
+Future<void> _checkMixedCodecs(String input, List<image.Image> expected) async {
+  final video = Video(input);
+  final workers = VideoCaptureDecoder(video, threads: 4);
+  final temp = Directory.systemTemp.createTempSync('vimg-mixed-codecs-');
+  try {
+    check(
+      video.codec == 'png' && video.usesReferencePictures,
+      'Mixed track starting in PNG',
+    );
+    final packets = video.packets().toList();
+    check(packets.length == expected.length, 'Mixed track frame count');
+    final positions = {
+      for (final (index, packet) in packets.indexed) packet: index,
+    };
+    for (final (index, packet) in packets.indexed) {
+      check(packet.seconds == index / 4, 'Mixed track PTS');
+    }
+    final keys = video.packets(preview: true).toList();
+    const previewIndexes = [0, 1, 2, 5, 8, 9, 10, 11, 12];
+    check(keys.length == previewIndexes.length, 'Mixed track keyframes');
+    for (final (index, key) in keys.indexed.toList().reversed) {
+      final source = previewIndexes[index];
+      check(key == packets[source], 'Mixed track preview PTS');
+      _same(
+        video.decode(key, preview: true).getBytes(),
+        expected[source].getBytes(),
+        '$input preview $source',
+      );
+    }
+    final pending = packets.toSet();
+    await for (final result in workers.decode(packets.reversed)) {
+      final index = positions[result.packet]!;
+      final frame = result.frame;
+      final reference = expected[index];
+      check(pending.remove(result.packet), 'Mixed track parallel packet');
+      check(
+        (frame.width, frame.height) == (reference.width, reference.height),
+        'Mixed track frame dimensions',
+      );
+      _same(
+        frame.getBytes(),
+        reference.getBytes(),
+        '$input parallel frame $index',
+      );
+    }
+    check(pending.isEmpty, 'Mixed track parallel frame count');
+    final output = '${temp.path}/sheet.avif';
+    var grids = 0;
+    await writeContactSheet(
+      input,
+      output,
+      const CaptureOptions(number: 7, frames: 2, window: 0.2),
+      columns: 7,
+      height: 24,
+      onGrid: (_, frame, tileWidth, tileHeight) {
+        check(
+          frame.width == tileWidth * 7 && frame.height == tileHeight,
+          'Mixed contact sheet dimensions',
+        );
+        grids++;
+      },
+    );
+    check(
+      grids == 2 && File(output).lengthSync() > 0,
+      'Mixed AVIF contact sheet',
+    );
+  } finally {
+    await workers.close();
+    video.close();
+    temp.deleteSync(recursive: true);
+  }
 }
 
 Future<void> _checkDescriptions(

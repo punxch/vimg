@@ -11,6 +11,7 @@ import 'av1/frame_header.dart';
 import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
+import 'grid.dart' show resizeToFit;
 import 'h264/access_unit.dart';
 import 'h264/idr_picture.dart';
 import 'hevc/access_unit.dart';
@@ -73,18 +74,17 @@ final class Video {
       metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
       (throw const FormatException('No video stream'));
 
-  // Workers only need the codec family from the container headers.
   String get _decodeCodec => _systems?.programCodec ?? codec;
 
-  bool get usesReferencePictures {
-    final name = _decodeCodec;
-    return name == 'h264' ||
-        name == 'hevc' ||
-        name == 'av1' ||
-        isMpegVideo(name);
-  }
+  bool get usesReferencePictures => _mixedIsoCodecs
+      ? _isoSections.any((section) => _usesReferences(section.codec))
+      : _usesReferences(_decodeCodec);
 
-  bool get scalesBeforeRgb => usesReferencePictures || codec == 'prores';
+  bool get scalesBeforeRgb =>
+      usesReferencePictures ||
+      (_mixedIsoCodecs
+          ? _isoSections.any((section) => section.codec == 'prores')
+          : codec == 'prores');
 
   void close() => _input.closeSync();
 
@@ -93,6 +93,50 @@ final class Video {
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
+  late final bool _mixedIsoCodecs = _hasMixedIsoCodecs();
+  late final List<_IsoSection> _isoSections = _readIsoSections();
+  late final Map<FramePacket, _IsoSection> _isoSectionByPacket = {
+    for (final section in _isoSections)
+      for (final packet in section.visible) packet: section,
+  };
+
+  bool _hasMixedIsoCodecs() {
+    final iso = _iso;
+    if (iso == null) return false;
+    final track = iso.firstVideoTrack();
+    final table = iso.sampleTable(iso.child(track, 'mdia'));
+    final entries = iso.sampleDescriptions(table).iterator;
+    if (!entries.moveNext()) return false;
+    final first = iso.videoCodec(entries.current);
+    while (entries.moveNext()) {
+      if (iso.videoCodec(entries.current) != first) return true;
+    }
+    return false;
+  }
+
+  List<_IsoSection> _readIsoSections() {
+    final iso = _iso!;
+    final sections = <_IsoSection>[];
+    for (final packet in isoFrames(
+      iso,
+      onDescription: (entry) {
+        sections.add(
+          _IsoSection(iso.videoCodec(entry), entry, sections.isNotEmpty),
+        );
+      },
+      onSample: (packet, sync) => sections.last.samples.add((packet, sync)),
+    )) {
+      sections.last.visible.add(packet);
+    }
+    return sections;
+  }
+
+  _IndexedVideo _indexIsoSection(_IsoSection section) {
+    final name = section.codec;
+    if (name == 'av1') return _indexAv1(section: section);
+    if (isMpegVideo(name)) return _indexMpeg(section: section);
+    return _indexNalVideo(section: section);
+  }
 
   Uint8List _av1Configuration([MediaBox? description]) {
     final matroska = _matroska;
@@ -127,6 +171,7 @@ final class Video {
   }
 
   Iterable<FramePacket> packets({bool preview = false}) {
+    if (_mixedIsoCodecs) return _mixedIsoPackets(preview);
     final systems = _systems;
     if (systems != null) {
       return preview
@@ -158,23 +203,61 @@ final class Video {
     }
     final keyframes = preview && codec == 'vp8';
     final avi = _avi;
-    final bitmap = codec == 'rawvideo' && avi?.supportsBitmap == true;
-    if (codec != 'mjpeg' &&
-        codec != 'png' &&
-        codec != 'prores' &&
-        !keyframes &&
-        !bitmap) {
-      throw UnsupportedError('Pure Dart decoding for $codec is unavailable');
-    }
+    _checkIndependentCodec(codec, preview: preview);
     if (avi != null) return avi.packets();
     return _containerPackets(keyframes);
+  }
+
+  Iterable<FramePacket> _mixedIsoPackets(bool preview) sync* {
+    final packets = <FramePacket>[];
+    for (final section in _isoSections) {
+      final name = section.codec;
+      if (_usesReferences(name)) {
+        final indexed = section.indexed ??= _indexIsoSection(section);
+        packets.addAll(
+          indexed.timeline.presentation.where((packet) {
+            if (!preview) return true;
+            return indexed.configurations.containsKey(
+              indexed.timeline.index[packet],
+            );
+          }),
+        );
+      } else {
+        _checkIndependentCodec(name, preview: preview);
+        packets.addAll(section.packets(keyframes: preview && name == 'vp8'));
+      }
+    }
+    // A fragment or chunk can begin in decode order before the preceding
+    // section's last composition timestamp.
+    final ordered = packets.indexed.toList()
+      ..sort((a, b) {
+        final byTime = a.$2.seconds.compareTo(b.$2.seconds);
+        return byTime == 0 ? a.$1.compareTo(b.$1) : byTime;
+      });
+    yield* ordered.map((entry) => entry.$2);
+  }
+
+  void _checkIndependentCodec(String name, {bool preview = false}) {
+    if (name == 'mjpeg' ||
+        name == 'png' ||
+        name == 'prores' ||
+        (preview && name == 'vp8') ||
+        (name == 'rawvideo' && _avi?.supportsBitmap == true)) {
+      return;
+    }
+    throw UnsupportedError('Pure Dart decoding for $name is unavailable');
   }
 
   Iterable<FramePacket> _containerPackets(
     bool keyframes, {
     FrameVisitor? onSample,
     void Function(MediaBox)? onDescription,
+    _IsoSection? section,
   }) {
+    if (section != null) {
+      onDescription?.call(section.description);
+      return section.packets(keyframes: keyframes, onSample: onSample);
+    }
     final systems = _systems;
     if (systems != null) return systems.packets(keyframes, onSample: onSample);
     final matroska = _matroska;
@@ -208,20 +291,21 @@ final class Video {
     }
   }
 
-  ({_VideoTimeline timeline, Map<int, Uint8List> configurations}) _indexAv1() {
+  _IndexedVideo _indexAv1({_IsoSection? section}) {
     var configuration = _iso == null ? _av1Configuration() : Uint8List(0);
     var units = Av1AccessUnits()..configure(configuration);
     final decodeOrder = <FramePacket>[], startPositions = <int>[];
     final shown = <FramePacket>{};
     final index = <FramePacket, int>{};
-    final configurations = <int, Uint8List>{};
+    final configurations = <int, _RunConfiguration>{};
     var start = -1;
     var newDescription = false;
     final presentation =
         _containerPackets(
           false,
+          section: section,
           onDescription: (entry) {
-            newDescription = decodeOrder.isNotEmpty;
+            newDescription = section?.restart == true || decodeOrder.isNotEmpty;
             configuration = _av1Configuration(entry);
             units = Av1AccessUnits()..configure(configuration);
           },
@@ -234,8 +318,10 @@ final class Video {
                   frame.shown &&
                   frame.syntax.existingSlot == null) {
                 start = position;
-                configurations[start] =
-                    units.sequenceConfiguration ?? configuration;
+                configurations[start] = (
+                  bytes: units.sequenceConfiguration ?? configuration,
+                  nal: null,
+                );
               }
               first = false;
               if (frame.shown) displays++;
@@ -267,6 +353,7 @@ final class Video {
         gopStart: startPositions,
       ),
       configurations: configurations,
+      sections: const {},
     );
   }
 
@@ -276,16 +363,18 @@ final class Video {
   Iterable<FramePacket> _nalPackets({
     bool preview = false,
     void Function(FramePacket, int?, bool, _NalConfiguration?, bool)? onSample,
+    _IsoSection? section,
   }) sync* {
     final systems = _systems;
-    final isHevc = codec == 'hevc';
+    final name = section?.codec ?? codec;
+    final isHevc = name == 'hevc';
     Uint8List? record;
     HevcConfiguration? hevc;
     AvcConfiguration? avc;
     var parameters = NalParameterSets();
     var newDescription = false, hasPicture = false;
     void configure([MediaBox? description]) {
-      record = _configuration(codec, description);
+      record = _configuration(name, description);
       if (isHevc) {
         hevc = HevcConfiguration(record!);
       } else {
@@ -294,7 +383,7 @@ final class Video {
       parameters = NalParameterSets(
         lengthBytes: hevc?.lengthBytes ?? avc!.lengthBytes,
       );
-      newDescription = hasPicture;
+      newDescription = hasPicture || section?.restart == true;
     }
 
     if (_matroska != null) configure();
@@ -309,6 +398,7 @@ final class Video {
     _NalConfiguration? configuration;
     for (final packet in _containerPackets(
       false,
+      section: section,
       onDescription: configure,
       onSample: (packet, sync) {
         final before = parameters.snapshot();
@@ -363,29 +453,25 @@ final class Video {
     }
   }
 
-  ({
-    _VideoTimeline timeline,
-    Map<int, _NalConfiguration> configurations,
-    Map<int, int> sections,
-  })
-  _indexNalVideo() {
-    final isHevc = codec == 'hevc';
+  _IndexedVideo _indexNalVideo({_IsoSection? section}) {
+    final isHevc = (section?.codec ?? codec) == 'hevc';
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
-    final configurations = <int, _NalConfiguration>{};
+    final configurations = <int, _RunConfiguration>{};
     final sections = <int, int>{};
-    var start = -1, previous = -1, section = 0;
+    var start = -1, previous = -1, sectionStart = 0;
     final presentation = _nalPackets(
+      section: section,
       onSample: (packet, type, randomAccess, configuration, newDescription) {
         final position = decodeOrder.length;
         if (randomAccess) {
           // RASL pictures following a CRA can still refer across it.
           previous = isHevc && type == 21 && !newDescription ? start : -1;
           start = position;
-          if (newDescription) section = start;
-          configurations[start] = configuration!;
-          sections[start] = section;
+          if (newDescription) sectionStart = start;
+          configurations[start] = (bytes: null, nal: configuration!);
+          sections[start] = sectionStart;
         }
         index[packet] = position;
         decodeOrder.add(packet);
@@ -411,12 +497,7 @@ final class Video {
     );
   }
 
-  ({
-    _VideoTimeline timeline,
-    Map<int, Uint8List> configurations,
-    Map<int, int> sections,
-  })
-  _indexMpeg() {
+  _IndexedVideo _indexMpeg({_IsoSection? section}) {
     final systems = _systems;
     var headers = MpegHeaders();
     final matroska = _matroska;
@@ -434,9 +515,10 @@ final class Video {
     if (matroska != null)
       configure(matroskaVideoConfiguration(matroska, codec));
     final decodeOrder = <FramePacket>[], gopStart = <int>[];
-    final index = <FramePacket, int>{}, configurations = <int, Uint8List>{};
+    final index = <FramePacket, int>{};
+    final configurations = <int, _RunConfiguration>{};
     final sections = <int, int>{};
-    var start = -1, bStart = -1, section = 0;
+    var start = -1, bStart = -1, sectionStart = 0;
     MpegPictureInfo pictureInfo(FramePacket packet) {
       if (systems != null) return systems.mpegPicture(packet);
       final bytes = _read(packet);
@@ -450,7 +532,10 @@ final class Video {
             flags,
           );
           if (picture.type == 1)
-            configurations[decodeOrder.length] = headers.configuration();
+            configurations[decodeOrder.length] = (
+              bytes: headers.configuration(),
+              nal: null,
+            );
         } else if (unit.code == 0xb8 && unit.end - unit.data >= 4) {
           flags = bytes[unit.data + 3];
         } else {
@@ -467,15 +552,18 @@ final class Video {
     final presentation =
         _containerPackets(
             false,
+            section: section,
             onDescription: (entry) {
               configure(_iso!.mpegVideoConfiguration(description: entry));
-              section = decodeOrder.length;
+              sectionStart = decodeOrder.length;
               start = bStart = -1;
             },
             onSample: (packet, _) {
               final position = decodeOrder.length;
               final picture = pictureInfo(packet);
-              if (section > 0 && position == section && picture.type != 1) {
+              if ((sectionStart > 0 || section?.restart == true) &&
+                  position == sectionStart &&
+                  picture.type != 1) {
                 throw const FormatException(
                   'MPEG video sample description changes outside an I-picture',
                 );
@@ -487,9 +575,12 @@ final class Video {
                       ? position
                       : (picture.brokenLink ? -1 : start);
                   start = position;
-                  sections[start] = section;
+                  sections[start] = sectionStart;
                   if (systems != null) {
-                    configurations[position] = systems.configurationAt(packet)!;
+                    configurations[position] = (
+                      bytes: systems.configurationAt(packet)!,
+                      nal: null,
+                    );
                   }
                 case 2:
                   bStart = start;
@@ -534,29 +625,52 @@ final class Video {
   /// Split exactly where the serial decoder would restart. In particular, an
   /// HEVC leading picture can require decoding across a random-access point.
   Iterable<_DecodeRun> _decodeRuns(Iterable<FramePacket> selected) sync* {
-    if (!usesReferencePictures) {
+    if (_mixedIsoCodecs) {
+      final bySection = <_IsoSection, List<FramePacket>>{};
+      for (final packet in selected) {
+        final section = _isoSectionByPacket[packet];
+        if (section == null)
+          throw const FormatException('Unknown video packet');
+        bySection.putIfAbsent(section, () => []).add(packet);
+      }
+      for (final entry in bySection.entries) {
+        final section = entry.key;
+        final name = section.codec;
+        final indexed = _usesReferences(name)
+            ? section.indexed ??= _indexIsoSection(section)
+            : null;
+        yield* _runs(entry.value, name, indexed);
+      }
+      return;
+    }
+    final name = _decodeCodec;
+    final indexed = switch (name) {
+      'av1' => _av1Timeline,
+      'h264' || 'hevc' => _nalTimeline,
+      _ when isMpegVideo(name) => _mpegTimeline,
+      _ => null,
+    };
+    yield* _runs(selected, name, indexed);
+  }
+
+  Iterable<_DecodeRun> _runs(
+    Iterable<FramePacket> selected,
+    String name,
+    _IndexedVideo? indexed,
+  ) sync* {
+    if (indexed == null) {
       for (final packet in selected) {
         yield (
+          codec: name,
           packets: [packet],
           targets: const [0],
           configuration: null,
-          nalConfiguration: null,
         );
       }
       return;
     }
-    final av1 = codec == 'av1';
-    final mpeg = isMpegVideo(codec);
-    final timeline = av1
-        ? _av1Timeline.timeline
-        : mpeg
-        ? _mpegTimeline.timeline
-        : _nalTimeline.timeline;
-    final sections = av1
-        ? const <int, int>{}
-        : mpeg
-        ? _mpegTimeline.sections
-        : _nalTimeline.sections;
+    final av1 = name == 'av1';
+    final (:timeline, :configurations, :sections) = indexed;
     final targets = {
       for (final packet in selected)
         timeline.index[packet] ??
@@ -565,16 +679,10 @@ final class Video {
     var start = -1, end = -1;
     var wanted = <int>[];
     _DecodeRun run() => (
+      codec: name,
       packets: timeline.decodeOrder.sublist(start, end + 1),
       targets: wanted,
-      configuration: av1
-          ? _av1Timeline.configurations[start]!
-          : mpeg
-          ? _mpegTimeline.configurations[start]!
-          : null,
-      nalConfiguration: av1 || mpeg
-          ? null
-          : _nalTimeline.configurations[start]!,
+      configuration: configurations[start]!,
     );
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
@@ -603,10 +711,11 @@ final class Video {
     YuvImageScaler? scaler,
     bool includeOriginal,
   ) sync* {
-    if (!usesReferencePictures) {
+    final name = run.codec;
+    if (!_usesReferences(name)) {
       final packet = run.packets.single;
       final _RenderPicture render;
-      if (codec == 'prores') {
+      if (name == 'prores') {
         final keepAlpha =
             includeOriginal ||
             (scaler?.width == null && scaler?.height == null);
@@ -616,8 +725,17 @@ final class Video {
           includeAlpha: scaler?.width == null && scaler?.height == null,
         );
       } else {
-        final source = decode(packet);
-        render = ({scaler}) => scaler?.filterRgb(source) ?? source;
+        final source = _decodeIndependent(packet, name);
+        render = ({scaler}) {
+          final filtered = scaler?.filterRgb(source) ?? source;
+          return scaler?.filters != null
+              ? filtered
+              : resizeToFit(
+                  filtered,
+                  width: scaler?.width,
+                  height: scaler?.height,
+                );
+        };
       }
       final frame = render(scaler: scaler);
       final unscaled = scaler?.unscaled;
@@ -640,9 +758,9 @@ final class Video {
       if (!selected) continue;
       if (render == null) {
         throw FormatException(
-          codec == 'av1'
+          name == 'av1'
               ? 'AV1 sample has no display picture'
-              : 'Invalid $codec video frame',
+              : 'Invalid $name video frame',
         );
       }
       final frame = render(scaler: scaler);
@@ -656,9 +774,10 @@ final class Video {
   }
 
   _RenderPicture? Function(Uint8List, bool) _pictureReader(_DecodeRun run) {
-    switch (_decodeCodec) {
+    final configuration = run.configuration!;
+    switch (run.codec) {
       case 'av1':
-        final units = Av1AccessUnits()..configure(run.configuration!);
+        final units = Av1AccessUnits()..configure(configuration.bytes!);
         final decoder = Av1StreamDecoder();
         return (bytes, selected) {
           Av1Picture? displayed;
@@ -675,14 +794,14 @@ final class Video {
         };
       case 'hevc':
         final decoder = HevcStreamDecoder(
-          _hevcDecoderConfig(run.nalConfiguration!),
+          _hevcDecoderConfig(configuration.nal!),
         );
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
       case 'mpeg1video' || 'mpeg2video':
-        final decoder = MpegStreamDecoder(run.configuration);
+        final decoder = MpegStreamDecoder(configuration.bytes);
         return (bytes, selected) {
           if (selected) return decoder.decode(bytes).rgb;
           decoder.advance(bytes);
@@ -690,7 +809,7 @@ final class Video {
         };
       default:
         final decoder = H264StreamDecoder(
-          _avcDecoderConfig(run.nalConfiguration!),
+          _avcDecoderConfig(configuration.nal!),
         );
         return (bytes, selected) {
           final picture = decoder.decode(bytes);
@@ -737,6 +856,13 @@ final class Video {
   }
 
   image.Image decode(FramePacket packet, {bool preview = false}) {
+    if (_mixedIsoCodecs) {
+      final section = _isoSectionByPacket[packet];
+      if (section == null) throw const FormatException('Unknown video packet');
+      return _usesReferences(section.codec)
+          ? decodeSelected([packet]).single.frame
+          : _decodeIndependent(packet, section.codec, preview: preview);
+    }
     if (usesReferencePictures &&
         (_systems != null ||
             !preview ||
@@ -746,38 +872,46 @@ final class Video {
                 : !_previewNalConfigurations.containsKey(packet)))) {
       return decodeSelected([packet]).single.frame;
     }
-    if (codec == 'prores') {
-      return _proRes(packet, preserveAlpha: !preview).rgb();
-    }
-    final bytes = _read(packet);
     if (codec == 'h264') {
       final config = _avcDecoderConfig(_previewNalConfigurations[packet]!);
-      return H264IdrDecoder(config).decode(bytes)?.rgb() ??
+      return H264IdrDecoder(config).decode(_read(packet))?.rgb() ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'hevc') {
       final config = _hevcDecoderConfig(_previewNalConfigurations[packet]!);
-      return HevcIntraDecoder(config).decode(bytes)?.rgb() ??
+      return HevcIntraDecoder(config).decode(_read(packet))?.rgb() ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'av1') {
       final decoder = Av1AccessUnits()
         ..configure(_previewAv1Configurations[packet]!);
-      for (final frame in decoder.readSample(bytes)) {
+      for (final frame in decoder.readSample(_read(packet))) {
         if (frame.header.type.intra && frame.shown) {
           return decodeAv1IntraImage(frame);
         }
       }
       throw const FormatException('No independently decodable AV1 picture');
     }
-    final frame = switch (codec) {
+    return _decodeIndependent(packet, codec, preview: preview);
+  }
+
+  image.Image _decodeIndependent(
+    FramePacket packet,
+    String name, {
+    bool preview = false,
+  }) {
+    if (name == 'prores') {
+      return _proRes(packet, preserveAlpha: !preview).rgb();
+    }
+    final bytes = _read(packet);
+    final frame = switch (name) {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
       'rawvideo' => _avi?.decodeBitmap(bytes),
       _ => null,
     };
-    if (frame == null) throw FormatException('Invalid $codec video frame');
+    if (frame == null) throw FormatException('Invalid $name video frame');
     return _rgb(frame);
   }
 
@@ -814,9 +948,39 @@ typedef _VideoTimeline = ({
 
 typedef _RenderPicture = image.Image Function({YuvImageScaler? scaler});
 typedef _NalConfiguration = ({Uint8List? record, Uint8List? parameterSets});
+typedef _RunConfiguration = ({Uint8List? bytes, _NalConfiguration? nal});
+typedef _IndexedVideo = ({
+  _VideoTimeline timeline,
+  Map<int, _RunConfiguration> configurations,
+  Map<int, int> sections,
+});
 typedef _DecodeRun = ({
+  String codec,
   List<FramePacket> packets,
   List<int> targets,
-  Uint8List? configuration,
-  _NalConfiguration? nalConfiguration,
+  _RunConfiguration? configuration,
 });
+
+bool _usesReferences(String codec) =>
+    codec == 'h264' || codec == 'hevc' || codec == 'av1' || isMpegVideo(codec);
+
+final class _IsoSection {
+  _IsoSection(this.codec, this.description, this.restart);
+
+  final String codec;
+  final MediaBox description;
+  final bool restart;
+  final samples = <(FramePacket, bool)>[];
+  final visible = <FramePacket>{};
+  _IndexedVideo? indexed;
+
+  Iterable<FramePacket> packets({
+    bool keyframes = false,
+    FrameVisitor? onSample,
+  }) sync* {
+    for (final (packet, sync) in samples) {
+      onSample?.call(packet, sync);
+      if ((!keyframes || sync) && visible.contains(packet)) yield packet;
+    }
+  }
+}

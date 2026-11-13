@@ -75,22 +75,38 @@ final class GridComposer {
   late final int width, height, _columns;
   late final List<GridLabel> _labels;
 
-  image.Image compose(List<image.Image> frames, {bool sourceAlpha = false}) {
+  image.Image compose(
+    List<image.Image> frames, {
+    bool sourceAlpha = false,
+    bool fitTiles = false,
+  }) {
     if (frames.length != count) {
       throw const FormatException('Grid capture count changed');
     }
     final grid = image.Image(width: width, height: height);
     for (var i = 0; i < frames.length; i++) {
-      final frame = frames[i];
-      if (frame.width != tileWidth || frame.height != tileHeight) {
+      final source = frames[i];
+      if (!fitTiles &&
+          (source.width != tileWidth || source.height != tileHeight)) {
         throw const FormatException(
           'Grid images must have the same dimensions',
         );
       }
+      final frame = fitTiles
+          ? resizeToFit(source, width: tileWidth, height: tileHeight)
+          : source;
       final x = i % _columns * tileWidth;
       final y = i ~/ _columns * tileHeight;
+      final left = x + (tileWidth - frame.width) ~/ 2;
+      final top = y + (tileHeight - frame.height) ~/ 2;
       for (final pixel in frame) {
-        grid.setPixelRgb(x + pixel.x, y + pixel.y, pixel.r, pixel.g, pixel.b);
+        grid.setPixelRgb(
+          left + pixel.x,
+          top + pixel.y,
+          pixel.r,
+          pixel.g,
+          pixel.b,
+        );
       }
       if (i < _labels.length) {
         _labels[i].paint(grid, x, y, source: sourceAlpha ? frame : null);

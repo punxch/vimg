@@ -319,7 +319,12 @@ Future<void> writeContactSheet(
       final first = tiles.first!;
       if (!changed && avif != null) {
         avif.repeatFrame();
-        onGrid?.call(frame, previousGrid!, first.width, first.height);
+        onGrid?.call(
+          frame,
+          previousGrid!,
+          composer!.tileWidth,
+          composer.tileHeight,
+        );
         continue;
       }
       composer ??= GridComposer(
@@ -337,9 +342,9 @@ Future<void> writeContactSheet(
           'Contact sheet exceeds 256 MiB of decoded frames',
         );
       }
-      final grid = composer.compose(tiles.cast<image.Image>());
+      final grid = composer.compose(tiles.cast<image.Image>(), fitTiles: true);
       if (onGrid != null) {
-        onGrid(frame, grid, first.width, first.height);
+        onGrid(frame, grid, composer.tileWidth, composer.tileHeight);
         previousGrid = grid;
       }
       if (encoder == null) {
