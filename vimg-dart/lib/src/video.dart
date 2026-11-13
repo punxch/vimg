@@ -27,6 +27,7 @@ import 'mpeg12/syntax.dart';
 import 'mpeg_systems.dart';
 import 'nal_parameter_sets.dart';
 import 'prores.dart';
+import 'msrle.dart';
 import 'quicktime_animation.dart';
 import 'quicktime_raw.dart';
 import 'quicktime_rpza.dart';
@@ -102,7 +103,7 @@ final class Video {
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
-  late final _quickTimeDeltaTimeline = _indexQuickTimeDelta(codec);
+  late final _deltaTimeline = _indexDeltaPictures(codec);
   late final bool _mixedIsoCodecs = _hasMixedIsoCodecs();
   late final List<_IsoSection> _isoSections = _readIsoSections();
   late final Map<FramePacket, _IsoSection> _isoSectionByPacket = {
@@ -159,22 +160,22 @@ final class Video {
 
   _IndexedVideo _indexIsoSection(_IsoSection section) {
     final name = section.codec;
-    if (_isQuickTimeDelta(name)) {
-      return _indexQuickTimeDelta(name, section: section);
+    if (_isDeltaBitmapCodec(name)) {
+      return _indexDeltaPictures(name, section: section);
     }
     if (name == 'av1') return _indexAv1(section: section);
     if (isMpegVideo(name)) return _indexMpeg(section: section);
     return _indexNalVideo(section: section);
   }
 
-  _IndexedVideo _indexQuickTimeDelta(String name, {_IsoSection? section}) {
+  _IndexedVideo _indexDeltaPictures(String name, {_IsoSection? section}) {
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
     final configurations = <int, _RunConfiguration>{};
     final sections = <int, int>{};
     var start = -1, sectionStart = 0;
-    late Uint8List description;
+    Uint8List? description;
     var rpzaBlocks = 0;
     SmcPictureOrder? smc;
     CinepakPictureOrder? cinepak;
@@ -183,9 +184,18 @@ final class Video {
       cinepak = CinepakPictureOrder(format.width, format.height);
     }
 
-    if (_avi case final avi?) {
-      description = avi.cinepakDescription!;
-      setCinepakDescription(description);
+    final avi = _avi;
+    final rle = avi?.rleFormat;
+    bool isRleKeyframe(FramePacket packet, int position) {
+      final raw = avi!.isUncompressedRle(packet);
+      final complete = raw || rle!.isComplete(_read(packet));
+      // The first picture can leave pixels at their initial palette index 0.
+      return complete || position == 0;
+    }
+
+    if (avi?.cinepakDescription case final entry?) {
+      description = entry;
+      setCinepakDescription(entry);
     }
     final presentation =
         _containerPackets(
@@ -198,15 +208,14 @@ final class Video {
                   'Oversized QuickTime video description',
                 );
               }
-              description = file.read(entry.data, entry.end - entry.data);
+              final bytes = file.read(entry.data, entry.end - entry.data);
+              description = bytes;
               if (name == 'rpza') {
-                rpzaBlocks = QuickTimeRpzaDecoder(description).blockCount;
+                rpzaBlocks = QuickTimeRpzaDecoder(bytes).blockCount;
               } else if (name == 'smc') {
-                smc = SmcPictureOrder(
-                  QuickTimeSmcDecoder(description).blockCount,
-                );
+                smc = SmcPictureOrder(QuickTimeSmcDecoder(bytes).blockCount);
               } else if (name == 'cinepak') {
-                setCinepakDescription(description);
+                setCinepakDescription(bytes);
               }
               start = -1;
               sectionStart = decodeOrder.length;
@@ -220,6 +229,8 @@ final class Video {
                   ? anchor == position
                   : name == 'rpza'
                   ? isRpzaKeyframe(_read(packet), rpzaBlocks)
+                  : rle != null
+                  ? isRleKeyframe(packet, position)
                   : sync;
               if (keyframe) {
                 start = position;
@@ -310,8 +321,8 @@ final class Video {
           ? _av1PreviewPackets()
           : _av1Timeline.timeline.presentation;
     }
-    if (_isQuickTimeDelta(codec)) {
-      final indexed = _quickTimeDeltaTimeline;
+    if (_isDeltaBitmapCodec(codec)) {
+      final indexed = _deltaTimeline;
       return indexed.timeline.presentation.where(
         (packet) =>
             !preview ||
@@ -778,7 +789,7 @@ final class Video {
     final indexed = switch (name) {
       'av1' => _av1Timeline,
       'h264' || 'hevc' => _nalTimeline,
-      _ when _isQuickTimeDelta(name) => _quickTimeDeltaTimeline,
+      _ when _isDeltaBitmapCodec(name) => _deltaTimeline,
       _ when isMpegVideo(name) => _mpegTimeline,
       _ => null,
     };
@@ -913,7 +924,7 @@ final class Video {
     var target = 0;
     for (final (i, packet) in run.packets.indexed) {
       final selected = i == run.targets[target];
-      final render = readPicture(_read(packet), selected, run.aviPalettes?[i]);
+      final render = readPicture(packet, selected, run.aviPalettes?[i]);
       if (!selected) continue;
       if (render == null) {
         throw FormatException(
@@ -932,22 +943,32 @@ final class Video {
     }
   }
 
-  _RenderPicture? Function(Uint8List, bool, List<int>?) _pictureReader(
+  _RenderPicture? Function(FramePacket, bool, List<int>?) _pictureReader(
     _DecodeRun run,
   ) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'msrle':
+        final avi = _avi!;
+        final decoder = MsRleDecoder(avi.rleFormat!);
+        return (packet, selected, palette) {
+          decoder.advance(_read(packet), raw: avi.isUncompressedRle(packet));
+          if (!selected) return null;
+          final source = decoder.rgb(palette!);
+          return ({scaler}) => _renderRgb(source, scaler);
+        };
       case 'cinepak':
         final decoder = CinepakDecoder(configuration.bytes!);
-        return (bytes, selected, palette) {
-          decoder.advance(bytes);
+        return (packet, selected, palette) {
+          decoder.advance(_read(packet));
           if (!selected) return null;
           final source = decoder.rgb(palette: palette);
           return ({scaler}) => _renderRgb(source, scaler);
         };
       case 'qtrle':
         final decoder = QuickTimeAnimationDecoder(configuration.bytes!);
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
@@ -955,7 +976,8 @@ final class Video {
         };
       case 'rpza':
         final decoder = QuickTimeRpzaDecoder(configuration.bytes!);
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
@@ -963,7 +985,8 @@ final class Video {
         };
       case 'smc':
         final decoder = QuickTimeSmcDecoder(configuration.bytes!);
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
@@ -972,7 +995,8 @@ final class Video {
       case 'av1':
         final units = Av1AccessUnits()..configure(configuration.bytes!);
         final decoder = Av1StreamDecoder();
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           Av1Picture? displayed;
           for (final frame in units.readSample(bytes)) {
             final picture = decoder.decode(frame);
@@ -989,13 +1013,15 @@ final class Video {
         final decoder = HevcStreamDecoder(
           _hevcDecoderConfig(configuration.nal!),
         );
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
       case 'mpeg1video' || 'mpeg2video':
         final decoder = MpegStreamDecoder(configuration.bytes);
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           if (selected) return decoder.decode(bytes).rgb;
           decoder.advance(bytes);
           return null;
@@ -1004,7 +1030,8 @@ final class Video {
         final decoder = H264StreamDecoder(
           _avcDecoderConfig(configuration.nal!),
         );
-        return (bytes, selected, _) {
+        return (packet, selected, _) {
+          final bytes = _read(packet);
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
@@ -1069,7 +1096,7 @@ final class Video {
       final frame = decodeSelected([packet]).single.frame;
       return preview && section.codec == 'qtrle' ? _rgb(frame) : frame;
     }
-    if (_isQuickTimeDelta(codec)) {
+    if (_isDeltaBitmapCodec(codec)) {
       final frame = decodeSelected([packet]).single.frame;
       return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
@@ -1184,11 +1211,15 @@ bool _usesReferences(String codec) =>
     codec == 'h264' ||
     codec == 'hevc' ||
     codec == 'av1' ||
-    _isQuickTimeDelta(codec) ||
+    _isDeltaBitmapCodec(codec) ||
     isMpegVideo(codec);
 
-bool _isQuickTimeDelta(String codec) =>
-    codec == 'qtrle' || codec == 'rpza' || codec == 'smc' || codec == 'cinepak';
+bool _isDeltaBitmapCodec(String codec) =>
+    codec == 'qtrle' ||
+    codec == 'rpza' ||
+    codec == 'smc' ||
+    codec == 'cinepak' ||
+    codec == 'msrle';
 
 final class _IsoSection {
   _IsoSection(this.codec, this.description, this.restart);

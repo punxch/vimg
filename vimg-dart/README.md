@@ -61,6 +61,8 @@ Cinepak (`cvid`) in MOV and AVI supports color, grayscale and indexed
 frames. Random access follows codebook updates and blocks retained from
 earlier pictures. AVI palette changes apply to both indexed Cinepak and
 indexed uncompressed video.
+AVI also supports Microsoft RLE4 and RLE8, including delta runs, palette
+changes and uncompressed bitmap chunks in the same track.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the

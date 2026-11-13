@@ -5,6 +5,7 @@ import 'package:image/image.dart' as image;
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'metadata.dart';
+import 'msrle.dart';
 
 typedef _Chunk = ({String id, int data, int end});
 typedef _ColorMasks = ({int r, int g, int b});
@@ -23,6 +24,7 @@ typedef _Track = ({
   int rate,
   _Bitmap? bitmap,
   Uint8List? cinepakDescription,
+  MsRleFormat? rle,
   List<int>? palette,
 });
 
@@ -119,6 +121,12 @@ final class Avi {
         'XVID' || 'DIVX' || 'DX50' || 'FMP4' => 'mpeg4',
         'FFV1' => 'ffv1',
         'CVID' => 'cinepak',
+        '\x01\x00\x00\x00' ||
+        '\x02\x00\x00\x00' ||
+        'MRLE' ||
+        'RLE ' ||
+        'RLE4' ||
+        'RLE8' => 'msrle',
         '\x00\x00\x00\x00' || '\x03\x00\x00\x00' => 'rawvideo',
         _ => 'unknown',
       };
@@ -126,6 +134,22 @@ final class Avi {
       final bitmap = codec != 'rawvideo'
           ? null
           : _bitmap(format, width, signedHeight, bits, bitfields: bitfields);
+      final MsRleFormat? rle;
+      if (codec == 'msrle') {
+        final depth = switch (compression) {
+          '\x01\x00\x00\x00' || 'RLE8' => 8,
+          '\x02\x00\x00\x00' || 'RLE4' => 4,
+          _ => bits,
+        };
+        if (depth != bits) {
+          throw const FormatException(
+            'AVI compression conflicts with bitmap depth',
+          );
+        }
+        rle = MsRleFormat(width, height, bits, topDown: signedHeight < 0);
+      } else {
+        rle = null;
+      }
       tracks.add((
         index: index,
         step: step,
@@ -142,8 +166,11 @@ final class Avi {
         cinepakDescription: codec == 'cinepak'
             ? _cinepakDescription(width, height, bits)
             : null,
+        rle: rle,
         palette:
-            (bitmap != null && bits <= 8) || (codec == 'cinepak' && bits == 8)
+            rle != null ||
+                (bitmap != null && bits <= 8) ||
+                (codec == 'cinepak' && bits == 8)
             ? _bitmapPalette(format, bits)
             : null,
       ));
@@ -159,6 +186,11 @@ final class Avi {
   bool get supportsBitmap => _header.tracks.firstOrNull?.bitmap != null;
   Uint8List? get cinepakDescription =>
       _header.tracks.firstOrNull?.cinepakDescription;
+  MsRleFormat? get rleFormat => _header.tracks.firstOrNull?.rle;
+
+  bool isUncompressedRle(FramePacket packet) =>
+      packet.size == rleFormat!.bitmapSize &&
+      file.unsigned(packet.offset - 6, 2) == 0x6462; // 'db'
 
   _Bitmap? _bitmap(
     _Chunk format,
