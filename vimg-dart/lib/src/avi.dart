@@ -15,6 +15,7 @@ typedef _Track = ({
   int scale,
   int rate,
   _Bitmap? bitmap,
+  Uint8List? cinepakDescription,
 });
 
 final class Avi {
@@ -109,6 +110,7 @@ final class Avi {
         'HEVC' || 'H265' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' || 'FMP4' => 'mpeg4',
         'FFV1' => 'ffv1',
+        'CVID' => 'cinepak',
         '\x00\x00\x00\x00' => 'rawvideo',
         _ => 'unknown',
       };
@@ -132,6 +134,9 @@ final class Avi {
                 topDown: signedHeight < 0,
               )
             : null,
+        cinepakDescription: codec == 'cinepak'
+            ? _cinepakDescription(format, width, height, bits)
+            : null,
       ));
     }
     return (tracks: tracks, duration: duration);
@@ -143,8 +148,50 @@ final class Avi {
   );
 
   bool get supportsBitmap => _header.tracks.firstOrNull?.bitmap != null;
+  Uint8List? get cinepakDescription =>
+      _header.tracks.firstOrNull?.cinepakDescription;
 
-  Iterable<FramePacket> packets() sync* {
+  Uint8List _cinepakDescription(
+    _Chunk format,
+    int width,
+    int height,
+    int bits,
+  ) {
+    if (width > 65535 || height > 65535) {
+      throw const FormatException('Invalid Cinepak dimensions in AVI');
+    }
+    var colors = 0;
+    var table = 0;
+    if (bits == 8 && format.end - format.data >= 40) {
+      table = format.data + _u32(format.data);
+      final declared = _u32(format.data + 32);
+      if (table < format.data + 40 || table > format.end || declared > 256) {
+        throw const FormatException('Invalid Cinepak palette in AVI');
+      }
+      final available = (format.end - table) ~/ 4;
+      colors = declared == 0 ? available.clamp(0, 256) : declared;
+      if (colors > available)
+        throw const FormatException('Truncated Cinepak palette in AVI');
+    }
+    final description = Uint8List(colors == 0 ? 78 : 86 + 8 * colors);
+    final bytes = ByteData.sublistView(description)
+      ..setUint16(24, width)
+      ..setUint16(26, height)
+      ..setUint16(74, bits)
+      ..setUint16(76, colors == 0 ? 65535 : 0);
+    if (colors > 0) {
+      bytes.setUint16(84, colors - 1);
+      for (var i = 0; i < colors; i++) {
+        final color = file.read(table + 4 * i, 4);
+        description[88 + 8 * i] = color[2];
+        description[90 + 8 * i] = color[1];
+        description[92 + 8 * i] = color[0];
+      }
+    }
+    return description;
+  }
+
+  Iterable<FramePacket> packets({FrameVisitor? onSample}) sync* {
     final track = _header.tracks.firstOrNull;
     if (track == null) return;
     var frame = 0;
@@ -160,7 +207,7 @@ final class Avi {
           final index = frame++;
           // AVI zero-length samples mark dropped frames.
           if (sample.end == sample.data) continue;
-          yield (
+          final packet = (
             seconds: index * track.step,
             offset: sample.data,
             size: sample.end - sample.data,
@@ -171,6 +218,8 @@ final class Avi {
               duration: 1,
             ),
           );
+          onSample?.call(packet, false);
+          yield packet;
         }
       }
     }

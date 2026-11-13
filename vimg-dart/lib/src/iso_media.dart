@@ -198,6 +198,7 @@ final class IsoMedia {
     'rle ' => 'qtrle',
     'rpza' => 'rpza',
     'smc ' => 'smc',
+    'cvid' => 'cinepak',
     'raw ' ||
     'yuv2' ||
     '2vuy' ||

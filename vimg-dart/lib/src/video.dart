@@ -10,6 +10,7 @@ import 'av1/access_units.dart';
 import 'av1/frame_header.dart';
 import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
+import 'cinepak.dart';
 import 'frame_packet.dart';
 import 'grid.dart' show resizeToFit;
 import 'h264/access_unit.dart';
@@ -176,6 +177,16 @@ final class Video {
     late Uint8List description;
     var rpzaBlocks = 0;
     SmcPictureOrder? smc;
+    CinepakPictureOrder? cinepak;
+    void setCinepakDescription(Uint8List entry) {
+      final format = CinepakDecoder(entry);
+      cinepak = CinepakPictureOrder(format.width, format.height);
+    }
+
+    if (_avi case final avi?) {
+      description = avi.cinepakDescription!;
+      setCinepakDescription(description);
+    }
     final presentation =
         _containerPackets(
             false,
@@ -194,13 +205,17 @@ final class Video {
                 smc = SmcPictureOrder(
                   QuickTimeSmcDecoder(description).blockCount,
                 );
+              } else if (name == 'cinepak') {
+                setCinepakDescription(description);
               }
               start = -1;
               sectionStart = decodeOrder.length;
             },
             onSample: (packet, sync) {
               final position = decodeOrder.length;
-              final anchor = smc?.anchor(_read(packet), position);
+              final anchor =
+                  smc?.anchor(_read(packet), position) ??
+                  cinepak?.anchor(_read(packet), position);
               final keyframe = anchor != null
                   ? anchor == position
                   : name == 'rpza'
@@ -375,6 +390,7 @@ final class Video {
     }
     final systems = _systems;
     if (systems != null) return systems.packets(keyframes, onSample: onSample);
+    if (_avi case final avi?) return avi.packets(onSample: onSample);
     final matroska = _matroska;
     if (matroska != null) {
       return matroskaFrames(matroska, keyframes: keyframes, onSample: onSample);
@@ -906,6 +922,14 @@ final class Video {
   _RenderPicture? Function(Uint8List, bool) _pictureReader(_DecodeRun run) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'cinepak':
+        final decoder = CinepakDecoder(configuration.bytes!);
+        return (bytes, selected) {
+          decoder.advance(bytes);
+          if (!selected) return null;
+          final source = decoder.rgb();
+          return ({scaler}) => _renderRgb(source, scaler);
+        };
       case 'qtrle':
         final decoder = QuickTimeAnimationDecoder(configuration.bytes!);
         return (bytes, selected) {
@@ -1144,7 +1168,7 @@ bool _usesReferences(String codec) =>
     isMpegVideo(codec);
 
 bool _isQuickTimeDelta(String codec) =>
-    codec == 'qtrle' || codec == 'rpza' || codec == 'smc';
+    codec == 'qtrle' || codec == 'rpza' || codec == 'smc' || codec == 'cinepak';
 
 final class _IsoSection {
   _IsoSection(this.codec, this.description, this.restart);

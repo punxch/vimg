@@ -56,6 +56,9 @@ Preview and extraction locate complete pictures from the block data.
 QuickTime Graphics (`smc `) supports 8-bit indexed color and grayscale,
 including embedded palettes, block repeats, and differential frames.
 Random access accounts for both pixel and palette dependencies.
+Cinepak (`cvid`) in MOV and AVI supports color, grayscale and indexed
+frames with a palette in the stream header. Random access follows
+codebook updates and blocks retained from earlier pictures.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
