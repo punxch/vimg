@@ -52,12 +52,15 @@ final class VideoFilterChain {
   final List<_SpatialFilter> _filters;
   final List<_TimingFilter> _timing;
 
-  static VideoFilterChain _orient(
-    VideoOrientation orientation,
+  static VideoFilterChain _presentation(
+    VideoCrop? crop,
+    VideoOrientation? orientation,
     VideoFilterChain? next,
   ) {
-    final (:degrees, :horizontal, :vertical) = orientation;
+    final (:degrees, :horizontal, :vertical) =
+        orientation ?? (degrees: 0, horizontal: false, vertical: false);
     return VideoFilterChain._(next?.source ?? '', [
+      if (crop != null) _PresentationCrop(crop),
       if (degrees == 90 || degrees == 270)
         _Transpose._(degrees == 90 ? 1 : 2, 0)
       else if (degrees != 0)
@@ -209,6 +212,29 @@ int _dimension(double value, {bool nearest = false}) {
 
 abstract interface class _SpatialFilter {
   _VideoPlanes apply(_VideoPlanes frame);
+}
+
+final class _PresentationCrop implements _SpatialFilter {
+  const _PresentationCrop(this.crop);
+  final VideoCrop crop;
+
+  @override
+  _VideoPlanes apply(_VideoPlanes frame) {
+    final (:left, :right, :top, :bottom) = crop;
+    final width = frame.width - left - right;
+    final height = frame.height - top - bottom;
+    if (width <= 0 || height <= 0) {
+      throw const FormatException('Matroska crop exceeds decoded dimensions');
+    }
+    return frame.map(
+      (plane, sx, sy) => plane.window(
+        left >> sx,
+        top >> sy,
+        _subSize(width, sx),
+        _subSize(height, sy),
+      ),
+    );
+  }
 }
 
 enum _Flip implements _SpatialFilter {

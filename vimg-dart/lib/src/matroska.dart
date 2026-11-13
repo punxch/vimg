@@ -217,6 +217,78 @@ final class Matroska {
     }
   }
 
+  ({VideoCrop? crop, VideoOrientation? orientation, double? sampleAspect})
+  videoPresentation() {
+    final tracks = segmentElements()
+        .where((e) => e.id == 0x1654ae6b)
+        .firstOrNull;
+    final track = tracks == null ? null : videoTracks(tracks).firstOrNull;
+    if (track == null)
+      return (crop: null, orientation: null, sampleAspect: null);
+    final video = fields(track[0xe0]!);
+    final crop = (
+      left: number(video[0x54cc]) ?? 0,
+      top: number(video[0x54bb]) ?? 0,
+      right: number(video[0x54dd]) ?? 0,
+      bottom: number(video[0x54aa]) ?? 0,
+    );
+    final width = number(video[0xb0]) ?? 0, height = number(video[0xba]) ?? 0;
+    final hasCrop = crop != (left: 0, top: 0, right: 0, bottom: 0);
+    if (hasCrop &&
+        (crop.left < 0 ||
+            crop.right < 0 ||
+            crop.top < 0 ||
+            crop.bottom < 0 ||
+            crop.left >= width ||
+            crop.right >= width - crop.left ||
+            crop.top >= height ||
+            crop.bottom >= height - crop.top)) {
+      throw const FormatException('Invalid Matroska video crop');
+    }
+    final croppedWidth = width - crop.left - crop.right;
+    final croppedHeight = height - crop.top - crop.bottom;
+
+    final unit = number(video[0x54b2]) ?? 0;
+    final displayWidth = number(video[0x54b0]);
+    final displayHeight = number(video[0x54ba]);
+    double? aspect;
+    if (unit >= 0 &&
+        unit <= 3 &&
+        (displayWidth != null || displayHeight != null) &&
+        croppedWidth > 0 &&
+        croppedHeight > 0) {
+      final w = displayWidth ?? (unit == 0 ? croppedWidth : 0);
+      final h = displayHeight ?? (unit == 0 ? croppedHeight : 0);
+      if (w > 0 && h > 0) aspect = (w / h) / (croppedWidth / croppedHeight);
+    }
+    return (
+      crop: hasCrop ? crop : null,
+      orientation: _flatOrientation(video[0x7670]),
+      sampleAspect: aspect,
+    );
+  }
+
+  VideoOrientation? _flatOrientation(EbmlElement? box) {
+    if (box == null) return null;
+    final projection = fields(box);
+    if ((number(projection[0x7671]) ?? 0) != 0) return null;
+    final yaw = floating(projection[0x7673]) ?? 0;
+    final pitch = floating(projection[0x7674]) ?? 0;
+    final roll = floating(projection[0x7675]) ?? 0;
+    if (pitch != 0 ||
+        (yaw != 0 && yaw.abs() != 180) ||
+        !roll.isFinite ||
+        roll.abs() > 180)
+      return null;
+    final mirror = yaw != 0;
+    // Matroska applies yaw before counterclockwise roll. Moving the mirror
+    // after the rotation reverses the angle when both are present.
+    final angle = (mirror ? roll : -roll).round() % 360;
+    return angle == 0 && !mirror
+        ? null
+        : (degrees: angle, horizontal: mirror, vertical: false);
+  }
+
   String trackCodec(Map<int, EbmlElement> track) {
     final codec = text(track[0x86]);
     final config = track[0x63a2];

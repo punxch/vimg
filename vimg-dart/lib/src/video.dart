@@ -102,17 +102,36 @@ final class Video {
 
   void close() => _input.closeSync();
 
-  late final _orientation = _iso?.videoOrientation();
-  late final _previewScaler = _orientedScaler(null);
-  late final _orientedCaptureScalers = Expando<YuvImageScaler>();
+  late final _matroskaPresentation = _matroska?.videoPresentation();
+  late final _orientation =
+      _iso?.videoOrientation() ?? _matroskaPresentation?.orientation;
+  late final _crop = _matroskaPresentation?.crop;
+  bool get _hasPresentationTransform => _orientation != null || _crop != null;
+  late final _previewScaler = _presentationScaler(null);
+  late final _captureScalers = Expando<Map<double?, YuvImageScaler>>();
 
-  YuvImageScaler? _orientedScaler(YuvImageScaler? scaler) {
-    final orientation = _orientation;
-    if (orientation == null) return scaler;
-    if (scaler == null) return YuvImageScaler.oriented(orientation, null);
-    return _orientedCaptureScalers[scaler] ??= YuvImageScaler.oriented(
-      orientation,
+  YuvImageScaler? _presentationScaler(
+    YuvImageScaler? scaler, {
+    double? aspect,
+  }) {
+    aspect ??= _matroskaPresentation?.sampleAspect;
+    if (!_hasPresentationTransform &&
+        (aspect == null || scaler?.filters == null)) {
+      return scaler;
+    }
+    if (scaler == null) {
+      return YuvImageScaler.presentation(
+        null,
+        crop: _crop,
+        orientation: _orientation,
+      );
+    }
+    final byAspect = _captureScalers[scaler] ??= {};
+    return byAspect[aspect] ??= YuvImageScaler.presentation(
       scaler,
+      crop: _crop,
+      orientation: _orientation,
+      sampleAspect: aspect,
     );
   }
 
@@ -139,6 +158,14 @@ final class Video {
   };
   final _quickTimeFormats = <MediaBox, QuickTimeRawFormat>{};
   final _quickTimeDescriptions = <FramePacket, MediaBox>{};
+  final _isoAspects = <FramePacket, double>{};
+  final _descriptionAspects = <MediaBox, double?>{};
+  late final _isoDescriptions = _readIsoDescriptions();
+
+  double? _descriptionAspect(MediaBox entry) => _descriptionAspects.putIfAbsent(
+    entry,
+    () => _iso!.visualSampleAspect(entry),
+  );
 
   QuickTimeRawFormat? _quickTimeFormat(FramePacket packet, String name) {
     final iso = _iso;
@@ -154,19 +181,21 @@ final class Video {
     );
   }
 
-  bool _hasMixedIsoCodecs() {
+  List<MediaBox> _readIsoDescriptions() {
     final iso = _iso;
-    if (iso == null) return false;
+    if (iso == null) return const [];
     final track = iso.firstVideoTrack();
     final table = iso.sampleTable(iso.child(track, 'mdia'));
-    final entries = iso.sampleDescriptions(table).iterator;
-    if (!entries.moveNext()) return false;
-    final first = iso.videoCodec(entries.current);
-    while (entries.moveNext()) {
-      if (iso.videoCodec(entries.current) != first) return true;
-    }
-    return false;
+    return iso.sampleDescriptions(table).toList();
   }
+
+  bool _hasMixedIsoCodecs() =>
+      _isoDescriptions.map((entry) => _iso!.videoCodec(entry)).toSet().length >
+      1;
+
+  late final _commonIsoAspect = _isoDescriptions.length == 1
+      ? _descriptionAspect(_isoDescriptions.single)
+      : null;
 
   List<_IsoSection> _readIsoSections() {
     final iso = _iso!;
@@ -440,16 +469,24 @@ final class Video {
       return matroskaFrames(matroska, keyframes: keyframes, onSample: onSample);
     }
     final iso = _iso!;
+    final changingAspect = _isoDescriptions.length > 1;
+    double? aspect;
     return isoFrames(
       iso,
       keyframes: keyframes,
-      onSample: onSample,
+      onSample: !changingAspect
+          ? onSample
+          : (packet, sync) {
+              if (aspect != null) _isoAspects[packet] = aspect!;
+              onSample?.call(packet, sync);
+            },
       onDescription: (entry) {
         if (iso.videoCodec(entry) != codec) {
           throw const FormatException(
             'ISO media video codec changes within a track',
           );
         }
+        if (changingAspect) aspect = _descriptionAspect(entry);
         onDescription?.call(entry);
       },
     );
@@ -842,6 +879,8 @@ final class Video {
           targets: const [0],
           configuration: null,
           rawFormat: _quickTimeFormat(packet, name),
+          sampleAspect: _commonIsoAspect,
+          sampleAspects: _captureAspects([packet]),
           aviPalettes: _avi?.hasPalette == true
               ? {0: _avi!.paletteFor(packet)!}
               : null,
@@ -864,6 +903,10 @@ final class Video {
       targets: wanted,
       configuration: configurations[start]!,
       rawFormat: null,
+      sampleAspect: _commonIsoAspect,
+      sampleAspects: _captureAspects(
+        wanted.map((i) => timeline.decodeOrder[start + i]),
+      ),
       aviPalettes: _avi?.hasPalette == true
           ? {
               for (final i in wanted)
@@ -893,17 +936,36 @@ final class Video {
     if (start >= 0) yield run();
   }
 
+  Map<FramePacket, double>? _captureAspects(Iterable<FramePacket> packets) {
+    if (_isoDescriptions.length <= 1) return null;
+    final result = <FramePacket, double>{};
+    for (final packet in packets) {
+      final description = _mixedIsoCodecs
+          ? _isoSectionByPacket[packet]?.description
+          : null;
+      final aspect = description == null
+          ? _isoAspects[packet]
+          : _descriptionAspect(description);
+      if (aspect != null) result[packet] = aspect;
+    }
+    return result.isEmpty ? null : result;
+  }
+
   Iterable<_SelectedFrame> _decodeRun(
     _DecodeRun run,
     YuvImageScaler? requestedScaler,
     bool includeOriginal,
   ) sync* {
-    final scaler = requestedScaler == null
+    YuvImageScaler? scalerFor(FramePacket packet) => requestedScaler == null
         ? _previewScaler
-        : _orientedScaler(requestedScaler);
+        : _presentationScaler(
+            requestedScaler,
+            aspect: run.sampleAspects?[packet] ?? run.sampleAspect,
+          );
     final name = run.codec;
     if (!_usesReferences(name)) {
       final packet = run.packets.single;
+      final scaler = scalerFor(packet);
       final _RenderPicture render;
       if (run.rawFormat case final raw?) {
         final bytes = _read(packet);
@@ -975,6 +1037,7 @@ final class Video {
               : 'Invalid $name video frame',
         );
       }
+      final scaler = scalerFor(packet);
       final frame = render(scaler: scaler);
       final unscaled = scaler?.unscaled;
       final original = includeOriginal
@@ -1142,7 +1205,7 @@ final class Video {
     if (_mixedIsoCodecs) {
       final section = _isoSectionByPacket[packet];
       if (section == null) throw const FormatException('Unknown video packet');
-      if (!_usesReferences(section.codec) && _orientation == null) {
+      if (!_usesReferences(section.codec) && !_hasPresentationTransform) {
         return _decodeIndependent(packet, section.codec, preview: preview);
       }
       final frame = decodeSelected([packet]).single.frame;
@@ -1183,7 +1246,7 @@ final class Video {
       }
       throw const FormatException('No independently decodable AV1 picture');
     }
-    if (_orientation != null) {
+    if (_hasPresentationTransform) {
       final frame = decodeSelected([packet]).single.frame;
       return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
@@ -1265,6 +1328,8 @@ typedef _DecodeRun = ({
   List<int> targets,
   _RunConfiguration? configuration,
   QuickTimeRawFormat? rawFormat,
+  double? sampleAspect,
+  Map<FramePacket, double>? sampleAspects,
   Map<int, List<int>>? aviPalettes,
 });
 

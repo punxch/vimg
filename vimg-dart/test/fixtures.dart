@@ -40,7 +40,11 @@ image.Image solidFrame(int frame) {
   return pixels;
 }
 
-File matroskaFixture(Directory directory, {bool vp8 = false}) {
+File matroskaFixture(
+  Directory directory, {
+  bool vp8 = false,
+  List<int> videoFields = const [],
+}) {
   final duration = ByteData(8)..setFloat64(0, 8000);
   final frames = [
     for (var frame = 0; frame < 8; frame++)
@@ -79,6 +83,7 @@ File matroskaFixture(Directory directory, {bool vp8 = false}) {
                   [
                     ...ebml([0xb0], [32]),
                     ...ebml([0xba], [24]),
+                    ...videoFields,
                   ],
                 ),
               ],
@@ -107,7 +112,10 @@ List<int> _vp8Packet(image.Image pixels) {
   return webp.sublist(20, 20 + size);
 }
 
-File isoFixture(Directory directory) {
+File isoFixture(
+  Directory directory, {
+  List<(int, int)> sampleAspects = const [],
+}) {
   final frames = List.generate(
     8,
     (index) => image.encodeJpg(solidFrame(index)),
@@ -116,6 +124,26 @@ File isoFixture(Directory directory) {
   List<int> table(String type, int count, List<int> entries) =>
       box(type, [...List.filled(4, 0), ...uint(count, 4), ...entries]);
   final timing = [...List.filled(12, 0), ...uint(1000, 4), ...uint(8000, 4)];
+  final descriptions = sampleAspects.isEmpty
+      ? box('jpeg', [...List.filled(24, 0), ...uint(32, 2), ...uint(24, 2)])
+      : [
+          for (final (numerator, denominator) in sampleAspects)
+            ...box('jpeg', [
+              ...List.filled(24, 0),
+              ...uint(32, 2),
+              ...uint(24, 2),
+              ...List.filled(50, 0),
+              ...box('pasp', [...uint(numerator, 4), ...uint(denominator, 4)]),
+            ]),
+        ];
+  final count = sampleAspects.isEmpty ? 1 : sampleAspects.length;
+  final framesPerChunk = frames.length ~/ count;
+  var offset = ftyp.length + 8;
+  final offsets = <int>[];
+  for (var i = 0; i < frames.length; i++) {
+    if (i % framesPerChunk == 0) offsets.add(offset);
+    offset += frames[i].length;
+  }
   return File('${directory.path}/video.mov')..writeAsBytesSync([
     ...ftyp,
     ...box('mdat', [for (final frame in frames) ...frame]),
@@ -129,22 +157,18 @@ File isoFixture(Directory directory) {
           ...box(
             'minf',
             box('stbl', [
-              ...table(
-                'stsd',
-                1,
-                box('jpeg', [
-                  ...List.filled(24, 0),
-                  ...uint(32, 2),
-                  ...uint(24, 2),
-                ]),
-              ),
+              ...table('stsd', count, descriptions),
               ...table('stts', 1, [...uint(8, 4), ...uint(1000, 4)]),
-              ...table('stsc', 1, [
-                ...uint(1, 4),
-                ...uint(8, 4),
-                ...uint(1, 4),
+              ...table('stsc', count, [
+                for (var i = 1; i <= count; i++) ...[
+                  ...uint(i, 4),
+                  ...uint(framesPerChunk, 4),
+                  ...uint(i, 4),
+                ],
               ]),
-              ...table('stco', 1, uint(ftyp.length + 8, 4)),
+              ...table('stco', count, [
+                for (final at in offsets) ...uint(at, 4),
+              ]),
               ...box('stsz', [
                 ...List.filled(8, 0),
                 ...uint(8, 4),

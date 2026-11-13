@@ -15,6 +15,15 @@ extension IsoVisualDescription on IsoMedia {
     return null;
   }
 
+  double? visualSampleAspect(MediaBox entry) {
+    final aspect = visualExtension(entry, 'pasp');
+    if (aspect == null) return null;
+    requireBytes(aspect, 8);
+    final h = file.unsigned(aspect.data, 4);
+    final v = file.unsigned(aspect.data + 4, 4);
+    return h == 0 || v == 0 ? null : h / v;
+  }
+
   ({String? codec, _DescriptorExtent? specific})? _visualDescriptor(
     MediaBox entry,
   ) {

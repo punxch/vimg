@@ -21,7 +21,7 @@ final class QuickTimeRawFormat {
       rgbDepth,
       matrix,
       fullRange,
-      _aspect(media, entry),
+      media.visualSampleAspect(entry) ?? 1,
       _splitFields(media, entry),
       _componentDepth(media, entry),
     );
@@ -69,15 +69,6 @@ final class QuickTimeRawFormat {
       }
     }
     return (2, entry.type == 'yuv2');
-  }
-
-  static double _aspect(IsoMedia media, MediaBox entry) {
-    final aspect = media.visualExtension(entry, 'pasp');
-    if (aspect == null) return 1;
-    media.requireBytes(aspect, 8);
-    final h = media.file.unsigned(aspect.data, 4);
-    final v = media.file.unsigned(aspect.data + 4, 4);
-    return h == 0 || v == 0 ? 1 : h / v;
   }
 
   static int _splitFields(IsoMedia media, MediaBox entry) {

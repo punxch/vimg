@@ -14,30 +14,46 @@ typedef _YuvGeometry = ({
 final class YuvImageScaler {
   YuvImageScaler({this.width, this.height, this.filters})
     : _exact = false,
-      _nearest = false;
+      _nearest = false,
+      _sampleAspect = null;
 
   YuvImageScaler._fixed(int this.width, int this.height, this._nearest)
     : _exact = true,
+      _sampleAspect = null,
       filters = null;
 
-  factory YuvImageScaler.oriented(
-    VideoOrientation orientation,
-    YuvImageScaler? scaler,
-  ) => YuvImageScaler(
-    width: scaler?.width,
-    height: scaler?.height,
-    filters: VideoFilterChain._orient(orientation, scaler?.filters),
+  YuvImageScaler._presentation(
+    this.width,
+    this.height,
+    this.filters,
+    this._sampleAspect,
+  ) : _exact = false,
+      _nearest = false;
+
+  factory YuvImageScaler.presentation(
+    YuvImageScaler? scaler, {
+    VideoCrop? crop,
+    VideoOrientation? orientation,
+    double? sampleAspect,
+  }) => YuvImageScaler._presentation(
+    scaler?.width,
+    scaler?.height,
+    crop == null && orientation == null
+        ? scaler?.filters
+        : VideoFilterChain._presentation(crop, orientation, scaler?.filters),
+    sampleAspect,
   );
 
   final int? width, height;
   final VideoFilterChain? filters;
+  final double? _sampleAspect;
   final bool _exact, _nearest;
   YuvImageScaler? _outputScale;
   late final YuvImageScaler? unscaled = filters == null
       ? null
       : width == null && height == null
       ? this
-      : YuvImageScaler(filters: filters);
+      : YuvImageScaler._presentation(null, null, filters, _sampleAspect);
   _YuvGeometry? _geometry;
   late _PlaneScaler _luma;
   _PlaneScaler? _chroma;
@@ -74,7 +90,7 @@ final class YuvImageScaler {
       0,
       matrix: 0,
       fullRange: true,
-      sampleAspect: sampleAspect,
+      sampleAspect: _sampleAspect ?? sampleAspect,
       alpha: alpha == null
           ? null
           : _FilterPlane(

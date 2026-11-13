@@ -13,7 +13,6 @@ part 'iso_fragments.dart';
 part 'iso_frames.dart';
 
 typedef MediaBox = ({String type, int start, int data, int end});
-typedef VideoOrientation = ({int degrees, bool horizontal, bool vertical});
 
 final class IsoMedia {
   IsoMedia(this.file);

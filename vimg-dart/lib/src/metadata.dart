@@ -1,3 +1,6 @@
+typedef VideoOrientation = ({int degrees, bool horizontal, bool vertical});
+typedef VideoCrop = ({int left, int top, int right, int bottom});
+
 final class VideoStream {
   const VideoStream({
     required this.codec,

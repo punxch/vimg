@@ -132,6 +132,9 @@ and LPCM tracks. A program stream map can also identify H.264 or HEVC.
 Scalable MPEG-2, DVD title navigation and reordered H.264 or HEVC pictures
 without usable timestamps remain pending.
 
+Matroska and WebM capture apply the selected track's pixel crop and rectangular
+projection roll or mirror before user filters and tile sizing.
+
 `preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
 AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
@@ -172,8 +175,9 @@ For example, `--vfilter 'pad=iw+32:ih+32:-1:-1:black,drawbox=8:8:64:40:yellow@0.
 adds a centered border and draws a translucent box. Colors accept named
 values, RGB/RGBA hex and explicit opacity. `negate=components=y+u`
 inverts selected planes. `setsar` and `setdar` affect aspect expressions
-such as `pad=aspect=16/9`. Source sample aspect is read from H.264 and
-HEVC sequence parameters, with square pixels as the default.
+such as `pad=aspect=16/9`. Filters read sample aspect from the active MP4/MOV
+`pasp` entry or Matroska display dimensions, with H.264 and HEVC sequence
+parameters as a fallback. Capture size limits use pixel dimensions.
 On deeper sources, `drawbox` retains native depth.
 
 Timing filters include `trim`, `setpts`, `settb` and `fps`. They run for
