@@ -2,6 +2,7 @@ import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:image/image.dart' as image;
+import 'package:path/path.dart' as paths;
 
 import 'avif_encoder.dart';
 import 'capture.dart';
@@ -206,6 +207,19 @@ int _avifQIndex(int crf, {required bool animated}) {
 typedef GridFrameVisitor =
     void Function(int index, image.Image grid, int tileWidth, int tileHeight);
 
+enum ContactSheetFormat {
+  avif,
+  webp,
+  jpeg;
+
+  static ContactSheetFormat forPath(String output, {bool preferWebp = false}) =>
+      switch (paths.extension(output).toLowerCase()) {
+        '.jpg' || '.jpeg' => jpeg,
+        '.webp' => webp,
+        _ => preferWebp ? webp : avif,
+      };
+}
+
 Future<void> writeContactSheet(
   String input,
   String output,
@@ -215,6 +229,8 @@ Future<void> writeContactSheet(
   int? height,
   double fps = 20,
   int avifCrf = defaultAvifCrf,
+  int? avifPreset,
+  ContactSheetFormat? format,
   int webp = 75,
   int threads = defaultCaptureThreads,
   VideoFilterChain? filters,
@@ -223,19 +239,16 @@ Future<void> writeContactSheet(
   CaptureSelection? onSelect,
   GridFrameVisitor? onGrid,
 }) async {
-  final extension = output.split('.').last.toLowerCase();
   final image.Encoder? encoder;
-  switch (extension) {
-    case 'jpg' || 'jpeg':
+  switch (format ?? ContactSheetFormat.forPath(output)) {
+    case ContactSheetFormat.jpeg:
       if (options.frames != 1)
         throw const FormatException('JPEG requires one frame per capture');
       encoder = image.JpegEncoder();
-    case 'webp':
+    case ContactSheetFormat.webp:
       encoder = image.WebPEncoder(lossless: false, quality: webp, method: 1);
-    case 'avif':
+    case ContactSheetFormat.avif:
       encoder = null;
-    default:
-      throw FormatException('Unsupported contact sheet output: $output');
   }
   _checkOutput(input, output);
   final video = Video(input);
@@ -353,6 +366,7 @@ Future<void> writeContactSheet(
           grid.height,
           fps: options.frames > 1 ? fps : null,
           qIndex: _avifQIndex(avifCrf, animated: options.frames > 1),
+          preset: avifPreset ?? defaultAvifPreset,
         );
         avif.addFrame(grid);
         continue;

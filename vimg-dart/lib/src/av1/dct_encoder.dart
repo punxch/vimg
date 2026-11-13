@@ -20,6 +20,9 @@ import 'transform.dart';
 
 part 'block_motion_search.dart';
 
+const defaultAvifPreset = 8;
+const maxAvifPreset = 13;
+
 /// 10-bit 4:2:0 AV1 with quantized DCT residuals and one temporal reference.
 final class Av1DctEncoder {
   Av1DctEncoder(
@@ -27,6 +30,7 @@ final class Av1DctEncoder {
     this.height, {
     required this.still,
     required this.qIndex,
+    this.preset = defaultAvifPreset,
   }) {
     if (width < 1 ||
         height < 1 ||
@@ -43,10 +47,15 @@ final class Av1DctEncoder {
         'AV1 transform quantizer must be between 1 and 255',
       );
     }
+    if (preset < 0 || preset > maxAvifPreset) {
+      throw const FormatException(
+        'AV1 preset must be between 0 and $maxAvifPreset',
+      );
+    }
   }
 
   static const profile = 0, level = 13, depth = 10, matrix = 6;
-  final int width, height, qIndex;
+  final int width, height, qIndex, preset;
   final bool still;
   late final Uint8List sequence = _sequence();
   List<Uint16List>? _reference;
@@ -166,6 +175,7 @@ final class Av1DctEncoder {
       height,
       pixels,
       qIndex,
+      preset,
       reference: inter ? _reference : null,
       priorContext: priorContext,
     );
@@ -180,14 +190,15 @@ final class Av1DctEncoder {
   }
 }
 
-enum _Syntax { partition, segment, skip, luma, chroma, transform }
+enum _Syntax { partition, segment, skip, luma, angle, chroma, transform }
 
 final class _DctTile {
   _DctTile(
     this.width,
     this.height,
     image.Image? pixels,
-    this.q, {
+    this.q,
+    this.preset, {
     required this.reference,
     required Av1EntropyContext? priorContext,
   }) : columns = 2 * ((width + 7) >> 3),
@@ -226,7 +237,7 @@ final class _DctTile {
     }
   }
 
-  final int width, height, q, columns, rows;
+  final int width, height, q, preset, columns, rows;
   final List<Uint16List>? reference;
   final bool repeat;
   final bool newSegmentation;
@@ -259,6 +270,7 @@ final class _DctTile {
     _planes[0].source,
     reference![0],
     av1AcQuantizers[1][q],
+    preset,
   );
   final _forward = _ForwardDct();
   final _inverse = Av1InverseTransform();
@@ -267,6 +279,7 @@ final class _DctTile {
   late final List<_DctPlane> _planes;
   late final _blockSizes = Uint8List(columns * rows);
   late final _skips = Uint8List(columns * rows);
+  late final _lumaContexts = Uint8List(columns * rows);
   late final _motionBlocks = List<Av1InterNeighbor?>.filled(
     columns * rows,
     null,
@@ -325,11 +338,24 @@ final class _DctTile {
         ? av1ZeroMv
         : _motionSearch.find(x4 * 4, y4 * 4, side * 4, stack);
     var skip = true;
+    var luma = Av1IntraMode.dc;
     if (!repeat) {
       final moving = mv != av1ZeroMv;
-      final candidate = _prepareBlock(x4, y4, side, mv, measure: moving);
+      final searchIntra =
+          !inter && preset < defaultAvifPreset && (x4 > 0 || y4 > 0);
+      final candidate = _prepareBlock(
+        x4,
+        y4,
+        side,
+        mv,
+        measure: moving || searchIntra,
+      );
       skip = candidate.rate == 0;
-      if (moving) {
+      if (searchIntra) {
+        final best = _searchIntra(x4, y4, side, candidate);
+        luma = best.mode;
+        skip = best.rate == 0;
+      } else if (moving) {
         for (final plane in _planes) {
           plane.swapTrial();
         }
@@ -368,9 +394,20 @@ final class _DctTile {
       skip ? 1 : 0,
     );
     if (!inter) {
-      _range
-        ..adaptive(_context.cdf(_Syntax.luma, intraLumaCdfs[0][0]), 0)
-        ..adaptive(_context.cdf(_Syntax.chroma, intraUvCdfs[1][0]), 0);
+      final above = y4 == 0 ? 0 : _lumaContexts[at - columns];
+      final left = x4 == 0 ? 0 : _lumaContexts[at - 1];
+      _range.adaptive(
+        _context.cdf((_Syntax.luma, above, left), intraLumaCdfs[above][left]),
+        luma.index,
+      );
+      if (luma.directional) {
+        final angle = intraAngleCdfs[luma.index - 1];
+        _range.adaptive(_context.cdf((_Syntax.angle, luma.index), angle), 3);
+      }
+      _range.adaptive(
+        _context.cdf((_Syntax.chroma, luma.index), intraUvCdfs[1][luma.index]),
+        0,
+      );
     }
     final motion = stack == null ? null : _motionWriter.write(stack, mv);
     final motionBlock = motion == null
@@ -380,6 +417,13 @@ final class _DctTile {
       final start = row * columns + x4;
       _blockSizes.fillRange(start, start + side, side);
       _skips.fillRange(start, start + side, skip ? 1 : 0);
+      if (!inter) {
+        _lumaContexts.fillRange(
+          start,
+          start + side,
+          intraLumaModeContext[luma.index],
+        );
+      }
       if (motionBlock != null)
         _motionBlocks.fillRange(start, start + side, motionBlock);
     }
@@ -405,11 +449,9 @@ final class _DctTile {
             if (p == 0) {
               final table = inter
                   ? interInterTxTypeSet3Cdf[size.square]
-                  : intraTxTypeCdfs[1][size.square][0];
-              _range.adaptive(
-                _context.cdf((_Syntax.transform, size.square), table),
-                1,
-              );
+                  : intraTxTypeCdfs[1][size.square][luma.index];
+              final key = (_Syntax.transform, size.square, luma.index);
+              _range.adaptive(_context.cdf(key, table), 1);
             }
           },
         );
@@ -438,12 +480,58 @@ final class _DctTile {
     }
   }
 
+  ({Av1IntraMode mode, int rate}) _searchIntra(
+    int x4,
+    int y4,
+    int side,
+    ({int rate, int error}) dc,
+  ) {
+    final quantStep = av1AcQuantizers[1][q];
+    final lambda = math.max(1, quantStep * quantStep >> 4);
+    var bestCost = dc.error + lambda * dc.rate;
+    var bestMode = Av1IntraMode.dc, bestRate = dc.rate;
+    for (final mode in [
+      if (y4 > 0) Av1IntraMode.vertical,
+      if (x4 > 0) Av1IntraMode.horizontal,
+      if (preset <= 3 && x4 > 0 && y4 > 0) ...[
+        Av1IntraMode.smooth,
+        Av1IntraMode.paeth,
+      ],
+    ]) {
+      for (final plane in _planes) {
+        plane.swapTrial();
+      }
+      final trial = _prepareBlock(
+        x4,
+        y4,
+        side,
+        av1ZeroMv,
+        measure: true,
+        luma: mode,
+      );
+      // Include the mode symbol and, for directional modes, its zero angle.
+      final cost =
+          trial.error + lambda * (trial.rate + (mode.directional ? 4 : 2));
+      if (cost < bestCost) {
+        bestMode = mode;
+        bestCost = cost;
+        bestRate = trial.rate;
+      } else {
+        for (final plane in _planes) {
+          plane.swapTrial();
+        }
+      }
+    }
+    return (mode: bestMode, rate: bestRate);
+  }
+
   ({int rate, int error}) _prepareBlock(
     int x4,
     int y4,
     int side,
     Av1Mv mv, {
     required bool measure,
+    Av1IntraMode luma = Av1IntraMode.dc,
   }) {
     var rate = 0;
     var error = 0;
@@ -456,7 +544,7 @@ final class _DctTile {
       final n = side << shift;
       final x = x4 << shift, y = y4 << shift;
       final size = Av1TxSize.of(n, n);
-      _predict(plane, p, x, y, size, mv);
+      _predict(plane, p, x, y, size, mv, p == 0 ? luma : Av1IntraMode.dc);
       final levels = _forward.quantize(plane, x, y, size, dc, ac, acDeadZone);
       rate += levels;
       if (measure) {
@@ -548,6 +636,7 @@ final class _DctTile {
     int y,
     Av1TxSize size,
     Av1Mv mv,
+    Av1IntraMode mode,
   ) {
     final n = size.width;
     if (reference case final prior?) {
@@ -599,7 +688,7 @@ final class _DctTile {
         y,
         size,
         depth: Av1DctEncoder.depth,
-        mode: Av1IntraMode.dc,
+        mode: mode,
         angleDelta: 0,
         above: y > 0,
         left: x > 0,

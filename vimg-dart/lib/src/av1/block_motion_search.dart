@@ -10,13 +10,19 @@ final class _BlockMotionSearch {
     this.source,
     this.reference,
     this.quantStep,
-  );
+    this.preset,
+  ) : _radius = switch (preset) {
+        <= 3 => 24,
+        <= 7 => 16,
+        8 => 12,
+        _ => 8,
+      };
 
-  static const _radius = 12;
-  static const _span = _radius * 2 + 1;
-  final int width, height, stride, quantStep;
+  final int _radius;
+  late final _span = _radius * 2 + 1;
+  final int width, height, stride, quantStep, preset;
   final Uint16List source, reference;
-  final _tested = Uint32List(_span * _span);
+  late final _tested = Uint32List(_span * _span);
   var _block = 0;
 
   Av1Mv find(int x, int y, int side, Av1MvStack stack) {
@@ -54,13 +60,15 @@ final class _BlockMotionSearch {
 
     consider(nearest.x >> 3, nearest.y >> 3);
     consider(near.x >> 3, near.y >> 3);
-    for (var dy = -3; dy <= 3; dy++) {
-      for (var dx = -3; dx <= 3; dx++) {
+    final local = preset <= 3 ? 4 : (preset <= 8 ? 3 : 2);
+    for (var dy = -local; dy <= local; dy++) {
+      for (var dx = -local; dx <= local; dx++) {
         consider(dx, dy);
       }
     }
-    for (var dy = -8; dy <= 8; dy += 4) {
-      for (var dx = -8; dx <= 8; dx += 4) {
+    final coarse = _radius - 4;
+    for (var dy = -coarse; dy <= coarse; dy += 4) {
+      for (var dx = -coarse; dx <= coarse; dx += 4) {
         consider(dx, dy);
       }
     }
@@ -73,6 +81,7 @@ final class _BlockMotionSearch {
       }
     }
     final center = (x: bestX << 3, y: bestY << 3);
+    if (preset >= 12) return center;
     var result = center;
     void refine(Av1Mv mv) {
       if (((mv.x | mv.y) & 7) == 0 ||
@@ -91,7 +100,7 @@ final class _BlockMotionSearch {
 
     refine(nearest);
     refine(near);
-    for (final step in [4, 2]) {
+    for (final step in preset <= 8 ? const [4, 2] : const [4]) {
       final center = result;
       for (var dy = -step; dy <= step; dy += step) {
         for (var dx = -step; dx <= step; dx += step) {

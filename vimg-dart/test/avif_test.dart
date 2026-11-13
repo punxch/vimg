@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/av1/access_units.dart';
+import 'package:vimg_dart/src/av1/dct_encoder.dart';
 import 'package:vimg_dart/src/av1/picture_decoder.dart';
 import 'package:vimg_dart/src/av1/palette_decoder.dart';
 import 'package:vimg_dart/src/avif_animation.dart';
@@ -24,11 +25,34 @@ Future<void> main(List<String> arguments) async {
     ]) {
       await _checkAvif(temp, width, height, frames, arguments.firstOrNull);
     }
-    await _checkTransformAnimation(temp, arguments.firstOrNull);
+    for (final preset in [0, defaultAvifPreset, maxAvifPreset]) {
+      await _checkTransformAnimation(temp, arguments.firstOrNull, preset);
+    }
+    _checkStillPreset();
     _checkMotionSavings(temp);
   } finally {
     temp.deleteSync(recursive: true);
   }
+}
+
+void _checkStillPreset() {
+  const width = 97, height = 65;
+  final source = image.Image(width: width, height: height);
+  for (final pixel in source) {
+    final luma = 24 + ((pixel.y * 41) & 191);
+    pixel.setRgb(luma, luma, luma);
+  }
+  final fast = Av1DctEncoder(width, height, still: true, qIndex: 24);
+  final slow = Av1DctEncoder(width, height, still: true, qIndex: 24, preset: 4);
+  final fastFrame = fast.frame(source);
+  final slowFrame = slow.frame(source);
+  check(slowFrame.length * 2 < fastFrame.length, 'Intra prediction saves bits');
+  final bytes = BytesBuilder(copy: false)
+    ..add(slow.sequence)
+    ..add(slowFrame);
+  final frame = Av1AccessUnits().readSample(bytes.takeBytes()).single;
+  final decoded = Av1StreamDecoder().decode(frame).rgb();
+  check(frameSsim(source, decoded) > 0.995, 'Still preset fidelity');
 }
 
 void _checkMotionSavings(Directory temp) {
@@ -72,9 +96,19 @@ void _checkMotionSavings(Directory temp) {
   }
 }
 
-Future<void> _checkTransformAnimation(Directory temp, String? dav1d) async {
+Future<void> _checkTransformAnimation(
+  Directory temp,
+  String? dav1d,
+  int preset,
+) async {
   const width = 97, height = 65, count = 34;
-  final encoder = AvifEncoder(width, height, fps: 20, qIndex: 24);
+  final encoder = AvifEncoder(
+    width,
+    height,
+    fps: 20,
+    qIndex: 24,
+    preset: preset,
+  );
   final source = <image.Image>[];
   for (var i = 0; i < count; i++) {
     if (i == 1 || (i >= 3 && i < 32)) {
@@ -94,7 +128,7 @@ Future<void> _checkTransformAnimation(Directory temp, String? dav1d) async {
     source.add(pixels);
   }
   final encoded = encoder.finish();
-  final path = '${temp.path}/dct-animation.avif';
+  final path = '${temp.path}/dct-$preset.avif';
   final container = File(path)..writeAsBytesSync(encoded);
   final input = container.openSync();
   final animation = AvifAnimation.open(path);
@@ -182,7 +216,8 @@ Future<void> _checkTransformAnimation(Directory temp, String? dav1d) async {
     input.closeSync();
   }
   if (dav1d == null) return;
-  final obuPath = '${temp.path}/dct.obu', yuvPath = '${temp.path}/dct.yuv';
+  final obuPath = '${temp.path}/dct-$preset.obu';
+  final yuvPath = '${temp.path}/dct-$preset.yuv';
   File(obuPath).writeAsBytesSync(elementary.takeBytes());
   final result = await Process.run(dav1d, [
     '-q',

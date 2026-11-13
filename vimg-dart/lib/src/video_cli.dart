@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:args/command_runner.dart';
 
 import 'authority.dart';
+import 'avif_encoder.dart';
 import 'capture.dart';
 import 'video_commands.dart';
 import 'yuv_image.dart';
@@ -165,13 +166,25 @@ final class VcsCommand extends _CaptureCommand {
       ..addOption(
         'webp',
         defaultsTo: '0',
-        help: 'Use WebP when set to a nonzero value.',
+        help: 'Use WebP when nonzero, except for JPEG outputs.',
       )
       ..addOption('avif-fps', defaultsTo: '20', help: 'Playback frame rate.')
       ..addOption(
         'avif-crf',
         defaultsTo: '$defaultAvifCrf',
         help: 'AVIF quality from 0 (finest quantization) to 63.',
+      )
+      ..addOption(
+        'avif-codec',
+        defaultsTo: 'dart',
+        allowed: ['dart', 'libsvtav1', 'libaom-av1'],
+        help: 'AVIF encoder. The legacy names select the Dart encoder.',
+      )
+      ..addOption(
+        'avif-preset',
+        help:
+            'AVIF search effort from 0 (most) to $maxAvifPreset (least). '
+            'Defaults to $defaultAvifPreset.',
       )
       ..addOption(
         'capture-backend',
@@ -215,15 +228,16 @@ final class VcsCommand extends _CaptureCommand {
     final directory = args.option('output-dir')!;
     final webp = integer('webp', max: 255)!;
     final avifCrf = integer('avif-crf', max: 63)!;
+    final avifPreset = integer('avif-preset', max: maxAvifPreset);
+    final avifCodec = args.option('avif-codec');
     final threads = integer('threads')!;
     final suffix = webp == 0 ? 'avif' : 'webp';
     final output =
         args.option('output') ??
         outputPath(directory, '${videoStem(input)}.$suffix');
-    final lower = output.toLowerCase();
-    final jpeg = lower.endsWith('.jpg') || lower.endsWith('.jpeg');
+    final format = ContactSheetFormat.forPath(output, preferWebp: webp != 0);
     final timings = args.flag('profile') ? _Timings() : null;
-    final capture = options(jpeg ? 1 : 30);
+    final capture = options(format == ContactSheetFormat.jpeg ? 1 : 30);
     final columns = integer('columns')!;
     final captures = args.flag('keep') ? directory : null;
     if (_authority) {
@@ -243,6 +257,8 @@ final class VcsCommand extends _CaptureCommand {
           args.option('vfilter') != null ||
           fps != 20 ||
           avifCrf != defaultAvifCrf ||
+          avifPreset != null ||
+          avifCodec == 'libaom-av1' ||
           webp != 0) {
         usageException(
           'Authority recording requires the fixed Preview profile '
@@ -271,6 +287,8 @@ final class VcsCommand extends _CaptureCommand {
         height: height,
         fps: fps,
         avifCrf: avifCrf,
+        avifPreset: avifPreset,
+        format: format,
         threads: threads,
         filters: filters,
         captureDirectory: captures,

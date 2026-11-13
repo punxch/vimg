@@ -30,6 +30,17 @@ Future<void> main(List<String> arguments) async {
       manifest,
       input,
     ];
+    for (final overrides in [
+      ['--avif-preset', '8'],
+      ['--avif-codec', 'libaom-av1'],
+    ]) {
+      final rejected = await run([...record, ...overrides]);
+      check(
+        rejected.exitCode != 0 &&
+            (rejected.stderr as String).contains('fixed Preview profile'),
+        'Authority rejects changes to its fixed encoder profile',
+      );
+    }
     final result = await run(record);
     check(result.exitCode == 0, 'Authority recording failed ${result.stderr}');
     final json = File(manifest).readAsStringSync();

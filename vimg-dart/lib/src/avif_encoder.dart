@@ -5,16 +5,29 @@ import 'package:image/image.dart' as image;
 import 'av1/dct_encoder.dart';
 import 'av1/palette_encoder.dart';
 
+export 'av1/dct_encoder.dart' show defaultAvifPreset, maxAvifPreset;
+
 /// Writes an AVIF primary image and, for multiple frames, a repeating
 /// image sequence. The transform encoder also retains its last reference.
 final class AvifEncoder {
-  AvifEncoder(this.width, this.height, {this.fps, int? qIndex})
-    : _palette = qIndex == null
-          ? Av1PaletteEncoder(width, height, still: fps == null)
-          : null,
-      _dct = qIndex == null
-          ? null
-          : Av1DctEncoder(width, height, still: fps == null, qIndex: qIndex) {
+  AvifEncoder(
+    this.width,
+    this.height, {
+    this.fps,
+    int? qIndex,
+    int preset = defaultAvifPreset,
+  }) : _palette = qIndex == null
+           ? Av1PaletteEncoder(width, height, still: fps == null)
+           : null,
+       _dct = qIndex == null
+           ? null
+           : Av1DctEncoder(
+               width,
+               height,
+               still: fps == null,
+               qIndex: qIndex,
+               preset: preset,
+             ) {
     final rate = fps;
     if (rate != null && (!rate.isFinite || rate < 0.001 || rate > 1000)) {
       throw const FormatException('Invalid AVIF frame rate');

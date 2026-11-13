@@ -34,6 +34,8 @@ const partitionCdf = [
   ],
 ];
 
+const intraLumaModeContext = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
+
 const intraLumaCdfs = [
   [
     [15588, 17027, 19338, 20218, 20682, 21110, 21825, 23244, 24189, 28165, 29093, 30466],

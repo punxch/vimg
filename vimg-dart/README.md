@@ -31,7 +31,12 @@ formats depend on the Dart image library's encoders and decoders.
 - `vimg extract -n3 --output-dir frames video.mkv` writes sampled BMP frames.
 - `vimg vcs -c3 -H160 -n9 video.mkv -o grid.avif` writes an animated AVIF.
   Pass `-f1` for a still, `--webp 1` for WebP or choose a `.jpg` output for JPEG.
+  A `.webp` output also selects WebP. Other output names default to AVIF
+  unless `--webp` is set.
   `--avif-crf` runs from 0 (finest quantization) to 63 and defaults to 30.
+  `--avif-preset` sets the encoder search effort from 0 (most) to 13 (least)
+  and defaults to 8. The values `dart`, `libsvtav1` and `libaom-av1` for
+  `--avif-codec` all select the pure Dart encoder.
 - `vimg authority record -c3 -H160 -n9 --output grid.avif --manifest grid.json video.mkv`
   records the fixed Preview profile, the selected source PTS and pre-encoder
   and decoded PNGs.
@@ -188,7 +193,10 @@ Workers share the capture schedule and decode independent runs of pictures.
 
 Contact sheet AVIFs use the pure Dart 10-bit 4:2:0 encoder with DCT residuals.
 Animated sheets search the preceding reconstructed frame for quarter-pixel
-motion and reuse reconstructed frames for repeats. Dart maps `--avif-crf`
+motion at the default preset and reuse reconstructed frames for repeats.
+Lower presets search a wider motion range and compare more intra predictions
+on still images and keyframes. Presets 12–13 search integer motion only.
+Dart maps `--avif-crf`
 to its own AV1 quantizers. `join` uses the 8-bit 4:4:4 palette encoder for
 still AVIF images. Both encoders support one AV1 Level 5.1 tile.
 

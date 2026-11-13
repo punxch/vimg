@@ -100,7 +100,7 @@ Future<void> main(List<String> arguments) async {
     )!;
     check(bmp.getPixel(0, 0).b > 200, 'Extracted the 2-second frame');
 
-    final sheet = File('${temp.path}/grid.webp');
+    final sheet = File('${temp.path}/webp-grid.avif');
     await run([
       'vcs',
       '-c2',
@@ -130,7 +130,17 @@ Future<void> main(List<String> arguments) async {
     );
 
     final still = File('${temp.path}/grid.jpg');
-    await run(['vcs', '-c2', '-W16', '-n2', mov.path, '-o', still.path]);
+    await run([
+      'vcs',
+      '-c2',
+      '-W16',
+      '-n2',
+      '--webp',
+      '1',
+      mov.path,
+      '-o',
+      still.path,
+    ]);
     check(
       image.decodeJpg(still.readAsBytesSync())!.width == 32,
       'Static grid layout',
@@ -143,12 +153,39 @@ Future<void> main(List<String> arguments) async {
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
       'Default VCS format is an AVIF image sequence',
     );
-    final serial = File('${temp.path}/grid-serial.avif');
+    final serial = File('${temp.path}/grid-serial.cache');
     await run([...gridArgs, '--threads', '1', '-o', serial.path]);
     check(
       base64Encode(avif.readAsBytesSync()) ==
           base64Encode(serial.readAsBytesSync()),
       'Serial and automatic-thread MJPEG grids are identical',
+    );
+    for (final codec in ['dart', 'libsvtav1', 'libaom-av1']) {
+      await run([
+        ...gridArgs,
+        '--avif-codec',
+        codec,
+        '--avif-preset',
+        '8',
+        '-o',
+        serial.path,
+      ]);
+      check(
+        base64Encode(avif.readAsBytesSync()) ==
+            base64Encode(serial.readAsBytesSync()),
+        'Codec alias $codec uses the Dart encoder',
+      );
+    }
+    final invalidPreset = await run([
+      ...gridArgs,
+      '--avif-preset',
+      '14',
+      '-o',
+      serial.path,
+    ], ok: false);
+    check(
+      (invalidPreset.stderr as String).contains('--avif-preset'),
+      'Reject an AVIF preset outside the supported range',
     );
 
     final avifStill = File('${temp.path}/grid-still.avif');
@@ -160,13 +197,15 @@ Future<void> main(List<String> arguments) async {
       '-f1',
       '--avif-crf',
       '42',
+      '--avif-preset',
+      '4',
       mkv.path,
       '-o',
       avifStill.path,
     ]);
     check(
       ascii.decode(avifStill.readAsBytesSync().sublist(4, 12)) == 'ftypavif',
-      'VCS uses the AVIF still format with a custom CRF',
+      'VCS uses the AVIF still format with a custom CRF and preset',
     );
   } finally {
     temp.deleteSync(recursive: true);

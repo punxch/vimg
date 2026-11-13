@@ -718,9 +718,8 @@ final class _PictureTile {
       return;
     }
 
-    const modeContext = [0, 1, 2, 3, 4, 4, 4, 4, 3, 0, 1, 2, 0];
-    final am = modeContext[(above?.yMode ?? Av1IntraMode.dc).index];
-    final lm = modeContext[(left?.yMode ?? Av1IntraMode.dc).index];
+    final am = intraLumaModeContext[(above?.yMode ?? Av1IntraMode.dc).index];
+    final lm = intraLumaModeContext[(left?.yMode ?? Av1IntraMode.dc).index];
     final group = (math.min(w4, h4).bitLength - 1).clamp(0, 3);
     final ym =
         Av1IntraMode.values[intraFrame
