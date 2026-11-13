@@ -196,6 +196,7 @@ final class IsoMedia {
     'aprn' || 'aprh' => 'prores_raw',
     'png ' => 'png',
     'rle ' => 'qtrle',
+    'rpza' => 'rpza',
     'raw ' ||
     'yuv2' ||
     '2vuy' ||

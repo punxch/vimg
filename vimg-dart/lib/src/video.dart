@@ -28,6 +28,7 @@ import 'nal_parameter_sets.dart';
 import 'prores.dart';
 import 'quicktime_animation.dart';
 import 'quicktime_raw.dart';
+import 'quicktime_rpza.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
@@ -99,7 +100,7 @@ final class Video {
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
-  late final _animationTimeline = _indexAnimation();
+  late final _quickTimeDeltaTimeline = _indexQuickTimeDelta(codec);
   late final bool _mixedIsoCodecs = _hasMixedIsoCodecs();
   late final List<_IsoSection> _isoSections = _readIsoSections();
   late final Map<FramePacket, _IsoSection> _isoSectionByPacket = {
@@ -156,13 +157,15 @@ final class Video {
 
   _IndexedVideo _indexIsoSection(_IsoSection section) {
     final name = section.codec;
-    if (name == 'qtrle') return _indexAnimation(section: section);
+    if (name == 'qtrle' || name == 'rpza') {
+      return _indexQuickTimeDelta(name, section: section);
+    }
     if (name == 'av1') return _indexAv1(section: section);
     if (isMpegVideo(name)) return _indexMpeg(section: section);
     return _indexNalVideo(section: section);
   }
 
-  _IndexedVideo _indexAnimation({_IsoSection? section}) {
+  _IndexedVideo _indexQuickTimeDelta(String name, {_IsoSection? section}) {
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
@@ -170,6 +173,7 @@ final class Video {
     final sections = <int, int>{};
     var start = -1, sectionStart = 0;
     late Uint8List description;
+    var rpzaBlocks = 0;
     final presentation =
         _containerPackets(
             false,
@@ -178,16 +182,22 @@ final class Video {
               _iso!.requireBytes(entry, 78);
               if (entry.end - entry.data > 1024 * 1024) {
                 throw const FormatException(
-                  'Oversized QuickTime Animation description',
+                  'Oversized QuickTime video description',
                 );
               }
               description = file.read(entry.data, entry.end - entry.data);
+              if (name == 'rpza') {
+                rpzaBlocks = QuickTimeRpzaDecoder(description).blockCount;
+              }
               start = -1;
               sectionStart = decodeOrder.length;
             },
             onSample: (packet, sync) {
               final position = decodeOrder.length;
-              if (sync) {
+              final keyframe = name == 'rpza'
+                  ? isRpzaKeyframe(_read(packet), rpzaBlocks)
+                  : sync;
+              if (keyframe) {
                 start = position;
                 configurations[start] = (bytes: description, nal: null);
                 sections[start] = sectionStart;
@@ -276,8 +286,8 @@ final class Video {
           ? _av1PreviewPackets()
           : _av1Timeline.timeline.presentation;
     }
-    if (codec == 'qtrle') {
-      final indexed = _animationTimeline;
+    if (codec == 'qtrle' || codec == 'rpza') {
+      final indexed = _quickTimeDeltaTimeline;
       return indexed.timeline.presentation.where(
         (packet) =>
             !preview ||
@@ -743,7 +753,7 @@ final class Video {
     final indexed = switch (name) {
       'av1' => _av1Timeline,
       'h264' || 'hevc' => _nalTimeline,
-      'qtrle' => _animationTimeline,
+      'qtrle' || 'rpza' => _quickTimeDeltaTimeline,
       _ when isMpegVideo(name) => _mpegTimeline,
       _ => null,
     };
@@ -846,16 +856,7 @@ final class Video {
         );
       } else {
         final source = _decodeIndependent(packet, name);
-        render = ({scaler}) {
-          final filtered = scaler?.filterRgb(source) ?? source;
-          return scaler?.filters != null
-              ? filtered
-              : resizeToFit(
-                  filtered,
-                  width: scaler?.width,
-                  height: scaler?.height,
-                );
-        };
+        render = ({scaler}) => _renderRgb(source, scaler);
       }
       final frame = render(scaler: scaler);
       final unscaled = scaler?.unscaled;
@@ -902,19 +903,15 @@ final class Video {
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
-          return ({scaler}) {
-            if (scaler == null) return source;
-            final frame = scaler.width == null && scaler.height == null
-                ? source
-                : _rgb(source);
-            return scaler.filters != null
-                ? scaler.filterRgb(frame)
-                : resizeToFit(
-                    frame,
-                    width: scaler.width,
-                    height: scaler.height,
-                  );
-          };
+          return ({scaler}) => _renderRgb(source, scaler);
+        };
+      case 'rpza':
+        final decoder = QuickTimeRpzaDecoder(configuration.bytes!);
+        return (bytes, selected) {
+          decoder.advance(bytes);
+          if (!selected) return null;
+          final source = decoder.rgb();
+          return ({scaler}) => _renderRgb(source, scaler);
         };
       case 'av1':
         final units = Av1AccessUnits()..configure(configuration.bytes!);
@@ -974,6 +971,17 @@ final class Video {
     return config;
   }
 
+  image.Image _renderRgb(image.Image source, YuvImageScaler? scaler) {
+    if (scaler == null) return source;
+    final frame =
+        source.hasAlpha && (scaler.width != null || scaler.height != null)
+        ? _rgb(source)
+        : source;
+    return scaler.filters != null
+        ? scaler.filterRgb(frame)
+        : resizeToFit(frame, width: scaler.width, height: scaler.height);
+  }
+
   image.Image? cover() {
     if (_avi != null || _systems != null) return null;
     final matroska = _matroska;
@@ -1005,9 +1013,9 @@ final class Video {
       final frame = decodeSelected([packet]).single.frame;
       return preview && section.codec == 'qtrle' ? _rgb(frame) : frame;
     }
-    if (codec == 'qtrle') {
+    if (codec == 'qtrle' || codec == 'rpza') {
       final frame = decodeSelected([packet]).single.frame;
-      return preview ? _rgb(frame) : frame;
+      return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
     if (usesReferencePictures &&
         (_systems != null ||
@@ -1116,6 +1124,7 @@ bool _usesReferences(String codec) =>
     codec == 'hevc' ||
     codec == 'av1' ||
     codec == 'qtrle' ||
+    codec == 'rpza' ||
     isMpegVideo(codec);
 
 final class _IsoSection {

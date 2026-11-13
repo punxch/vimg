@@ -50,6 +50,9 @@ QuickTime Animation (`rle `) supports RGB555, RGB24, ARGB32 and 1-, 2-,
 4- and 8-bit indexed or grayscale frames. Extraction restores partial
 updates and repeated frames from the preceding sync sample and keeps ARGB
 alpha in BMPs.
+QuickTime Apple Video (`rpza`) supports RGB555 blocks with solid colors,
+four-color palettes, literal pixels and updates that reuse earlier blocks.
+Preview and extraction locate complete pictures from the block data.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the

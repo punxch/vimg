@@ -2,6 +2,8 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
+import 'rgb555.dart';
+
 /// QuickTime Animation keeps the unchanged parts of the last decoded frame.
 final class QuickTimeAnimationDecoder {
   factory QuickTimeAnimationDecoder(Uint8List description) {
@@ -168,12 +170,7 @@ final class QuickTimeAnimationDecoder {
       } else if (depth == 16) {
         final offset = row + pixel.x * 2;
         final word = _pixels[offset] << 8 | _pixels[offset + 1];
-        int expand(int bits) => (bits << 3) | (bits >> 2);
-        pixel.setRgb(
-          expand((word >> 10) & 31),
-          expand((word >> 5) & 31),
-          expand(word & 31),
-        );
+        setRgb555(pixel, word);
       } else {
         final offset = row + pixel.x * _unitBytes;
         final rgb = offset + _unitBytes - 3;

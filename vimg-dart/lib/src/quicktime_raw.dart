@@ -4,6 +4,7 @@ import 'package:image/image.dart' as image;
 
 import 'grid.dart' show resizeToFit;
 import 'iso_media.dart';
+import 'rgb555.dart';
 import 'yuv_image.dart';
 
 bool isQuickTimeRawCodec(String name) => name == 'rawvideo' || name == 'v210';
@@ -288,12 +289,7 @@ final class QuickTimeRawFormat {
       final offset = _storedRow(pixel.y) * stride + pixel.x * step;
       if (step == 2) {
         final word = words.getUint16(offset);
-        int expand(int bits) => (bits << 3) | (bits >> 2);
-        pixel.setRgb(
-          expand((word >> 10) & 31),
-          expand((word >> 5) & 31),
-          expand(word & 31),
-        );
+        setRgb555(pixel, word);
       } else {
         final rgb = offset + step - 3;
         pixel.setRgb(bytes[rgb], bytes[rgb + 1], bytes[rgb + 2]);
