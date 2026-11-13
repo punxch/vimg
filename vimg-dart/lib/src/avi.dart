@@ -5,6 +5,7 @@ import 'package:image/image.dart' as image;
 import 'binary_file.dart';
 import 'dib_palette.dart';
 import 'frame_packet.dart';
+import 'huffyuv.dart';
 import 'metadata.dart';
 import 'msrle.dart';
 import 'msvideo1.dart';
@@ -28,6 +29,7 @@ typedef _Track = ({
   Uint8List? cinepakDescription,
   MsRleFormat? rle,
   MsVideo1Format? video1,
+  _Chunk? huffFormat,
   List<int>? palette,
 });
 
@@ -123,6 +125,8 @@ final class Avi {
         'HEVC' || 'H265' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' || 'FMP4' => 'mpeg4',
         'FFV1' => 'ffv1',
+        'HFYU' => 'huffyuv',
+        'FFVH' => 'ffvhuff',
         'CVID' => 'cinepak',
         'MSVC' || 'CRAM' || 'WHAM' => 'msvideo1',
         '\x01\x00\x00\x00' ||
@@ -175,6 +179,7 @@ final class Avi {
             : null,
         rle: rle,
         video1: video1,
+        huffFormat: codec == 'huffyuv' || codec == 'ffvhuff' ? format : null,
         palette:
             rle != null ||
                 video1?.indexed == true ||
@@ -197,6 +202,13 @@ final class Avi {
       _header.tracks.firstOrNull?.cinepakDescription;
   MsRleFormat? get rleFormat => _header.tracks.firstOrNull?.rle;
   MsVideo1Format? get video1Format => _header.tracks.firstOrNull?.video1;
+
+  HuffYuvDecoder? huffYuvDecoder() {
+    final format = _header.tracks.firstOrNull?.huffFormat;
+    return format == null
+        ? null
+        : readHuffYuvFormat(file, format.data, format.end);
+  }
 
   bool isUncompressedRle(FramePacket packet) =>
       packet.size == rleFormat!.bitmapSize &&

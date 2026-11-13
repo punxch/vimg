@@ -66,6 +66,11 @@ changes and uncompressed bitmap chunks in the same track.
 Microsoft Video 1 (`MSVC`, `CRAM`, `WHAM`) in AVI and Matroska supports
 8-bit indexed color, RGB555 and blocks carried forward from the preceding
 frame. AVI can update the palette between pictures.
+HuffYUV and FFVHUFF in AVI and Matroska support fixed or stored Huffman
+tables, per-frame tables, left, plane and median prediction, and interlaced
+prediction. The decoder keeps native YUV and planar RGB samples through
+scaling and filters, including up to 16 bits per component in FFVHUFF.
+BMP extraction preserves alpha from streams that carry it.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the

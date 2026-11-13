@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'dib_palette.dart';
+import 'huffyuv.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
 import 'msvideo1.dart';
@@ -41,6 +42,13 @@ Uint8List? matroskaVideoConfiguration(Matroska media, String codec) {
   final length = config.end - start;
   if (length < _minimumSize(codec) || length > 1024 * 1024) return null;
   return media.file.read(start, length);
+}
+
+HuffYuvDecoder? matroskaHuffYuvConfiguration(Matroska media, String codec) {
+  final config = _firstVideoTrack(media, codec)?[0x63a2];
+  return config == null
+      ? null
+      : readHuffYuvFormat(media.file, config.data, config.end);
 }
 
 Map<int, EbmlElement>? _firstVideoTrack(Matroska media, String codec) {

@@ -95,7 +95,9 @@ final class Video {
                   section.codec == 'prores' ||
                   isQuickTimeRawCodec(section.codec),
             )
-          : codec == 'prores' || (_iso != null && isQuickTimeRawCodec(codec)));
+          : codec == 'prores' ||
+                _isHuffYuv(codec) ||
+                (_iso != null && isQuickTimeRawCodec(codec)));
 
   void close() => _input.closeSync();
 
@@ -105,6 +107,12 @@ final class Video {
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
   late final _deltaTimeline = _indexDeltaPictures(codec);
+  late final _huffYuv =
+      _avi?.huffYuvDecoder() ??
+      (_matroska == null
+          ? null
+          : matroskaHuffYuvConfiguration(_matroska!, codec)) ??
+      (throw const FormatException('Missing HuffYUV configuration'));
   late final _matroskaVideo1 = _matroska == null
       ? null
       : matroskaVideo1Configuration(_matroska!);
@@ -390,6 +398,7 @@ final class Video {
     if (name == 'mjpeg' ||
         name == 'png' ||
         name == 'prores' ||
+        _isHuffYuv(name) ||
         (_iso != null && isQuickTimeRawCodec(name)) ||
         (preview && name == 'vp8') ||
         (name == 'rawvideo' && _avi?.supportsBitmap == true)) {
@@ -899,6 +908,12 @@ final class Video {
             includeAlpha: scaler?.width == null && scaler?.height == null,
           );
         }
+      } else if (_isHuffYuv(name)) {
+        final picture = _huffYuv.decode(_read(packet));
+        render = ({scaler}) => picture.rgb(
+          scaler: scaler,
+          includeAlpha: scaler?.width == null && scaler?.height == null,
+        );
       } else if (name == 'prores') {
         final keepAlpha =
             includeOriginal ||
@@ -1161,6 +1176,9 @@ final class Video {
       return _proRes(packet, preserveAlpha: !preview).rgb();
     }
     final bytes = _read(packet);
+    if (_isHuffYuv(name)) {
+      return _huffYuv.decode(bytes).rgb(includeAlpha: !preview);
+    }
     if (_quickTimeFormat(packet, name) case final raw?) {
       return raw.decode(bytes, includeAlpha: !preview);
     }
@@ -1225,6 +1243,8 @@ typedef _DecodeRun = ({
   QuickTimeRawFormat? rawFormat,
   Map<int, List<int>>? aviPalettes,
 });
+
+bool _isHuffYuv(String codec) => codec == 'huffyuv' || codec == 'ffvhuff';
 
 bool _usesReferences(String codec) =>
     codec == 'h264' ||

@@ -241,6 +241,7 @@ final class Matroska {
         'XVID' || 'DIVX' || 'DX50' => 'mpeg4',
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
+        'FFVH' => 'ffvhuff',
         'MSVC' || 'CRAM' || 'WHAM' => 'msvideo1',
         _ => 'unknown',
       };
