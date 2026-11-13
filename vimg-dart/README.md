@@ -50,10 +50,12 @@ Rust CLI's constant-frame-rate selection rules. `sample/input.mkv`
 can be used with `preview`, `extract` and `vcs`. `preview` selects an IDR for
 a quick static image.
 
-Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in
+Matroska and MP4/MOV also support HEVC I/P/B pictures in
 monochrome, 4:2:0, 4:2:2 and 4:4:4. `preview` selects an
 HEVC random-access picture. `extract` and `vcs` decode from the preceding
 random-access point and handle leading pictures that depend on an earlier GOP.
+HEVC field sequences are decoded in either field order. Each field keeps its
+own height and presentation timestamp, including in MPEG transport streams.
 The decoder also handles range extension streams with residual DPCM,
 transform-skip rotation and CABAC contexts, persistent Rice adaptation,
 cross-component prediction, coding-unit chroma QP adjustments and

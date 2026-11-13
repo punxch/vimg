@@ -65,14 +65,13 @@ HevcPicture _reconstruct(
   int poc = 0,
 }) {
   final first = slices.first, sps = first.sps;
-  if (sps.fieldSequence || sps.separateColourPlane) {
-    throw UnsupportedError(
-      'Unsupported HEVC field sequence or separate colour plane',
-    );
+  if (sps.separateColourPlane) {
+    throw UnsupportedError('Unsupported HEVC separate colour planes');
   }
   if (sps.codedWidth * sps.codedHeight > 36 * 1024 * 1024) {
     throw const FormatException('Oversized HEVC picture');
   }
+  // For a field sequence the SPS dimensions describe one coded field.
   final picture = HevcPicture(
     sps,
     inter: slices.any((s) => s.parameters.kind != HevcSliceKind.intra),

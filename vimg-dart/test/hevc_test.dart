@@ -71,6 +71,9 @@ const _main444 = 'test/fixtures/hevc-444-12.mp4';
 const _rext = 'test/fixtures/hevc-rext-wpp.mkv';
 const _highThroughput = 'test/fixtures/hevc-high-throughput-16.mkv';
 const _extendedPrecision = 'test/fixtures/hevc-extended-precision-16.mkv';
+const _bottomFields = 'test/fixtures/hevc-fields-bff.mkv';
+const _bottomFieldsTs = 'test/fixtures/hevc-fields-bff.ts';
+const _topFields = 'test/fixtures/hevc-fields-tff-b.mp4';
 
 // FFmpeg's cropped YUV planes, with all signalled loop filters applied.
 const _mainPixels = [
@@ -112,6 +115,45 @@ const _allIntraPixels = [
   [0x9286709a, 0xf6bc2ec8, 0xd2610260],
   [0x7c9d9ffb, 0xfd58bebf, 0xd2e6c798],
   [0x07666432, 0x145a7c72, 0xb0143536],
+];
+
+// FFmpeg output for x265 field sequences at 16 fields/s, made by separating
+// the rows of an 8 fps testsrc2 clip before encoding two closed GOPs.
+const _bottomFieldPixels = [
+  [0xcd4b299d, 0xf4242014, 0xfa55f427],
+  [0x52a261aa, 0x895c9741, 0x68e1ba20],
+  [0x9f9c4e9f, 0x76a7b514, 0x547152c6],
+  [0xa79bf762, 0xd54df126, 0xd8463503],
+  [0x9966c926, 0x3c6c800a, 0xf47b143f],
+  [0x063970df, 0xc79ebdc4, 0x0b9a469c],
+  [0xa8b756c6, 0x1b5e5212, 0xe54800eb],
+  [0x45eeb949, 0x564f3b7c, 0x26d74e23],
+  [0x837d2b9f, 0x5aa84bcb, 0x70ecf169],
+  [0x87986209, 0xb73a9a7e, 0xfbe2c7eb],
+  [0x59914032, 0x68006423, 0x97874f41],
+  [0xc0eb1b46, 0xf58a260d, 0x7795be47],
+  [0x8b03cdb5, 0x4f91a31c, 0x5832379e],
+  [0x28829bc8, 0xd7ff0d19, 0xdcd8f09a],
+  [0x33e3f9ee, 0x153253d3, 0x54bcfdde],
+  [0x0b78eb1c, 0xf8dc2472, 0x89fa8585],
+];
+const _topFieldPixels = [
+  [0xb23c9023, 0x5313a5b2, 0x86cf3e5b],
+  [0x55b3545f, 0x612f5f5b, 0x2ed730ff],
+  [0x32dbb180, 0x60b7ad31, 0x43aecf0a],
+  [0xa7098f51, 0xd19e98df, 0xcb3f3f93],
+  [0x1944bce9, 0xd5498031, 0xf06798d4],
+  [0xc55def57, 0x15d27748, 0x440d33e2],
+  [0xaace6643, 0x11813c40, 0xddc75f1f],
+  [0xd9d3d892, 0xc9d2583d, 0x5db73e0f],
+  [0x6be3cf3d, 0x21fb4b40, 0x8475098d],
+  [0x3cdfd543, 0xb3ffa19d, 0xbbeed74d],
+  [0xb26adc45, 0x75505848, 0x4b9297ad],
+  [0xde9ca8df, 0x5647d32b, 0x1bc69c4c],
+  [0xde203824, 0xd5bd1c24, 0xd11ae1c9],
+  [0xe9291ca1, 0x71832dc7, 0xd86439da],
+  [0x34dbe24b, 0x77303741, 0xbf459682],
+  [0x5b96e605, 0xdd50d19c, 0x6fdec90a],
 ];
 
 Future<void> main(List<String> arguments) async {
@@ -289,7 +331,70 @@ Future<void> main(List<String> arguments) async {
     extendedPrecision: true,
     bypassAlignment: true,
   );
+  _checkInterClip(_bottomFields, _bottomFieldPixels, fieldSequence: true);
+  _checkInterClip(_topFields, _topFieldPixels, fieldSequence: true);
+  final bottomFields = await _checkFieldCaptures(_bottomFields);
+  final transportFields = await _checkFieldCaptures(_bottomFieldsTs);
+  for (final (index, bytes) in transportFields.indexed) {
+    _checkRgb(bytes, bottomFields[index], 'HEVC remuxed field $index');
+  }
+  await _checkFieldCaptures(_topFields);
   await _checkCli(arguments);
+}
+
+Future<List<Uint8List>> _checkFieldCaptures(String path) async {
+  final video = Video(path);
+  final workers = VideoCaptureDecoder(video, threads: 2);
+  try {
+    final stream = video.metadata.streams.single;
+    check((stream.width, stream.height) == (128, 48), 'HEVC field dimensions');
+    final packets = video.packets().toList();
+    check(packets.length == 16, 'HEVC presentation field count');
+    for (final (index, packet) in packets.indexed) {
+      check(
+        (packet.seconds - index / 16).abs() < 0.000501,
+        'HEVC field PTS in $path',
+      );
+    }
+    final keys = video.packets(preview: true).toList();
+    check(
+      keys.length == 2 &&
+          keys.first == packets.first &&
+          keys.last == packets[8],
+      'HEVC random-access fields',
+    );
+    final expected = {
+      for (final result in video.decodeSelected(packets))
+        result.packet: result.frame.getBytes(),
+    };
+    _checkRgb(
+      video.decode(keys.last, preview: true).getBytes(),
+      expected[keys.last]!,
+      'HEVC field preview',
+    );
+    final selected = [packets[3], packets[13], packets[15]].toSet();
+    await for (final result in workers.decode(selected.toList())) {
+      check(selected.remove(result.packet), 'HEVC sparse field identity');
+      _checkRgb(
+        result.frame.getBytes(),
+        expected[result.packet]!,
+        'HEVC sparse field decode',
+      );
+    }
+    check(selected.isEmpty, 'HEVC sparse field count');
+    return [for (final packet in packets) expected[packet]!];
+  } finally {
+    await workers.close();
+    video.close();
+  }
+}
+
+void _checkRgb(Uint8List bytes, Uint8List expected, String label) {
+  check(
+    bytes.length == expected.length &&
+        bytes.indexed.every((sample) => sample.$2 == expected[sample.$1]),
+    '$label differs from sequential decode',
+  );
 }
 
 void _check(String path, {required bool main10}) {
@@ -491,6 +596,7 @@ void _checkInterClip(
   int depth = 8,
   bool extendedPrecision = false,
   bool bypassAlignment = false,
+  bool fieldSequence = false,
 }) {
   final handle = File(path).openSync();
   try {
@@ -504,10 +610,11 @@ void _checkInterClip(
     final packets = mkv == null ? isoFrames(iso!) : matroskaFrames(mkv);
     final seen = <int>{};
     for (final packet in packets) {
-      final index = (packet.seconds * 8).round();
+      final index = (packet.seconds * (fieldSequence ? 16 : 8)).round();
       check(seen.add(index), 'HEVC fixture PTS must be unique');
       final picture = decoder.decode(file.read(packet.offset, packet.size))!;
       final sps = picture.sps;
+      check(sps.fieldSequence == fieldSequence, 'HEVC field sequence flag');
       check(
         (sps.chromaArrayType, sps.lumaDepth, sps.chromaDepth) ==
             (format, depth, depth),
@@ -571,6 +678,7 @@ Future<void> _checkCli(List<String> arguments) async {
       (_main444, 50, 63),
       (_rext, 0, 55),
       (_highThroughput, 50, 63),
+      (_topFields, 50, 31),
     ]) {
       final jpeg = File('${directory.path}/preview.jpg');
       final response =
@@ -602,6 +710,7 @@ Future<void> _checkCli(List<String> arguments) async {
       (_main444, 130, 98),
       (_rext, 192, 128),
       (_highThroughput, 130, 98),
+      (_bottomFieldsTs, 128, 48),
     ].indexed) {
       final output = '${directory.path}/frames-$index';
       await run(['extract', '-n2', '-t200ms', '--output-dir', output, input]);
@@ -615,22 +724,25 @@ Future<void> _checkCli(List<String> arguments) async {
         );
       }
     }
-    final avif = File('${directory.path}/grid.avif');
-    await run([
-      'vcs',
-      '-c2',
-      '-n2',
-      '-H24',
-      '-f3',
-      '-t400ms',
-      '-o',
-      avif.path,
-      _extendedPrecision,
-    ]);
-    check(
-      ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
-      'HEVC animated contact sheet',
-    );
+    for (final input in [_extendedPrecision, _topFields]) {
+      final avif = File('${directory.path}/grid.avif');
+      await run([
+        'vcs',
+        '-c2',
+        '-n2',
+        '-H24',
+        '-f3',
+        '-t400ms',
+        '-o',
+        avif.path,
+        input,
+      ]);
+      check(
+        ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
+        'HEVC animated contact sheet',
+      );
+      avif.deleteSync();
+    }
   } finally {
     directory.deleteSync(recursive: true);
   }
