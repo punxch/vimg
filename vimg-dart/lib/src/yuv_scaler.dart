@@ -35,7 +35,7 @@ final class YuvImageScaler {
   ({int matrix, bool fullRange})? _tableColor;
   late _RgbTable _table;
 
-  image.Image filterRgb(image.Image frame) {
+  image.Image filterRgb(image.Image frame, {double sampleAspect = 1}) {
     if (filters == null) return frame;
     _checkFilterSize(frame.width, frame.height);
     final green = Uint8List(frame.width * frame.height);
@@ -65,6 +65,7 @@ final class YuvImageScaler {
       0,
       matrix: 0,
       fullRange: true,
+      sampleAspect: sampleAspect,
       alpha: alpha == null
           ? null
           : _FilterPlane(

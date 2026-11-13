@@ -2,8 +2,8 @@ part of 'iso_media.dart';
 
 typedef _DescriptorExtent = ({int data, int end});
 
-extension on IsoMedia {
-  MediaBox? _visualBox(MediaBox entry, String type) {
+extension IsoVisualDescription on IsoMedia {
+  MediaBox? visualExtension(MediaBox entry, String type) {
     var offset = entry.data + 78;
     while (offset < entry.end) {
       // A QuickTime video sample description may end with a four-byte zero.
@@ -18,7 +18,7 @@ extension on IsoMedia {
   ({String? codec, _DescriptorExtent? specific})? _visualDescriptor(
     MediaBox entry,
   ) {
-    final esds = _visualBox(entry, 'esds');
+    final esds = visualExtension(entry, 'esds');
     if (esds == null) return null;
     requireBytes(esds, 4);
     final es = _descriptor(0x03, esds.data + 4, esds.end);

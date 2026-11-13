@@ -195,7 +195,15 @@ final class IsoMedia {
     'ap4h' || 'ap4x' || 'apch' || 'apcn' || 'apcs' || 'apco' => 'prores',
     'aprn' || 'aprh' => 'prores_raw',
     'png ' => 'png',
-    'raw ' || 'yuv2' || '2vuy' => 'rawvideo',
+    'raw ' ||
+    'yuv2' ||
+    '2vuy' ||
+    '2vuY' ||
+    'v216' ||
+    'v308' ||
+    'v408' ||
+    'v410' => 'rawvideo',
+    'v210' => 'v210',
     _ => 'unknown',
   };
 
@@ -204,7 +212,7 @@ final class IsoMedia {
         description ??
         sampleDescription(sampleTable(child(firstVideoTrack(), 'mdia')));
     if (entry == null) return null;
-    final global = _visualBox(entry, 'glbl');
+    final global = visualExtension(entry, 'glbl');
     final extent =
         _visualDescriptor(entry)?.specific ??
         (global == null ? null : (data: global.data, end: global.end));

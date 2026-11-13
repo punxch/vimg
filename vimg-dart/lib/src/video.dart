@@ -26,6 +26,7 @@ import 'mpeg12/syntax.dart';
 import 'mpeg_systems.dart';
 import 'nal_parameter_sets.dart';
 import 'prores.dart';
+import 'quicktime_raw.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
@@ -83,8 +84,12 @@ final class Video {
   bool get scalesBeforeRgb =>
       usesReferencePictures ||
       (_mixedIsoCodecs
-          ? _isoSections.any((section) => section.codec == 'prores')
-          : codec == 'prores');
+          ? _isoSections.any(
+              (section) =>
+                  section.codec == 'prores' ||
+                  isQuickTimeRawCodec(section.codec),
+            )
+          : codec == 'prores' || (_iso != null && isQuickTimeRawCodec(codec)));
 
   void close() => _input.closeSync();
 
@@ -99,6 +104,22 @@ final class Video {
     for (final section in _isoSections)
       for (final packet in section.visible) packet: section,
   };
+  final _quickTimeFormats = <MediaBox, QuickTimeRawFormat>{};
+  final _quickTimeDescriptions = <FramePacket, MediaBox>{};
+
+  QuickTimeRawFormat? _quickTimeFormat(FramePacket packet, String name) {
+    final iso = _iso;
+    if (iso == null || !isQuickTimeRawCodec(name)) return null;
+    final description =
+        _quickTimeDescriptions[packet] ??
+        _isoSectionByPacket[packet]?.description;
+    if (description == null)
+      throw const FormatException('Unknown QuickTime video sample');
+    return _quickTimeFormats.putIfAbsent(
+      description,
+      () => QuickTimeRawFormat(iso, description),
+    );
+  }
 
   bool _hasMixedIsoCodecs() {
     final iso = _iso;
@@ -205,7 +226,19 @@ final class Video {
     final avi = _avi;
     _checkIndependentCodec(codec, preview: preview);
     if (avi != null) return avi.packets();
+    if (_iso != null && isQuickTimeRawCodec(codec)) return _quickTimePackets();
     return _containerPackets(keyframes);
+  }
+
+  Iterable<FramePacket> _quickTimePackets() sync* {
+    late MediaBox description;
+    for (final packet in _containerPackets(
+      false,
+      onDescription: (entry) => description = entry,
+    )) {
+      _quickTimeDescriptions[packet] = description;
+      yield packet;
+    }
   }
 
   Iterable<FramePacket> _mixedIsoPackets(bool preview) sync* {
@@ -241,6 +274,7 @@ final class Video {
     if (name == 'mjpeg' ||
         name == 'png' ||
         name == 'prores' ||
+        (_iso != null && isQuickTimeRawCodec(name)) ||
         (preview && name == 'vp8') ||
         (name == 'rawvideo' && _avi?.supportsBitmap == true)) {
       return;
@@ -665,6 +699,7 @@ final class Video {
           packets: [packet],
           targets: const [0],
           configuration: null,
+          rawFormat: _quickTimeFormat(packet, name),
         );
       }
       return;
@@ -683,6 +718,7 @@ final class Video {
       packets: timeline.decodeOrder.sublist(start, end + 1),
       targets: wanted,
       configuration: configurations[start]!,
+      rawFormat: null,
     );
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
@@ -715,7 +751,28 @@ final class Video {
     if (!_usesReferences(name)) {
       final packet = run.packets.single;
       final _RenderPicture render;
-      if (name == 'prores') {
+      if (run.rawFormat case final raw?) {
+        final bytes = _read(packet);
+        if (raw.tag == 'raw ') {
+          render = ({scaler}) => raw.decode(
+            bytes,
+            scaler: scaler,
+            includeAlpha: scaler?.width == null && scaler?.height == null,
+          );
+        } else {
+          final picture = raw.components(
+            bytes,
+            includeAlpha:
+                raw.hasAlpha &&
+                (includeOriginal ||
+                    (scaler?.width == null && scaler?.height == null)),
+          );
+          render = ({scaler}) => picture.rgb(
+            scaler: scaler,
+            includeAlpha: scaler?.width == null && scaler?.height == null,
+          );
+        }
+      } else if (name == 'prores') {
         final keepAlpha =
             includeOriginal ||
             (scaler?.width == null && scaler?.height == null);
@@ -904,6 +961,9 @@ final class Video {
       return _proRes(packet, preserveAlpha: !preview).rgb();
     }
     final bytes = _read(packet);
+    if (_quickTimeFormat(packet, name) case final raw?) {
+      return raw.decode(bytes, includeAlpha: !preview);
+    }
     final frame = switch (name) {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
@@ -959,6 +1019,7 @@ typedef _DecodeRun = ({
   List<FramePacket> packets,
   List<int> targets,
   _RunConfiguration? configuration,
+  QuickTimeRawFormat? rawFormat,
 });
 
 bool _usesReferences(String codec) =>

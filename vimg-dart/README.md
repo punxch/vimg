@@ -41,8 +41,12 @@ formats depend on the Dart image library's encoders and decoders.
   script for the Dart CLI.
 
 Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
-MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit
-BGR. Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
+MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit BGR.
+QuickTime supports uncompressed RGB555, RGB24, ARGB32 and packed YCbCr
+(`2vuy`, `yuv2`, `v210`, `v216`, `v308`, `v408` and `v410`).
+Packed YCbCr keeps its component depth through filtering and scaling.
+ARGB and `v408` retain alpha in BMP extraction.
+Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
 same GOP, and schedule captures using the source frame durations and the
