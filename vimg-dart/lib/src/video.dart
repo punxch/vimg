@@ -25,9 +25,10 @@ import 'metadata.dart';
 import 'mpeg12/decode.dart';
 import 'mpeg12/syntax.dart';
 import 'mpeg_systems.dart';
+import 'msrle.dart';
+import 'msvideo1.dart';
 import 'nal_parameter_sets.dart';
 import 'prores.dart';
-import 'msrle.dart';
 import 'quicktime_animation.dart';
 import 'quicktime_raw.dart';
 import 'quicktime_rpza.dart';
@@ -104,6 +105,9 @@ final class Video {
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
   late final _deltaTimeline = _indexDeltaPictures(codec);
+  late final _matroskaVideo1 = _matroska == null
+      ? null
+      : matroskaVideo1Configuration(_matroska!);
   late final bool _mixedIsoCodecs = _hasMixedIsoCodecs();
   late final List<_IsoSection> _isoSections = _readIsoSections();
   late final Map<FramePacket, _IsoSection> _isoSectionByPacket = {
@@ -186,6 +190,9 @@ final class Video {
 
     final avi = _avi;
     final rle = avi?.rleFormat;
+    final video1 = name == 'msvideo1'
+        ? avi?.video1Format ?? _matroskaVideo1?.format
+        : null;
     bool isRleKeyframe(FramePacket packet, int position) {
       final raw = avi!.isUncompressedRle(packet);
       final complete = raw || rle!.isComplete(_read(packet));
@@ -231,6 +238,8 @@ final class Video {
                   ? isRpzaKeyframe(_read(packet), rpzaBlocks)
                   : rle != null
                   ? isRleKeyframe(packet, position)
+                  : video1 != null
+                  ? video1.isComplete(_read(packet)) || position == 0
                   : sync;
               if (keyframe) {
                 start = position;
@@ -948,6 +957,16 @@ final class Video {
   ) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'msvideo1':
+        final decoder = MsVideo1Decoder(
+          _avi?.video1Format ?? _matroskaVideo1!.format,
+        );
+        return (packet, selected, palette) {
+          decoder.advance(_read(packet));
+          if (!selected) return null;
+          final source = decoder.rgb(palette ?? _matroskaVideo1?.palette);
+          return ({scaler}) => _renderRgb(source, scaler);
+        };
       case 'msrle':
         final avi = _avi!;
         final decoder = MsRleDecoder(avi.rleFormat!);
@@ -1219,7 +1238,8 @@ bool _isDeltaBitmapCodec(String codec) =>
     codec == 'rpza' ||
     codec == 'smc' ||
     codec == 'cinepak' ||
-    codec == 'msrle';
+    codec == 'msrle' ||
+    codec == 'msvideo1';
 
 final class _IsoSection {
   _IsoSection(this.codec, this.description, this.restart);

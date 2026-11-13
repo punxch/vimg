@@ -1,9 +1,49 @@
 import 'dart:typed_data';
 
+import 'dib_palette.dart';
 import 'iso_media.dart';
 import 'matroska.dart';
+import 'msvideo1.dart';
+
+({MsVideo1Format format, List<int>? palette}) matroskaVideo1Configuration(
+  Matroska media,
+) {
+  final config = _firstVideoTrack(media, 'msvideo1')?[0x63a2];
+  if (config == null || config.end - config.data < 40) {
+    throw const FormatException('Missing Microsoft Video 1 bitmap header');
+  }
+  final data = ByteData.sublistView(media.file.read(config.data, 40));
+  final headerSize = data.getUint32(0, Endian.little);
+  if (headerSize < 40 || headerSize > config.end - config.data) {
+    throw const FormatException('Invalid Microsoft Video 1 bitmap header');
+  }
+  final bits = data.getUint16(14, Endian.little);
+  final format = MsVideo1Format(
+    data.getInt32(4, Endian.little),
+    data.getInt32(8, Endian.little).abs(),
+    bits,
+  );
+  return (
+    format: format,
+    palette: format.indexed
+        ? readDibPalette(media.file, config.data, config.end, bits)
+        : null,
+  );
+}
 
 Uint8List? matroskaVideoConfiguration(Matroska media, String codec) {
+  final track = _firstVideoTrack(media, codec);
+  final config = track?[0x63a2];
+  if (config == null) return null;
+  final start = media.text(track![0x86]) == 'V_MS/VFW/FOURCC'
+      ? config.data + 40
+      : config.data;
+  final length = config.end - start;
+  if (length < _minimumSize(codec) || length > 1024 * 1024) return null;
+  return media.file.read(start, length);
+}
+
+Map<int, EbmlElement>? _firstVideoTrack(Matroska media, String codec) {
   final tracks = media
       .segmentElements()
       .where((box) => box.id == 0x1654ae6b)
@@ -11,14 +51,7 @@ Uint8List? matroskaVideoConfiguration(Matroska media, String codec) {
   if (tracks == null) return null;
   final track = media.videoTracks(tracks).firstOrNull;
   if (track == null || media.trackCodec(track) != codec) return null;
-  final config = track[0x63a2];
-  if (config == null) return null;
-  final start = media.text(track[0x86]) == 'V_MS/VFW/FOURCC'
-      ? config.data + 40
-      : config.data;
-  final length = config.end - start;
-  if (length < _minimumSize(codec) || length > 1024 * 1024) return null;
-  return media.file.read(start, length);
+  return track;
 }
 
 Uint8List? isoVideoConfiguration(

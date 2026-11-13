@@ -3,9 +3,11 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import 'binary_file.dart';
+import 'dib_palette.dart';
 import 'frame_packet.dart';
 import 'metadata.dart';
 import 'msrle.dart';
+import 'msvideo1.dart';
 
 typedef _Chunk = ({String id, int data, int end});
 typedef _ColorMasks = ({int r, int g, int b});
@@ -25,6 +27,7 @@ typedef _Track = ({
   _Bitmap? bitmap,
   Uint8List? cinepakDescription,
   MsRleFormat? rle,
+  MsVideo1Format? video1,
   List<int>? palette,
 });
 
@@ -121,6 +124,7 @@ final class Avi {
         'XVID' || 'DIVX' || 'DX50' || 'FMP4' => 'mpeg4',
         'FFV1' => 'ffv1',
         'CVID' => 'cinepak',
+        'MSVC' || 'CRAM' || 'WHAM' => 'msvideo1',
         '\x01\x00\x00\x00' ||
         '\x02\x00\x00\x00' ||
         'MRLE' ||
@@ -150,6 +154,9 @@ final class Avi {
       } else {
         rle = null;
       }
+      final video1 = codec == 'msvideo1'
+          ? MsVideo1Format(width, height, bits)
+          : null;
       tracks.add((
         index: index,
         step: step,
@@ -167,11 +174,13 @@ final class Avi {
             ? _cinepakDescription(width, height, bits)
             : null,
         rle: rle,
+        video1: video1,
         palette:
             rle != null ||
+                video1?.indexed == true ||
                 (bitmap != null && bits <= 8) ||
                 (codec == 'cinepak' && bits == 8)
-            ? _bitmapPalette(format, bits)
+            ? readDibPalette(file, format.data, format.end, bits)
             : null,
       ));
     }
@@ -187,6 +196,7 @@ final class Avi {
   Uint8List? get cinepakDescription =>
       _header.tracks.firstOrNull?.cinepakDescription;
   MsRleFormat? get rleFormat => _header.tracks.firstOrNull?.rle;
+  MsVideo1Format? get video1Format => _header.tracks.firstOrNull?.video1;
 
   bool isUncompressedRle(FramePacket packet) =>
       packet.size == rleFormat!.bitmapSize &&
@@ -247,27 +257,6 @@ final class Avi {
       ..setUint16(74, bits)
       ..setUint16(76, 65535);
     return description;
-  }
-
-  List<int> _bitmapPalette(_Chunk format, int bits) {
-    final limit = 1 << bits;
-    final palette = List<int>.filled(256, 0);
-    if (format.end - format.data < 40) return palette;
-    final table = format.data + _u32(format.data);
-    final declared = _u32(format.data + 32);
-    if (table < format.data + 40 || table > format.end || declared > limit) {
-      throw const FormatException('Invalid AVI bitmap palette');
-    }
-    final available = (format.end - table) ~/ 4;
-    final colors = declared == 0 ? available.clamp(0, limit) : declared;
-    if (colors > available) {
-      throw const FormatException('Truncated AVI bitmap palette');
-    }
-    final data = ByteData.sublistView(file.read(table, 4 * colors));
-    for (var i = 0; i < colors; i++) {
-      palette[i] = data.getUint32(4 * i, Endian.little) & 0xffffff;
-    }
-    return palette;
   }
 
   Iterable<FramePacket> packets({FrameVisitor? onSample}) sync* {
