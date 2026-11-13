@@ -45,6 +45,14 @@ const _palette = [
   0xee7930ad,
   0xac910061,
 ];
+const _changingPalette = [
+  0x893b7a05,
+  0x1149b025,
+  0x55556b05,
+  0x2f1c3455,
+  0xebd4b255,
+  0xd9cdd1bd,
+];
 
 Future<void> main(List<String> arguments) async {
   await _checkVideo('color.mov', _color, [0, 8], 8);
@@ -54,6 +62,9 @@ Future<void> main(List<String> arguments) async {
   // sample, even though the third sample can be decoded on its own.
   await _checkVideo('palette.mov', _palette, [0, 2, 4], 4);
   await _checkVideo('palette.avi', _palette, [0, 2, 4], 4);
+  // Two partial changes arrive inside a record list before a delta frame.
+  // A full palette change in the first RIFF applies to the next AVIX segment.
+  await _checkVideo('palette-change.avi', _changingPalette, [0, 2, 4], 4);
   _checkPaddedPicture();
   await _checkCli(arguments.firstOrNull);
 }

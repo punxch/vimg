@@ -798,6 +798,9 @@ final class Video {
           targets: const [0],
           configuration: null,
           rawFormat: _quickTimeFormat(packet, name),
+          aviPalettes: _avi?.hasPalette == true
+              ? {0: _avi!.paletteFor(packet)!}
+              : null,
         );
       }
       return;
@@ -817,6 +820,12 @@ final class Video {
       targets: wanted,
       configuration: configurations[start]!,
       rawFormat: null,
+      aviPalettes: _avi?.hasPalette == true
+          ? {
+              for (final i in wanted)
+                i: _avi!.paletteFor(timeline.decodeOrder[start + i])!,
+            }
+          : null,
     );
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
@@ -880,7 +889,11 @@ final class Video {
           includeAlpha: scaler?.width == null && scaler?.height == null,
         );
       } else {
-        final source = _decodeIndependent(packet, name);
+        final source = _decodeIndependent(
+          packet,
+          name,
+          palette: run.aviPalettes?[0],
+        );
         render = ({scaler}) => _renderRgb(source, scaler);
       }
       final frame = render(scaler: scaler);
@@ -900,7 +913,7 @@ final class Video {
     var target = 0;
     for (final (i, packet) in run.packets.indexed) {
       final selected = i == run.targets[target];
-      final render = readPicture(_read(packet), selected);
+      final render = readPicture(_read(packet), selected, run.aviPalettes?[i]);
       if (!selected) continue;
       if (render == null) {
         throw FormatException(
@@ -919,20 +932,22 @@ final class Video {
     }
   }
 
-  _RenderPicture? Function(Uint8List, bool) _pictureReader(_DecodeRun run) {
+  _RenderPicture? Function(Uint8List, bool, List<int>?) _pictureReader(
+    _DecodeRun run,
+  ) {
     final configuration = run.configuration!;
     switch (run.codec) {
       case 'cinepak':
         final decoder = CinepakDecoder(configuration.bytes!);
-        return (bytes, selected) {
+        return (bytes, selected, palette) {
           decoder.advance(bytes);
           if (!selected) return null;
-          final source = decoder.rgb();
+          final source = decoder.rgb(palette: palette);
           return ({scaler}) => _renderRgb(source, scaler);
         };
       case 'qtrle':
         final decoder = QuickTimeAnimationDecoder(configuration.bytes!);
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
@@ -940,7 +955,7 @@ final class Video {
         };
       case 'rpza':
         final decoder = QuickTimeRpzaDecoder(configuration.bytes!);
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
@@ -948,7 +963,7 @@ final class Video {
         };
       case 'smc':
         final decoder = QuickTimeSmcDecoder(configuration.bytes!);
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           decoder.advance(bytes);
           if (!selected) return null;
           final source = decoder.rgb();
@@ -957,7 +972,7 @@ final class Video {
       case 'av1':
         final units = Av1AccessUnits()..configure(configuration.bytes!);
         final decoder = Av1StreamDecoder();
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           Av1Picture? displayed;
           for (final frame in units.readSample(bytes)) {
             final picture = decoder.decode(frame);
@@ -974,13 +989,13 @@ final class Video {
         final decoder = HevcStreamDecoder(
           _hevcDecoderConfig(configuration.nal!),
         );
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
       case 'mpeg1video' || 'mpeg2video':
         final decoder = MpegStreamDecoder(configuration.bytes);
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           if (selected) return decoder.decode(bytes).rgb;
           decoder.advance(bytes);
           return null;
@@ -989,7 +1004,7 @@ final class Video {
         final decoder = H264StreamDecoder(
           _avcDecoderConfig(configuration.nal!),
         );
-        return (bytes, selected) {
+        return (bytes, selected, _) {
           final picture = decoder.decode(bytes);
           return selected ? picture?.rgb : null;
         };
@@ -1094,6 +1109,7 @@ final class Video {
     FramePacket packet,
     String name, {
     bool preview = false,
+    List<int>? palette,
   }) {
     if (name == 'prores') {
       return _proRes(packet, preserveAlpha: !preview).rgb();
@@ -1106,7 +1122,10 @@ final class Video {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
       'vp8' => _vp8Keyframe(bytes),
-      'rawvideo' => _avi?.decodeBitmap(bytes),
+      'rawvideo' => _avi?.decodeBitmap(
+        bytes,
+        palette: palette ?? _avi?.paletteFor(packet),
+      ),
       _ => null,
     };
     if (frame == null) throw FormatException('Invalid $name video frame');
@@ -1158,6 +1177,7 @@ typedef _DecodeRun = ({
   List<int> targets,
   _RunConfiguration? configuration,
   QuickTimeRawFormat? rawFormat,
+  Map<int, List<int>>? aviPalettes,
 });
 
 bool _usesReferences(String codec) =>

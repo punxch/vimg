@@ -94,11 +94,12 @@ final class CinepakDecoder {
     final v = color ? bytes[5].toSigned(8) : 0;
     for (var j = 0; j < 4; j++) {
       final y = bytes[j];
-      books[4 * slot + j] = _palette == null
-          ? (y + 2 * v).clamp(0, 255) << 16 |
+      // Keep palette indices in both codebooks and retained pixel blocks.
+      books[4 * slot + j] = _palette != null
+          ? y
+          : (y + 2 * v).clamp(0, 255) << 16 |
                 (y - u ~/ 2 - v).clamp(0, 255) << 8 |
-                (y + 2 * u).clamp(0, 255)
-          : _palette[y];
+                (y + 2 * u).clamp(0, 255);
     }
   }
 
@@ -124,11 +125,13 @@ final class CinepakDecoder {
     }
   }
 
-  image.Image rgb() {
+  image.Image rgb({List<int>? palette}) {
     if (!_ready) throw const FormatException('Missing Cinepak reference frame');
     final frame = image.Image(width: width, height: height);
+    final colors = palette ?? _palette;
     for (final pixel in frame) {
-      final color = _pixels[pixel.y * _stride + pixel.x];
+      final value = _pixels[pixel.y * _stride + pixel.x];
+      final color = colors == null ? value : colors[value];
       pixel.setRgb(color >> 16, color >> 8 & 255, color & 255);
     }
     return frame;

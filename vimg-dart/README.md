@@ -41,7 +41,8 @@ formats depend on the Dart image library's encoders and decoders.
   script for the Dart CLI.
 
 Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
-MP4/MOV or AVI. AVI also supports uncompressed 24-bit and 32-bit BGR.
+MP4/MOV or AVI. AVI also supports uncompressed indexed 1-, 4- and 8-bit
+video, RGB555, 24- and 32-bit BGR and 16- and 32-bit RGB bitfields.
 QuickTime supports uncompressed RGB555, RGB24, ARGB32 and packed YCbCr
 (`2vuy`, `yuv2`, `v210`, `v216`, `v308`, `v408` and `v410`).
 Packed YCbCr keeps its component depth through filtering and scaling.
@@ -57,8 +58,9 @@ QuickTime Graphics (`smc `) supports 8-bit indexed color and grayscale,
 including embedded palettes, block repeats, and differential frames.
 Random access accounts for both pixel and palette dependencies.
 Cinepak (`cvid`) in MOV and AVI supports color, grayscale and indexed
-frames with a palette in the stream header. Random access follows
-codebook updates and blocks retained from earlier pictures.
+frames. Random access follows codebook updates and blocks retained from
+earlier pictures. AVI palette changes apply to both indexed Cinepak and
+indexed uncompressed video.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
