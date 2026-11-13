@@ -66,12 +66,12 @@ H264Picture _decodePicture(
 }) {
   final first = slices.first;
   final sps = first.pps.sps;
-  if (sps.lumaDepth != 8 ||
-      sps.chromaDepth != 8 ||
+  if (sps.lumaDepth > 10 ||
+      (sps.chromaFormat != 0 && sps.chromaDepth != sps.lumaDepth) ||
       sps.chromaFormat > 1 ||
       sps.transformBypass) {
     throw UnsupportedError(
-      'H.264 decoding supports progressive 8-bit 4:2:0 and monochrome',
+      'H.264 decoding supports progressive 8–10-bit 4:2:0 and monochrome',
     );
   }
   if (sps.mbWidth * sps.mbHeight > 139264) {
@@ -98,15 +98,7 @@ H264Picture _decodePicture(
   if (decoder.decoded != decoder.blocks.length) {
     throw const FormatException('Incomplete H.264 picture');
   }
-  deblockPicture(
-    decoder.blocks,
-    picture.y,
-    picture.cb,
-    picture.cr,
-    sps.mbWidth,
-    picture.motionL0,
-    picture.motionL1,
-  );
+  deblockPicture(decoder.blocks, picture);
   return picture;
 }
 
@@ -123,7 +115,7 @@ final class _Reconstruction {
   final int width;
   final List<Macroblock?> blocks;
   final ScalingMatrices _scaling;
-  final _predict = IntraPrediction();
+  late final _predict = IntraPrediction(picture.sps.lumaDepth);
   final _transform = IntraTransform();
   var decoded = 0;
 
@@ -225,6 +217,7 @@ final class _Reconstruction {
       return;
     }
 
+    final lumaQp = block.qp + picture.sps.lumaQpOffset;
     if (block.intra16) {
       _predict.luma(
         picture.y,
@@ -234,18 +227,14 @@ final class _Reconstruction {
         (block.type - 1) & 3,
         available,
       );
-      final dc = _transform.lumaDc(
-        levels.lumaDc,
-        block.qp,
-        _scaling.four[0][0],
-      );
+      final dc = _transform.lumaDc(levels.lumaDc, lumaQp, _scaling.four[0][0]);
       for (var i = 0; i < 16; i++) {
         final x = blockX(i);
         final row = blockY(i);
         _transform.block4(
           levels.luma,
           i * 16,
-          block.qp,
+          lumaQp,
           _scaling.four[0],
           dc: dc[row * 4 + x],
         );
@@ -276,9 +265,9 @@ final class _Reconstruction {
           neighbors,
         );
         if (block.transform8x8) {
-          _transform.block8(levels.luma, i * 64, block.qp, _scaling.eight);
+          _transform.block8(levels.luma, i * 64, lumaQp, _scaling.eight);
         } else {
-          _transform.block4(levels.luma, i * 16, block.qp, _scaling.four[0]);
+          _transform.block4(levels.luma, i * 16, lumaQp, _scaling.four[0]);
         }
         _add(picture.y, stride, offset, size, size, 0);
       }
@@ -316,18 +305,14 @@ final class _Reconstruction {
     );
     _copyPcm(_predict.pixels, 0, picture.y, offset, stride, 16);
     if (block.codedLuma != 0) {
+      final lumaQp = block.qp + picture.sps.lumaQpOffset;
       final size = block.transform8x8 ? 8 : 4;
       for (var z = 0; z < 16; z += block.transform8x8 ? 4 : 1) {
         if ((block.codedLuma & (1 << z)) == 0) continue;
         if (block.transform8x8) {
-          _transform.block8(levels.luma, z * 16, block.qp, _scaling.interEight);
+          _transform.block8(levels.luma, z * 16, lumaQp, _scaling.interEight);
         } else {
-          _transform.block4(
-            levels.luma,
-            z * 16,
-            block.qp,
-            _scaling.interFour[0],
-          );
+          _transform.block4(levels.luma, z * 16, lumaQp, _scaling.interFour[0]);
         }
         _add(
           picture.y,
@@ -359,11 +344,7 @@ final class _Reconstruction {
       );
       _copyPcm(_predict.pixels, 0, plane, chromaOffset, chromaStride, 8);
       if (block.chromaPattern == 0) continue;
-      final pps = slice.pps;
-      final qp = chromaQp(
-        block.qp,
-        component == 0 ? pps.chromaOffset : pps.secondChromaOffset,
-      );
+      final qp = _chromaTransformQp(block, component);
       final weights = _scaling.interFour[component + 1];
       final dc = IntraTransform.chromaDc(
         levels.chromaDc,
@@ -394,7 +375,7 @@ final class _Reconstruction {
   }
 
   void _chroma(
-    Uint8List plane,
+    List<int> plane,
     int offset,
     int stride,
     Neighbors available,
@@ -402,11 +383,7 @@ final class _Reconstruction {
     MacroblockCoefficients levels,
     int component,
   ) {
-    final pps = block.slice.pps;
-    final qp = chromaQp(
-      block.qp,
-      component == 0 ? pps.chromaOffset : pps.secondChromaOffset,
-    );
+    final qp = _chromaTransformQp(block, component);
     final weights = _scaling.four[component + 1];
     _predict.chroma(plane, stride, offset, block.chromaMode, available);
     final dc = IntraTransform.chromaDc(
@@ -429,20 +406,28 @@ final class _Reconstruction {
     }
   }
 
+  int _chromaTransformQp(Macroblock block, int component) {
+    final pps = block.slice.pps;
+    final depthOffset = pps.sps.chromaQpOffset;
+    final offset = component == 0 ? pps.chromaOffset : pps.secondChromaOffset;
+    return chromaQp(block.qp, offset, depthOffset) + depthOffset;
+  }
+
   void _add(
-    Uint8List plane,
+    List<int> plane,
     int stride,
     int start,
     int size,
     int predStride,
     int predStart,
   ) {
+    final maximum = _predict.maximum;
     for (var row = 0; row < size; row++) {
       for (var x = 0; x < size; x++) {
         plane[start + row * stride + x] =
             (_predict.pixels[predStart + row * predStride + x] +
                     _transform.residual[row * size + x])
-                .clamp(0, 255);
+                .clamp(0, maximum);
       }
     }
   }
@@ -466,9 +451,9 @@ Neighbors _withinMb(int x, int y, int size, Neighbors mb, int block) {
 }
 
 void _copyPcm(
-  Uint8List source,
+  List<int> source,
   int sourceStart,
-  Uint8List target,
+  List<int> target,
   int targetStart,
   int stride,
   int size,

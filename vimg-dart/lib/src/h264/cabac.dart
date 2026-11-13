@@ -28,8 +28,9 @@ Uint8List _models(int qp, int? interInit) {
       ? intraContextInit
       : interContextInit[interInit];
   final models = Uint8List(table.length ~/ 2);
+  final initialQp = qp.clamp(0, 51);
   for (var i = 0; i < models.length; i++) {
-    models[i] = cabacModel(table[2 * i], table[2 * i + 1], qp);
+    models[i] = cabacModel(table[2 * i], table[2 * i + 1], initialQp);
   }
   return models;
 }

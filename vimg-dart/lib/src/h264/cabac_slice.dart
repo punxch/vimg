@@ -161,7 +161,7 @@ final class CabacSlice extends SliceData {
     var delta = 0;
     if (block.intra16 || block.lumaPattern != 0 || block.chromaPattern != 0) {
       delta = _qpDelta();
-      _qp = (_qp + delta) % 52;
+      _updateQp(delta);
     }
     _previousQpDelta = delta != 0;
     block.qp = _qp;
@@ -229,8 +229,9 @@ final class CabacSlice extends SliceData {
   int _qpDelta() {
     if (_cabac.decision(_previousQpDelta ? 61 : 60) == 0) return 0;
     var value = 1;
+    final maximum = 52 + header.pps.sps.lumaQpOffset;
     while (_cabac.decision(value == 1 ? 62 : 63) != 0) {
-      if (++value > 52)
+      if (++value > maximum)
         throw const FormatException('Invalid H.264 macroblock QP delta');
     }
     return value.isOdd ? (value + 1) >> 1 : -(value >> 1);

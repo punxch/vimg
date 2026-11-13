@@ -112,8 +112,8 @@ const _chromaQp = [
   39,
 ];
 
-int chromaQp(int luma, int offset) {
-  final index = (luma + offset).clamp(0, 51);
+int chromaQp(int luma, int offset, int depthOffset) {
+  final index = (luma + offset).clamp(-depthOffset, 51);
   return index < 30 ? index : _chromaQp[index - 30];
 }
 

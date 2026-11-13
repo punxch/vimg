@@ -113,7 +113,7 @@ final class SliceHeader {
     if (reference) _referenceMarking();
     if (pps.cabac && kind != SliceKind.intra) cabacInit = bits.ue(2);
     qp = pps.initialQp + bits.se();
-    if (qp < -6 * (sps.lumaDepth - 8) ||
+    if (qp < -sps.lumaQpOffset ||
         qp > 51 ||
         firstMb >= sps.mbWidth * sps.mbHeight) {
       throw const FormatException(

@@ -31,7 +31,9 @@ final class Macroblock {
   var transform8x8 = false;
   var skipped = false, direct = false;
   var lumaPattern = 0, chromaPattern = 0;
-  var chromaMode = 0, qp = 0;
+  var chromaMode = 0;
+  // Signed QPY before adding the bit-depth offset for inverse quantization.
+  var qp = 0;
   var codedLuma = 0, codedChroma = 0, codedDc = 0;
   Uint8List? modes;
   Uint8List? totalCoefficients;
@@ -47,7 +49,7 @@ final class MacroblockCoefficients {
   final lumaDc = Int32List(16);
   final chroma = Int32List(128);
   final chromaDc = Int32List(8);
-  final pcm = Uint8List(384);
+  final pcm = Uint16List(384);
 
   void clearResiduals() {
     luma.fillRange(0, luma.length, 0);
@@ -64,6 +66,14 @@ abstract class SliceData {
   final coefficients = MacroblockCoefficients();
   var _previousQpDelta = false;
   int _qp;
+
+  void _updateQp(int delta) {
+    final offset = header.pps.sps.lumaQpOffset;
+    if (delta < -26 - offset ~/ 2 || delta > 25 + offset ~/ 2) {
+      throw const FormatException('Invalid H.264 macroblock QP delta');
+    }
+    _qp = (_qp + delta + offset) % (52 + offset) - offset;
+  }
 
   bool endOfSlice();
   bool _skip(Macroblock? left, Macroblock? top);
@@ -118,9 +128,13 @@ abstract class SliceData {
     if (block.pcm) {
       final bits = header.bits;
       bits.align(0);
-      final count = header.pps.sps.chromaFormat == 0 ? 256 : 384;
+      final sps = header.pps.sps;
+      block.qp = -sps.lumaQpOffset;
+      final count = sps.chromaFormat == 0 ? 256 : 384;
       for (var i = 0; i < count; i++) {
-        coefficients.pcm[i] = bits.read(8);
+        coefficients.pcm[i] = bits.read(
+          i < 256 ? sps.lumaDepth : sps.chromaDepth,
+        );
       }
       _restartAfterPcm();
       _previousQpDelta = false;

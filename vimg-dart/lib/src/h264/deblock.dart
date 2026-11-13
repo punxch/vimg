@@ -1,22 +1,17 @@
-import 'dart:typed_data';
-
 import 'deblock_tables.dart';
 import 'motion.dart';
+import 'picture.dart';
 import 'slice_data.dart';
 import 'transforms.dart';
 
 /// H.264 deblocking (§8.7) in macroblock order. Inter edges use per-4×4
 /// residual and reference information to choose the boundary strength.
-void deblockPicture(
-  List<Macroblock?> blocks,
-  Uint8List y,
-  Uint8List cb,
-  Uint8List cr,
-  int width,
-  MotionField? motion,
-  MotionField? motion1,
-) {
-  final stride = width * 16;
+void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
+  final sps = picture.sps;
+  final width = sps.mbWidth, stride = picture.stride;
+  final chromaQpOffset = sps.chromaQpOffset;
+  final motion = picture.motionL0, motion1 = picture.motionL1;
+  final cb = picture.cb, cr = picture.cr;
   for (var address = 0; address < blocks.length; address++) {
     final block = blocks[address]!;
     final slice = block.slice;
@@ -46,11 +41,12 @@ void deblockPicture(
         segment,
       );
       _edges(
-        y,
+        picture.y,
         start,
         stride,
         vertical,
         16,
+        sps.lumaDepth,
         block.transform8x8 ? 8 : 4,
         block.qp,
         neighbor?.qp,
@@ -59,17 +55,20 @@ void deblockPicture(
         strength,
       );
       if (cb.isNotEmpty) {
-        final cbQp = chromaQp(block.qp, pps.chromaOffset);
-        final crQp = chromaQp(block.qp, pps.secondChromaOffset);
+        final cbQp = chromaQp(block.qp, pps.chromaOffset, chromaQpOffset);
+        final crQp = chromaQp(block.qp, pps.secondChromaOffset, chromaQpOffset);
         _edges(
           cb,
           chromaStart,
           chromaStride,
           vertical,
           8,
+          sps.chromaDepth,
           4,
           cbQp,
-          neighbor == null ? null : chromaQp(neighbor.qp, pps.chromaOffset),
+          neighbor == null
+              ? null
+              : chromaQp(neighbor.qp, pps.chromaOffset, chromaQpOffset),
           slice.alphaOffset,
           slice.betaOffset,
           strength,
@@ -80,11 +79,12 @@ void deblockPicture(
           chromaStride,
           vertical,
           8,
+          sps.chromaDepth,
           4,
           crQp,
           neighbor == null
               ? null
-              : chromaQp(neighbor.qp, pps.secondChromaOffset),
+              : chromaQp(neighbor.qp, pps.secondChromaOffset, chromaQpOffset),
           slice.alphaOffset,
           slice.betaOffset,
           strength,
@@ -131,11 +131,12 @@ int _strength(
 }
 
 void _edges(
-  Uint8List plane,
+  List<int> plane,
   int start,
   int stride,
   bool vertical,
   int width,
+  int depth,
   int spacing,
   int qp,
   int? neighborQp,
@@ -146,6 +147,8 @@ void _edges(
   final across = vertical ? 1 : stride;
   final along = vertical ? stride : 1;
   final chroma = width == 8;
+  final shift = depth - 8;
+  final maximum = (1 << depth) - 1;
   final segmentWidth = width ~/ 4;
   for (
     var edge = neighborQp == null ? spacing : 0;
@@ -154,13 +157,15 @@ void _edges(
   ) {
     final averaged = edge == 0 ? (qp + neighborQp! + 1) >> 1 : qp;
     final index = (averaged + alphaOffset).clamp(0, 51);
-    final alpha = deblockAlpha[index];
-    final beta = deblockBeta[(averaged + betaOffset).clamp(0, 51)];
+    final alpha = deblockAlpha[index] << shift;
+    final beta = deblockBeta[(averaged + betaOffset).clamp(0, 51)] << shift;
     if (alpha == 0 || beta == 0) continue;
     for (var segment = 0; segment < 4; segment++) {
       final strength = strengthAt(edge ~/ segmentWidth, segment);
       if (strength == 0) continue;
-      final limit = strength == 4 ? 0 : deblockLimit[strength - 1][index];
+      final limit = strength == 4
+          ? 0
+          : deblockLimit[strength - 1][index] << shift;
       final offset = start + edge * across + segment * segmentWidth * along;
       for (var i = 0; i < segmentWidth; i++) {
         _filter(
@@ -170,6 +175,7 @@ void _edges(
           alpha,
           beta,
           limit,
+          maximum,
           chroma: chroma,
           boundary: strength == 4,
         );
@@ -179,12 +185,13 @@ void _edges(
 }
 
 void _filter(
-  Uint8List plane,
+  List<int> plane,
   int offset,
   int step,
   int alpha,
   int beta,
-  int limit, {
+  int limit,
+  int maximum, {
   required bool chroma,
   required bool boundary,
 }) {
@@ -225,7 +232,7 @@ void _filter(
       if (limit != 0) {
         plane[offset -
             2 * step] = (p1 + (((p2 + middle) >> 1) - p1).clamp(-limit, limit))
-            .clamp(0, 255);
+            .clamp(0, maximum);
       }
       clip++;
     }
@@ -233,12 +240,12 @@ void _filter(
       if (limit != 0) {
         plane[offset +
             step] = (q1 + (((q2 + middle) >> 1) - q1).clamp(-limit, limit))
-            .clamp(0, 255);
+            .clamp(0, maximum);
       }
       clip++;
     }
   }
   final delta = (((q0 - p0) * 4 + p1 - q1 + 4) >> 3).clamp(-clip, clip);
-  plane[offset - step] = (p0 + delta).clamp(0, 255);
-  plane[offset] = (q0 - delta).clamp(0, 255);
+  plane[offset - step] = (p0 + delta).clamp(0, maximum);
+  plane[offset] = (q0 - delta).clamp(0, maximum);
 }

@@ -161,6 +161,9 @@ final class H264Sps {
   final double sampleAspect;
   final (int, int)? timing; // frame ticks, ticks per second
   final List<H264ScalingList?>? scaling;
+
+  int get lumaQpOffset => 6 * (lumaDepth - 8);
+  int get chromaQpOffset => 6 * (chromaDepth - 8);
 }
 
 ({H264Color color, double sampleAspect, (int, int)? timing}) _readVui(
@@ -252,7 +255,7 @@ final class H264Pps {
       }
       secondOffset = bits.se();
     }
-    if (qp < -6 * (sps.lumaDepth - 8) ||
+    if (qp < -sps.lumaQpOffset ||
         qp > 51 ||
         chromaOffset < -12 ||
         chromaOffset > 12 ||

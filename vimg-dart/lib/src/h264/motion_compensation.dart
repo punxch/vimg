@@ -1,13 +1,11 @@
-import 'dart:typed_data';
-
 import 'b_motion.dart';
 import 'motion.dart';
 import 'reference.dart';
 import 'slice_header.dart';
 
-/// Inter prediction for progressive 8-bit pictures (§8.4.2.2–8.4.2.3).
+/// Inter prediction for progressive pictures (§8.4.2.2–8.4.2.3).
 void predictInter(
-  Uint8List output,
+  List<int> output,
   int plane,
   int mbX,
   int mbY,
@@ -19,6 +17,10 @@ void predictInter(
   int poc,
 ) {
   final luma = plane == 0;
+  final sps = header.pps.sps;
+  final depth = luma ? sps.lumaDepth : sps.chromaDepth;
+  final maximum = (1 << depth) - 1;
+  final offsetShift = depth - 8;
   final block = luma ? 4 : 2;
   final size = block * 4;
   final unit = luma ? 4 : 8;
@@ -56,27 +58,28 @@ void predictInter(
           final dx = col * unit, dy = row * unit;
           final int sample;
           if (first == null || second == null) {
-            final raw = _interSample(first ?? second!, luma, dx, dy);
+            final raw = _interSample(first ?? second!, luma, dx, dy, maximum);
             final weight = weight0 ?? weight1;
             sample = weight == null
                 ? raw
-                : _weighted(raw, weight, denominator!);
+                : _weighted(raw, weight, denominator!, offsetShift, maximum);
           } else {
-            final a = _interSample(first, luma, dx, dy);
-            final b = _interSample(second, luma, dx, dy);
+            final a = _interSample(first, luma, dx, dy, maximum);
+            final b = _interSample(second, luma, dx, dy, maximum);
             if (weight0 != null && weight1 != null) {
               final shift = denominator!;
+              final offset = (weight0.offset + weight1.offset) << offsetShift;
               sample =
                   (((a * weight0.weight + b * weight1.weight + (1 << shift)) >>
                               (shift + 1)) +
-                          ((weight0.offset + weight1.offset + 1) >> 1))
-                      .clamp(0, 255);
+                          ((offset + 1) >> 1))
+                      .clamp(0, maximum);
             } else {
               sample = implicit == 32
                   ? _average(a, b)
                   : (((64 - implicit) * a + implicit * b + 32) >> 6).clamp(
                       0,
-                      255,
+                      maximum,
                     );
             }
           }
@@ -89,7 +92,7 @@ void predictInter(
 
 typedef _Source = ({
   ReferencePicture ref,
-  Uint8List data,
+  List<int> data,
   int stride,
   int height,
   int x,
@@ -121,13 +124,14 @@ _Source _source(
   );
 }
 
-int _interSample(_Source source, bool luma, int dx, int dy) => luma
+int _interSample(_Source source, bool luma, int dx, int dy, int maximum) => luma
     ? _luma(
         source.data,
         source.stride,
         source.height,
         source.x + dx,
         source.y + dy,
+        maximum,
       )
     : _chroma(
         source.data,
@@ -137,18 +141,23 @@ int _interSample(_Source source, bool luma, int dx, int dy) => luma
         source.y + dy,
       );
 
-int _weighted(int sample, PredictionWeight weight, int shift) {
+int _weighted(
+  int sample,
+  PredictionWeight weight,
+  int shift,
+  int offsetShift,
+  int maximum,
+) {
   final round = shift == 0 ? 0 : 1 << (shift - 1);
-  return (((sample * weight.weight + round) >> shift) + weight.offset).clamp(
-    0,
-    255,
-  );
+  return (((sample * weight.weight + round) >> shift) +
+          (weight.offset << offsetShift))
+      .clamp(0, maximum);
 }
 
-int _sample(Uint8List data, int stride, int height, int x, int y) =>
+int _sample(List<int> data, int stride, int height, int x, int y) =>
     data[y.clamp(0, height - 1) * stride + x.clamp(0, stride - 1)];
 
-int _chroma(Uint8List data, int stride, int height, int x8, int y8) {
+int _chroma(List<int> data, int stride, int height, int x8, int y8) {
   final x = x8 >> 3, y = y8 >> 3;
   final dx = x8 & 7, dy = y8 & 7;
   final a = _sample(data, stride, height, x, y);
@@ -162,32 +171,38 @@ int _chroma(Uint8List data, int stride, int height, int x8, int y8) {
       6;
 }
 
-int _luma(Uint8List data, int stride, int height, int x4, int y4) {
+int _luma(List<int> data, int stride, int height, int x4, int y4, int maximum) {
   final x = x4 >> 2, y = y4 >> 2;
   final dx = x4 & 3, dy = y4 & 3;
   if (dx == 0 && dy == 0) return _sample(data, stride, height, x, y);
   if (dy == 0) {
-    final half = _halfX(data, stride, height, x, y);
+    final half = _halfX(data, stride, height, x, y, maximum);
     return dx == 2
         ? half
         : _average(half, _sample(data, stride, height, x + (dx >> 1), y));
   }
   if (dx == 0) {
-    final half = _halfY(data, stride, height, x, y);
+    final half = _halfY(data, stride, height, x, y, maximum);
     return dy == 2
         ? half
         : _average(half, _sample(data, stride, height, x, y + (dy >> 1)));
   }
   if (dx == 2 || dy == 2) {
-    final half = _diagonal(data, stride, height, x, y);
+    final half = _diagonal(data, stride, height, x, y, maximum);
     if (dx == 2 && dy == 2) return half;
     return dx == 2
-        ? _average(half, _halfX(data, stride, height, x, y + (dy >> 1)))
-        : _average(half, _halfY(data, stride, height, x + (dx >> 1), y));
+        ? _average(
+            half,
+            _halfX(data, stride, height, x, y + (dy >> 1), maximum),
+          )
+        : _average(
+            half,
+            _halfY(data, stride, height, x + (dx >> 1), y, maximum),
+          );
   }
   return _average(
-    _halfX(data, stride, height, x, y + (dy >> 1)),
-    _halfY(data, stride, height, x + (dx >> 1), y),
+    _halfX(data, stride, height, x, y + (dy >> 1), maximum),
+    _halfY(data, stride, height, x + (dx >> 1), y, maximum),
   );
 }
 
@@ -196,7 +211,7 @@ int _average(int a, int b) => (a + b + 1) >> 1;
 int _six(int a, int b, int c, int d, int e, int f) =>
     a - 5 * (b + e) + 20 * (c + d) + f;
 
-int _horizontal(Uint8List data, int stride, int height, int x, int y) {
+int _horizontal(List<int> data, int stride, int height, int x, int y) {
   final row = y.clamp(0, height - 1) * stride;
   if (x >= 2 && x + 3 < stride) {
     final p = row + x;
@@ -213,10 +228,10 @@ int _horizontal(Uint8List data, int stride, int height, int x, int y) {
   return _six(at(-2), at(-1), at(0), at(1), at(2), at(3));
 }
 
-int _halfX(Uint8List data, int stride, int height, int x, int y) =>
-    ((_horizontal(data, stride, height, x, y) + 16) >> 5).clamp(0, 255);
+int _halfX(List<int> data, int stride, int height, int x, int y, int maximum) =>
+    ((_horizontal(data, stride, height, x, y) + 16) >> 5).clamp(0, maximum);
 
-int _halfY(Uint8List data, int stride, int height, int x, int y) {
+int _halfY(List<int> data, int stride, int height, int x, int y, int maximum) {
   final column = x.clamp(0, stride - 1);
   if (y >= 2 && y + 3 < height) {
     final p = y * stride + column;
@@ -230,20 +245,27 @@ int _halfY(Uint8List data, int stride, int height, int x, int y) {
                 ) +
                 16) >>
             5)
-        .clamp(0, 255);
+        .clamp(0, maximum);
   }
   int at(int offset) =>
       data[(y + offset).clamp(0, height - 1) * stride + column];
   return ((_six(at(-2), at(-1), at(0), at(1), at(2), at(3)) + 16) >> 5).clamp(
     0,
-    255,
+    maximum,
   );
 }
 
-int _diagonal(Uint8List data, int stride, int height, int x, int y) {
+int _diagonal(
+  List<int> data,
+  int stride,
+  int height,
+  int x,
+  int y,
+  int maximum,
+) {
   int at(int offset) => _horizontal(data, stride, height, x, y + offset);
   return ((_six(at(-2), at(-1), at(0), at(1), at(2), at(3)) + 512) >> 10).clamp(
     0,
-    255,
+    maximum,
   );
 }

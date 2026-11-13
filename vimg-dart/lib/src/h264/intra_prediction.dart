@@ -5,14 +5,20 @@ typedef Neighbors = ({bool left, bool top, bool corner, bool topRight});
 
 /// Reusable reference and prediction buffers for H.264 intra prediction.
 final class IntraPrediction {
-  final pixels = Uint8List(256);
-  final _top = Uint8List(16);
-  final _left = Uint8List(16);
-  final _raw = Uint8List(16);
+  IntraPrediction(int depth)
+    : pixels = depth == 8 ? Uint8List(256) : Uint16List(256),
+      _midpoint = 1 << (depth - 1),
+      maximum = (1 << depth) - 1;
+
+  final List<int> pixels;
+  final int _midpoint, maximum;
+  final _top = Uint16List(16);
+  final _left = Uint16List(16);
+  final _raw = Uint16List(16);
   var _corner = 0;
 
   void luma(
-    Uint8List plane,
+    List<int> plane,
     int stride,
     int start,
     int size,
@@ -58,7 +64,7 @@ final class IntraPrediction {
   }
 
   void chroma(
-    Uint8List plane,
+    List<int> plane,
     int stride,
     int start,
     int mode,
@@ -87,7 +93,7 @@ final class IntraPrediction {
             count++;
           }
         }
-        final value = count == 0 ? 128 : (sum + count ~/ 2) ~/ count;
+        final value = count == 0 ? _midpoint : (sum + count ~/ 2) ~/ count;
         for (var i = 0; i < 4; i++) {
           final offset = (by + i) * size + bx;
           pixels.fillRange(offset, offset + 4, value);
@@ -97,7 +103,7 @@ final class IntraPrediction {
   }
 
   void _references(
-    Uint8List plane,
+    List<int> plane,
     int stride,
     int start,
     int size,
@@ -137,7 +143,7 @@ final class IntraPrediction {
       _smooth(_left, size, available.corner ? corner : _left[0]);
   }
 
-  void _smooth(Uint8List edge, int length, int preceding) {
+  void _smooth(Uint16List edge, int length, int preceding) {
     _raw.setRange(0, length, edge);
     for (var i = 0; i < length; i++) {
       edge[i] = _quarter(
@@ -155,7 +161,7 @@ final class IntraPrediction {
       if (available.left) sum += _left[i];
     }
     final count = (available.top ? size : 0) + (available.left ? size : 0);
-    return count == 0 ? 128 : (sum + count ~/ 2) ~/ count;
+    return count == 0 ? _midpoint : (sum + count ~/ 2) ~/ count;
   }
 
   void _large(int size, int mode, Neighbors available) {
@@ -188,7 +194,7 @@ final class IntraPrediction {
           1 => _left[y],
           3 => ((a + b * (x - half + 1) + c * (y - half + 1) + 16) >> 5).clamp(
             0,
-            255,
+            maximum,
           ),
           _ => throw const FormatException(
             'Invalid H.264 block prediction mode',
@@ -218,7 +224,7 @@ final class IntraPrediction {
     return _half(_diagonal(p, transpose), _diagonal(p + 1, transpose));
   }
 
-  int _along(Uint8List edge, int x, int y, int last) {
+  int _along(Uint16List edge, int x, int y, int last) {
     final i = math.min(x + (y >> 1), last);
     final j = math.min(i + 1, last);
     return y.isEven

@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/binary_file.dart';
@@ -121,12 +120,69 @@ const _cavlcHighPlanes = [
   [0x2e581ec3, 0xa76e0486, 0xc17aa016],
 ];
 
+// 10-bit ramps, motion and fades with I/P/B pictures, cropping and two slices.
+// The CAVLC stream also exercises negative slice QP.
+const _high10CabacPlanes = [
+  [0x756f8f3a, 0x4b9da04c, 0xe1f970ce],
+  [0xb40fd956, 0x38490590, 0xa237e644],
+  [0xb46018f9, 0xbb254034, 0xddd5af28],
+  [0x868a4dcf, 0xdcbf7c61, 0x8b30a5e4],
+  [0x086f9872, 0x3920483b, 0xf189ac7e],
+  [0x104ad48c, 0x124732f5, 0x0681c858],
+  [0x3d261238, 0x2c827d95, 0x8ffe2994],
+  [0x2bdf0f1a, 0x58d4936c, 0xcb11850b],
+  [0x2a7b487a, 0x68e305e0, 0x99695540],
+  [0x1df90ead, 0xe4752130, 0x1d4dee77],
+  [0xad28cfcd, 0x9b769ee4, 0x812cef96],
+  [0x74edc0a0, 0x5b421c15, 0x95028451],
+  [0x591f50e3, 0xbb493c54, 0x704fe875],
+  [0x9b8030c8, 0xa806497f, 0x9d260c1c],
+  [0x84e200a8, 0x946b2f58, 0xc8b2e298],
+  [0x5babd3fd, 0x8a7ee623, 0xb031b9ff],
+];
+
+const _high10CavlcPlanes = [
+  [0x33f100d9, 0x0ab8775f, 0x817d1ec6],
+  [0xeec2729c, 0xa6032d3e, 0x226ed26b],
+  [0x1309362c, 0x837dcddf, 0x676e72b2],
+  [0xa1e0667f, 0x10d70287, 0xcc469c44],
+  [0xa1534b6c, 0x94f87484, 0x652a2997],
+  [0x8e4ec8d0, 0xc3a9a11c, 0x2c8d8694],
+  [0x612801b6, 0x22c07c7f, 0x59ced4fc],
+  [0x76cd3f18, 0x9893e6cb, 0xe4998b10],
+  [0x21b6dc9e, 0xc4995c55, 0xfe851dd8],
+  [0x048add8a, 0x4e4db0d7, 0x4beef889],
+  [0x3c4955b1, 0x220058d4, 0xd7f64246],
+  [0x8c57d7be, 0xadd7df31, 0x54291ca8],
+  [0x69a3ebda, 0xf94ec89c, 0x42a8f9fa],
+  [0xbba32d5a, 0x5f4bb4b6, 0x6bf252c9],
+  [0xb429479a, 0xd5623563, 0xd921cd13],
+  [0x058ec3fd, 0xe34f9946, 0x08a60635],
+];
+
+// High 10 monochrome with intra and inter prediction.
+const _high10MonochromePlanes = [
+  [0xe21637d1],
+  [0x99197636],
+  [0xe68843f7],
+  [0x49c02a90],
+  [0x1eb66953],
+  [0x4788d1fc],
+];
+
+// One 9-bit picture with two I_PCM macroblocks.
+const _high10Pcm9Planes = [
+  [0x10b95145, 0x21b90145, 0x2ec7f3c5],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
   bool inter = false,
   bool cabac = true,
   int profile = 100,
+  int depth = 8,
+  bool monochrome = false,
   (int, int) dimensions = (78, 50),
 }) {
   final handle = File(input).openSync();
@@ -158,13 +214,16 @@ void _checkPlanes(
       final picture = decode(file.read(packet.offset, packet.size))!;
       final sps = picture.sps;
       check(
-        sps.profile == profile && (sps.width, sps.height) == dimensions,
-        'H.264 dimensions and profile',
+        sps.profile == profile &&
+            sps.lumaDepth == depth &&
+            sps.chromaDepth == depth &&
+            sps.chromaFormat == (monochrome ? 0 : 1) &&
+            (sps.width, sps.height) == dimensions,
+        'H.264 dimensions, bit depth and profile',
       );
       for (final (index, plane) in [
         (0, picture.y),
-        (1, picture.cb),
-        (2, picture.cr),
+        if (!monochrome) ...[(1, picture.cb), (2, picture.cr)],
       ]) {
         final shift = index == 0 ? 0 : 1;
         final stride = picture.stride >> shift;
@@ -186,7 +245,7 @@ void _checkPlanes(
   }
 }
 
-int _checksum(Uint8List plane, int stride, int offset, int width, int height) {
+int _checksum(List<int> plane, int stride, int offset, int width, int height) {
   var hash = 0x811c9dc5;
   for (var y = 0; y < height; y++) {
     for (var x = 0; x < width; x++) {
@@ -206,6 +265,9 @@ Future<void> main(List<String> arguments) async {
   const temporal = 'test/fixtures/cabac-b-temporal.mp4';
   const cavlcBaseline = 'test/fixtures/cavlc-baseline.mp4';
   const cavlcHigh = 'test/fixtures/cavlc-high.mkv';
+  const high10Cabac = 'test/fixtures/high10-cabac.mkv';
+  const high10Cavlc = 'test/fixtures/high10-cavlc.mp4';
+  const high10Monochrome = 'test/fixtures/high10-mono.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -228,6 +290,42 @@ Future<void> main(List<String> arguments) async {
     dimensions: (166, 110),
   );
 
+  _checkPlanes(
+    high10Cabac,
+    _high10CabacPlanes,
+    inter: true,
+    profile: 110,
+    depth: 10,
+    dimensions: (94, 62),
+  );
+  _checkPlanes(
+    high10Cavlc,
+    _high10CavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 110,
+    depth: 10,
+    dimensions: (94, 62),
+  );
+
+  _checkPlanes(
+    high10Monochrome,
+    _high10MonochromePlanes,
+    inter: true,
+    profile: 110,
+    depth: 10,
+    monochrome: true,
+    dimensions: (94, 62),
+  );
+  _checkPlanes(
+    'test/fixtures/high10-pcm9.mp4',
+    _high10Pcm9Planes,
+    cabac: false,
+    profile: 110,
+    depth: 9,
+    dimensions: (32, 16),
+  );
+
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
     final result = await Process.run(
@@ -243,6 +341,8 @@ Future<void> main(List<String> arguments) async {
     for (final (input, width, height) in [
       (mkv, 39, 25),
       (mp4, 39, 25),
+      (high10Cabac, 47, 31),
+      (high10Monochrome, 47, 31),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -270,6 +370,7 @@ Future<void> main(List<String> arguments) async {
 
     for (final (input, width, height) in [
       (interMkv, 78, 50),
+      (high10Cavlc, 94, 62),
       (cavlcBaseline, 166, 110),
     ]) {
       final output = '${directory.path}/frames-$width';
@@ -282,7 +383,11 @@ Future<void> main(List<String> arguments) async {
       );
     }
 
-    for (final (mode, input) in [('cabac', temporal), ('cavlc', cavlcHigh)]) {
+    for (final (mode, input, width, height) in [
+      ('cabac', temporal, 166, 110),
+      ('cavlc', cavlcHigh, 166, 110),
+      ('high10', high10Cabac, 94, 62),
+    ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';
       await run([
@@ -308,7 +413,7 @@ Future<void> main(List<String> arguments) async {
       for (final capture in captures) {
         final frame = image.decodeBmp(capture.readAsBytesSync())!;
         check(
-          frame.width == 166 && frame.height == 110,
+          frame.width == width && frame.height == height,
           'H.264 --keep retains the original capture dimensions',
         );
       }

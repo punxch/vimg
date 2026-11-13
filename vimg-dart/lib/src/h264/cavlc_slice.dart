@@ -86,10 +86,7 @@ final class CavlcSlice extends SliceData {
   ) {
     final acOnly = block.intra16;
     if (acOnly || block.lumaPattern != 0 || block.chromaPattern != 0) {
-      final delta = header.bits.se();
-      if (delta < -26 || delta > 25)
-        throw const FormatException('Invalid H.264 macroblock QP delta');
-      _qp = (_qp + delta) % 52;
+      _updateQp(header.bits.se());
     }
     block.qp = _qp;
     coefficients.clearResiduals();

@@ -9,17 +9,19 @@ import 'parameters.dart';
 final class H264Picture {
   H264Picture(this.sps)
     : stride = sps.mbWidth * 16,
-      y = Uint8List(sps.mbWidth * sps.mbHeight * 256),
-      cb = Uint8List(
+      y = _samples(sps.mbWidth * sps.mbHeight * 256, sps.lumaDepth),
+      cb = _samples(
         sps.chromaFormat == 0 ? 0 : sps.mbWidth * sps.mbHeight * 64,
+        sps.chromaDepth,
       ),
-      cr = Uint8List(
+      cr = _samples(
         sps.chromaFormat == 0 ? 0 : sps.mbWidth * sps.mbHeight * 64,
+        sps.chromaDepth,
       );
 
   final H264Sps sps;
   final int stride;
-  final Uint8List y, cb, cr;
+  final List<int> y, cb, cr;
   MotionField? motionL0;
   MotionField? motionL1;
 
@@ -35,7 +37,12 @@ final class H264Picture {
     cropTop: sps.cropTop,
     matrix: sps.color.matrix,
     fullRange: sps.color.fullRange,
+    lumaDepth: sps.lumaDepth,
+    chromaDepth: sps.chromaDepth,
     sampleAspect: sps.sampleAspect,
     scaler: scaler,
   );
 }
+
+List<int> _samples(int count, int depth) =>
+    depth == 8 ? Uint8List(count) : Uint16List(count);
