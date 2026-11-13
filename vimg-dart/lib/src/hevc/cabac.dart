@@ -5,17 +5,25 @@ import '../rbsp.dart';
 import 'contexts.dart';
 import 'slice_header.dart';
 
+typedef HevcEntropyState = ({Uint8List models, Uint8List rice});
+
 /// HEVC CABAC initialization for the first substream or an independent tile.
 /// Wavefront rows can instead start with models saved after the second CTU
 /// of the preceding row.
 final class HevcCabac extends CabacEngine {
-  HevcCabac(Rbsp bits, HevcSliceParameters slice, {Uint8List? savedModels})
-    : super(
+  HevcCabac(Rbsp bits, HevcSliceParameters slice, {HevcEntropyState? saved})
+    : rice = saved == null ? Uint8List(4) : Uint8List.fromList(saved.rice),
+      super(
         bits,
-        savedModels == null
+        saved == null
             ? _initialModels(slice)
-            : Uint8List.fromList(savedModels),
+            : Uint8List.fromList(saved.models),
       );
+
+  final Uint8List rice;
+
+  HevcEntropyState snapshot() =>
+      (models: copyModels(), rice: Uint8List.fromList(rice));
 
   int decode(HevcContext context, [int increment = 0]) {
     if (increment < 0 || increment >= context.length) {

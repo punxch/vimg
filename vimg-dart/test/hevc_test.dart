@@ -68,6 +68,7 @@ const _allIntra = 'test/fixtures/hevc-all-intra.mkv';
 const _pcmTiles = 'test/fixtures/hevc-pcm-tiles.mkv';
 const _main422 = 'test/fixtures/hevc-422-10.mkv';
 const _main444 = 'test/fixtures/hevc-444-12.mp4';
+const _rext = 'test/fixtures/hevc-rext-wpp.mkv';
 
 // FFmpeg's cropped YUV planes, with all signalled loop filters applied.
 const _mainPixels = [
@@ -179,6 +180,65 @@ Future<void> main(List<String> arguments) async {
     ],
     format: 3,
     depth: 12,
+  );
+  // HM 16.8 encoded synthetic 10-bit clips with WPP, residual
+  // rotation, single transform-skip contexts, RDPCM and persistent Rice.
+  // Compare with the encoder's reconstructed planes in presentation order.
+  _checkInterClip(
+    _rext,
+    [
+      [0xacf82628, 0x0a415e08, 0x41a3ea4f],
+      [0x34d15b73, 0x8f118159, 0x982d58f5],
+      [0x8143908d, 0xcad7740b, 0x632c1b70],
+      [0x48b097b2, 0xb0ad4f88, 0x60a6ae9d],
+      [0xb4e7e39b, 0xf9a4f020, 0x386035d3],
+      [0x36bef40e, 0x68011f91, 0x1ae2bdfb],
+      [0xc4209254, 0xeb7e15ef, 0xf08a4130],
+      [0x7bd36e8e, 0x592e6600, 0x56a13bf6],
+      [0x8b0a7583, 0x7d8687dc, 0x4145f9fc],
+    ],
+    format: 3,
+    depth: 10,
+  );
+  _checkInterClip(
+    'test/fixtures/hevc-rext-weighted.mkv',
+    [
+      [0xfd86d42b, 0x2e101dc5, 0x2e101dc5],
+      [0xa12085ef, 0xbe941878, 0x44522899],
+      [0xa6efc8ec, 0x3299c3e9, 0x07f4c5c3],
+      [0x481e49cc, 0xbf474f08, 0xae8957b6],
+      [0x2fbfa6ff, 0x9bdadbbf, 0xb72af76c],
+    ],
+    format: 3,
+    depth: 10,
+  );
+  _checkInterClip(
+    'test/fixtures/hevc-rext-lossless.mkv',
+    [
+      [0xab7acdb5, 0x60699a95, 0x35933e59],
+      [0x336821f9, 0x83f75bb5, 0xc719fbb5],
+      [0x1f551f41, 0x5f945039, 0x9150e5c1],
+      [0x8a294a75, 0x966a39e5, 0x8ef448c5],
+      [0xb9c86f71, 0x5529239d, 0x19e164bd],
+    ],
+    format: 3,
+    depth: 10,
+  );
+  _checkInterClip(
+    'test/fixtures/hevc-rext-422.mkv',
+    [
+      [0xe9f36b01, 0xda14a7ac, 0xcd82bfb4],
+      [0x05d05efd, 0x3dc4ae0d, 0x4190574b],
+      [0xf716e9c3, 0x1359cb4e, 0xe44a5fa1],
+      [0xac149ee1, 0xc86bb3b8, 0xe0f30c63],
+      [0x4892eeb9, 0x9525c300, 0x1f09bef0],
+      [0xa1a612db, 0x10f661f4, 0x54f7d2eb],
+      [0x149a22d8, 0x2c888715, 0xd87af05d],
+      [0xb48846d4, 0x31d5e160, 0x9605d222],
+      [0xab36df85, 0xc27dbe6b, 0xee91cad0],
+    ],
+    format: 2,
+    depth: 10,
   );
   await _checkCli(arguments);
 }
@@ -453,6 +513,7 @@ Future<void> _checkCli(List<String> arguments) async {
       (_main10, 0, 55),
       (_main422, 50, 63),
       (_main444, 50, 63),
+      (_rext, 0, 55),
     ]) {
       final jpeg = File('${directory.path}/preview.jpg');
       final response =
@@ -482,6 +543,7 @@ Future<void> _checkCli(List<String> arguments) async {
       (_main10, 166, 110),
       (_main422, 130, 98),
       (_main444, 130, 98),
+      (_rext, 192, 128),
     ].indexed) {
       final output = '${directory.path}/frames-$index';
       await run(['extract', '-n2', '-t200ms', '--output-dir', output, input]);
@@ -505,7 +567,7 @@ Future<void> _checkCli(List<String> arguments) async {
       '-t400ms',
       '-o',
       avif.path,
-      _main444,
+      _rext,
     ]);
     check(
       ascii.decode(avif.readAsBytesSync().sublist(4, 12)) == 'ftypavis',

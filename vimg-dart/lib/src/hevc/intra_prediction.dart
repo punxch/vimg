@@ -17,6 +17,7 @@ final class HevcIntraPrediction {
     int mode, {
     required bool luma,
     required bool filterReferences,
+    bool filterAngularBoundary = true,
     required bool strongSmoothing,
     required bool Function(int, int) available,
     Int32List? residual,
@@ -110,12 +111,18 @@ final class HevcIntraPrediction {
               : row == 0 && col == 0
               ? (left(0) + top(0) + 2 * dc + 2) >> 2
               : ((row == 0 ? top(col) : left(row)) + 3 * dc + 2) >> 2;
-        } else if (boundary && mode == 26 && col == 0) {
+        } else if (boundary &&
+            filterAngularBoundary &&
+            mode == 26 &&
+            col == 0) {
           predicted = (top(0) + ((left(row) - reference[corner]) >> 1)).clamp(
             0,
             plane.maximum,
           );
-        } else if (boundary && mode == 10 && row == 0) {
+        } else if (boundary &&
+            filterAngularBoundary &&
+            mode == 10 &&
+            row == 0) {
           predicted = (left(0) + ((top(col) - reference[corner]) >> 1)).clamp(
             0,
             plane.maximum,

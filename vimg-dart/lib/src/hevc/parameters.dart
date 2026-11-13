@@ -235,7 +235,13 @@ final class HevcSps {
   int get chromaShiftX => chromaArrayType == 1 || chromaArrayType == 2 ? 1 : 0;
   int get chromaShiftY => chromaArrayType == 1 ? 1 : 0;
   bool get intraSmoothingDisabled => rangeExtension & 8 != 0;
-  bool get hasUnsupportedRangeTools => rangeExtension & ~8 != 0;
+  bool get rotateTransformSkip => rangeExtension & 0x100 != 0;
+  bool get transformSkipContext => rangeExtension & 0x80 != 0;
+  bool get implicitRdpcm => rangeExtension & 0x40 != 0;
+  bool get explicitRdpcm => rangeExtension & 0x20 != 0;
+  bool get persistentRice => rangeExtension & 2 != 0;
+  bool get highPrecisionOffsets => rangeExtension & 4 != 0;
+  bool get hasUnsupportedRangeTools => rangeExtension & 0x11 != 0;
 }
 
 typedef HevcTiles = ({List<int> columns, List<int> rows, bool filterAcross});

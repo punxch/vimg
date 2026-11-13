@@ -353,9 +353,11 @@ HevcWeights _weights(Rbsp bits, HevcSps sps, int l0, int l1) {
   final hasChroma = sps.chromaArrayType != 0;
   final y = bits.ue(7);
   final c = hasChroma ? y + _boundedSigned(bits, -y, 7 - y) : 0;
-  final highPrecision = sps.rangeExtension & 4 != 0;
+  final highPrecision = sps.highPrecisionOffsets;
   final yRange = 1 << (highPrecision ? sps.lumaDepth - 1 : 7);
   final cRange = 1 << (highPrecision ? sps.chromaDepth - 1 : 7);
+  final yOffsetShift = highPrecision ? 0 : sps.lumaDepth - 8;
+  final cOffsetShift = highPrecision ? 0 : sps.chromaDepth - 8;
 
   List<List<HevcWeight>> readList(int count) {
     final lumaFlags = List.generate(count, (_) => bits.flag());
@@ -365,7 +367,9 @@ HevcWeights _weights(Rbsp bits, HevcSps sps, int l0, int l1) {
     return List.generate(count, (i) {
       final luma = (
         weight: (1 << y) + (lumaFlags[i] ? _boundedSigned(bits, -128, 127) : 0),
-        offset: lumaFlags[i] ? _boundedSigned(bits, -yRange, yRange - 1) : 0,
+        offset: lumaFlags[i]
+            ? _boundedSigned(bits, -yRange, yRange - 1) << yOffsetShift
+            : 0,
       );
       HevcWeight chroma() {
         if (!hasChroma || !chromaFlags[i]) return (weight: 1 << c, offset: 0);
@@ -373,10 +377,12 @@ HevcWeights _weights(Rbsp bits, HevcSps sps, int l0, int l1) {
         final delta = _boundedSigned(bits, -4 * cRange, 4 * cRange - 1);
         return (
           weight: weight,
-          offset: (delta + cRange - ((cRange * weight) >> c)).clamp(
-            -cRange,
-            cRange - 1,
-          ),
+          offset:
+              (delta + cRange - ((cRange * weight) >> c)).clamp(
+                -cRange,
+                cRange - 1,
+              ) <<
+              cOffsetShift,
         );
       }
 

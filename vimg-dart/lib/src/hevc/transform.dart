@@ -5,6 +5,8 @@ import 'scaling_lists.dart';
 import 'scan.dart';
 import 'transform_tables.dart';
 
+enum HevcRdpcm { off, horizontal, vertical }
+
 final class HevcTransform {
   final _dequantized = Int32List(1024);
   final _vertical = Int32List(1024);
@@ -19,10 +21,19 @@ final class HevcTransform {
     required bool lumaIntra,
     required bool skip,
     required bool bypass,
+    bool rotate = false,
+    HevcRdpcm rdpcm = HevcRdpcm.off,
     Uint8List? weights,
   }) {
-    if (bypass) return levels;
     final size = 1 << log2;
+    final count = size * size;
+    if (bypass) {
+      if (!rotate && rdpcm == HevcRdpcm.off) return levels;
+      for (var i = 0; i < count; i++) {
+        _residual[i] = levels[rotate ? count - 1 - i : i];
+      }
+      return _inverseRdpcm(size, rdpcm);
+    }
     final scale = _levelScale[qp % 6] << (qp ~/ 6);
     final shift = depth + log2 - 5;
     final round = 1 << (shift - 1);
@@ -44,11 +55,12 @@ final class HevcTransform {
     final outputShift = 20 - depth;
     final outputRound = 1 << (outputShift - 1);
     if (skip) {
-      for (var i = 0; i < size * size; i++) {
+      for (var i = 0; i < count; i++) {
+        final coefficient = _dequantized[rotate ? count - 1 - i : i];
         _residual[i] =
-            ((_dequantized[i] << (5 + log2)) + outputRound) >> outputShift;
+            ((coefficient << (5 + log2)) + outputRound) >> outputShift;
       }
-      return _residual;
+      return _inverseRdpcm(size, rdpcm);
     }
 
     final basis = log2 == 2 && lumaIntra ? _dst : _dct[log2 - 2];
@@ -69,6 +81,24 @@ final class HevcTransform {
         for (var k = 0; k <= maxX; k++) value += row[k] * _vertical[start + k];
         _residual[start + x] = (value + outputRound) >> outputShift;
       }
+    }
+    return _residual;
+  }
+
+  Int32List _inverseRdpcm(int size, HevcRdpcm direction) {
+    switch (direction) {
+      case HevcRdpcm.off:
+        break;
+      case HevcRdpcm.horizontal:
+        for (var row = 0; row < size * size; row += size) {
+          for (var i = row + 1; i < row + size; i++) {
+            _residual[i] += _residual[i - 1];
+          }
+        }
+      case HevcRdpcm.vertical:
+        for (var i = size; i < size * size; i++) {
+          _residual[i] += _residual[i - size];
+        }
     }
     return _residual;
   }

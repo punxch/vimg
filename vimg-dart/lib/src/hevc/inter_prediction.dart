@@ -61,8 +61,8 @@ final class HevcInterPrediction {
     final weight1 = m1 == null ? null : weights?.l1[m1.index][component];
     final w0 = m0 == null ? 0 : weight0?.weight ?? 1;
     final w1 = m1 == null ? 0 : weight1?.weight ?? 1;
-    final o0 = (weight0?.offset ?? 0) << (destination.depth - 8);
-    final o1 = (weight1?.offset ?? 0) << (destination.depth - 8);
+    final o0 = weight0?.offset ?? 0;
+    final o1 = weight1?.offset ?? 0;
     final offset = bi ? 0 : o0 + o1;
     final round = bi ? (o0 + o1 + 1) << shift : 1 << (shift - 1);
     final finalShift = shift + (bi ? 1 : 0);

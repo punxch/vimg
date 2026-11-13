@@ -20,6 +20,8 @@ final class HevcResidual {
     required bool chroma,
     required bool directionalScan,
     required bool hideSign,
+    required bool transformSkipContext,
+    int? riceClass,
   }) {
     final scan = directionalScan
         ? (mode >= 6 && mode <= 14
@@ -77,14 +79,16 @@ final class HevcResidual {
             n == 0 && inferFirst ||
             cabac.decode(
                   HevcContext.sigCoeffFlag,
-                  _significantContext(
-                    log2,
-                    chroma,
-                    scan,
-                    cell == 0,
-                    position,
-                    right + 2 * below,
-                  ),
+                  transformSkipContext
+                      ? (chroma ? 43 : 42)
+                      : _significantContext(
+                          log2,
+                          chroma,
+                          scan,
+                          cell == 0,
+                          position,
+                          right + 2 * below,
+                        ),
                 ) !=
                 0;
         if (significant) {
@@ -121,7 +125,9 @@ final class HevcResidual {
       final hidden = hideSign && _positions.first - _positions[count - 1] >= 4;
       final explicitSigns = count - (hidden ? 1 : 0);
       for (var i = 0; i < explicitSigns; i++) _signs[i] = cabac.bypass();
-      var rice = 0, sum = 0;
+      final initialRice = riceClass == null ? 0 : cabac.rice[riceClass] >> 2;
+      var rice = initialRice, sum = 0;
+      var updateRice = riceClass != null;
       for (var i = 0; i < count; i++) {
         var magnitude = _magnitudes[i];
         final threshold = i >= 8
@@ -130,8 +136,18 @@ final class HevcResidual {
             ? 3
             : 2;
         if (magnitude == threshold) {
-          magnitude += _remaining(cabac, rice);
-          if (magnitude > 3 << rice && rice < 4) rice++;
+          final remaining = _remaining(cabac, rice);
+          magnitude += remaining;
+          if (magnitude > 3 << rice && (riceClass != null || rice < 4)) rice++;
+          if (updateRice) {
+            final statistic = cabac.rice[riceClass!];
+            if (remaining >= 3 << initialRice) {
+              cabac.rice[riceClass] = statistic + 1;
+            } else if (statistic > 0 && 2 * remaining < 1 << initialRice) {
+              cabac.rice[riceClass] = statistic - 1;
+            }
+            updateRice = false;
+          }
         }
         if (magnitude > 32768)
           throw const FormatException('HEVC coefficient out of range');

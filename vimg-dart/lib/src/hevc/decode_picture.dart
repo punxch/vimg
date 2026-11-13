@@ -9,12 +9,16 @@ import 'inter_motion.dart';
 import 'inter_prediction.dart';
 import 'intra_prediction.dart';
 import 'loop_filter.dart';
+import 'parameters.dart';
 import 'picture.dart';
 import 'picture_order.dart';
 import 'residual.dart';
 import 'sao.dart';
 import 'slice_header.dart';
 import 'transform.dart';
+
+const _derivedChromaMode = 1 << 6;
+const _chromaModeMask = _derivedChromaMode - 1;
 
 /// Reconstruct an intra-coded HEVC picture from a container sample.
 final class HevcIntraDecoder {
@@ -61,14 +65,11 @@ HevcPicture _reconstruct(
   int poc = 0,
 }) {
   final first = slices.first, sps = first.sps;
-  final range = first.pps.rangeExtension;
   if (sps.fieldSequence ||
       sps.separateColourPlane ||
       sps.lumaDepth > 12 ||
       sps.chromaDepth > 12 ||
-      sps.hasUnsupportedRangeTools ||
-      range?.crossComponent == true ||
-      range?.chromaOffsetDepth != null) {
+      sps.hasUnsupportedRangeTools) {
     throw UnsupportedError(
       'Unsupported HEVC field, separate plane, bit depth or range extension tools',
     );
@@ -125,11 +126,13 @@ final class _Reconstruction {
   final _predict = HevcIntraPrediction();
   final _coefficients = HevcResidual();
   final _transform = HevcTransform();
+  late final _lumaResidual = Int32List(1024);
+  late final _crossResidual = Int32List(1024);
   final int _cellsWide;
   late final Int32List _owners;
   late final List<HevcSliceHeader?> _headers;
   late final List<HevcSao> _sao;
-  late final List<Uint8List?> _synchronized;
+  late final List<HevcEntropyState?> _synchronized;
   late final Int8List _depth, _qp;
   late final Uint8List _mode,
       _chromaMode,
@@ -145,6 +148,8 @@ final class _Reconstruction {
   var _groupX = -1, _groupY = -1;
   var _previousQp = 0, _predictedQp = 0, _currentQp = 0;
   var _deltaRead = false;
+  var _chromaGroupX = -1, _chromaGroupY = -1;
+  HevcChromaOffsets? _chromaAdjustment;
 
   int _cell(int x, int y) => (y >> 2) * _cellsWide + (x >> 2);
 
@@ -193,15 +198,15 @@ final class _Reconstruction {
               layout.tileWidth[_address] > 1 &&
               _address >= picture.sps.ctbWidth &&
               _sameCtuRegion(aboveRight);
-          final models = tileStart || independent
+          final entropy = tileStart || independent
               ? null
               : rowStart
               ? (sync ? _synchronized[_address] : null)
-              : _cabac.copyModels();
+              : _cabac.snapshot();
           _cabac = HevcCabac(
             streams.current,
             _slice.parameters,
-            savedModels: models,
+            saved: entropy,
           );
           if (tileStart || rowStart) _resetQp();
         }
@@ -223,7 +228,7 @@ final class _Reconstruction {
             y + 1 < picture.sps.ctbHeight) {
           final next = _address + width - 1;
           if (layout.tile[next] == layout.tile[_address])
-            _synchronized[next] = _cabac.copyModels();
+            _synchronized[next] = _cabac.snapshot();
         }
         final done = _cabac.terminate();
         if (done != (i + 1 == end))
@@ -275,6 +280,16 @@ final class _Reconstruction {
         _slice.pps.transquantBypass &&
         _cabac.decode(HevcContext.cuTransquantBypassFlag) != 0;
     _beginQuantGroup(x, y);
+    final chromaDepth = _slice.pps.rangeExtension?.chromaOffsetDepth;
+    if (_slice.parameters.cuChromaOffset && chromaDepth != null) {
+      final mask = (1 << (sps.ctbLog2 - chromaDepth)) - 1;
+      final gx = x & ~mask, gy = y & ~mask;
+      if (gx != _chromaGroupX || gy != _chromaGroupY) {
+        _chromaGroupX = gx;
+        _chromaGroupY = gy;
+        _chromaAdjustment = null;
+      }
+    }
     final interSlice = _motion != null;
     int skipped(int sx, int sy) =>
         _available(sx, sy) ? _skip[_cell(sx, sy)] : 0;
@@ -324,7 +339,7 @@ final class _Reconstruction {
         _fill(_chromaMode, px, py, part, _readChromaMode(_mode[_cell(px, py)]));
       }
     } else if (picture.cb != null) {
-      chroma = _readChromaMode(_mode[_cell(x, y)]);
+      chroma = _readChromaMode(_mode[_cell(x, y)]) & _chromaModeMask;
       if (sps.chromaArrayType == 2) chroma = _chroma422Modes[chroma];
     }
     _transformTree(x, y, log2, 0, 0, 0, split, chroma, bypass, intra: true);
@@ -332,7 +347,9 @@ final class _Reconstruction {
   }
 
   int _readChromaMode(int luma) {
-    if (_cabac.decode(HevcContext.intraChromaPredMode) == 0) return luma;
+    if (_cabac.decode(HevcContext.intraChromaPredMode) == 0) {
+      return luma | _derivedChromaMode;
+    }
     final mode = const [0, 26, 10, 1][_cabac.bypassBits(2)];
     return mode == luma ? 34 : mode;
   }
@@ -477,21 +494,44 @@ final class _Reconstruction {
         !_deltaRead &&
         _slice.pps.qpDeltaDepth != null)
       _readDelta();
+    if (chroma != 0 &&
+        !bypass &&
+        _slice.parameters.cuChromaOffset &&
+        _chromaAdjustment == null) {
+      _readChromaAdjustment();
+    }
     final size = 1 << log2;
     _edges(x, y, size, size, transform: true);
     if (lumaCoded) _fill(_lumaCbf, x, y, size, 1);
     final mode = intra ? _mode[_cell(x, y)] : -1;
-    _block(picture.luma, x, y, log2, mode, 0, lumaCoded, bypass);
+    final chromaPrediction = intra && format == 3
+        ? _chromaMode[_cell(x, y)]
+        : chromaMode;
+    final crossComponent =
+        format == 3 &&
+        lumaCoded &&
+        _slice.pps.rangeExtension?.crossComponent == true &&
+        (!intra || chromaPrediction & _derivedChromaMode != 0);
+    final lumaResidual = _block(
+      picture.luma,
+      x,
+      y,
+      log2,
+      mode,
+      0,
+      lumaCoded,
+      bypass,
+    );
+    if (crossComponent) _lumaResidual.setRange(0, size * size, lumaResidual!);
     if (writeChroma) {
       final cx = (shared ? x & ~7 : x) >> sps.chromaShiftX;
       final cy = (shared ? y & ~7 : y) >> sps.chromaShiftY;
       final log2Chroma = shared ? 2 : log2 - sps.chromaShiftX;
-      final prediction = intra && format == 3
-          ? _chromaMode[_cell(x, y)]
-          : chromaMode;
+      final prediction = intra ? chromaPrediction & _chromaModeMask : -1;
       final blocks = format == 2 ? 2 : 1;
       for (var component = 1; component <= 2; component++) {
         final plane = component == 1 ? picture.cb! : picture.cr!;
+        final alpha = crossComponent ? _readResidualScale(component - 1) : 0;
         for (var i = 0; i < blocks; i++) {
           final flag = 1 << ((component - 1) * 2 + i);
           _block(
@@ -503,13 +543,14 @@ final class _Reconstruction {
             component,
             chroma & flag != 0,
             bypass,
+            alpha: alpha,
           );
         }
       }
     }
   }
 
-  void _block(
+  Int32List? _block(
     HevcPlane plane,
     int x,
     int y,
@@ -517,9 +558,11 @@ final class _Reconstruction {
     int mode,
     int component,
     bool coded,
-    bool bypass,
-  ) {
+    bool bypass, {
+    int alpha = 0,
+  }) {
     final chroma = component != 0, intra = mode >= 0;
+    final sps = picture.sps;
     Int32List? residual;
     if (coded) {
       final skip =
@@ -527,6 +570,25 @@ final class _Reconstruction {
           _slice.pps.transformSkip &&
           log2 <= (_slice.pps.rangeExtension?.maxTransformSkipLog2 ?? 2) &&
           _cabac.decode(HevcContext.transformSkipFlag, chroma ? 1 : 0) != 0;
+      final untransformed = skip || bypass;
+      var rdpcm = HevcRdpcm.off;
+      if (untransformed) {
+        if (intra && sps.implicitRdpcm) {
+          rdpcm = switch (mode) {
+            10 => HevcRdpcm.horizontal,
+            26 => HevcRdpcm.vertical,
+            _ => HevcRdpcm.off,
+          };
+        } else if (!intra && sps.explicitRdpcm) {
+          final context = chroma ? 1 : 0;
+          if (_cabac.decode(HevcContext.explicitRdpcmFlag, context) != 0) {
+            rdpcm =
+                _cabac.decode(HevcContext.explicitRdpcmDirFlag, context) == 0
+                ? HevcRdpcm.horizontal
+                : HevcRdpcm.vertical;
+          }
+        }
+      }
       final levels = _coefficients.read(
         _cabac,
         log2,
@@ -535,13 +597,22 @@ final class _Reconstruction {
         directionalScan:
             log2 == 2 ||
             (log2 == 3 && (!chroma || picture.sps.chromaArrayType == 3)),
-        hideSign: !bypass && _slice.pps.signHiding,
+        hideSign: !bypass && rdpcm == HevcRdpcm.off && _slice.pps.signHiding,
+        transformSkipContext: untransformed && sps.transformSkipContext,
+        riceClass: sps.persistentRice
+            ? (chroma ? 2 : 0) + (untransformed ? 1 : 0)
+            : null,
       );
       final offset = 6 * (plane.depth - 8);
       var qp = _currentQp;
       if (chroma) {
         final offsets = _slice.parameters.chromaOffsets;
-        final qpi = qp + (component == 1 ? offsets.cb : offsets.cr);
+        final adjustment = bypass ? null : _chromaAdjustment;
+        final qpi =
+            qp +
+            (component == 1
+                ? offsets.cb + (adjustment?.cb ?? 0)
+                : offsets.cr + (adjustment?.cr ?? 0));
         qp = picture.sps.chromaArrayType == 1
             ? hevcChromaQp420(qpi.clamp(-offset, 57))
             : qpi.clamp(-offset, 51);
@@ -554,10 +625,24 @@ final class _Reconstruction {
         lumaIntra: intra && !chroma,
         skip: skip,
         bypass: bypass,
+        rotate: untransformed && intra && log2 == 2 && sps.rotateTransformSkip,
+        rdpcm: rdpcm,
         weights: skip && log2 > 2
             ? null
             : _scaling.weights(log2, component + (intra ? 0 : 3)),
       );
+    }
+    if (alpha != 0) {
+      final count = 1 << (log2 * 2);
+      final depthDifference = sps.lumaDepth - sps.chromaDepth;
+      final chromaResidual = residual;
+      residual = _crossResidual;
+      for (var i = 0; i < count; i++) {
+        final luma = depthDifference >= 0
+            ? _lumaResidual[i] >> depthDifference
+            : _lumaResidual[i] << -depthDifference;
+        residual[i] = (chromaResidual?[i] ?? 0) + ((alpha * luma) >> 3);
+      }
     }
     if (!intra) {
       if (residual != null) {
@@ -571,7 +656,7 @@ final class _Reconstruction {
           }
         }
       }
-      return;
+      return residual;
     }
     bool available(int sx, int sy) =>
         _available(sx, sy) &&
@@ -583,6 +668,7 @@ final class _Reconstruction {
       log2,
       mode,
       luma: !chroma,
+      filterAngularBoundary: !(bypass && sps.implicitRdpcm),
       filterReferences:
           !picture.sps.intraSmoothingDisabled &&
           (!chroma || picture.sps.chromaArrayType == 3),
@@ -595,10 +681,44 @@ final class _Reconstruction {
           : available,
       residual: residual,
     );
+    return residual;
+  }
+
+  int _readResidualScale(int component) {
+    var exponent = 0;
+    while (exponent < 4 &&
+        _cabac.decode(
+              HevcContext.log2ResScaleAbsPlus1,
+              4 * component + exponent,
+            ) !=
+            0) {
+      exponent++;
+    }
+    if (exponent == 0) return 0;
+    final magnitude = 1 << (exponent - 1);
+    return _cabac.decode(HevcContext.resScaleSignFlag, component) == 0
+        ? magnitude
+        : -magnitude;
+  }
+
+  void _readChromaAdjustment() {
+    if (_cabac.decode(HevcContext.cuChromaQpOffsetFlag) == 0) {
+      _chromaAdjustment = (cb: 0, cr: 0);
+      return;
+    }
+    final offsets = _slice.pps.rangeExtension!.chromaOffsets;
+    var index = 0;
+    while (index + 1 < offsets.length &&
+        _cabac.decode(HevcContext.cuChromaQpOffsetIdx) != 0) {
+      index++;
+    }
+    _chromaAdjustment = offsets[index];
   }
 
   void _resetQp() {
     _groupX = _groupY = -1;
+    _chromaGroupX = _chromaGroupY = -1;
+    _chromaAdjustment = null;
     _previousQp = _slice.parameters.qp;
   }
 

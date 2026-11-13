@@ -54,6 +54,12 @@ Matroska and MP4/MOV also support progressive HEVC I/P/B pictures in
 monochrome, 4:2:0, 4:2:2 and 4:4:4, up to 12 bits. `preview` selects an
 HEVC random-access picture. `extract` and `vcs` decode from the preceding
 random-access point and handle leading pictures that depend on an earlier GOP.
+The decoder also handles range extension streams with residual DPCM,
+transform-skip rotation and CABAC contexts, persistent Rice adaptation,
+cross-component prediction, coding-unit chroma QP adjustments and
+high-precision weighted prediction offsets. Separate colour planes,
+extended transform precision, CABAC bypass alignment and hardware capture
+backends remain pending.
 
 MPEG-TS supports H.264, HEVC, MPEG-1 Video and MPEG-2 Video in 188-byte TS,
 192-byte M2TS and 204-byte transport packets. Capture uses the first
@@ -89,9 +95,6 @@ references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
 intra block copy for screen content.
 Film grain synthesis runs on AV1 display frames before RGB conversion.
-HEVC separate colour planes, residual DPCM, cross-component prediction and
-other advanced range extension tools remain pending, as do hardware capture
-backends.
 
 MP4/MOV and Matroska support Apple ProRes 422 and 4444, including Proxy,
 LT, HQ and XQ. The decoder handles progressive frames and both interlaced
