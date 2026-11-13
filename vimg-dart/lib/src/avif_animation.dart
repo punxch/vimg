@@ -5,6 +5,7 @@ import 'package:image/image.dart' as image;
 
 import 'av1/access_units.dart';
 import 'av1/picture_decoder.dart';
+import 'avif_image.dart';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'iso_media.dart';
@@ -18,7 +19,7 @@ final class AvifAnimation {
       final media = IsoMedia(file);
       final boxes = media.boxes(0, file.length).toList();
       final type = boxes.where((b) => b.type == 'ftyp').firstOrNull;
-      if (type == null || !_avifBrand(media, type))
+      if (type == null || !isAvifBrand(media, type))
         throw const FormatException('Expected an AVIF file');
       final movie = media.movie();
       final primary = boxes.any((b) => b.type == 'meta');
@@ -69,14 +70,7 @@ final class AvifAnimation {
             .firstOrNull;
         if (configuration == null)
           throw const FormatException('Missing AVIF AV1 configuration');
-        media.requireBytes(configuration, 4);
-        if (file.unsigned(configuration.data, 1) != 0x81 ||
-            configuration.end - configuration.data > 1024 * 1024)
-          throw const FormatException('Invalid AVIF AV1 configuration');
-        final config = file.read(
-          configuration.data + 4,
-          configuration.end - configuration.data - 4,
-        );
+        final config = avifConfiguration(media, configuration);
         selected = AvifAnimation._(
           handle,
           file,
@@ -163,16 +157,4 @@ final class AvifAnimation {
   }
 
   void close() => _handle.closeSync();
-}
-
-bool _avifBrand(IsoMedia media, MediaBox box) {
-  media.requireBytes(box, 8);
-  if ((box.end - box.data) % 4 != 0)
-    throw const FormatException('Invalid AVIF brand list');
-  for (var at = box.data; at < box.end; at += 4) {
-    if (at == box.data + 4) continue; // minor_version
-    final tag = media.tag(at);
-    if (tag == 'avif' || tag == 'avis') return true;
-  }
-  return false;
 }

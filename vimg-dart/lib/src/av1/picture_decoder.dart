@@ -70,24 +70,25 @@ final class Av1Picture {
   final Av1ColorConfig color;
   final List<Av1Plane> planes;
 
-  image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
-    y: planes[0].samples,
-    cb: color.monochrome ? const [] : planes[1].samples,
-    cr: color.monochrome ? const [] : planes[2].samples,
-    stride: planes[0].stride,
-    chromaStride: color.monochrome ? 0 : planes[1].stride,
-    width: planes[0].width,
-    height: planes[0].height,
-    cropLeft: 0,
-    cropTop: 0,
-    matrix: color.matrix,
-    fullRange: color.fullRange,
-    lumaDepth: color.depth,
-    chromaDepth: color.depth,
-    subsamplingX: color.subsamplingX,
-    subsamplingY: color.subsamplingY,
-    scaler: scaler,
-  );
+  image.Image rgb({YuvImageScaler? scaler, int? matrix, bool? fullRange}) =>
+      yuvImage(
+        y: planes[0].samples,
+        cb: color.monochrome ? const [] : planes[1].samples,
+        cr: color.monochrome ? const [] : planes[2].samples,
+        stride: planes[0].stride,
+        chromaStride: color.monochrome ? 0 : planes[1].stride,
+        width: planes[0].width,
+        height: planes[0].height,
+        cropLeft: 0,
+        cropTop: 0,
+        matrix: matrix ?? color.matrix,
+        fullRange: fullRange ?? color.fullRange,
+        lumaDepth: color.depth,
+        chromaDepth: color.depth,
+        subsamplingX: color.subsamplingX,
+        subsamplingY: color.subsamplingY,
+        scaler: scaler,
+      );
 }
 
 image.Image decodeAv1IntraImage(Av1CodedFrame frame) => applyAv1FilmGrain(

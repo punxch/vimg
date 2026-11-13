@@ -3,7 +3,7 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
-
+import 'package:vimg_dart/src/avif_encoder.dart';
 import 'package:vimg_dart/src/probe.dart';
 
 import 'fixtures.dart';
@@ -168,6 +168,40 @@ Future<void> testJoin(Directory temp) async {
   check(
     ascii.decode(File(avif).readAsBytesSync().sublist(4, 12)) == 'ftypavif',
     'Join produced an AVIF still image',
+  );
+
+  final cover = '${temp.path}/cover.avif';
+  final encoder = AvifEncoder(120, 80, fps: 20, qIndex: 12);
+  for (final color in [
+    image.ColorRgb8(240, 20, 20),
+    image.ColorRgb8(20, 20, 240),
+  ]) {
+    encoder.addFrame(image.Image(width: 120, height: 80)..clear(color));
+  }
+  File(cover).writeAsBytesSync(encoder.finish());
+  final cache = File('${temp.path}/sheet.cache');
+  File(avif).copySync(cache.path);
+  final roundTrip = await Process.run(Platform.resolvedExecutable, [
+    'bin/vimg.dart',
+    'join',
+    '-c2',
+    '-W60',
+    '-H40',
+    '-o',
+    output,
+    cache.path,
+    cover,
+  ]);
+  check(roundTrip.exitCode == 0, 'AVIF input join failed: ${roundTrip.stderr}');
+  final combined = image.decodePng(File(output).readAsBytesSync())!;
+  check(combined.width == 120 && combined.height == 40, 'AVIF input bounds');
+  check(
+    combined.getPixel(0, 0).r == 255,
+    'Read the still AVIF from a cache path',
+  );
+  check(
+    combined.getPixel(60, 0).r > 225 && combined.getPixel(60, 0).b < 40,
+    'Read the red AVIF animation cover',
   );
 }
 

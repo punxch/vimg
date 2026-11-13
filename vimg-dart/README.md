@@ -21,6 +21,9 @@ On Windows, use `-o build/vimg.exe`.
   MPEG-PS and standalone MPEG video metadata and prints vimg-compatible JSON.
 - `vimg join -c3 -H160 image1.png image2.png -o grid.png` resizes images and
   composes a contact sheet. Pass a repeated `--label` to label successive tiles.
+  AVIF inputs use the primary image, including the cover of an animation.
+  The Dart reader supports coded images, tiled grids, auxiliary alpha, and
+  clean aperture, rotation and mirror properties.
 
 The grid renders labels with the embedded Cantarell font. Supported image
 formats depend on the Dart image library's encoders and decoders.

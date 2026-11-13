@@ -5,6 +5,7 @@ import 'package:args/command_runner.dart';
 import 'package:image/image.dart' as image;
 
 import 'avif_encoder.dart';
+import 'avif_image.dart';
 import 'completions.dart';
 import 'grid.dart';
 import 'output.dart';
@@ -105,7 +106,9 @@ final class _Join extends VimgCommand {
     }
     final frames = <image.Image>[];
     for (final path in arguments.rest) {
-      final decoded = image.decodeImage(File(path).readAsBytesSync());
+      final decoded =
+          readAvifImage(path) ??
+          image.decodeImage(File(path).readAsBytesSync());
       if (decoded == null)
         throw FormatException('Unsupported input image: $path');
       frames.add(
