@@ -197,6 +197,7 @@ final class IsoMedia {
     'png ' => 'png',
     'rle ' => 'qtrle',
     'rpza' => 'rpza',
+    'smc ' => 'smc',
     'raw ' ||
     'yuv2' ||
     '2vuy' ||

@@ -29,6 +29,7 @@ import 'prores.dart';
 import 'quicktime_animation.dart';
 import 'quicktime_raw.dart';
 import 'quicktime_rpza.dart';
+import 'quicktime_smc.dart';
 import 'video_configuration.dart';
 import 'yuv_image.dart';
 
@@ -157,7 +158,7 @@ final class Video {
 
   _IndexedVideo _indexIsoSection(_IsoSection section) {
     final name = section.codec;
-    if (name == 'qtrle' || name == 'rpza') {
+    if (_isQuickTimeDelta(name)) {
       return _indexQuickTimeDelta(name, section: section);
     }
     if (name == 'av1') return _indexAv1(section: section);
@@ -174,6 +175,7 @@ final class Video {
     var start = -1, sectionStart = 0;
     late Uint8List description;
     var rpzaBlocks = 0;
+    SmcPictureOrder? smc;
     final presentation =
         _containerPackets(
             false,
@@ -188,13 +190,20 @@ final class Video {
               description = file.read(entry.data, entry.end - entry.data);
               if (name == 'rpza') {
                 rpzaBlocks = QuickTimeRpzaDecoder(description).blockCount;
+              } else if (name == 'smc') {
+                smc = SmcPictureOrder(
+                  QuickTimeSmcDecoder(description).blockCount,
+                );
               }
               start = -1;
               sectionStart = decodeOrder.length;
             },
             onSample: (packet, sync) {
               final position = decodeOrder.length;
-              final keyframe = name == 'rpza'
+              final anchor = smc?.anchor(_read(packet), position);
+              final keyframe = anchor != null
+                  ? anchor == position
+                  : name == 'rpza'
                   ? isRpzaKeyframe(_read(packet), rpzaBlocks)
                   : sync;
               if (keyframe) {
@@ -204,7 +213,7 @@ final class Video {
               }
               index[packet] = position;
               decodeOrder.add(packet);
-              gopStart.add(start);
+              gopStart.add(anchor ?? start);
             },
           ).where((packet) => gopStart[index[packet]!] >= 0).toList()
           ..sort((a, b) {
@@ -286,7 +295,7 @@ final class Video {
           ? _av1PreviewPackets()
           : _av1Timeline.timeline.presentation;
     }
-    if (codec == 'qtrle' || codec == 'rpza') {
+    if (_isQuickTimeDelta(codec)) {
       final indexed = _quickTimeDeltaTimeline;
       return indexed.timeline.presentation.where(
         (packet) =>
@@ -753,7 +762,7 @@ final class Video {
     final indexed = switch (name) {
       'av1' => _av1Timeline,
       'h264' || 'hevc' => _nalTimeline,
-      'qtrle' || 'rpza' => _quickTimeDeltaTimeline,
+      _ when _isQuickTimeDelta(name) => _quickTimeDeltaTimeline,
       _ when isMpegVideo(name) => _mpegTimeline,
       _ => null,
     };
@@ -913,6 +922,14 @@ final class Video {
           final source = decoder.rgb();
           return ({scaler}) => _renderRgb(source, scaler);
         };
+      case 'smc':
+        final decoder = QuickTimeSmcDecoder(configuration.bytes!);
+        return (bytes, selected) {
+          decoder.advance(bytes);
+          if (!selected) return null;
+          final source = decoder.rgb();
+          return ({scaler}) => _renderRgb(source, scaler);
+        };
       case 'av1':
         final units = Av1AccessUnits()..configure(configuration.bytes!);
         final decoder = Av1StreamDecoder();
@@ -1013,7 +1030,7 @@ final class Video {
       final frame = decodeSelected([packet]).single.frame;
       return preview && section.codec == 'qtrle' ? _rgb(frame) : frame;
     }
-    if (codec == 'qtrle' || codec == 'rpza') {
+    if (_isQuickTimeDelta(codec)) {
       final frame = decodeSelected([packet]).single.frame;
       return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
@@ -1123,9 +1140,11 @@ bool _usesReferences(String codec) =>
     codec == 'h264' ||
     codec == 'hevc' ||
     codec == 'av1' ||
-    codec == 'qtrle' ||
-    codec == 'rpza' ||
+    _isQuickTimeDelta(codec) ||
     isMpegVideo(codec);
+
+bool _isQuickTimeDelta(String codec) =>
+    codec == 'qtrle' || codec == 'rpza' || codec == 'smc';
 
 final class _IsoSection {
   _IsoSection(this.codec, this.description, this.restart);

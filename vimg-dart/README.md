@@ -53,6 +53,9 @@ alpha in BMPs.
 QuickTime Apple Video (`rpza`) supports RGB555 blocks with solid colors,
 four-color palettes, literal pixels and updates that reuse earlier blocks.
 Preview and extraction locate complete pictures from the block data.
+QuickTime Graphics (`smc `) supports 8-bit indexed color and grayscale,
+including embedded palettes, block repeats, and differential frames.
+Random access accounts for both pixel and palette dependencies.
 Matroska and MP4/MOV support progressive 8-bit H.264 I/P/B pictures
 with CABAC or CAVLC and 4:2:0 or monochrome chroma. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
