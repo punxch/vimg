@@ -46,7 +46,10 @@ formats depend on the Dart image library's encoders and decoders.
 - `vimg authority verify reference.avif candidate.avif --min-ssim 0.999`
   compares animation structure and every decoded frame.
 - `vimg print-completions [bash|zsh|fish|powershell|elvish]` prints a completion
-  script for the Dart CLI.
+  script for the Dart CLI. The script queries the installed `vimg` for the
+  active command's options, subcommands and allowed values. Source the Bash,
+  Fish, PowerShell or Elvish script in the corresponding shell. For Zsh, save
+  it as `_vimg` on `fpath` before running `compinit`.
 
 Extraction and contact sheets decode MJPEG and PNG tracks in Matroska,
 MP4/MOV or AVI. AVI also supports uncompressed indexed 1-, 4- and 8-bit

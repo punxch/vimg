@@ -29,6 +29,10 @@ CommandRunner<void> createRunner() =>
 Future<void> runCli(List<String> arguments) async {
   final runner = createRunner();
   try {
+    if (arguments.firstOrNull == completionQuery) {
+      completeArguments(runner.argParser, arguments.skip(1).toList());
+      return;
+    }
     final result = runner.parse(arguments);
     if (result.flag('version')) {
       stdout.writeln('vimg-dart 0.1.0');
