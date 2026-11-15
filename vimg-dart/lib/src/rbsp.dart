@@ -20,7 +20,8 @@ final class Rbsp {
     for (var i = headerBytes; i < nal.length; i++) {
       final byte = nal[i];
       if (zeroes == 2 && byte == 3) {
-        if (i + 1 == nal.length || nal[i + 1] > 3) {
+        // A final cabac_zero_word is encoded as 00 00 03.
+        if (i + 1 < nal.length && nal[i + 1] > 3) {
           throw FormatException('Invalid $codec emulation prevention byte');
         }
         if (trackPrevention) (prevention ??= []).add(i - headerBytes);

@@ -276,6 +276,49 @@ const _chroma444LosslessRgbPlanes = [
   [0x84aa0a24, 0xcb89a901, 0x67815f0a],
 ];
 
+// Synthetic 64×48 samples encoded with JM 19.0. These hashes are from
+// reconstructed native samples before RGB conversion.
+const _depth12CabacPlanes = [
+  [0x486a4649, 0x8c125446, 0xbe4a8cb4],
+  [0x606a4cdd, 0x040f0bdb, 0x47ac88cd],
+  [0x8802ce7c, 0x5b27ca0e, 0x1daf3446],
+  [0xbc789a48, 0x739a4725, 0x79d347b4],
+  [0xb484debb, 0xc3a0d831, 0xf6b394fd],
+  [0xb80d9b0d, 0x054d1044, 0x53f4f038],
+  [0xed540e43, 0xd51d31c9, 0x1ea40aa0],
+];
+
+const _depth12CavlcPlanes = [
+  [0x6c54df38, 0x5b93c0fc, 0xbb45443c],
+  [0x91154a36, 0xa4e88f13, 0x032c4106],
+  [0x6d6ed47e, 0x2a18d458, 0x4fc8cf85],
+  [0xe70f3297, 0x13eb569a, 0xb53a28f3],
+  [0xf4ee7d8e, 0x75221c3c, 0x39299f78],
+  [0xe25e95df, 0xce0a267e, 0xe2edd504],
+  [0xc992d857, 0x2779564d, 0x15bab000],
+];
+
+const _depth14LosslessPlanes = [
+  [0x4afa56c5, 0x442fefc5, 0x40cc98d2],
+  [0xf2cc75c5, 0x9f268245, 0x0bcbc95b],
+  [0x8b6a08c5, 0x2c2157c5, 0xa317203d],
+  [0x6c759dc5, 0xae176f45, 0x968b9c39],
+  [0xd88fddc5, 0x226b0ac5, 0x265ed9da],
+  [0x02dee0c5, 0xa7f06e45, 0xa188964b],
+  [0xa24d0dc5, 0x20961dc5, 0x12d7f0f0],
+];
+
+// JM decoder output reordered from RGB to GBR. The IDR carries CABAC padding.
+const _mixedDepthGbrPlanes = [
+  [0x98bb73df, 0xe40d4c25, 0x6fe85c80],
+  [0xa47226e8, 0x1d667af5, 0xcb8bf060],
+  [0x82300eba, 0x9a3446ed, 0x8449a947],
+  [0x6c76a9be, 0x73fe76ef, 0x1e0c09bb],
+  [0x55c5eb8b, 0x7d269570, 0x0ff5e2e8],
+  [0xf550d459, 0x2d026c21, 0x2fd4b218],
+  [0x065f4596, 0x14b407b3, 0xbb5b5f5e],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -283,6 +326,7 @@ void _checkPlanes(
   bool cabac = true,
   int profile = 100,
   int depth = 8,
+  int? chromaDepth,
   int chromaFormat = 1,
   bool lossless = false,
   bool rgb = false,
@@ -318,20 +362,30 @@ void _checkPlanes(
       final sps = picture.sps;
       if (rgb) {
         final converted = picture.rgb();
-        final p = converted.getPixel(25, 13);
-        final i = (13 + sps.cropTop) * picture.stride + 25 + sps.cropLeft;
         check(
-          sps.color.matrix == 0 &&
-              p.r == picture.cr[i] &&
-              p.g == picture.y[i] &&
-              p.b == picture.cb[i],
-          'Expected identity GBR conversion in $input',
+          sps.color.matrix == 0 && sps.color.fullRange,
+          'Expected full-range GBR',
         );
+        int toRgb(int sample, int bits) {
+          final max = (1 << bits) - 1;
+          return (sample * 255 + max ~/ 2) ~/ max;
+        }
+
+        for (final (x, y) in [(25, 13), (7, 9), (45, 17)]) {
+          final pixel = converted.getPixel(x, y);
+          final i = (y + sps.cropTop) * picture.stride + x + sps.cropLeft;
+          check(
+            (pixel.r - toRgb(picture.cr[i], sps.chromaDepth)).abs() <= 1 &&
+                (pixel.g - toRgb(picture.y[i], sps.lumaDepth)).abs() <= 1 &&
+                (pixel.b - toRgb(picture.cb[i], sps.chromaDepth)).abs() <= 1,
+            'Expected identity GBR conversion in $input at $x,$y',
+          );
+        }
       }
       check(
         sps.profile == profile &&
             sps.lumaDepth == depth &&
-            sps.chromaDepth == depth &&
+            sps.chromaDepth == (chromaDepth ?? depth) &&
             sps.chromaFormat == chromaFormat &&
             sps.transformBypass == lossless &&
             (sps.width, sps.height) == dimensions,
@@ -393,6 +447,10 @@ Future<void> main(List<String> arguments) async {
   const cabac444 = 'test/fixtures/avc-444-cabac.mkv';
   const cavlc444 = 'test/fixtures/avc-444-cavlc.mp4';
   const losslessRgb = 'test/fixtures/avc-444-lossless-rgb.mkv';
+  const cabac12 = 'test/fixtures/avc-12-b.mkv';
+  const cavlc12 = 'test/fixtures/avc-12-cavlc.mp4';
+  const lossless14 = 'test/fixtures/avc-14-lossless.mkv';
+  const mixedGbr = 'test/fixtures/avc-mixed-gbr.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -528,6 +586,46 @@ Future<void> main(List<String> arguments) async {
     dimensions: (93, 61),
   );
 
+  _checkPlanes(
+    cabac12,
+    _depth12CabacPlanes,
+    inter: true,
+    profile: 244,
+    depth: 12,
+    chromaFormat: 3,
+    dimensions: (64, 48),
+  );
+  _checkPlanes(
+    cavlc12,
+    _depth12CavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 12,
+    dimensions: (64, 48),
+  );
+  _checkPlanes(
+    lossless14,
+    _depth14LosslessPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 14,
+    chromaFormat: 3,
+    lossless: true,
+    dimensions: (64, 48),
+  );
+  _checkPlanes(
+    mixedGbr,
+    _mixedDepthGbrPlanes,
+    inter: true,
+    profile: 244,
+    chromaDepth: 14,
+    chromaFormat: 3,
+    rgb: true,
+    dimensions: (64, 48),
+  );
+
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
     final result = await Process.run(
@@ -548,6 +646,7 @@ Future<void> main(List<String> arguments) async {
       (losslessCabac, 47, 31),
       (cabac422, 47, 31),
       (cabac444, 47, 31),
+      (mixedGbr, 32, 24),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -579,6 +678,7 @@ Future<void> main(List<String> arguments) async {
       (losslessCavlc, 94, 62),
       (cavlc422, 94, 61),
       (cavlc444, 93, 61),
+      (cavlc12, 64, 48),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -599,6 +699,7 @@ Future<void> main(List<String> arguments) async {
       ('lossless', losslessCavlc, 94, 62),
       ('422', cavlc422, 94, 61),
       ('444-rgb', losslessRgb, 93, 61),
+      ('12-bit', cabac12, 64, 48),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';

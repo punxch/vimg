@@ -471,6 +471,9 @@ void _writeRgb(
   final lumaRange = fullRange ? 256 - 1 / (1 << (lumaDepth - 8)) : 219;
   final scale = (65536 * 255 / lumaRange).round();
   final chromaRange = fullRange ? 256 - 1 / (1 << (chromaDepth - 8)) : 224;
+  final rgbScale = gbr && fullRange && chromaDepth != lumaDepth
+      ? (65536 * 255 / chromaRange).round()
+      : scale;
   final (rv, bu, gu, gv) = _rgbCoefficients(matrix);
   final red = (rv * 224 / chromaRange).round();
   final blue = (bu * 224 / chromaRange).round();
@@ -484,9 +487,9 @@ void _writeRgb(
     final v = cr?[chroma] ?? (128 << 9);
     if (gbr) {
       pixel.setRgb(
-        (((v - bias) * scale + half) >> 25).clamp(0, 255),
+        (((v - bias) * rgbScale + half) >> 25).clamp(0, 255),
         (luma >> 25).clamp(0, 255),
-        (((u - bias) * scale + half) >> 25).clamp(0, 255),
+        (((u - bias) * rgbScale + half) >> 25).clamp(0, 255),
       );
     } else {
       final uDelta = u - (128 << 9);

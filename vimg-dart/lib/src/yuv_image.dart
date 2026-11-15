@@ -131,17 +131,25 @@ image.Image yuvImage({
           .round();
   final bias = fullRange ? 0 : 16 << (lumaDepth - 8);
   final midpoint = 1 << (chromaDepth - 1);
+  final gbr = matrix == 0 && cb.isNotEmpty;
+  final rgbBias = fullRange ? 0 : 16 << (chromaDepth - 8);
+  final rgbScale = !gbr || chromaDepth == lumaDepth
+      ? yScale
+      : (precision *
+                255 /
+                (fullRange ? (1 << chromaDepth) - 1 : 219 << (chromaDepth - 8)))
+            .round();
   for (final pixel in pixels) {
     final x = cropLeft + pixel.x;
     final row = cropTop + pixel.y;
     final luma = (y[row * stride + x] - bias) * yScale + (precision >> 1);
     final offset = (row >> subsamplingY) * chromaStride + (x >> subsamplingX);
-    if (matrix == 0 && cb.isNotEmpty) {
+    if (gbr) {
       final rounding = precision >> 1;
       pixel.setRgb(
-        (((cr[offset] - bias) * yScale + rounding) >> 14).clamp(0, 255),
+        (((cr[offset] - rgbBias) * rgbScale + rounding) >> 14).clamp(0, 255),
         (luma >> 14).clamp(0, 255),
-        (((cb[offset] - bias) * yScale + rounding) >> 14).clamp(0, 255),
+        (((cb[offset] - rgbBias) * rgbScale + rounding) >> 14).clamp(0, 255),
       );
       continue;
     }

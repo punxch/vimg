@@ -66,12 +66,6 @@ H264Picture _decodePicture(
 }) {
   final first = slices.first;
   final sps = first.pps.sps;
-  if (sps.lumaDepth > 10 ||
-      (sps.chromaFormat != 0 && sps.chromaDepth != sps.lumaDepth)) {
-    throw UnsupportedError(
-      'H.264 decoding supports progressive 8–10-bit 4:2:0, 4:2:2, 4:4:4 and monochrome',
-    );
-  }
   if (sps.mbWidth * sps.mbHeight > 139264) {
     throw const FormatException(
       'H.264 picture exceeds the maximum macroblock count',
@@ -113,7 +107,11 @@ final class _Reconstruction {
   final int width;
   final List<Macroblock?> blocks;
   final ScalingMatrices _scaling;
-  late final _predict = IntraPrediction(picture.sps.lumaDepth);
+  late final _lumaPrediction = IntraPrediction(picture.sps.lumaDepth);
+  late final _chromaPrediction =
+      picture.sps.chromaDepth == picture.sps.lumaDepth
+      ? _lumaPrediction
+      : IntraPrediction(picture.sps.chromaDepth);
   final _transform = IntraTransform();
   var decoded = 0;
 
@@ -232,7 +230,7 @@ final class _Reconstruction {
           available,
         );
       } else {
-        _predict.chroma(
+        _chromaPrediction.chroma(
           plane,
           stride,
           offset,
@@ -267,6 +265,9 @@ final class _Reconstruction {
     );
   }
 
+  IntraPrediction _predictionFor(int component) =>
+      component == 0 ? _lumaPrediction : _chromaPrediction;
+
   void _reconstructFullIntra(
     Macroblock block,
     Int32List levels,
@@ -279,9 +280,10 @@ final class _Reconstruction {
     bool bypass,
     Neighbors available,
   ) {
+    final prediction = _predictionFor(component);
     if (block.intra16) {
       final mode = (block.type - 1) & 3;
-      _predict.luma(plane, stride, yOffset, 16, mode, available);
+      prediction.luma(plane, stride, yOffset, 16, mode, available);
       final dc = _transform.lumaDc(
         dcLevels,
         qp,
@@ -290,7 +292,7 @@ final class _Reconstruction {
       );
       if (bypass) {
         _transform.bypassMacroblock(levels, 0, dc, 16, 16, mode);
-        _add(plane, stride, yOffset, 16, 16, 0);
+        _add(prediction, plane, stride, yOffset, 16, 16, 0);
       } else {
         for (var i = 0; i < 16; i++) {
           final x = blockX(i);
@@ -303,6 +305,7 @@ final class _Reconstruction {
             dc: dc[row * 4 + x],
           );
           _add(
+            prediction,
             plane,
             stride,
             yOffset + 4 * (row * stride + x),
@@ -322,7 +325,7 @@ final class _Reconstruction {
         final offset = yOffset + 4 * (row * stride + x);
         final neighbors = _withinMb(x * 4, row * 4, size, available, i);
         final mode = block.predictionMode(x, row);
-        _predict.luma(plane, stride, offset, size, mode, neighbors);
+        prediction.luma(plane, stride, offset, size, mode, neighbors);
         if (bypass) {
           _transform.bypassBlock(levels, z * 16, size, mode: mode);
         } else if (block.transform8x8) {
@@ -330,7 +333,7 @@ final class _Reconstruction {
         } else {
           _transform.block4(levels, i * 16, qp, _scaling.four[component]);
         }
-        _add(plane, stride, offset, size, size, 0);
+        _add(prediction, plane, stride, offset, size, size, 0);
       }
     }
   }
@@ -352,8 +355,9 @@ final class _Reconstruction {
     final bypass = sps.transformBypass && lumaQp == 0;
     for (var component = 0; component < levels.levels.length; component++) {
       final (plane, stride, offset) = _target(component, mbX, mbY);
+      final prediction = _predictionFor(component);
       predictInter(
-        _predict.pixels,
+        prediction.pixels,
         component,
         mbX,
         mbY,
@@ -365,7 +369,7 @@ final class _Reconstruction {
         poc,
       );
       if (component == 0 || sps.fullChroma) {
-        _copyBlock(_predict.pixels, 0, plane, offset, stride, 16);
+        _copyBlock(prediction.pixels, 0, plane, offset, stride, 16);
         final coded = block.codedPlane(component);
         if (coded == 0) continue;
         _addFullInterResiduals(
@@ -404,6 +408,7 @@ final class _Reconstruction {
     int qp,
     bool bypass,
   ) {
+    final prediction = _predictionFor(component);
     final size = block.transform8x8 ? 8 : 4;
     for (var z = 0; z < 16; z += block.transform8x8 ? 4 : 1) {
       if ((coded & (1 << z)) == 0) continue;
@@ -415,6 +420,7 @@ final class _Reconstruction {
         _transform.block4(levels, z * 16, qp, _scaling.interFour[component]);
       }
       _add(
+        prediction,
         plane,
         stride,
         offset + 4 * (blockY(z) * stride + blockX(z)),
@@ -436,7 +442,15 @@ final class _Reconstruction {
   ) {
     final height = picture.sps.chromaHeight;
     if (block.chromaPattern == 0) {
-      _copyBlock(_predict.pixels, 0, plane, offset, stride, 8, height: height);
+      _copyBlock(
+        _chromaPrediction.pixels,
+        0,
+        plane,
+        offset,
+        stride,
+        8,
+        height: height,
+      );
       return;
     }
     final count = picture.sps.chromaBlockCount;
@@ -465,7 +479,7 @@ final class _Reconstruction {
         height,
         mode,
       );
-      _add(plane, stride, offset, 8, 8, 0, height: height);
+      _add(_chromaPrediction, plane, stride, offset, 8, 8, 0, height: height);
       return;
     }
     for (var i = 0; i < count; i++) {
@@ -478,7 +492,15 @@ final class _Reconstruction {
         weights,
         dc: dc[i],
       );
-      _add(plane, stride, offset + row * stride + x, 4, 8, row * 8 + x);
+      _add(
+        _chromaPrediction,
+        plane,
+        stride,
+        offset + row * stride + x,
+        4,
+        8,
+        row * 8 + x,
+      );
     }
   }
 
@@ -490,6 +512,7 @@ final class _Reconstruction {
   }
 
   void _add(
+    IntraPrediction prediction,
     List<int> plane,
     int stride,
     int start,
@@ -498,11 +521,11 @@ final class _Reconstruction {
     int predStart, {
     int? height,
   }) {
-    final maximum = _predict.maximum;
+    final maximum = prediction.maximum;
     for (var row = 0; row < (height ?? size); row++) {
       for (var x = 0; x < size; x++) {
         plane[start + row * stride + x] =
-            (_predict.pixels[predStart + row * predStride + x] +
+            (prediction.pixels[predStart + row * predStride + x] +
                     _transform.residual[row * size + x])
                 .clamp(0, maximum);
       }
