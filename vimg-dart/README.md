@@ -91,9 +91,12 @@ horizontal slices, restarting prediction at each slice boundary.
 FFV1 versions 0, 1 and 3 in Matroska, AVI and MP4/MOV support Golomb–Rice
 and range coding, YCbCr, grayscale and reversible RGB with optional alpha.
 Versions 1 and 3 can retain up to 16 bits per sample, and version 3 supports
-multiple slices and CRC checking. The integer variant of experimental
-FFV1 v4 supports FFmpeg's alternate CRC seed, chroma-aligned slices,
-per-slice RGB transforms and raw PCM slices. Random access rebuilds entropy
+multiple slices and CRC checking. Experimental FFV1 v4 supports
+chroma-aligned slices, per-slice RGB transforms, raw PCM, sample remapping
+and FFmpeg's alternate CRC seed. It also decodes 16-bit floating-point
+grayscale and RGB, 32-bit floating-point RGB and 16-bit RGGB Bayer.
+Float previews and captures clamp channels to the display range [0, 1].
+Bayer capture uses bilinear demosaicing. Random access rebuilds entropy
 contexts from the preceding FFV1 keyframe.
 Matroska and MP4/MOV support 8–14-bit H.264 I/P/B pictures
 with CABAC or CAVLC in monochrome, 4:2:0, 4:2:2 and 4:4:4. This includes

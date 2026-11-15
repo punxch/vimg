@@ -5,15 +5,17 @@ import 'package:image/image.dart' as image;
 
 import 'yuv_image.dart';
 
+part 'ffv1_bayer.dart';
 part 'ffv1_range.dart';
 part 'ffv1_rice.dart';
+part 'ffv1_samples.dart';
 
 bool isFfv1Keyframe(Uint8List bytes) {
   if (bytes.length < 2) throw const FormatException('Truncated FFV1 frame');
   return (bytes[0] << 8 | bytes[1]) >= 0x7f80;
 }
 
-/// FFV1 integer video. Contexts are carried across frames in a GOP.
+/// FFV1 video. Contexts are carried across frames in a GOP.
 final class Ffv1Decoder {
   Ffv1Decoder(this.width, this.height, Uint8List? configuration)
     : _record = configuration == null
@@ -59,10 +61,14 @@ final class Ffv1Decoder {
         : _findSlices(bytes, grid, crcSeed: config.sliceCrcSeed);
     final chromaWidth = _ceilShift(width, config.shiftX);
     final chromaHeight = _ceilShift(height, config.shiftY);
-    final y = Uint16List(width * height);
-    final cb = Uint16List(config.chroma ? chromaWidth * chromaHeight : 0);
-    final cr = Uint16List(cb.length);
-    final alpha = config.alpha ? Uint16List(y.length) : null;
+    List<int> planeBuffer(int length) =>
+        config.depth == 32 ? Uint32List(length) : Uint16List(length);
+    final y = planeBuffer(width * height);
+    final cb = planeBuffer(
+      config.chroma && !config.bayer ? chromaWidth * chromaHeight : 0,
+    );
+    final cr = planeBuffer(cb.length);
+    final alpha = config.alpha ? planeBuffer(y.length) : null;
     final next = <(int, int, int, int), _SliceState>{};
     for (final (start, end) in slices.reversed) {
       final range = legacyRange ?? _RangeDecoder(bytes, start, end);
@@ -83,9 +89,6 @@ final class Ffv1Decoder {
       }
       next[position] = state;
 
-      final rice = config.rice && !header.raw
-          ? _RiceReader(bytes, range.riceStart(config.riceSentinel), end)
-          : null;
       final x = config.sliceCoordinate(
         width,
         sx,
@@ -112,14 +115,46 @@ final class Ffv1Decoder {
       if (w <= 0 || h <= 0) {
         throw const FormatException('Empty FFV1 slice');
       }
+      final maps = header.remap == 0
+          ? const <_SampleMap>[]
+          : List.generate(
+              1 + (config.chroma ? 2 : 0) + (config.alpha ? 1 : 0),
+              (_) => _SampleMap.read(
+                range,
+                config.depth,
+                w * h,
+                flipSignOrder: header.remap == 2,
+              ),
+            );
+      final rice = config.rice && !header.raw
+          ? _RiceReader(bytes, range.riceStart(config.riceSentinel), end)
+          : null;
+      if (config.bayer) {
+        _decodeBayerSlice(range, header, state, rice, y, width, (x, top, w, h));
+        continue;
+      }
       if (config.rgb) {
         final indices = [0, 1, 1, if (alpha != null) 2];
+        final domain = 1 << config.depth;
+        final domains = maps.isEmpty
+            ? List.filled(indices.length, domain)
+            : [for (final map in maps) map.samples.length];
+        final bits = [for (final count in domains) (count - 1).bitLength];
+        final center = domains[0];
+        if (!header.raw) {
+          bits[0] = bits.take(3).reduce(math.max);
+          bits[1] = (center + domains[1] - 1).bitLength;
+          bits[2] = (center + domains[2] - 1).bitLength;
+          if (config.extraRgbBit) {
+            bits[0]++;
+            if (alpha != null) bits[3]++;
+          }
+        }
         final planes = [
-          for (final index in indices)
+          for (final (plane, index) in indices.indexed)
             _ScanLines(
               w,
-              config.depth +
-                  (!header.raw && (index == 1 || config.extraRgbBit) ? 1 : 0),
+              bits[plane],
               range,
               tables[index],
               state.contexts[index],
@@ -127,8 +162,7 @@ final class Ffv1Decoder {
               raw: header.raw,
             ),
         ];
-        final center = 1 << config.depth;
-        final mask = center - 1;
+        final mask = domain - 1;
         // FFV1's 9–15-bit GBR exception uses blue as the RCT base.
         final blueFirst =
             config.depth > 8 && config.depth < 16 && alpha == null;
@@ -146,16 +180,25 @@ final class Ffv1Decoder {
               b += g;
               r += g;
             }
+            if (maps.isNotEmpty) {
+              g = maps[0].restore(g);
+              b = maps[1].restore(b);
+              r = maps[2].restore(r);
+            }
             y[offset] = (blueFirst ? b : g) & mask;
             cb[offset] = (blueFirst ? g : b) & mask;
             cr[offset] = r & mask;
-            if (alpha != null) alpha[offset] = samples[3][column] & mask;
+            if (alpha != null) {
+              final a = samples[3][column];
+              alpha[offset] = maps.isEmpty ? a & mask : maps[3].restore(a);
+            }
           }
         }
       } else {
         void plane(
-          Uint16List destination,
+          List<int> destination,
           int index,
+          int plane,
           int stride,
           int shiftX,
           int shiftY,
@@ -163,28 +206,39 @@ final class Ffv1Decoder {
           final columns = _ceilShift(w, shiftX);
           final rows = _ceilShift(h, shiftY);
           if (rice != null) rice.runIndex = 0;
+          final map = maps.isEmpty ? null : maps[plane];
+          final bits = map?.bits ?? config.depth;
           final scan = _ScanLines(
             columns,
-            config.depth,
+            bits,
             range,
             tables[index],
             state.contexts[index],
             rice: rice,
-            signedPredictor: config.depth == 16,
+            signedPredictor: bits == 16,
             raw: header.raw,
           );
           var offset = (top >> shiftY) * stride + (x >> shiftX);
           for (var row = 0; row < rows; row++, offset += stride) {
-            destination.setRange(offset, offset + columns, scan.decode(), 2);
+            final samples = scan.decode();
+            if (map == null) {
+              destination.setRange(offset, offset + columns, samples, 2);
+            } else {
+              for (var column = 0; column < columns; column++) {
+                destination[offset + column] = map.restore(samples[column + 2]);
+              }
+            }
           }
         }
 
-        plane(y, 0, width, 0, 0);
+        plane(y, 0, 0, width, 0, 0);
         if (config.chroma) {
-          plane(cb, 1, chromaWidth, config.shiftX, config.shiftY);
-          plane(cr, 1, chromaWidth, config.shiftX, config.shiftY);
+          plane(cb, 1, 1, chromaWidth, config.shiftX, config.shiftY);
+          plane(cr, 1, 2, chromaWidth, config.shiftX, config.shiftY);
         }
-        if (alpha != null) plane(alpha, tables.length - 1, width, 0, 0);
+        if (alpha != null) {
+          plane(alpha, tables.length - 1, config.chroma ? 3 : 1, width, 0, 0);
+        }
       }
     }
     if (covered?.contains(0) ?? false) {
@@ -203,7 +257,8 @@ final class Ffv1Decoder {
     final planes =
         1 +
         (config.chroma || config.version < 4 ? 1 : 0) +
-        (config.alpha ? 1 : 0);
+        (config.alpha ? 1 : 0) +
+        (config.bayer ? 1 : 0);
     if (covered == null) {
       return _SliceHeader((
         0,
@@ -241,19 +296,27 @@ final class Ffv1Decoder {
     final mode = range.symbol(header);
     if (mode > 1) throw UnsupportedError('FFV1 slice coding mode $mode');
     final raw = mode == 1;
-    final blueWeight = config.rgb && !raw ? range.symbol(header) : 1;
-    final redWeight = config.rgb && !raw ? range.symbol(header) : 1;
+    final transform = (config.rgb || config.bayer) && !raw;
+    final blueWeight = transform ? range.symbol(header) : 1;
+    final redWeight = transform ? range.symbol(header) : 1;
     if (blueWeight + redWeight > 4) {
       throw const FormatException('Invalid FFV1 color transform');
     }
-    if (config.microVersion >= 4 && range.symbol(header) != 0) {
-      throw UnsupportedError('FFV1 slice sample remapping');
+    final remap = config.microVersion >= 4 ? range.symbol(header) : 0;
+    if (remap > 2 ||
+        (remap == 2 && !config.floatingPoint) ||
+        (remap != 0 && config.bayer)) {
+      throw const FormatException('Invalid FFV1 sample remapping mode');
+    }
+    if (config.depth == 32 && remap == 0) {
+      throw const FormatException('Missing FFV1 sample map');
     }
     return _SliceHeader(
       position,
       tables,
       reset: reset,
       raw: raw,
+      remap: remap,
       blueWeight: blueWeight,
       redWeight: redWeight,
     );
@@ -298,6 +361,7 @@ final class _SliceHeader {
     this.tables, {
     this.reset = false,
     this.raw = false,
+    this.remap = 0,
     this.blueWeight = 1,
     this.redWeight = 1,
   });
@@ -306,6 +370,7 @@ final class _SliceHeader {
   final List<_Quantization> tables;
   final bool reset;
   final bool raw;
+  final int remap;
   final int blueWeight;
   final int redWeight;
 }
@@ -323,33 +388,48 @@ final class Ffv1Picture {
 
   final int width;
   final int height;
-  final Uint16List y;
-  final Uint16List cb;
-  final Uint16List cr;
-  final Uint16List? alpha;
+
+  /// Original sample codes, including IEEE floating-point bit patterns.
+  final List<int> y;
+  final List<int> cb;
+  final List<int> cr;
+  final List<int>? alpha;
   final _Ffv1Configuration _config;
 
-  image.Image rgb({YuvImageScaler? scaler, int? matrix, bool? fullRange}) =>
-      yuvImage(
-        y: y,
-        cb: cb,
-        cr: cr,
-        alpha: alpha,
-        stride: width,
-        chromaStride: _ceilShift(width, _config.shiftX),
-        width: width,
-        height: height,
-        cropLeft: 0,
-        cropTop: 0,
-        matrix: _config.rgb ? 0 : matrix ?? 6,
-        fullRange: _config.rgb || (fullRange ?? false),
-        lumaDepth: _config.depth,
-        chromaDepth: _config.depth,
-        alphaDepth: _config.depth,
-        subsamplingX: _config.shiftX,
-        subsamplingY: _config.shiftY,
-        scaler: scaler,
-      );
+  image.Image rgb({YuvImageScaler? scaler, int? matrix, bool? fullRange}) {
+    final floating = _config.floatingPoint;
+    final depth = floating ? 16 : _config.depth;
+    List<int> samples(List<int> source) =>
+        floating ? _floatToVideoSamples(source, _config.depth) : source;
+    final bayer = _config.bayer;
+    final (luma, blue, red) = bayer
+        ? _demosaicRggb(y, width, height)
+        : (samples(y), samples(cb), samples(cr));
+    final opacity = alpha;
+    final rgb = _config.rgb || bayer;
+    final shiftX = bayer ? 0 : _config.shiftX;
+    final shiftY = bayer ? 0 : _config.shiftY;
+    return yuvImage(
+      y: luma,
+      cb: blue,
+      cr: red,
+      alpha: opacity == null ? null : samples(opacity),
+      stride: width,
+      chromaStride: _ceilShift(width, shiftX),
+      width: width,
+      height: height,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: rgb ? 0 : matrix ?? 6,
+      fullRange: rgb || (fullRange ?? floating),
+      lumaDepth: depth,
+      chromaDepth: depth,
+      alphaDepth: depth,
+      subsamplingX: shiftX,
+      subsamplingY: shiftY,
+      scaler: scaler,
+    );
+  }
 }
 
 final class _ScanLines {
@@ -382,6 +462,7 @@ final class _ScanLines {
 
   Int32List decode() {
     final current = _current, above = _above, twoUp = _twoUp;
+    if (bits == 0) return current;
     if (raw) {
       final state = _initialStates(1);
       for (var i = 2; i < width + 2; i++) {
@@ -489,7 +570,8 @@ final class _Ffv1Configuration {
     this.version,
     this.microVersion,
     this.depth,
-    this.rgb,
+    this.floatingPoint,
+    this.colorspace,
     this.chroma,
     this.alpha,
     this.shiftX,
@@ -506,7 +588,8 @@ final class _Ffv1Configuration {
   final int version;
   final int microVersion;
   final int depth;
-  final bool rgb;
+  final bool floatingPoint;
+  final int colorspace;
   final bool chroma;
   final bool alpha;
   final int shiftX;
@@ -519,10 +602,13 @@ final class _Ffv1Configuration {
   final List<int> transitions;
   final List<_Quantization> tables;
 
+  bool get rgb => colorspace == 1;
+  bool get bayer => colorspace == 2;
   bool get extraRgbBit => version < 4 || microVersion < 8;
 
   int sliceCoordinate(int length, int index, int count, int shift) {
     if (version < 4 || microVersion < 3) return length * index ~/ count;
+    if (bayer) shift = math.max(1, shift);
     final units = _ceilShift(length, shift);
     final coordinate = ((2 * units * index + count) ~/ (2 * count)) << shift;
     return math.min(coordinate, length);
@@ -572,17 +658,32 @@ final class _Ffv1Configuration {
     final colorspace = range.symbol(state);
     final rawDepth = version == 0 ? 8 : range.symbol(state);
     final depth = rawDepth == 0 ? 8 : rawDepth;
-    if (colorspace == 2) throw UnsupportedError('FFV1 Bayer video');
-    if (depth > 16) throw UnsupportedError('FFV1 sample depth $depth');
+
+    if (depth > 16 && depth != 32) {
+      throw UnsupportedError('FFV1 sample depth $depth');
+    }
     final chroma = range.bit(state, 0) != 0;
     final shiftX = range.symbol(state), shiftY = range.symbol(state);
     final alpha = range.bit(state, 0) != 0;
-    if (colorspace > 1 ||
+    if (colorspace > 2 ||
         depth < 8 ||
         shiftX > 4 ||
         shiftY > 4 ||
         (colorspace == 1 && (!chroma || shiftX != 0 || shiftY != 0))) {
       throw const FormatException('Invalid FFV1 pixel format');
+    }
+    final bayer = colorspace == 2;
+    if (bayer) {
+      if (version < 4 ||
+          depth != 16 ||
+          !chroma ||
+          alpha ||
+          width.isOdd ||
+          height.isOdd) {
+        throw const FormatException('Invalid FFV1 Bayer format');
+      }
+      final order = range.symbol(state);
+      if (order != 0) throw UnsupportedError('FFV1 Bayer order $order');
     }
     final columns = hasRecord ? range.symbol(state) + 1 : 1;
     final rows = hasRecord ? range.symbol(state) + 1 : 1;
@@ -595,6 +696,7 @@ final class _Ffv1Configuration {
     }
     final tables = List.generate(count, (_) => _Quantization.read(range));
     int? sliceCrcSeed;
+    var floatingPoint = false;
     if (hasRecord) {
       final deltaStates = _initialStates(32 * 32);
       for (final table in tables) {
@@ -616,18 +718,20 @@ final class _Ffv1Configuration {
       };
       if (microVersion >= 3 || version >= 4)
         range.symbol(state); // Intra-only flag
-      if (version >= 4 &&
-          microVersion >= 4 &&
-          range.symbol(state) != 0 &&
-          depth == 16) {
-        throw UnsupportedError('FFV1 floating-point samples');
+      if (version >= 4 && microVersion >= 4) {
+        final floatingFlag = range.symbol(state);
+        floatingPoint = !bayer && depth >= 16 && floatingFlag != 0;
       }
+    }
+    if (depth == 32 && (!floatingPoint || colorspace != 1)) {
+      throw UnsupportedError('FFV1 32-bit sample format');
     }
     return _Ffv1Configuration(
       version,
       microVersion,
       depth,
-      colorspace == 1,
+      floatingPoint,
+      colorspace,
       chroma,
       alpha,
       shiftX,
