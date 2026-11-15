@@ -235,6 +235,7 @@ final class IsoMedia {
   }
 
   String videoCodec(MediaBox entry) => switch (entry.type) {
+    'FFV1' || 'ffv1' => 'ffv1',
     'avc1' || 'avc2' || 'avc3' || 'avc4' || 'dva1' || 'dvav' => 'h264',
     'hvc1' || 'hev1' || 'dvhe' || 'dvh1' => 'hevc',
     'vvc1' || 'vvi1' => 'vvc',

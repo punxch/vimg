@@ -32,7 +32,7 @@ typedef _Track = ({
   MsRleFormat? rle,
   MsVideo1Format? video1,
   _Chunk? huffFormat,
-  _Chunk? nalFormat,
+  _Chunk? privateFormat,
   List<int>? palette,
 });
 
@@ -190,7 +190,9 @@ final class Avi {
         rle: rle,
         video1: video1,
         huffFormat: isHuffYuvCodec(codec) ? format : null,
-        nalFormat: codec == 'h264' || codec == 'hevc' ? format : null,
+        privateFormat: const {'h264', 'hevc', 'ffv1'}.contains(codec)
+            ? format
+            : null,
         palette:
             rle != null ||
                 video1?.indexed == true ||
@@ -215,8 +217,8 @@ final class Avi {
   MsRleFormat? get rleFormat => _header.tracks.firstOrNull?.rle;
   MsVideo1Format? get video1Format => _header.tracks.firstOrNull?.video1;
 
-  Uint8List? nalPrivateData() {
-    final format = _header.tracks.firstOrNull?.nalFormat;
+  Uint8List? videoPrivateData() {
+    final format = _header.tracks.firstOrNull?.privateFormat;
     if (format == null) return null;
     var length = format.end - format.data;
     if (length <= 40) return null;

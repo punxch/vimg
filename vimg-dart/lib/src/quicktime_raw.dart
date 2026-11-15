@@ -56,19 +56,12 @@ final class QuickTimeRawFormat {
   }
 
   static (int, bool) _color(IsoMedia media, MediaBox entry) {
-    final color = media.visualExtension(entry, 'colr');
-    if (color != null && color.end - color.data >= 4) {
-      final type = media.tag(color.data);
-      if (type == 'nclc' || type == 'nclx') {
-        media.requireBytes(color, type == 'nclx' ? 11 : 10);
-        final matrix = media.file.unsigned(color.data + 8, 2);
-        final full =
-            type == 'nclx' &&
-            media.file.unsigned(color.data + 10, 1) & 128 != 0;
-        return (matrix == 0 ? 2 : matrix, full || entry.type == 'yuv2');
-      }
-    }
-    return (2, entry.type == 'yuv2');
+    final color = media.visualColor(entry);
+    final matrix = color?.matrix ?? 2;
+    return (
+      matrix == 0 ? 2 : matrix,
+      color?.fullRange == true || entry.type == 'yuv2',
+    );
   }
 
   static int _splitFields(IsoMedia media, MediaBox entry) {

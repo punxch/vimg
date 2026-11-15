@@ -21,16 +21,35 @@ RawVideoFormat? matroskaRawVideoConfiguration(Matroska media) {
       (!vfw && box.end - box.data != 4)) {
     throw const FormatException('Missing or invalid Matroska raw video FourCC');
   }
-  final colorBox = video[0x55b0];
-  final color = colorBox == null ? null : media.fields(colorBox);
-  final matrix = media.number(color?[0x55b1]);
-  final range = media.number(color?[0x55b9]);
+  final color = _matroskaColor(media, video);
   return RawVideoFormat(
     String.fromCharCodes(media.file.read(box.data + offset, 4)),
     width,
     height,
-    matrix: matrix,
-    fullRange: switch (range) {
+    matrix: color.matrix,
+    fullRange: color.fullRange,
+  );
+}
+
+({int? matrix, bool? fullRange})? matroskaVideoColor(
+  Matroska media,
+  String codec,
+) {
+  final track = _firstVideoTrack(media, codec);
+  return track == null
+      ? null
+      : _matroskaColor(media, media.fields(track[0xe0]!));
+}
+
+({int? matrix, bool? fullRange}) _matroskaColor(
+  Matroska media,
+  Map<int, EbmlElement> video,
+) {
+  final colorBox = video[0x55b0];
+  final color = colorBox == null ? null : media.fields(colorBox);
+  return (
+    matrix: media.number(color?[0x55b1]),
+    fullRange: switch (media.number(color?[0x55b9])) {
       1 => false,
       2 => true,
       _ => null,
@@ -102,6 +121,7 @@ Uint8List? isoVideoConfiguration(
   final boxType = switch (codec) {
     'hevc' => 'hvcC',
     'av1' => 'av1C',
+    'ffv1' => 'glbl',
     _ => 'avcC',
   };
   final entry =
@@ -123,5 +143,6 @@ Uint8List? isoVideoConfiguration(
 int _minimumSize(String codec) => switch (codec) {
   'hevc' => 23,
   'av1' => 4,
+  'ffv1' => 6,
   _ => 7,
 };

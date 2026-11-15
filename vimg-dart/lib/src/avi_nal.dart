@@ -34,7 +34,7 @@ final class AviNal {
 
   final Avi avi;
   final String codec;
-  late final Uint8List _private = avi.nalPrivateData() ?? Uint8List(0);
+  late final Uint8List _private = avi.videoPrivateData() ?? Uint8List(0);
   late final Uint8List? record = _private.firstOrNull == 1 ? _private : null;
   late final List<AviNalFrame> frames = _index();
 

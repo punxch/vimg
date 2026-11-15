@@ -15,6 +15,20 @@ extension IsoVisualDescription on IsoMedia {
     return null;
   }
 
+  ({int matrix, bool? fullRange})? visualColor(MediaBox entry) {
+    final color = visualExtension(entry, 'colr');
+    if (color == null || color.end - color.data < 4) return null;
+    final type = tag(color.data);
+    if (type != 'nclc' && type != 'nclx') return null;
+    requireBytes(color, type == 'nclx' ? 11 : 10);
+    return (
+      matrix: file.unsigned(color.data + 8, 2),
+      fullRange: type == 'nclx'
+          ? file.unsigned(color.data + 10, 1) & 128 != 0
+          : null,
+    );
+  }
+
   double? visualSampleAspect(MediaBox entry) {
     final aspect = visualExtension(entry, 'pasp');
     if (aspect == null) return null;

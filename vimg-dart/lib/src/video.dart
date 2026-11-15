@@ -13,6 +13,7 @@ import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
 import 'capture_timeline.dart';
 import 'cinepak.dart';
+import 'ffv1.dart';
 import 'frame_packet.dart';
 import 'grid.dart' show resizeToFit;
 import 'huffyuv.dart' show isHuffYuvCodec;
@@ -156,7 +157,7 @@ final class Video {
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
-  late final _deltaTimeline = _indexDeltaPictures(codec);
+  late final _statefulTimeline = _indexStatefulPictures(codec);
   late final _huffYuv =
       _avi?.huffYuvDecoder() ??
       (_matroska == null
@@ -173,7 +174,7 @@ final class Video {
       for (final packet in section.visible) packet: section,
   };
   final _quickTimeFormats = <MediaBox, QuickTimeRawFormat>{};
-  final _quickTimeDescriptions = <FramePacket, MediaBox>{};
+  final _isoDescriptionsByPacket = <FramePacket, MediaBox>{};
   final _isoAspects = <FramePacket, double>{};
   final _descriptionAspects = <MediaBox, double?>{};
   late final _isoDescriptions = _readIsoDescriptions();
@@ -187,7 +188,7 @@ final class Video {
     final iso = _iso;
     if (iso == null || !isQuickTimeRawCodec(name)) return null;
     final description =
-        _quickTimeDescriptions[packet] ??
+        _isoDescriptionsByPacket[packet] ??
         _isoSectionByPacket[packet]?.description;
     if (description == null)
       throw const FormatException('Unknown QuickTime video sample');
@@ -232,15 +233,15 @@ final class Video {
 
   _IndexedVideo _indexIsoSection(_IsoSection section) {
     final name = section.codec;
-    if (_isDeltaBitmapCodec(name)) {
-      return _indexDeltaPictures(name, section: section);
+    if (_hasStatefulFrames(name)) {
+      return _indexStatefulPictures(name, section: section);
     }
     if (name == 'av1') return _indexAv1(section: section);
     if (isMpegVideo(name)) return _indexMpeg(section: section);
     return _indexNalVideo(section: section);
   }
 
-  _IndexedVideo _indexDeltaPictures(String name, {_IsoSection? section}) {
+  _IndexedVideo _indexStatefulPictures(String name, {_IsoSection? section}) {
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final gopStart = <int>[];
@@ -258,6 +259,7 @@ final class Video {
 
     final avi = _avi;
     final rle = avi?.rleFormat;
+    MediaBox? ffv1Entry;
     final video1 = name == 'msvideo1'
         ? avi?.video1Format ?? _matroskaVideo1?.format
         : null;
@@ -268,16 +270,31 @@ final class Video {
       return complete || position == 0;
     }
 
+    if (name == 'ffv1') {
+      description =
+          avi?.videoPrivateData() ??
+          (_matroska == null
+              ? null
+              : matroskaVideoConfiguration(_matroska!, name));
+    }
     if (avi?.cinepakDescription case final entry?) {
       description = entry;
       setCinepakDescription(entry);
     }
     final presentation =
         _containerPackets(
-            false,
-            section: section,
-            onDescription: (entry) {
-              _iso!.requireBytes(entry, 78);
+          false,
+          section: section,
+          onDescription: (entry) {
+            _iso!.requireBytes(entry, 78);
+            if (name == 'ffv1') {
+              ffv1Entry = entry;
+              description = isoVideoConfiguration(
+                _iso!,
+                name,
+                description: entry,
+              );
+            } else {
               if (entry.end - entry.data > 1024 * 1024) {
                 throw const FormatException(
                   'Oversized QuickTime video description',
@@ -292,37 +309,47 @@ final class Video {
               } else if (name == 'cinepak') {
                 setCinepakDescription(bytes);
               }
-              start = -1;
-              sectionStart = decodeOrder.length;
-            },
-            onSample: (packet, sync) {
-              final position = decodeOrder.length;
-              final anchor =
-                  smc?.anchor(_read(packet), position) ??
-                  cinepak?.anchor(_read(packet), position);
-              final keyframe = anchor != null
-                  ? anchor == position
-                  : name == 'rpza'
-                  ? isRpzaKeyframe(_read(packet), rpzaBlocks)
-                  : rle != null
-                  ? isRleKeyframe(packet, position)
-                  : video1 != null
-                  ? video1.isComplete(_read(packet)) || position == 0
-                  : sync;
-              if (keyframe) {
-                start = position;
-                configurations[start] = (bytes: description, nal: null);
-                sections[start] = sectionStart;
+            }
+            start = -1;
+            sectionStart = decodeOrder.length;
+          },
+          onSample: (packet, sync) {
+            final position = decodeOrder.length;
+            final anchor =
+                smc?.anchor(_read(packet), position) ??
+                cinepak?.anchor(_read(packet), position);
+            final keyframe = anchor != null
+                ? anchor == position
+                : name == 'ffv1'
+                ? isFfv1Keyframe(
+                    file.read(packet.offset, packet.size < 2 ? packet.size : 2),
+                  )
+                : name == 'rpza'
+                ? isRpzaKeyframe(_read(packet), rpzaBlocks)
+                : rle != null
+                ? isRleKeyframe(packet, position)
+                : video1 != null
+                ? video1.isComplete(_read(packet)) || position == 0
+                : sync;
+            if (keyframe) {
+              start = position;
+              if (ffv1Entry case final entry?) {
+                _isoDescriptionsByPacket[packet] = entry;
               }
-              index[packet] = position;
-              decodeOrder.add(packet);
-              gopStart.add(anchor ?? start);
-            },
-          ).where((packet) => gopStart[index[packet]!] >= 0).toList()
-          ..sort((a, b) {
-            final byTime = a.seconds.compareTo(b.seconds);
-            return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
-          });
+              configurations[start] = (bytes: description, nal: null);
+              sections[start] = sectionStart;
+            }
+            index[packet] = position;
+            decodeOrder.add(packet);
+            gopStart.add(anchor ?? start);
+          },
+        ).where((packet) => gopStart[index[packet]!] >= 0).toList()..sort((
+          a,
+          b,
+        ) {
+          final byTime = a.seconds.compareTo(b.seconds);
+          return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+        });
     return (
       timeline: (
         decodeOrder: decodeOrder,
@@ -398,8 +425,8 @@ final class Video {
           ? _orderedIfNeeded(_av1PreviewPackets())
           : _av1Timeline.timeline.presentation;
     }
-    if (_isDeltaBitmapCodec(codec)) {
-      final indexed = _deltaTimeline;
+    if (_hasStatefulFrames(codec)) {
+      final indexed = _statefulTimeline;
       return indexed.timeline.presentation.where(
         (packet) =>
             !preview ||
@@ -430,7 +457,7 @@ final class Video {
       false,
       onDescription: (entry) => description = entry,
     )) {
-      _quickTimeDescriptions[packet] = description;
+      _isoDescriptionsByPacket[packet] = description;
       yield packet;
     }
   }
@@ -961,7 +988,7 @@ final class Video {
     final indexed = switch (name) {
       'av1' => _av1Timeline,
       'h264' || 'hevc' => _nalTimeline,
-      _ when _isDeltaBitmapCodec(name) => _deltaTimeline,
+      _ when _hasStatefulFrames(name) => _statefulTimeline,
       _ when isMpegVideo(name) => _mpegTimeline,
       _ => null,
     };
@@ -1179,6 +1206,30 @@ final class Video {
   ) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'ffv1':
+        final stream = metadata.streams.firstWhere(
+          (stream) => !stream.attached,
+        );
+        final entry = _isoDescriptionsByPacket[run.packets.first];
+        final decoder = Ffv1Decoder(
+          entry == null ? stream.width : file.unsigned(entry.data + 24, 2),
+          entry == null ? stream.height : file.unsigned(entry.data + 26, 2),
+          configuration.bytes,
+        );
+        final color = entry != null
+            ? _iso!.visualColor(entry)
+            : _matroska == null
+            ? null
+            : matroskaVideoColor(_matroska!, 'ffv1');
+        return (packet, selected, _) {
+          final picture = decoder.decode(_read(packet));
+          if (!selected) return null;
+          return ({scaler}) => picture.rgb(
+            scaler: scaler,
+            matrix: color?.matrix,
+            fullRange: color?.fullRange,
+          );
+        };
       case 'msvideo1':
         final decoder = MsVideo1Decoder(
           _avi?.video1Format ?? _matroskaVideo1!.format,
@@ -1339,7 +1390,7 @@ final class Video {
       final frame = decodeSelected([packet]).single.frame;
       return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
-    if (_isDeltaBitmapCodec(codec)) {
+    if (_hasStatefulFrames(codec)) {
       final frame = decodeSelected([packet]).single.frame;
       return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
@@ -1499,10 +1550,11 @@ bool _usesReferences(String codec) =>
     codec == 'h264' ||
     codec == 'hevc' ||
     codec == 'av1' ||
-    _isDeltaBitmapCodec(codec) ||
+    _hasStatefulFrames(codec) ||
     isMpegVideo(codec);
 
-bool _isDeltaBitmapCodec(String codec) =>
+bool _hasStatefulFrames(String codec) =>
+    codec == 'ffv1' ||
     codec == 'qtrle' ||
     codec == 'rpza' ||
     codec == 'smc' ||

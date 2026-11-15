@@ -88,6 +88,10 @@ scaling and filters, including up to 16 bits per component in FFVHUFF.
 BMP extraction preserves alpha from streams that carry it.
 HuffYUV MT (`HYMT`) in AVI and Matroska can reconstruct frames from
 horizontal slices, restarting prediction at each slice boundary.
+FFV1 version 3 in Matroska, AVI and MP4/MOV supports Golomb–Rice and range
+coding, multiple slices with CRC checking, 8–16-bit YCbCr and grayscale,
+and reversible RGB with optional alpha. Random access rebuilds entropy
+contexts from the preceding FFV1 keyframe.
 Matroska and MP4/MOV support 8–14-bit H.264 I/P/B pictures
 with CABAC or CAVLC in monochrome, 4:2:0, 4:2:2 and 4:4:4. This includes
 lossless streams that use transform bypass and 4:4:4 RGB streams signaled
