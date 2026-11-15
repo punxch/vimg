@@ -4,6 +4,7 @@ import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'metadata.dart';
 import 'vp8/decoder.dart' show vp8FrameTag;
+import 'vp9/bitstream.dart';
 
 typedef _IvfFrame = ({
   int offset,
@@ -121,6 +122,13 @@ final class Ivf {
             (size < 10 || file.unsigned(offset + 3, 3) != 0x9d012a)) {
           throw const FormatException('Invalid VP8 keyframe header');
         }
+      } else if (codec == 'vp9') {
+        final tag = vp9PacketTag(
+          size,
+          (start, length) => file.read(offset + start, length),
+        );
+        shown = tag.shown;
+        keyframe = tag.key;
       }
       if (frames.isNotEmpty && pts < frames.last.pts) outOfOrder = true;
       frames.add((

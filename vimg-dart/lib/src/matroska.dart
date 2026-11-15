@@ -385,6 +385,7 @@ final class Matroska {
         'HEVC' || 'H265' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' => 'mpeg4',
         'VP80' || 'VP08' => 'vp8',
+        'VP90' || 'VP09' => 'vp9',
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
         'FFVH' => 'ffvhuff',
