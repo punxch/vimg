@@ -128,6 +128,7 @@ final class Avi {
         'H264' || 'X264' || 'AVC1' || 'AVC3' => 'h264',
         'HEVC' || 'H265' || 'HVC1' || 'HEV1' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' || 'FMP4' => 'mpeg4',
+        'VP80' || 'VP08' => 'vp8',
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
         'FFVH' => 'ffvhuff',

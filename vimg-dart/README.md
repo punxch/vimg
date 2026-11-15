@@ -173,9 +173,11 @@ projection roll or mirror before user filters and tile sizing.
 
 `preview`, `extract` and `vcs` decode AV1 from Matroska, MP4 and IVF. IVF
 uses packet timestamps to derive playback duration and retains coded order
-for reference pictures. IVF also supports VP8 keyframe previews, extraction
-from all-intra VP8 streams and VP9 metadata probing. The
-AVIF animation reader handles intra and inter pictures, including hidden
+for reference pictures. VP8 supports keyframe previews and extraction
+from interframes in IVF, WebM/Matroska and AVI, as well as MOV/MP4 tracks
+with a `vp08` sample entry. Capture decodes the
+hidden reference frames in coded order. IVF can also probe VP9 metadata.
+The AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
 intra block copy for screen content.

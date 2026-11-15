@@ -152,10 +152,13 @@ File _checkVp8(Directory temp) {
       image.decodeWebP(webp.first)!.getBytes(order: image.ChannelOrder.rgb),
     );
     try {
-      predicted.packets().toList();
-      throw StateError('Exposed inter-coded VP8 capture');
-    } on UnsupportedError {
-      // Inter pictures require a reference decoder.
+      predicted.decode(predicted.packets().last);
+      throw StateError('Accepted a VP8 interframe with no header partition');
+    } on FormatException catch (error) {
+      check(
+        error.message.contains('header partition'),
+        'VP8 malformed interframe',
+      );
     }
   } finally {
     predicted.close();

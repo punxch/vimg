@@ -39,6 +39,7 @@ import 'quicktime_raw.dart';
 import 'quicktime_rpza.dart';
 import 'quicktime_smc.dart';
 import 'video_configuration.dart';
+import 'vp8/decoder.dart';
 import 'yuv_image.dart';
 
 part 'video_workers.dart';
@@ -244,6 +245,7 @@ final class Video {
   _IndexedVideo _indexStatefulPictures(String name, {_IsoSection? section}) {
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
+    final hidden = <FramePacket>{};
     final gopStart = <int>[];
     final configurations = <int, _RunConfiguration>{};
     final sections = <int, int>{};
@@ -283,73 +285,92 @@ final class Video {
     }
     final presentation =
         _containerPackets(
-          false,
-          section: section,
-          onDescription: (entry) {
-            _iso!.requireBytes(entry, 78);
-            if (name == 'ffv1') {
-              ffv1Entry = entry;
-              description = isoVideoConfiguration(
-                _iso!,
-                name,
-                description: entry,
-              );
-            } else {
-              if (entry.end - entry.data > 1024 * 1024) {
-                throw const FormatException(
-                  'Oversized QuickTime video description',
-                );
-              }
-              final bytes = file.read(entry.data, entry.end - entry.data);
-              description = bytes;
-              if (name == 'rpza') {
-                rpzaBlocks = QuickTimeRpzaDecoder(bytes).blockCount;
-              } else if (name == 'smc') {
-                smc = SmcPictureOrder(QuickTimeSmcDecoder(bytes).blockCount);
-              } else if (name == 'cinepak') {
-                setCinepakDescription(bytes);
-              }
-            }
-            start = -1;
-            sectionStart = decodeOrder.length;
-          },
-          onSample: (packet, sync) {
-            final position = decodeOrder.length;
-            final anchor =
-                smc?.anchor(_read(packet), position) ??
-                cinepak?.anchor(_read(packet), position);
-            final keyframe = anchor != null
-                ? anchor == position
-                : name == 'ffv1'
-                ? isFfv1Keyframe(
-                    file.read(packet.offset, packet.size < 2 ? packet.size : 2),
-                  )
-                : name == 'rpza'
-                ? isRpzaKeyframe(_read(packet), rpzaBlocks)
-                : rle != null
-                ? isRleKeyframe(packet, position)
-                : video1 != null
-                ? video1.isComplete(_read(packet)) || position == 0
-                : sync;
-            if (keyframe) {
-              start = position;
-              if (ffv1Entry case final entry?) {
-                _isoDescriptionsByPacket[packet] = entry;
-              }
-              configurations[start] = (bytes: description, nal: null);
-              sections[start] = sectionStart;
-            }
-            index[packet] = position;
-            decodeOrder.add(packet);
-            gopStart.add(anchor ?? start);
-          },
-        ).where((packet) => gopStart[index[packet]!] >= 0).toList()..sort((
-          a,
-          b,
-        ) {
-          final byTime = a.seconds.compareTo(b.seconds);
-          return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
-        });
+              false,
+              section: section,
+              onDescription: (entry) {
+                _iso!.requireBytes(entry, 78);
+                if (name == 'ffv1') {
+                  ffv1Entry = entry;
+                  description = isoVideoConfiguration(
+                    _iso!,
+                    name,
+                    description: entry,
+                  );
+                } else if (name != 'vp8') {
+                  if (entry.end - entry.data > 1024 * 1024) {
+                    throw const FormatException(
+                      'Oversized QuickTime video description',
+                    );
+                  }
+                  final bytes = file.read(entry.data, entry.end - entry.data);
+                  description = bytes;
+                  if (name == 'rpza') {
+                    rpzaBlocks = QuickTimeRpzaDecoder(bytes).blockCount;
+                  } else if (name == 'smc') {
+                    smc = SmcPictureOrder(
+                      QuickTimeSmcDecoder(bytes).blockCount,
+                    );
+                  } else if (name == 'cinepak') {
+                    setCinepakDescription(bytes);
+                  }
+                }
+                start = -1;
+                sectionStart = decodeOrder.length;
+              },
+              onSample: (packet, sync) {
+                final position = decodeOrder.length;
+                final vp8 = name == 'vp8'
+                    ? vp8FrameTag(
+                        file.read(
+                          packet.offset,
+                          packet.size < 3 ? packet.size : 3,
+                        ),
+                      )
+                    : null;
+                if (vp8?.shown == false) hidden.add(packet);
+                final anchor =
+                    smc?.anchor(_read(packet), position) ??
+                    cinepak?.anchor(_read(packet), position);
+                final keyframe =
+                    vp8?.key ??
+                    (anchor != null
+                        ? anchor == position
+                        : name == 'ffv1'
+                        ? isFfv1Keyframe(
+                            file.read(
+                              packet.offset,
+                              packet.size < 2 ? packet.size : 2,
+                            ),
+                          )
+                        : name == 'rpza'
+                        ? isRpzaKeyframe(_read(packet), rpzaBlocks)
+                        : rle != null
+                        ? isRleKeyframe(packet, position)
+                        : video1 != null
+                        ? video1.isComplete(_read(packet)) || position == 0
+                        : sync);
+                if (keyframe) {
+                  start = position;
+                  if (ffv1Entry case final entry?) {
+                    _isoDescriptionsByPacket[packet] = entry;
+                  }
+                  configurations[start] = (bytes: description, nal: null);
+                  sections[start] = sectionStart;
+                }
+                index[packet] = position;
+                decodeOrder.add(packet);
+                gopStart.add(anchor ?? start);
+              },
+            )
+            .where(
+              (packet) =>
+                  !hidden.contains(packet) && gopStart[index[packet]!] >= 0,
+            )
+            .toList()
+          ..sort((a, b) {
+            final byTime = a.seconds.compareTo(b.seconds);
+            return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
+          });
     return (
       timeline: (
         decodeOrder: decodeOrder,
@@ -433,14 +454,13 @@ final class Video {
             indexed.configurations.containsKey(indexed.timeline.index[packet]),
       );
     }
-    final keyframes = preview && codec == 'vp8';
     final avi = _avi;
-    _checkIndependentCodec(codec, preview: preview);
+    _checkIndependentCodec(codec);
     if (avi != null) return avi.packets();
     return _orderedIfNeeded(
       _iso != null && isQuickTimeRawCodec(codec)
           ? _quickTimePackets()
-          : _containerPackets(keyframes),
+          : _containerPackets(false),
     );
   }
 
@@ -479,8 +499,8 @@ final class Video {
           }),
         );
       } else {
-        _checkIndependentCodec(name, preview: preview);
-        packets.addAll(section.packets(keyframes: preview && name == 'vp8'));
+        _checkIndependentCodec(name);
+        packets.addAll(section.packets());
       }
     }
     // A fragment or chunk can begin in decode order before the preceding
@@ -497,13 +517,12 @@ final class Video {
     return ordered.map((entry) => entry.$2);
   }
 
-  void _checkIndependentCodec(String name, {bool preview = false}) {
+  void _checkIndependentCodec(String name) {
     if (name == 'mjpeg' ||
         name == 'png' ||
         name == 'prores' ||
         isHuffYuvCodec(name) ||
         (_iso != null && isQuickTimeRawCodec(name)) ||
-        (name == 'vp8' && (preview || _ivf?.supportsVp8Capture == true)) ||
         (name == 'rawvideo' &&
             (_avi?.supportsBitmap == true || _rawVideoFormat != null))) {
       return;
@@ -1206,6 +1225,25 @@ final class Video {
   ) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'vp8':
+        final decoder = Vp8Decoder();
+        final independent = run.packets.length == 1;
+        return (packet, selected, _) {
+          final bytes = _read(packet);
+          if (independent && selected) {
+            // Keep the existing unscaled WebP color conversion for a keyframe.
+            Vp8Picture? picture;
+            return ({scaler}) {
+              if (scaler == null && vp8FrameTag(bytes).key) {
+                final frame = _vp8Keyframe(bytes);
+                if (frame != null) return _rgb(frame);
+              }
+              return (picture ??= decoder.decode(bytes)).rgb(scaler: scaler);
+            };
+          }
+          final picture = decoder.decode(bytes);
+          return selected ? picture.rgb : null;
+        };
       case 'ffv1':
         final stream = metadata.streams.firstWhere(
           (stream) => !stream.attached,
@@ -1454,7 +1492,6 @@ final class Video {
     final frame = switch (name) {
       'mjpeg' => image.decodeJpg(bytes),
       'png' => image.decodePng(bytes),
-      'vp8' => _vp8Keyframe(bytes),
       'rawvideo' => _avi?.decodeBitmap(
         bytes,
         palette: palette ?? _avi?.paletteFor(packet),
@@ -1485,7 +1522,12 @@ final class Video {
     header.setUint32(4, riff.length - 8, Endian.little);
     header.setUint32(16, bytes.length, Endian.little);
     riff.setRange(20, 20 + bytes.length, bytes);
-    return image.decodeWebP(riff);
+    try {
+      return image.decodeWebP(riff);
+    } on image.ImageException {
+      // Some video keyframes use VP8 features outside the WebP subset.
+      return null;
+    }
   }
 }
 
@@ -1554,6 +1596,7 @@ bool _usesReferences(String codec) =>
     isMpegVideo(codec);
 
 bool _hasStatefulFrames(String codec) =>
+    codec == 'vp8' ||
     codec == 'ffv1' ||
     codec == 'qtrle' ||
     codec == 'rpza' ||

@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'metadata.dart';
+import 'vp8/decoder.dart' show vp8FrameTag;
 
 typedef _IvfFrame = ({
   int offset,
@@ -53,10 +54,6 @@ final class Ivf {
 
   bool get outOfOrder => _index.outOfOrder;
 
-  late final bool supportsVp8Capture =
-      codec == 'vp8' &&
-      _index.frames.every((frame) => !frame.shown || frame.keyframe);
-
   VideoMetadata metadata() {
     final timing = _timing;
     return VideoMetadata(
@@ -85,7 +82,6 @@ final class Ivf {
     if (timing == null) return;
     final (:start, :durations, :step, end: _) = timing;
     for (final frame in _index.frames) {
-      if (!frame.shown) continue;
       final packet = (
         seconds: (frame.pts - start) * _num.toDouble() / _den,
         offset: frame.offset,
@@ -98,7 +94,7 @@ final class Ivf {
         ),
       );
       onSample?.call(packet, frame.keyframe);
-      if (!keyframes || frame.keyframe) yield packet;
+      if (frame.shown && (!keyframes || frame.keyframe)) yield packet;
     }
   }
 
@@ -118,10 +114,9 @@ final class Ivf {
       }
       var shown = true, keyframe = false;
       if (codec == 'vp8') {
-        if (size < 3) throw const FormatException('Truncated VP8 frame tag');
-        final tag = file.unsigned(offset, 1);
-        shown = tag & 0x10 != 0;
-        keyframe = tag & 1 == 0;
+        final tag = vp8FrameTag(file.read(offset, size < 3 ? size : 3));
+        shown = tag.shown;
+        keyframe = tag.key;
         if (keyframe &&
             (size < 10 || file.unsigned(offset + 3, 3) != 0x9d012a)) {
           throw const FormatException('Invalid VP8 keyframe header');

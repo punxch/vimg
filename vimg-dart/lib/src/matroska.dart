@@ -312,6 +312,7 @@ final class Matroska {
         'H264' || 'X264' || 'AVC1' => 'h264',
         'HEVC' || 'H265' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' => 'mpeg4',
+        'VP80' || 'VP08' => 'vp8',
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
         'FFVH' => 'ffvhuff',
