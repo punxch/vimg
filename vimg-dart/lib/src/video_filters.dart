@@ -419,6 +419,7 @@ final class _Transpose implements _SpatialFilter {
       frame.subX,
       matrix: frame.matrix,
       fullRange: frame.fullRange,
+      packedRgb: frame.packedRgb,
       sampleAspect: 1 / frame.sampleAspect,
       alpha: frame.alpha?.orient(
         transpose: true,
@@ -486,9 +487,10 @@ final class _Scale extends _FrameSpatialFilter {
       ['w', 'h', 'flags', 'eval'],
       {'width': 'w', 'height': 'h'},
     );
-    final nearest = switch (options['flags']) {
-      null || 'bicubic' => false,
-      'neighbor' => true,
+    final (nearest, fullChromaInput) = switch (options['flags']) {
+      null || 'bicubic' => (false, false),
+      'neighbor' => (true, false),
+      'neighbor+full_chroma_inp' || 'full_chroma_inp+neighbor' => (true, true),
       _ => throw const FormatException(
         'Supported scale flags are bicubic and neighbor',
       ),
@@ -516,12 +518,18 @@ final class _Scale extends _FrameSpatialFilter {
       variables,
       onVariable: reference,
     );
-    return _Scale._(width, height, nearest, dynamicSize);
+    return _Scale._(width, height, nearest, fullChromaInput, dynamicSize);
   }
 
-  _Scale._(this.width, this.height, this.nearest, this.usesFramePosition);
+  _Scale._(
+    this.width,
+    this.height,
+    this.nearest,
+    this.fullChromaInput,
+    this.usesFramePosition,
+  );
   final FilterExpression width, height;
-  final bool nearest;
+  final bool nearest, fullChromaInput;
   @override
   final bool usesFramePosition;
   final _scalers = <(int, int, int, int), _PlaneScaler>{};
@@ -529,9 +537,29 @@ final class _Scale extends _FrameSpatialFilter {
   @override
   _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) {
     final (w, h) = dimensions(frame, position);
-    return frame.map(
-      (plane, sx, sy) => _resize(plane, _subSize(w, sx), _subSize(h, sy)),
-      sampleAspect: frame.sampleAspect * frame.width * h / (frame.height * w),
+    return resize(frame, w, h);
+  }
+
+  bool _subsamplesRgb(_VideoPlanes frame, int width) =>
+      nearest &&
+      !fullChromaInput &&
+      frame.packedRgb &&
+      frame.width.isEven &&
+      width <= frame.width ~/ 2;
+
+  _VideoPlanes resize(_VideoPlanes frame, int width, int height) {
+    if (_subsamplesRgb(frame, width)) {
+      return _pointScalePackedRgb(frame, width, height);
+    }
+    return frame.mapComponents(
+      (plane, sx, sy, component) => _resize(
+        plane,
+        _subSize(width, sx),
+        _subSize(height, sy),
+        packedAlpha: frame.packedRgb && component == 3,
+      ),
+      sampleAspect:
+          frame.sampleAspect * frame.width * height / (frame.height * width),
     );
   }
 
@@ -563,7 +591,12 @@ final class _Scale extends _FrameSpatialFilter {
     return (w, h);
   }
 
-  _FilterPlane _resize(_FilterPlane source, int width, int height) {
+  _FilterPlane _resize(
+    _FilterPlane source,
+    int width,
+    int height, {
+    required bool packedAlpha,
+  }) {
     if (source.width == width && source.height == height) return source;
     if (nearest) {
       final samples = Int32List(width * height);
@@ -574,10 +607,8 @@ final class _Scale extends _FrameSpatialFilter {
         final row = _nearestIndex(y, dy, source.height);
         for (var x = 0; x < width; x++) {
           final column = _nearestIndex(x, dx, source.width);
-          samples[i++] =
-              source.samples[source.offset +
-                  row * source.rowStep +
-                  column * source.columnStep];
+          final sample = source.at(column, row);
+          samples[i++] = packedAlpha ? _packedPointAlpha(sample) : sample;
         }
       }
       return _FilterPlane(samples, width, height, source.depth, rowStep: width);
@@ -620,6 +651,7 @@ final class _VideoPlanes {
     this.subY, {
     required this.matrix,
     required this.fullRange,
+    this.packedRgb = false,
     this.sampleAspect = 1,
     this.alpha,
   });
@@ -628,6 +660,7 @@ final class _VideoPlanes {
   final _FilterPlane? alpha;
   final int matrix;
   final bool fullRange;
+  final bool packedRgb;
   final double sampleAspect;
 
   int get width => planes.first.width;
@@ -667,6 +700,7 @@ final class _VideoPlanes {
     subY,
     matrix: matrix,
     fullRange: fullRange,
+    packedRgb: packedRgb,
     sampleAspect: sampleAspect ?? this.sampleAspect,
     alpha: alpha == null ? null : transform(alpha!, 0, 0, 3),
   );
@@ -688,6 +722,8 @@ final class _FilterPlane {
 
   final List<int> samples;
   final int width, height, depth, rowStep, columnStep, offset;
+
+  int at(int x, int y) => samples[offset + y * rowStep + x * columnStep];
 
   _FilterPlane window(int x, int y, int width, int height) => _FilterPlane(
     samples,

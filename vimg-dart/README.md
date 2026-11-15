@@ -187,6 +187,10 @@ accept static dimension expressions with arithmetic and functions such as
 `flags=neighbor`. Crop aligns to chroma samples by default and accepts
 `exact=1` for odd coordinates and dimensions.
 
+For packed RGB, `flags=neighbor` follows FFmpeg's chroma sampling when
+reducing an even width by at least half. Use `flags=neighbor+full_chroma_inp`
+to sample the RGB channels at the same coordinates.
+
 Crop coordinates accept frame number `n` and timestamp `t` in seconds.
 Scale accepts these variables in its dimensions with `eval=frame`.
 As in FFmpeg 8, the first frame has `n=0` in crop and `n=1` in scale.

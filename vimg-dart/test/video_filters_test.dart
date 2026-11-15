@@ -50,6 +50,62 @@ void _checkRgb() {
   for (final p in scaled) {
     check(p.r == 41 && p.g == 129 && p.b == 221, 'Bicubic preserves constants');
   }
+
+  final rgba = image.Image(width: 8, height: 6, numChannels: 4);
+  for (final p in rgba) {
+    p.setRgba(
+      p.x * 17,
+      p.y * 32,
+      p.x * 5 + p.y * 7,
+      (p.x * 53 + p.y * 27) & 255,
+    );
+  }
+  // FFmpeg 8.1.2 output in RGBA order for a 3×4 point resize.
+  const subsampled = [
+    (11, 3, 5, 53),
+    (51, 8, 21, 213),
+    (108, 0, 30, 62),
+    (11, 67, 19, 107),
+    (51, 72, 35, 10),
+    (108, 61, 44, 116),
+    (11, 99, 26, 135),
+    (51, 104, 42, 37),
+    (108, 93, 51, 144),
+    (11, 163, 40, 189),
+    (51, 168, 56, 91),
+    (108, 157, 65, 198),
+  ];
+  const fullChroma = [
+    (17, 0, 5, 53),
+    (68, 0, 20, 213),
+    (102, 0, 30, 62),
+    (17, 64, 19, 107),
+    (68, 64, 34, 10),
+    (102, 64, 44, 116),
+    (17, 96, 26, 135),
+    (68, 96, 41, 37),
+    (102, 96, 51, 144),
+    (17, 160, 40, 189),
+    (68, 160, 55, 91),
+    (102, 160, 65, 198),
+  ];
+  for (final (filter, expected, flip) in [
+    ('scale=3:4:flags=neighbor', subsampled, false),
+    ('scale=3:4:flags=neighbor,hflip', subsampled, true),
+    ('scale=3:4:flags=neighbor+full_chroma_inp', fullChroma, false),
+  ]) {
+    final output = YuvImageScaler(
+      filters: VideoFilterChain.parse(filter),
+    ).filterRgb(rgba);
+    check(output.width == 3 && output.height == 4, 'RGBA resize dimensions');
+    for (final p in output) {
+      final i = p.y * output.width + (flip ? 2 - p.x : p.x);
+      check(
+        (p.r, p.g, p.b, p.a) == expected[i],
+        '$filter sample ${p.x},${p.y}',
+      );
+    }
+  }
 }
 
 void _checkYuv() {
@@ -264,15 +320,7 @@ Future<void> _checkCli(String? executable) async {
         frame.width == 18 + 2 * i && frame.height == 12,
         'Dynamic scale size',
       );
-      // FFmpeg 8 showinfo reports Adler-32 over BGR24, initialized at zero.
-      var low = 0, high = 0;
-      for (final pixel in frame) {
-        for (final value in [pixel.b, pixel.g, pixel.r]) {
-          low = (low + value.toInt()) % 65521;
-          high = (high + low) % 65521;
-        }
-      }
-      check((high << 16 | low) == reference[i], 'Dynamic frame $i pixels');
+      check(_bgrChecksum(frame) == reference[i], 'Dynamic frame $i pixels');
     }
     final dynamicKeep = '${temp.path}/dynamic-keep';
     await run([
@@ -299,6 +347,42 @@ Future<void> _checkCli(String? executable) async {
         file.readAsBytesSync(),
         dynamicFrames[i].readAsBytesSync(),
         'Kept dynamic frame $i',
+      );
+    }
+
+    const timedShrink =
+        "fps=8,scale=w=16:h='12+if(isnan(t),0,8*t)':flags=neighbor:eval=frame";
+    const shrinkReference = [
+      0x1740ce40,
+      0xbc05db50,
+      0x4bbbfca0,
+      0x411f107f,
+      0x6756358f,
+      0xf50c488f,
+      0x57ea70af,
+      0x3e3a86ff,
+    ];
+    final shrink = '${temp.path}/shrink';
+    await run([
+      'extract',
+      '-n1',
+      '-f8',
+      '-t1s',
+      '--output-dir',
+      shrink,
+      '--vfilter',
+      timedShrink,
+      motion,
+    ]);
+    final reduced = ordered(shrink);
+    check(reduced.length == 8, 'Downscale capture count');
+    for (final (i, file) in reduced.indexed) {
+      final frame = image.decodeBmp(file.readAsBytesSync())!;
+      check(
+        frame.width == 16 &&
+            frame.height == 12 + i &&
+            _bgrChecksum(frame) == shrinkReference[i],
+        'Downscaled frame $i',
       );
     }
 
@@ -386,4 +470,16 @@ void _sameBytes(Uint8List a, Uint8List b, String label) {
   for (var i = 0; i < a.length; i++) {
     if (a[i] != b[i]) throw StateError('$label differs at byte $i');
   }
+}
+
+// FFmpeg showinfo uses Adler-32 over BGR24, initialized at zero.
+int _bgrChecksum(image.Image frame) {
+  var low = 0, high = 0;
+  for (final pixel in frame) {
+    for (final value in [pixel.b, pixel.g, pixel.r]) {
+      low = (low + value.toInt()) % 65521;
+      high = (high + low) % 65521;
+    }
+  }
+  return high << 16 | low;
 }

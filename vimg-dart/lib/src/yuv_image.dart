@@ -12,6 +12,7 @@ part 'video_filters.dart';
 part 'video_filter_colors.dart';
 part 'video_paint_filters.dart';
 part 'video_timing_filters.dart';
+part 'rgb_point_scale.dart';
 part 'yuv_scaler.dart';
 
 /// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.
@@ -34,6 +35,7 @@ image.Image yuvImage({
   List<int>? alpha,
   int alphaDepth = 8,
   double sampleAspect = 1,
+  bool packedRgb = false,
   YuvImageScaler? scaler,
 }) {
   if (scaler != null && scaler.filters != null) {
@@ -67,6 +69,7 @@ image.Image yuvImage({
       sy,
       matrix: matrix,
       fullRange: fullRange,
+      packedRgb: packedRgb,
       sampleAspect: scaler._sampleAspect ?? sampleAspect,
       alpha: alpha == null
           ? null

@@ -104,6 +104,7 @@ final class YuvImageScaler {
       0,
       matrix: 0,
       fullRange: true,
+      packedRgb: true,
       sampleAspect: _sampleAspect ?? sampleAspect,
       alpha: alpha == null
           ? null
@@ -120,22 +121,27 @@ final class YuvImageScaler {
 
   image.Image _renderFiltered(_VideoPlanes source) {
     final scale = width == null && height == null ? filters!._finalScale : null;
-    final frame = filters!._apply(
-      source,
-      _positions,
-      deferScale: scale != null,
-    );
+    var frame = filters!._apply(source, _positions, deferScale: scale != null);
+    YuvImageScaler? outputScale;
     if (scale != null) {
       // The terminal scale can upsample chroma while converting to RGB.
       final (w, h) = scale.dimensions(
         frame,
         scale.usesFramePosition ? _positions.lastOrNull : null,
       );
-      if (_outputScale?.width != w || _outputScale?.height != h) {
-        _outputScale = YuvImageScaler._fixed(w, h, scale.nearest);
+      if (scale.nearest && frame.packedRgb) {
+        frame = scale.resize(frame, w, h);
+      } else {
+        if (_outputScale?.width != w || _outputScale?.height != h) {
+          _outputScale = YuvImageScaler._fixed(w, h, scale.nearest);
+        }
+        outputScale = _outputScale;
       }
     } else if (width != null || height != null) {
-      _outputScale ??= YuvImageScaler(width: width, height: height);
+      outputScale = _outputScale ??= YuvImageScaler(
+        width: width,
+        height: height,
+      );
     }
     var y = frame.planes.first.atOrigin;
     var cb = frame.planes.length == 3 ? frame.planes[1].atOrigin : null;
@@ -169,7 +175,7 @@ final class YuvImageScaler {
       subsamplingY: frame.subY,
       alpha: alpha?.samples,
       alphaDepth: alpha?.depth ?? 8,
-      scaler: _outputScale,
+      scaler: outputScale,
     );
   }
 

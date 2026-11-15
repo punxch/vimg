@@ -67,6 +67,7 @@ final class _SetAspect implements _SpatialFilter {
       frame.subY,
       matrix: frame.matrix,
       fullRange: frame.fullRange,
+      packedRgb: frame.packedRgb,
       sampleAspect: sar,
       alpha: frame.alpha,
     );
