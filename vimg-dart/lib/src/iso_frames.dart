@@ -76,9 +76,10 @@ Iterable<FramePacket> isoFrames(
         duration: sample.duration,
       ),
     );
-    // A sample trimmed by an edit may still be needed for inter prediction.
+    // Edited and overlapping samples can still be needed for prediction.
     onSample?.call(packet, sample.sync);
-    if ((!keyframes || sample.sync) &&
+    if (!sample.discard &&
+        (!keyframes || sample.sync) &&
         _inEdit(
           edit,
           sample.pts,
@@ -98,6 +99,7 @@ typedef _IsoSample = ({
   int duration,
   int description,
   bool sync,
+  bool discard,
 });
 
 Iterable<_IsoSample> _tableSamples(
@@ -176,6 +178,7 @@ Iterable<_IsoSample> _tableSamples(
         duration: step,
         description: description,
         sync: isSync,
+        discard: false,
       );
       timestamp = _addTime(timestamp, step);
       durationUsed++;

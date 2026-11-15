@@ -381,12 +381,12 @@ final class Video {
     }
     if (codec == 'h264' || codec == 'hevc') {
       return preview
-          ? _nalPackets(preview: true)
+          ? _orderedIfOverlapping(_nalPackets(preview: true))
           : _nalTimeline.timeline.presentation;
     }
     if (codec == 'av1') {
       return preview
-          ? _av1PreviewPackets()
+          ? _orderedIfOverlapping(_av1PreviewPackets())
           : _av1Timeline.timeline.presentation;
     }
     if (_isDeltaBitmapCodec(codec)) {
@@ -401,9 +401,17 @@ final class Video {
     final avi = _avi;
     _checkIndependentCodec(codec, preview: preview);
     if (avi != null) return avi.packets();
-    if (_iso != null && isQuickTimeRawCodec(codec)) return _quickTimePackets();
-    return _containerPackets(keyframes);
+    return _orderedIfOverlapping(
+      _iso != null && isQuickTimeRawCodec(codec)
+          ? _quickTimePackets()
+          : _containerPackets(keyframes),
+    );
   }
+
+  Iterable<FramePacket> _orderedIfOverlapping(Iterable<FramePacket> packets) =>
+      _iso?.hasOverlappingVideoFragments == true
+      ? _presentationOrder(packets)
+      : packets;
 
   Iterable<FramePacket> _quickTimePackets() sync* {
     late MediaBox description;
@@ -419,6 +427,7 @@ final class Video {
   Iterable<FramePacket> _mixedIsoPackets(bool preview) sync* {
     final packets = <FramePacket>[];
     for (final section in _isoSections) {
+      if (section.visible.isEmpty) continue;
       final name = section.codec;
       if (_usesReferences(name)) {
         final indexed = section.indexed ??= _indexIsoSection(section);
@@ -438,12 +447,16 @@ final class Video {
     }
     // A fragment or chunk can begin in decode order before the preceding
     // section's last composition timestamp.
+    yield* _presentationOrder(packets);
+  }
+
+  Iterable<FramePacket> _presentationOrder(Iterable<FramePacket> packets) {
     final ordered = packets.indexed.toList()
       ..sort((a, b) {
         final byTime = a.$2.seconds.compareTo(b.$2.seconds);
         return byTime == 0 ? a.$1.compareTo(b.$1) : byTime;
       });
-    yield* ordered.map((entry) => entry.$2);
+    return ordered.map((entry) => entry.$2);
   }
 
   void _checkIndependentCodec(String name, {bool preview = false}) {

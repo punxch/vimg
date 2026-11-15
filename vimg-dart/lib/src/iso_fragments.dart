@@ -115,17 +115,14 @@ _MovieFragments? _readMovieFragments(IsoMedia media) {
           header.base,
           offset,
           dts,
+          discardThrough: track.lastDts,
         );
         offset = run.offset;
         if (run.count == 0) continue;
         if (header.empty) {
           throw const FormatException('Empty track fragment contains samples');
         }
-        if (run.dts < track.decodeEnd) {
-          throw const FormatException(
-            'Overlapping or out-of-order ISO media fragments',
-          );
-        }
+        track.overlaps |= dts < track.decodeEnd;
         final limit = _mediaDataEnd(data, offset);
         for (final sample in run.samples(media)) {
           if (sample.size <= 0 || sample.offset > limit - sample.size) {
@@ -176,8 +173,11 @@ final class _FragmentTrack {
   final _TrackEdit edit;
   final runs = <_FragmentRun>[];
   int? _firstDecode;
+  int? lastDts;
   int _compositionShift = 0;
+  int _latestDecodeEnd = 0;
   int decodeEnd = 0;
+  bool overlaps = false;
   double? _firstPresentation;
 
   // Align the playback clock with FFmpeg's handling of negative composition
@@ -189,12 +189,19 @@ final class _FragmentTrack {
       _firstPresentation == null ? null : _firstPresentation! + playbackShift;
 
   double get presentationEnd =>
-      edit.end ?? firstPresentation! + (decodeEnd - _firstDecode!) / scale;
+      edit.end ??
+      firstPresentation! + (_latestDecodeEnd - _firstDecode!) / scale;
 
   void observe(_IsoSample sample) {
     _firstDecode ??= sample.dts;
+    lastDts = sample.dts;
     decodeEnd = _addTime(sample.dts, sample.duration);
+    _latestDecodeEnd = math.max(_latestDecodeEnd, decodeEnd);
     _compositionShift = math.max(_compositionShift, sample.dts - sample.pts);
+    if (sample.discard) {
+      overlaps = true;
+      return;
+    }
     final seconds = (sample.pts - (edit.start ?? 0)) / scale + edit.delay;
     if (_inEdit(edit, sample.pts, seconds, fragmented: true)) {
       _firstPresentation = math.min(_firstPresentation ?? seconds, seconds);
@@ -281,8 +288,9 @@ final class _FragmentRun {
     this.defaults,
     int base,
     int previousEnd,
-    this.dts,
-  ) {
+    this.dts, {
+    required this.discardThrough,
+  }) {
     media.requireBytes(box, 8);
     flags = _fullBoxFlags(media, box, maximumVersion: 1);
     signedComposition = media.file.unsigned(box.data, 1) == 1;
@@ -321,6 +329,8 @@ final class _FragmentRun {
 
   final _FragmentDefaults defaults;
   final int dts;
+  // Trim presentation against the preceding run while retaining decode order.
+  final int? discardThrough;
   late final int flags, count, offset, entries, firstFlags;
   late final bool signedComposition;
 
@@ -330,6 +340,7 @@ final class _FragmentRun {
     final hasSize = (flags & _sampleSize) != 0;
     final hasFlags = (flags & _sampleFlags) != 0;
     final hasComposition = (flags & _compositionOffset) != 0;
+    final cutoff = discardThrough;
     int field() {
       final value = media.file.unsigned(entry, 4);
       entry += 4;
@@ -352,6 +363,7 @@ final class _FragmentRun {
         duration: duration,
         description: defaults.description,
         sync: (sampleFlags & (_nonSync | _dependsOnOtherSamples)) == 0,
+        discard: cutoff != null && decode <= cutoff,
       );
       decode = _addTime(decode, duration);
       position += size;

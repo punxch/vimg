@@ -1,9 +1,11 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/frame_packet.dart';
 import 'package:vimg_dart/src/iso_media.dart';
+import 'package:vimg_dart/src/video.dart';
 
 import 'fixtures.dart';
 
@@ -11,9 +13,131 @@ Future<void> main(List<String> arguments) async {
   final temp = Directory.systemTemp.createTempSync('vimg-fragments-');
   try {
     _checkRuns(temp);
+    _checkOverlappingRuns(temp);
     await _checkCapture(temp, arguments.firstOrNull);
   } finally {
     temp.deleteSync(recursive: true);
+  }
+}
+
+void _checkOverlappingRuns(Directory temp) {
+  final input = File('test/fixtures/cabac-b-fragmented.mp4');
+  final fragments = <Uint8List>[];
+  final decodeTimeOffsets = <int>[];
+  late Uint8List initialization;
+  late List<FramePacket> baseline;
+  _withMedia(input, (media) {
+    final boxes = media.boxes(0, media.file.length).toList();
+    final first = boxes.indexWhere((box) => box.type == 'moof');
+    initialization = media.file.read(0, boxes[first].start);
+    for (var i = first; i < boxes.length && boxes[i].type == 'moof'; i += 2) {
+      final moof = boxes[i];
+      final mdat = boxes[i + 1];
+      final tfdt = media.child(media.child(moof, 'traf'), 'tfdt')!;
+      check(mdat.type == 'mdat', 'Fragment followed by media data');
+      check(media.file.unsigned(tfdt.data, 1) == 1, '64-bit decode time');
+      decodeTimeOffsets.add(tfdt.data + 4 - moof.start);
+      fragments.add(media.file.read(moof.start, mdat.end - moof.start));
+    }
+    baseline = isoFrames(media).toList();
+  });
+
+  final source = Video(input.path);
+  try {
+    final originals = {
+      for (final frame in source.decodeSelected(source.packets()))
+        frame.packet: frame.frame.getBytes(),
+    };
+    void verify(
+      String name,
+      List<int> order,
+      Set<int> discarded,
+      double duration, {
+      Map<int, int> shifts = const {},
+      bool decode = false,
+    }) {
+      const starts = [0, 7, 14, 17];
+      final bytes = BytesBuilder(copy: false)..add(initialization);
+      final indices = <int>[];
+      final timestamps = <int>[];
+      for (final part in order) {
+        final data = Uint8List.fromList(fragments[part]);
+        final view = ByteData.sublistView(data);
+        final offset = decodeTimeOffsets[part];
+        final shift = shifts[part] ?? 0;
+        view.setUint64(offset, view.getUint64(offset) + shift);
+        bytes.add(data);
+        for (var i = starts[part]; i < starts[part + 1]; i++) {
+          indices.add(i);
+          timestamps.add(baseline[i].timestamp!.pts + shift);
+        }
+      }
+      final path = File('${temp.path}/$name.mp4')
+        ..writeAsBytesSync(bytes.takeBytes());
+      final physical = <FramePacket>[];
+      _withMedia(path, (media) {
+        final visible = isoFrames(
+          media,
+          onSample: (packet, _) => physical.add(packet),
+        ).toSet();
+        check(physical.length == baseline.length, '$name retains all samples');
+        for (final (i, packet) in physical.indexed) {
+          check(packet.timestamp!.pts == timestamps[i], '$name sample PTS $i');
+          check(
+            visible.contains(packet) == !discarded.contains(indices[i]),
+            '$name sample visibility $i',
+          );
+        }
+        check(media.metadata().duration == duration, '$name duration');
+      });
+      if (decode) {
+        final clip = Video(path.path);
+        try {
+          final expected = {
+            for (final (i, packet) in physical.indexed)
+              if (!discarded.contains(indices[i]))
+                packet: originals[baseline[indices[i]]]!,
+          };
+          final selected = clip.packets().toList();
+          for (var i = 1; i < selected.length; i++) {
+            check(
+              selected[i - 1].seconds <= selected[i].seconds,
+              '$name playback order',
+            );
+          }
+          for (final result in clip.decodeSelected(selected)) {
+            _sameBytes(
+              result.frame.getBytes(),
+              expected.remove(result.packet)!,
+              '$name decoded frame at ${result.packet.seconds}',
+            );
+          }
+          check(expected.isEmpty, '$name decodes all visible frames');
+        } finally {
+          clip.close();
+        }
+      }
+    }
+
+    verify(
+      'overlap',
+      [0, 1, 2],
+      {7, 8},
+      2.125,
+      shifts: {1: -4000},
+      decode: true,
+    );
+    verify('subframe', [0, 1, 2], {}, 2.125, shifts: {1: -1000});
+    verify('out-of-order', [0, 2, 1], {7, 8, 9, 10, 11, 12, 13}, 2.125);
+    verify(
+      'overlapping-tail',
+      [0, 1, 2],
+      {14, 15, 16},
+      1.75,
+      shifts: {2: -20000},
+    );
+  } finally {
+    source.close();
   }
 }
 

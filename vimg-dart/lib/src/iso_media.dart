@@ -90,6 +90,9 @@ final class IsoMedia {
 
   MediaBox movie() => _movie;
 
+  bool get hasOverlappingVideoFragments =>
+      _fragments?.tracks[firstVideoTrack()]?.overlaps ?? false;
+
   MediaBox? firstVideoTrack({MediaBox? moov}) =>
       children(moov ?? movie()).where((box) {
         if (box.type != 'trak') return false;

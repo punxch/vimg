@@ -175,8 +175,9 @@ the authority manifest. Preview and capture switch sample descriptions at
 random-access pictures, including when the track switches between supported
 codecs. Probe reports the first description in use. Contact sheets center
 each image in a tile of fixed dimensions and preserve its aspect ratio when
-the source geometry changes. Encrypted tracks and overlapping or out-of-order
-fragments remain pending.
+the source geometry changes. When fragment decode times overlap, samples at or
+before the preceding run's last decode time are still available as references
+and are skipped during presentation. Encrypted tracks remain pending.
 
 `extract` and `vcs` accept a comma-separated `--vfilter` chain such as
 `--vfilter 'crop=iw/2:ih,transpose=clock,hflip'`. The Dart filters include
