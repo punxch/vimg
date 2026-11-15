@@ -127,6 +127,10 @@ access units, preserves source PTS across 33-bit rollover and accounts for
 an earlier audio start in the same program. Capture workers read the
 selected GOPs directly from the source file.
 
+Standalone H.264 and HEVC Annex B streams support probe, preview, extraction
+and contact sheets. Their timeline starts at zero and uses picture order and
+the signalled frame rate. Streams without a signalled rate use 25 fps.
+
 Matroska, MP4/MOV, MPEG-TS, MPEG-PS and elementary `.m1v`/`.m2v` streams
 support MPEG-1 and MPEG-2 I/P/B pictures. MP4/MOV can supply the sequence
 headers in the video samples, an `esds` descriptor or a QuickTime `glbl`

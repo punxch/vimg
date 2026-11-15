@@ -33,6 +33,7 @@ final class HevcVps {
     this.temporalLayers,
     this.profile,
     this.bufferLimits,
+    this.timing,
   );
 
   factory HevcVps.parse(HevcNal nal) {
@@ -49,8 +50,10 @@ final class HevcVps {
     final layerId = bits.read(6);
     final layerSets = bits.ue(1023);
     bits.skip(layerSets * (layerId + 1));
+    (int, int)? timing;
     if (bits.flag()) {
-      bits.skip(64); // timing numerator and denominator
+      final units = bits.read(32), scale = bits.read(32);
+      if (units > 0 && scale > 0) timing = (units, scale);
       if (bits.flag()) bits.ue(); // ticks per picture order increment
       final hrdCount = bits.ue(layerSets + 1);
       _HrdCommon? previous;
@@ -61,12 +64,13 @@ final class HevcVps {
       }
     }
     if (!bits.flag()) _endParameters(bits);
-    return HevcVps(id, layers, temporalLayers, profile, limits);
+    return HevcVps(id, layers, temporalLayers, profile, limits, timing);
   }
 
   final int id, layers, temporalLayers;
   final HevcProfile profile;
   final List<HevcBufferLimits> bufferLimits;
+  final (int, int)? timing;
 }
 
 final class HevcSps {

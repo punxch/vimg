@@ -110,8 +110,15 @@ List<int> _nalPresentationTimes(
   Map<int, int> stamps,
   (int, int)? timing,
   int period,
+  int clock,
 ) {
-  final display = _presentationTimes(order.length, stamps, timing, period);
+  final display = _presentationTimes(
+    order.length,
+    stamps,
+    timing,
+    period,
+    clock,
+  );
   final physical = List.filled(count, display.first);
   for (final (i, index) in order.indexed) {
     physical[index] = display[i];

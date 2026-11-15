@@ -17,6 +17,7 @@ import 'mpeg12/syntax.dart';
 import 'nal_parameter_sets.dart';
 import 'rbsp.dart';
 
+part 'elementary_video.dart';
 part 'mpeg_nal_timing.dart';
 part 'program_stream.dart';
 part 'transport_packets.dart';
@@ -100,6 +101,8 @@ final class MpegSystemsVideo {
     final elementary = _input is _ElementaryVideo;
     final missing = stamps.length != video.frames.length;
     final isNal = program.codec == 'h264' || program.codec == 'hevc';
+    final rawNal = elementary && isNal;
+    final clock = rawNal ? 1200000 : _mpegClock;
     if (stamps.isEmpty && !elementary && !isNal) {
       throw const FormatException('Missing MPEG video timestamps');
     }
@@ -123,14 +126,14 @@ final class MpegSystemsVideo {
               if (stamps[index] case final pts?) i: pts,
           };
     final estimatedPeriod = _displayPeriod(displayStamps) ?? _mode(cadence);
-    final timing = video.timing;
+    final timing = video.timing ?? (rawNal ? (1, 25) : null);
     final nominalRate = timing != null
         ? timing.$2 / timing.$1
         : estimatedPeriod == null
         ? null
-        : _mpegClock / estimatedPeriod;
+        : clock / estimatedPeriod;
     final period = timing != null
-        ? math.max(1, timing.$1 * _mpegClock ~/ timing.$2)
+        ? math.max(1, timing.$1 * clock ~/ timing.$2)
         : estimatedPeriod;
     final mpegTiming = missing && video.bitstreamCodec != null ? timing : null;
     if (missing &&
@@ -149,12 +152,19 @@ final class MpegSystemsVideo {
             displayStamps!,
             timing,
             period!,
+            clock,
           )
-        : _presentationTimes(video.frames.length, stamps, timing, period);
+        : _presentationTimes(
+            video.frames.length,
+            stamps,
+            timing,
+            period,
+            clock,
+          );
     final visible = order?.toSet();
     int? packetDuration(_AccessUnit frame) =>
         timing != null && frame.fields != 2
-        ? math.max(1, frame.fields * timing.$1 * _mpegClock ~/ (2 * timing.$2))
+        ? math.max(1, frame.fields * timing.$1 * clock ~/ (2 * timing.$2))
         : period;
     var start = (order == null ? pts : order.map((i) => pts[i])).reduce(
       math.min,
@@ -194,14 +204,14 @@ final class MpegSystemsVideo {
         (throw const FormatException('Missing MPEG video sequence header'));
     final duration = _input is _ProgramInput
         ? (_mpegMicroseconds(end) - _mpegMicroseconds(start)) / 1000000
-        : (end - start) / _mpegClock;
+        : (end - start) / clock;
     return (
       metadata: VideoMetadata(duration > 0 ? duration : null, [
         VideoStream(
           codec: video.bitstreamCodec ?? program.codec,
           width: width,
           height: height,
-          timeBase: '1/$_mpegClock',
+          timeBase: '1/$clock',
           nominalFrameRate: nominalRate,
         ),
       ]),
@@ -210,11 +220,11 @@ final class MpegSystemsVideo {
           (
             offset: frame.offset,
             size: frame.size,
-            seconds: (pts[i] - start) / _mpegClock,
+            seconds: (pts[i] - start) / clock,
             timestamp: frameTimestamp(
               pts[i],
               1,
-              _mpegClock,
+              clock,
               duration: packetDuration(frame),
             ),
           ),
@@ -236,6 +246,7 @@ List<int> _presentationTimes(
   Map<int, int> stamps,
   (int, int)? timing,
   int? period,
+  int clock,
 ) {
   if (stamps.length == count) {
     return List.generate(count, (i) => stamps[i]!, growable: false);
@@ -248,7 +259,7 @@ List<int> _presentationTimes(
     return anchor.value +
         (timing == null
             ? distance * (period ?? 0)
-            : (distance * (timing.$1 * _mpegClock / timing.$2)).round());
+            : (distance * (timing.$1 * clock / timing.$2)).round());
   }, growable: false);
 }
 
@@ -319,52 +330,6 @@ abstract interface class _PacketSource {
   _Program program();
   Iterable<_AudioClock> scan(_Program program, _AccessUnits video);
   Uint8List read(FramePacket frame, int videoId);
-}
-
-/// A standalone H.262 or MPEG-1 elementary stream has sequence timing and
-/// temporal references but carries no systems clock or PES timestamps.
-final class _ElementaryVideo implements _PacketSource {
-  _ElementaryVideo(this.file);
-
-  static _ElementaryVideo? detect(BinaryFile file) {
-    if (file.length < 16 || file.unsigned(0, 4) != 0x000001b3) return null;
-    final bytes = file.read(0, math.min(1024, file.length));
-    final units = mpegStartCodes(bytes).iterator;
-    if (!units.moveNext()) return null;
-    final header = units.current;
-    if (!units.moveNext() ||
-        !const {0, 0xb2, 0xb5, 0xb8}.contains(units.current.code)) {
-      return null;
-    }
-    try {
-      MpegSequence(Uint8List.sublistView(bytes, header.data, header.end));
-      return _ElementaryVideo(file);
-    } on FormatException {
-      return null;
-    }
-  }
-
-  final BinaryFile file;
-
-  @override
-  _Program program() => (videoId: 0, codec: 'mpeg2video', audio: const {});
-
-  @override
-  Iterable<_AudioClock> scan(_Program program, _AccessUnits video) {
-    const chunkSize = 256 * 1024;
-    for (var offset = 0; offset < file.length; offset += chunkSize) {
-      final bytes = file.read(
-        offset,
-        math.min(chunkSize, file.length - offset),
-      );
-      video.payload(bytes, 0, bytes.length, offset);
-    }
-    return const [];
-  }
-
-  @override
-  Uint8List read(FramePacket frame, int videoId) =>
-      file.read(frame.offset, frame.size);
 }
 
 (int, int)? _mpeg2PesTime(Uint8List bytes, int size) {
@@ -463,6 +428,7 @@ final class _AccessUnits {
   final _parameters = NalParameterSets();
   final _avcSequences = <int, H264Sps>{};
   final _avcPpsSequences = <int, int>{};
+  final _hevcVideoTimings = <int, (int, int)>{};
   var _avcPlanes = 0;
   H264FieldKey? _avcField;
   (int, int)? _avcPrefix;
@@ -724,11 +690,14 @@ final class _AccessUnits {
       type = unit.header.type;
       switch (type) {
         case 32:
-          id = unit.rbsp().read(4);
+          final vps = HevcVps.parse(unit);
+          id = vps.id;
+          _hevcVideoTimings.remove(id);
+          if (vps.timing case final value?) _hevcVideoTimings[id] = value;
         case 33:
           final sps = HevcSps.parse(unit);
           dimensions ??= (sps.width, sps.height);
-          timing ??= sps.timing;
+          timing ??= _hevcVideoTimings[sps.vpsId] ?? sps.timing;
           id = sps.id;
         default:
           id = unit.rbsp().ue(63);
@@ -826,6 +795,6 @@ Uint8List _lengthPrefix(Uint8List bytes) {
   if (start >= 0 && bytes.length - zeros > start) {
     nals.add(Uint8List.sublistView(bytes, start, bytes.length - zeros));
   }
-  if (nals.isEmpty) throw const FormatException('Missing MPEG-TS NAL units');
+  if (nals.isEmpty) throw const FormatException('Missing Annex B NAL units');
   return lengthPrefixNals(nals);
 }
