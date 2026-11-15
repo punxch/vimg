@@ -6,13 +6,18 @@ import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
 import 'h264/parameters.dart';
+import 'h264/reference.dart';
+import 'h264/slice_header.dart';
+import 'hevc/access_unit.dart';
 import 'hevc/nal.dart';
 import 'hevc/parameters.dart';
+import 'hevc/picture_order.dart';
 import 'metadata.dart';
 import 'mpeg12/syntax.dart';
 import 'nal_parameter_sets.dart';
 import 'rbsp.dart';
 
+part 'mpeg_nal_timing.dart';
 part 'program_stream.dart';
 part 'transport_packets.dart';
 
@@ -41,7 +46,9 @@ final class MpegSystemsVideo {
     for (final packet in _index.packets) {
       final sync = _randomAccess(nalType(packet));
       onSample?.call(packet, sync);
-      if (!preview || sync) yield packet;
+      if (!_index.hidden.contains(packet.offset) && (!preview || sync)) {
+        yield packet;
+      }
     }
   }
 
@@ -91,17 +98,31 @@ final class MpegSystemsVideo {
       previousIndex = i;
     }
     final elementary = _input is _ElementaryVideo;
-    if (stamps.isEmpty && !elementary) {
+    final missing = stamps.length != video.frames.length;
+    final isNal = program.codec == 'h264' || program.codec == 'hevc';
+    if (stamps.isEmpty && !elementary && !isNal) {
       throw const FormatException('Missing MPEG video timestamps');
     }
-    final estimatedPeriod = cadence.entries.fold<int?>(null, (mode, entry) {
-      if (mode == null ||
-          entry.value > cadence[mode]! ||
-          (entry.value == cadence[mode] && entry.key < mode)) {
-        return entry.key;
-      }
-      return mode;
-    });
+    final order = missing && isNal
+        ? _nalDisplayOrder(
+            video.frames,
+            video.configurations,
+            program.codec,
+            (frame) => read((
+              offset: frame.offset,
+              size: frame.size,
+              seconds: 0,
+              timestamp: null,
+            )),
+          )
+        : null;
+    final displayStamps = order == null
+        ? null
+        : {
+            for (final (i, index) in order.indexed)
+              if (stamps[index] case final pts?) i: pts,
+          };
+    final estimatedPeriod = _displayPeriod(displayStamps) ?? _mode(cadence);
     final timing = video.timing;
     final nominalRate = timing != null
         ? timing.$2 / timing.$1
@@ -111,26 +132,43 @@ final class MpegSystemsVideo {
     final period = timing != null
         ? math.max(1, timing.$1 * _mpegClock ~/ timing.$2)
         : estimatedPeriod;
-    final missing = stamps.length != video.frames.length;
     final mpegTiming = missing && video.bitstreamCodec != null ? timing : null;
-    if (missing && mpegTiming == null && (reordered || period == null)) {
+    if (missing &&
+        mpegTiming == null &&
+        (period == null || order == null && reordered)) {
       throw UnsupportedError(
         'MPEG video has access units without a usable presentation timestamp',
       );
     }
     final pts = mpegTiming != null
         ? _mpegPresentationTimes(video.frames, stamps, mpegTiming)
+        : order != null
+        ? _nalPresentationTimes(
+            video.frames.length,
+            order,
+            displayStamps!,
+            timing,
+            period!,
+          )
         : _presentationTimes(video.frames.length, stamps, timing, period);
+    final visible = order?.toSet();
     int? packetDuration(_AccessUnit frame) =>
         timing != null && frame.fields != 2
         ? math.max(1, frame.fields * timing.$1 * _mpegClock ~/ (2 * timing.$2))
         : period;
-    var start = pts.reduce(math.min);
+    var start = (order == null ? pts : order.map((i) => pts[i])).reduce(
+      math.min,
+    );
     // FFprobe estimates program-stream duration from explicit PES timestamps.
     // Inferred timestamps keep the remaining decoded pictures seekable.
     var end = start;
     for (final (i, frame) in video.frames.indexed) {
-      if (_input is _ProgramInput && !stamps.containsKey(i)) continue;
+      if (visible != null && !visible.contains(i)) continue;
+      if (_input is _ProgramInput &&
+          stamps.isNotEmpty &&
+          !stamps.containsKey(i)) {
+        continue;
+      }
       final duration = packetDuration(frame) ?? 0;
       // For MPEG-1 systems, FFprobe uses the field rate in this estimate.
       final tail = !elementary && video.bitstreamCodec == 'mpeg1video'
@@ -184,6 +222,11 @@ final class MpegSystemsVideo {
       types: {for (final frame in video.frames) frame.offset: frame.type},
       mpegPictures: video.mpegPictures,
       configurations: video.configurations,
+      hidden: {
+        if (visible != null)
+          for (final (i, frame) in video.frames.indexed)
+            if (!visible.contains(i)) frame.offset,
+      },
     );
   }
 }
@@ -197,7 +240,7 @@ List<int> _presentationTimes(
   if (stamps.length == count) {
     return List.generate(count, (i) => stamps[i]!, growable: false);
   }
-  var anchor = stamps.entries.first;
+  var anchor = stamps.entries.firstOrNull ?? const MapEntry(0, 0);
   return List.generate(count, (i) {
     final stamp = stamps[i];
     if (stamp != null) anchor = MapEntry(i, stamp);
@@ -259,6 +302,7 @@ typedef _SystemsIndex = ({
   Map<int, int> types,
   Map<int, MpegPictureInfo> mpegPictures,
   Map<int, Uint8List> configurations,
+  Set<int> hidden,
 });
 
 int _unwrapTimestamp(int raw, int? anchor) {

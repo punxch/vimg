@@ -1,6 +1,6 @@
 import 'slice_header.dart';
 
-typedef HevcOrder = ({int poc, bool output, bool discardRasl});
+typedef HevcOrder = ({int poc, bool reset, bool output, bool discardRasl});
 
 /// H.265 §8.3.1 picture-order state for a decode-order stream started at an
 /// IRAP picture. A fresh instance also models a seek directly to a CRA.
@@ -43,6 +43,7 @@ final class HevcPictureOrder {
     final discard = nal.rasl && _suppressRasl;
     return (
       poc: poc,
+      reset: reset,
       output: first.parameters.output && !discard,
       discardRasl: discard,
     );

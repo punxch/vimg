@@ -281,7 +281,8 @@ final class ReferenceState {
     );
   }
 
-  void commit(PendingPicture pending, H264Picture picture) {
+  /// Pass null when advancing picture order from headers without decoding.
+  void commit(PendingPicture pending, H264Picture? picture) {
     final header = pending.header;
     final sps = header.pps.sps;
     final next = [...pending._store];

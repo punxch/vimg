@@ -77,6 +77,8 @@ Future<void> main(List<String> arguments) async {
       duration: '1.280000',
     );
     _checkElementaryVideo(temp);
+    await _checkSparseNalTiming(temp, 'test/fixtures/cabac-b-aac.ts');
+    await _checkSparseNalTiming(temp, 'test/fixtures/hevc-open-gop.m2ts');
     _checkTruncatedPes(temp);
     _checkIsoBoxSizes(temp);
     if (arguments.isNotEmpty) await _checkCommands(arguments.single, temp);
@@ -182,6 +184,144 @@ void _checkProgramMap() {
     original.close();
   }
 }
+
+Future<void> _checkSparseNalTiming(Directory temp, String input) async {
+  final original = Video(input);
+  try {
+    final systems = MpegSystemsVideo.detect(original.file)!;
+    final physical = systems.packets(false).toList();
+    final display = original.packets().toList();
+    final firstPts = display.first.timestamp!.pts;
+    final decoded = {
+      for (final frame in original.decodeSelected(display))
+        frame.packet.timestamp!.pts - firstPts: frame.frame.getBytes(),
+    };
+    final hevc = original.codec == 'hevc';
+    for (final flags in [0xc0, 0x80, 0]) {
+      final output = File('${temp.path}/${original.codec}-$flags.vob');
+      final bytes = BytesBuilder(copy: false)
+        // MPEG-2 pack and program stream map with a single video stream.
+        ..add([
+          0,
+          0,
+          1,
+          0xba,
+          0x44,
+          0,
+          4,
+          0,
+          4,
+          1,
+          0,
+          4,
+          0x53,
+          0xf8,
+          0,
+          0,
+          1,
+          0xbc,
+          0,
+          14,
+          0xe0,
+          0xff,
+          0,
+          0,
+          0,
+          4,
+          hevc ? 0x24 : 0x1b,
+          0xe0,
+          0,
+          0,
+          ...uint(hevc ? 0x0c49b076 : 0xf4dcbd45, 4),
+        ]);
+      final base = flags == 0 ? 0 : 45000;
+      final known = <int>[];
+      for (final (i, frame) in physical.indexed) {
+        final data = systems.read(frame);
+        final view = ByteData.sublistView(data);
+        for (var offset = 0; offset < data.length;) {
+          final size = view.getUint32(offset);
+          view.setUint32(offset, 1);
+          offset += size + 4;
+        }
+        final pts = frame.timestamp!.pts - firstPts + base;
+        final timestamp = <int>[
+          if (flags != 0 && i % 3 == 1) ...[
+            ..._pesTimestamp(pts, flags >> 6),
+            if (flags == 0xc0) ..._pesTimestamp(base + (i - 2) * 11250, 1),
+          ],
+        ];
+        if (timestamp.isNotEmpty) known.add(pts);
+        bytes.add([
+          0,
+          0,
+          1,
+          0xe0,
+          ...uint(data.length + timestamp.length + 3, 2),
+          0x80,
+          timestamp.isEmpty ? 0 : flags,
+          timestamp.length,
+          ...timestamp,
+        ]);
+        bytes.add(data);
+      }
+      output.writeAsBytesSync(bytes.takeBytes());
+
+      final video = Video(output.path);
+      final workers = VideoCaptureDecoder(video, threads: 2);
+      try {
+        final packets = video.packets().toList();
+        check(video.codec == original.codec, 'Sparse program codec');
+        check(packets.length == display.length, 'Sparse program frame count');
+        known.sort();
+        final lastPts = known.lastOrNull ?? packets.last.timestamp!.pts;
+        check(
+          video.metadata.duration == (lastPts - base + 11250) / 90000,
+          'Program duration uses signalled PTS when present',
+        );
+        for (final (i, packet) in packets.indexed) {
+          final ticks = display[i].timestamp!.pts - firstPts;
+          check(packet.timestamp!.pts == ticks + base, 'Restored PTS $i');
+          check(packet.seconds == ticks / 90000, 'Sparse presentation time $i');
+          check(packet.timestamp!.duration == 11250, 'NAL picture duration');
+        }
+        final keys = video.packets(preview: true).toList();
+        final key = keys.last;
+        _equal(
+          video.decode(key, preview: true).getBytes(),
+          decoded[key.timestamp!.pts - base]!,
+        );
+        final targets = [
+          packets.first,
+          packets[packets.length ~/ 2],
+          packets.last,
+        ];
+        var count = 0;
+        await for (final frame in workers.decode(targets)) {
+          _equal(
+            frame.frame.getBytes(),
+            decoded[frame.packet.timestamp!.pts - base]!,
+          );
+          count++;
+        }
+        check(count == targets.length, 'Sparse program captures');
+      } finally {
+        await workers.close();
+        video.close();
+      }
+    }
+  } finally {
+    original.close();
+  }
+}
+
+List<int> _pesTimestamp(int pts, int prefix) => [
+  (prefix << 4) | ((pts >> 29) & 0x0e) | 1,
+  (pts >> 22) & 0xff,
+  ((pts >> 14) & 0xfe) | 1,
+  (pts >> 7) & 0xff,
+  ((pts << 1) & 0xfe) | 1,
+];
 
 String _splitFirstHeader(Directory temp) {
   final source = File(_sparseVob).readAsBytesSync();

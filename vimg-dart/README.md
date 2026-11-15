@@ -145,8 +145,10 @@ start at zero and use sequence timing, including signalled repeated fields.
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS
 and LPCM tracks. A program stream map can also identify H.264 or HEVC.
-Scalable MPEG-2, DVD title navigation and reordered H.264 or HEVC pictures
-without usable timestamps remain pending.
+H.264 and HEVC with missing PES timestamps use the bitstream's picture order
+and frame cadence to infer presentation times. Fully untimed video starts at
+zero when the bitstream provides a frame rate. Scalable MPEG-2 and DVD title
+navigation remain pending.
 
 Matroska and WebM capture apply the selected track's pixel crop and rectangular
 projection roll or mirror before user filters and tile sizing.
