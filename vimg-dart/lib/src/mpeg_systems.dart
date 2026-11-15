@@ -114,6 +114,7 @@ final class MpegSystemsVideo {
               offset: frame.offset,
               size: frame.size,
               seconds: 0,
+              subframe: null,
               timestamp: null,
             )),
           )
@@ -220,6 +221,7 @@ final class MpegSystemsVideo {
             offset: frame.offset,
             size: frame.size,
             seconds: (pts[i] - start) / clock,
+            subframe: null,
             timestamp: frameTimestamp(
               pts[i],
               1,

@@ -73,6 +73,7 @@ FramePacket _packet(int pts, int numerator, int denominator, {int? duration}) =>
       seconds: pts * numerator / denominator,
       offset: pts,
       size: 1,
+      subframe: null,
       timestamp: frameTimestamp(
         pts,
         numerator,

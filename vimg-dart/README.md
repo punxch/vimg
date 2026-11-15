@@ -188,7 +188,10 @@ compound prediction, scaled references, segmentation, tiles, hidden
 reference updates in superframes, and display of previously decoded frames.
 WebM/Matroska VP9 opacity uses the separately coded alpha stream, including
 when its keyframes differ from the color stream. BMP extraction keeps the
-alpha channel. Multiple displayed pictures in a single superframe remain pending.
+alpha channel. A VP9 superframe can present multiple pictures. Capture assigns
+them equal shares of the sample's duration and uses adjacent sample timing
+when the duration is missing. The authority manifest retains the original
+sample PTS and records the presentation index of each selected picture.
 The AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and

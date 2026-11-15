@@ -156,6 +156,7 @@ Future<void> _checkWorkerFailure(String path) async {
       seconds: good.seconds,
       offset: good.offset,
       size: 0,
+      subframe: null,
       timestamp: good.timestamp,
     );
     try {

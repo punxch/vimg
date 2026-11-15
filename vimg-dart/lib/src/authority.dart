@@ -256,7 +256,7 @@ final class _Recorder {
   Uint8List? _previousPng;
 
   void selection(int animation, int capture, FramePacket packet, int index) {
-    final timestamp = packet.timestamp;
+    final timestamp = packet.sourceTimestamp;
     if (timestamp == null)
       throw const FormatException(
         'Selected video frame has no source timestamp',

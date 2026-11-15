@@ -208,5 +208,6 @@ FramePacket _withTime(
   offset: sample.offset,
   size: sample.size,
   seconds: time.seconds,
+  subframe: null,
   timestamp: time.timestamp,
 );

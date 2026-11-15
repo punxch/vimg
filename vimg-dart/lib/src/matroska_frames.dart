@@ -12,6 +12,7 @@ Iterable<FramePacket> matroskaCovers(Matroska media) sync* {
         seconds: 0,
         offset: data.data,
         size: data.end - data.data,
+        subframe: null,
         timestamp: null,
       );
     }
@@ -127,6 +128,7 @@ Iterable<FramePacket> _block(
       seconds: seconds,
       offset: offset,
       size: block.end - offset,
+      subframe: null,
       timestamp: frameTimestamp(
         pts,
         timestampScale,
@@ -210,6 +212,7 @@ Iterable<FramePacket> _block(
       seconds: seconds + index * step,
       offset: offset,
       size: sizes[index],
+      subframe: null,
       timestamp: laceTimestamp(index),
     );
     onSample?.call(packet, sync);

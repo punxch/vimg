@@ -13,6 +13,7 @@ Iterable<FramePacket> isoCovers(IsoMedia media) sync* {
         seconds: 0,
         offset: data.data + 8,
         size: data.end - data.data - 8,
+        subframe: null,
         timestamp: null,
       );
     }
@@ -69,6 +70,7 @@ Iterable<FramePacket> isoFrames(
           (fragments?.start ?? 0),
       offset: sample.offset,
       size: sample.size,
+      subframe: null,
       timestamp: frameTimestamp(
         sample.pts,
         1,

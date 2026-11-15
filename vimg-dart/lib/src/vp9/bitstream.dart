@@ -62,28 +62,31 @@ Vp9FrameTag _readTag(Vp9Bits bits) {
   );
 }
 
-/// The visible picture in a packet can follow hidden reference updates.
-typedef Vp9PacketTag = ({bool shown, bool key, Vp9FrameExtent? preview});
+typedef Vp9CodedFrame = ({Vp9FrameExtent extent, Vp9FrameTag tag});
 
-Vp9PacketTag vp9PacketTag(
+List<Vp9CodedFrame> vp9CodedFrames(
+  int length,
+  Uint8List Function(int offset, int length) read,
+) => [
+  for (final extent in vp9FrameExtents(length, read))
+    (
+      extent: extent,
+      tag: vp9FrameTag(
+        read(extent.offset, extent.length < 2 ? extent.length : 2),
+      ),
+    ),
+];
+
+({bool shown, bool key}) vp9PacketTag(
   int length,
   Uint8List Function(int offset, int length) read,
 ) {
-  var shown = 0;
-  var key = false;
-  Vp9FrameExtent? preview, displayReference;
-  for (final frame in vp9FrameExtents(length, read)) {
-    final tag = vp9FrameTag(
-      read(frame.offset, frame.length < 2 ? frame.length : 2),
-    );
+  var shown = false, key = false;
+  for (final (:tag, extent: _) in vp9CodedFrames(length, read)) {
     key |= tag.key;
-    if (tag.existing == null) displayReference = tag.key ? frame : null;
-    if (tag.shown) {
-      shown++;
-      preview = displayReference;
-    }
+    shown |= tag.shown;
   }
-  return (shown: shown > 0, key: key, preview: shown == 1 ? preview : null);
+  return (shown: shown, key: key);
 }
 
 typedef Vp9Color = ({int depth, int space, bool fullRange, int subX, int subY});

@@ -1,9 +1,14 @@
 part of 'video.dart';
 
+typedef _MatroskaSampleLocation = (int, int);
+
+_MatroskaSampleLocation _matroskaSample(FramePacket packet) =>
+    (packet.offset, packet.size);
+
 typedef _MatroskaAlphaExtent = ({int offset, int size});
 typedef _MatroskaAlphaRun = ({
   List<_MatroskaAlphaExtent> warmup,
-  Map<FramePacket, _MatroskaAlphaExtent> blocks,
+  Map<_MatroskaSampleLocation, _MatroskaAlphaExtent> blocks,
 });
 
 /// The opacity stream can start its GOPs at different packets from the color
@@ -13,7 +18,7 @@ final class _MatroskaAlphaIndex {
 
   final BinaryFile file;
   final String codec;
-  final _packets = <FramePacket, int>{};
+  final _packets = <_MatroskaSampleLocation, int>{};
   final _payloads = <_MatroskaAlphaExtent>[];
   final _anchors = <int>[];
   int _key = -1;
@@ -22,26 +27,27 @@ final class _MatroskaAlphaIndex {
     final index = _payloads.length;
     final size = data.end - data.data;
     final key = codec == 'vp9'
-        ? vp9PacketTag(
+        ? vp9CodedFrames(
             size,
             (offset, length) => file.read(data.data + offset, length),
-          ).key
+          ).first.tag.key
         : vp8FrameTag(file.read(data.data, size < 3 ? size : 3)).key;
     if (key) _key = index;
-    _packets[packet] = index;
+    _packets[_matroskaSample(packet)] = index;
     _payloads.add((offset: data.data, size: size));
     _anchors.add(_key);
   }
 
   _MatroskaAlphaRun? forRun(List<FramePacket> packets) {
     if (_packets.isEmpty) return null;
-    final blocks = <FramePacket, _MatroskaAlphaExtent>{};
+    final blocks = <_MatroskaSampleLocation, _MatroskaAlphaExtent>{};
     int? first;
     for (final packet in packets) {
-      final index = _packets[packet];
+      final sample = _matroskaSample(packet);
+      final index = _packets[sample];
       if (index == null) continue;
       first ??= index;
-      blocks[packet] = _payloads[index];
+      blocks[sample] = _payloads[index];
     }
     if (first == null) return null;
     final key = _anchors[first];
@@ -62,9 +68,18 @@ final class _MatroskaAlphaDecoder<T> {
   final _MatroskaAlphaRun run;
   final T? Function(Uint8List) _decode;
 
+  _MatroskaSampleLocation? _lastSample;
+  T? _lastPicture;
+
   T? decode(FramePacket packet) {
-    final extent = run.blocks[packet];
-    if (extent == null) return null;
-    return _decode(file.read(extent.offset, extent.size));
+    final sample = _matroskaSample(packet);
+    if (sample != _lastSample) {
+      final extent = run.blocks[sample];
+      _lastPicture = extent == null
+          ? null
+          : _decode(file.read(extent.offset, extent.size));
+      _lastSample = sample;
+    }
+    return _lastPicture;
   }
 }

@@ -78,14 +78,14 @@ void _checkSequence(
             ).shown,
           )
           .length;
-      final picture = decoder.decodePacket(bytes)!;
+      final picture = decoder.decodePacket(bytes).single;
       final header = picture.header;
       if (!header.intra) {
         inter++;
         if (!repeatedReference &&
             header.tag.profile == 0 &&
             header.refreshMask & 1 != 0) {
-          final again = decoder.decodePacket(Uint8List.fromList([0x88]));
+          final again = decoder.decodePacket(Uint8List.fromList([0x88])).single;
           check(identical(again, picture), 'VP9 show-existing inter reference');
           repeatedReference = true;
         }

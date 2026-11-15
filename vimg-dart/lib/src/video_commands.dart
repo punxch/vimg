@@ -109,18 +109,12 @@ List<List<CaptureFrame>> _selectCaptures(
   if (filters == null || !filters.usesTimeline) {
     return plan.selectFrames(packets, onSelect: onSelect);
   }
-  final stream = video.metadata.streams.firstWhere(
-    (stream) => !stream.attached,
-  );
-  final [numerator, denominator] = stream.timeBase
-      .split('/')
-      .map(int.parse)
-      .toList();
+  final (:timeBase, :frameRate) = video.filterTiming;
   return plan.selectFilteredFrames(
     packets,
     filters.filterTiming,
-    timeBase: (numerator: numerator, denominator: denominator),
-    frameRate: stream.nominalFrameRate,
+    timeBase: timeBase,
+    frameRate: frameRate,
     onSelect: onSelect,
   );
 }

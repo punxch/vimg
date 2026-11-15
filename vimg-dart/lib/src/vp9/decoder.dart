@@ -91,61 +91,45 @@ final class Vp9Decoder {
   Vp9FrameHeader? _previous;
   _BlockMap? _previousMotion;
 
-  static Vp9Picture preview(Uint8List bytes) {
-    final tag = vp9PacketTag(
-      bytes.length,
-      (offset, length) => Uint8List.sublistView(bytes, offset, offset + length),
-    );
-    final frame = tag.preview;
-    if (frame == null) {
-      throw const FormatException('No independent VP9 display picture');
-    }
-    final coded = Uint8List.sublistView(
-      bytes,
-      frame.offset,
-      frame.offset + frame.length,
-    );
-    return Vp9Decoder()._decodeFrame(coded, Vp9FrameHeader.read(coded)!);
-  }
-
-  Vp9Picture? decodePacket(Uint8List bytes) {
+  List<Vp9Picture> decodePacket(Uint8List bytes) {
     final extents = vp9FrameExtents(
       bytes.length,
       (offset, length) => Uint8List.sublistView(bytes, offset, offset + length),
     );
-    Vp9Picture? shown;
+    final pictures = <Vp9Picture>[];
     for (final extent in extents) {
-      final frame = Uint8List.sublistView(
-        bytes,
-        extent.offset,
-        extent.offset + extent.length,
+      final result = decodeCodedFrame(
+        Uint8List.sublistView(
+          bytes,
+          extent.offset,
+          extent.offset + extent.length,
+        ),
       );
-      final tag = vp9FrameTag(frame);
-      final header = Vp9FrameHeader.read(
-        frame,
-        reference: (index) => _references[index]?.header,
-      );
-      final Vp9Picture picture;
-      if (header == null) {
-        picture =
-            _references[tag.existing!] ??
-            (throw const FormatException('Missing VP9 display reference'));
-      } else {
-        picture = _decodeFrame(frame, header);
-        for (var slot = 0; slot < 8; slot++) {
-          if (header.refreshMask & (1 << slot) != 0) {
-            _references[slot] = picture;
-          }
+      if (result.shown) pictures.add(result.picture);
+    }
+    return pictures;
+  }
+
+  ({Vp9Picture picture, bool shown}) decodeCodedFrame(Uint8List bytes) {
+    final tag = vp9FrameTag(bytes);
+    final header = Vp9FrameHeader.read(
+      bytes,
+      reference: (index) => _references[index]?.header,
+    );
+    final Vp9Picture picture;
+    if (header == null) {
+      picture =
+          _references[tag.existing!] ??
+          (throw const FormatException('Missing VP9 display reference'));
+    } else {
+      picture = _decodeFrame(bytes, header);
+      for (var slot = 0; slot < 8; slot++) {
+        if (header.refreshMask & (1 << slot) != 0) {
+          _references[slot] = picture;
         }
-      }
-      if (tag.shown) {
-        if (shown != null) {
-          throw UnsupportedError('Multiple VP9 display pictures per sample');
-        }
-        shown = picture;
       }
     }
-    return shown;
+    return (picture: picture, shown: tag.shown);
   }
 
   Vp9Picture _decodeFrame(Uint8List bytes, Vp9FrameHeader header) {

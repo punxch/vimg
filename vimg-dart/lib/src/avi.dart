@@ -387,6 +387,7 @@ final class Avi {
             seconds: index * track.step,
             offset: sample.data,
             size: sample.end - sample.data,
+            subframe: null,
             timestamp: frameTimestamp(
               index,
               track.scale,

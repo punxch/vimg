@@ -79,9 +79,9 @@ Future<void> main(List<String> arguments) async {
       );
       final decoder = Vp9Decoder();
       for (final (i, packet) in packets.indexed) {
-        final picture = decoder.decodePacket(
-          video.file.read(packet.offset, packet.size),
-        )!;
+        final picture = decoder
+            .decodePacket(video.file.read(packet.offset, packet.size))
+            .single;
         final header = picture.header;
         check(
           header.tag.key && header.lossless == fixture.lossless,

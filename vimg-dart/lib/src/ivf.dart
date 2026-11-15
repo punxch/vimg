@@ -87,6 +87,7 @@ final class Ivf {
         seconds: (frame.pts - start) * _num.toDouble() / _den,
         offset: frame.offset,
         size: frame.size,
+        subframe: null,
         timestamp: frameTimestamp(
           frame.pts,
           _num,
