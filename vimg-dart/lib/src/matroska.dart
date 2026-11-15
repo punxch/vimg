@@ -383,7 +383,7 @@ final class Matroska {
         'MPNG' || 'PNG ' => 'png',
         'H264' || 'X264' || 'AVC1' => 'h264',
         'HEVC' || 'H265' => 'hevc',
-        'XVID' || 'DIVX' || 'DX50' => 'mpeg4',
+        'XVID' || 'DIVX' || 'DX50' || 'FMP4' || 'MP4V' => 'mpeg4',
         'VP80' || 'VP08' => 'vp8',
         'VP90' || 'VP09' => 'vp9',
         'FFV1' => 'ffv1',

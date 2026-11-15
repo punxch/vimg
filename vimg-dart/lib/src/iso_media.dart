@@ -266,7 +266,10 @@ final class IsoMedia {
     _ => 'unknown',
   };
 
-  Uint8List? mpegVideoConfiguration({MediaBox? description}) {
+  Uint8List? mpegVideoConfiguration({
+    MediaBox? description,
+    bool visual = false,
+  }) {
     final entry =
         description ??
         sampleDescription(sampleTable(child(firstVideoTrack(), 'mdia')));
@@ -282,7 +285,11 @@ final class IsoMedia {
     }
     final bytes = file.read(extent.data, length);
     // Some QuickTime entries carry vendor metadata in the global box.
-    return mpegStartCodes(bytes).any((unit) => unit.code == 0xb3)
+    return mpegStartCodes(bytes).any(
+          (unit) => visual
+              ? unit.code >= 0x20 && unit.code <= 0x2f
+              : unit.code == 0xb3,
+        )
         ? bytes
         : null;
   }

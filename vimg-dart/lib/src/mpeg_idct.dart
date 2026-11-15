@@ -1,4 +1,4 @@
-part of 'decode.dart';
+import 'dart:typed_data';
 
 // A separable fixed-point 8×8 IDCT. The row pass leaves three fractional bits
 // for the column pass, which rounds to the nearest reconstructed sample.
@@ -15,7 +15,7 @@ int _idctWeight(int phase) {
   return angle > 8 ? -weights[16 - angle] : weights[angle];
 }
 
-final class _Transform {
+final class MpegIdct {
   final _rows = Int16List(64);
 
   void write(

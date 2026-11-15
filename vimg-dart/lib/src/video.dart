@@ -29,6 +29,8 @@ import 'matroska_frames.dart';
 import 'metadata.dart';
 import 'mpeg12/decode.dart';
 import 'mpeg12/syntax.dart';
+import 'mpeg4/decoder.dart';
+import 'mpeg4/syntax.dart';
 import 'mpeg_systems.dart';
 import 'msrle.dart';
 import 'msvideo1.dart';
@@ -47,6 +49,7 @@ import 'yuv_image.dart';
 part 'video_workers.dart';
 part 'video_matroska_alpha.dart';
 part 'video_vp9.dart';
+part 'video_mpeg4.dart';
 
 typedef _SelectedFrame = ({
   FramePacket packet,
@@ -285,6 +288,7 @@ final class Video {
 
   _IndexedVideo _indexStatefulPictures(String name, {_IsoSection? section}) {
     if (name == 'vp9') return _indexVp9(section: section);
+    if (name == 'mpeg4') return _indexMpeg4(section: section);
     final alpha = _matroska != null && name == 'vp8'
         ? _MatroskaAlphaIndex(file, name)
         : null;
@@ -1295,9 +1299,19 @@ final class Video {
   ) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'mpeg4':
+        final reader = _SamplePayloadReader(this);
+        final decoder = Mpeg4Decoder(configuration.bytes);
+        return (packet, selected, _) {
+          final picture = decoder
+              .decode(reader.read(packet), includeBidirectional: selected)
+              .singleOrNull;
+          if (!selected || picture == null) return null;
+          return picture.rgb;
+        };
       case 'vp9':
         final decoder = Vp9Decoder();
-        final reader = _Vp9PayloadReader(this);
+        final reader = _SamplePayloadReader(this);
         final alpha = run.matroskaAlpha;
         final opacity = alpha == null
             ? null
@@ -1722,6 +1736,7 @@ bool _usesReferences(String codec) =>
 bool _hasStatefulFrames(String codec) =>
     codec == 'vp8' ||
     codec == 'vp9' ||
+    codec == 'mpeg4' ||
     codec == 'ffv1' ||
     codec == 'qtrle' ||
     codec == 'rpza' ||
@@ -1748,5 +1763,36 @@ final class _IsoSection {
       onSample?.call(packet, sync);
       if ((!keyframes || sync) && visible.contains(packet)) yield packet;
     }
+  }
+}
+
+/// Keeps a single restored compressed container sample across its coded units.
+final class _SamplePayloadReader {
+  _SamplePayloadReader(this.video);
+
+  final Video video;
+  late final bool _compressed = video._matroska?.hasEncodedFrames == true;
+  (int, int)? _sample;
+  Uint8List? _bytes;
+
+  Uint8List read(FramePacket packet) {
+    final frame = packet.subframe;
+    if (frame == null) return video._read(packet);
+    if (frame.length > 64 * 1024 * 1024) {
+      throw const FormatException('Invalid video frame size');
+    }
+    if (!_compressed) {
+      return video.file.read(packet.offset + frame.offset, frame.length);
+    }
+    final sample = (packet.offset, packet.size);
+    if (sample != _sample) {
+      _bytes = video._read(packet);
+      _sample = sample;
+    }
+    return Uint8List.sublistView(
+      _bytes!,
+      frame.offset,
+      frame.offset + frame.length,
+    );
   }
 }

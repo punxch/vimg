@@ -3,12 +3,12 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import '../rbsp.dart';
+import '../mpeg_idct.dart';
 import '../yuv_image.dart';
 import 'syntax.dart';
 
 part 'motion.dart';
 part 'tables.dart';
-part 'transform.dart';
 
 /// Sequential MPEG video decoder. Each sample is one coded frame, consisting
 /// of a frame picture or two field pictures, in coding order.
@@ -19,7 +19,7 @@ final class MpegStreamDecoder {
 
   MpegSequence? _sequence;
   MpegPicture? _older, _newer;
-  final _transform = _Transform();
+  final _transform = MpegIdct();
 
   MpegPicture decode(Uint8List bytes) =>
       _read(bytes) ??
@@ -192,7 +192,7 @@ final class _PictureSlices {
 
   final MpegSequence sequence;
   final MpegPictureHeader header;
-  final _Transform transform;
+  final MpegIdct transform;
   final MpegPicture? forward, backward;
   final MpegPicture picture;
   final int? previousField;

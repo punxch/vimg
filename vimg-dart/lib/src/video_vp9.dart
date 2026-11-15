@@ -173,7 +173,7 @@ extension _Vp9Timeline on Video {
   image.Image? _vp9Preview(FramePacket packet) {
     final key = _vp9PreviewPictures[packet];
     if (key == null) return null;
-    final reader = _Vp9PayloadReader(this);
+    final reader = _SamplePayloadReader(this);
     return Vp9Decoder()
         .decodeCodedFrame(reader.read(key))
         .picture
@@ -231,37 +231,6 @@ final class _Vp9SampleTiming {
       numerator: stamp.numerator,
       denominator: stamp.denominator,
       duration: stamp.duration,
-    );
-  }
-}
-
-/// Keeps a single restored compressed container sample across its coded units.
-final class _Vp9PayloadReader {
-  _Vp9PayloadReader(this.video);
-
-  final Video video;
-  late final bool _compressed = video._matroska?.hasEncodedFrames == true;
-  (int, int)? _sample;
-  Uint8List? _bytes;
-
-  Uint8List read(FramePacket packet) {
-    final frame = packet.subframe;
-    if (frame == null) return video._read(packet);
-    if (frame.length > 64 * 1024 * 1024) {
-      throw const FormatException('Invalid video frame size');
-    }
-    if (!_compressed) {
-      return video.file.read(packet.offset + frame.offset, frame.length);
-    }
-    final sample = (packet.offset, packet.size);
-    if (sample != _sample) {
-      _bytes = video._read(packet);
-      _sample = sample;
-    }
-    return Uint8List.sublistView(
-      _bytes!,
-      frame.offset,
-      frame.offset + frame.length,
     );
   }
 }

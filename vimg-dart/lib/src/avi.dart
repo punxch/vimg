@@ -192,7 +192,7 @@ final class Avi {
         rle: rle,
         video1: video1,
         huffFormat: isHuffYuvCodec(codec) ? format : null,
-        privateFormat: const {'h264', 'hevc', 'ffv1'}.contains(codec)
+        privateFormat: const {'h264', 'hevc', 'ffv1', 'mpeg4'}.contains(codec)
             ? format
             : null,
         palette:
