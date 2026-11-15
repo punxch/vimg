@@ -34,7 +34,9 @@ final class Macroblock {
   var chromaMode = 0;
   // Signed QPY before adding the bit-depth offset for inverse quantization.
   var qp = 0;
-  var codedLuma = 0, codedChroma = 0, codedDc = 0;
+  var codedBlocks = 0, codedDc = 0;
+  int codedPlane(int plane) => (codedBlocks >> (16 * plane)) & 0xffff;
+  int get codedLuma => codedPlane(0);
   Uint8List? modes;
   Uint8List? totalCoefficients;
 
@@ -45,25 +47,34 @@ final class Macroblock {
 /// them to the transform matrix. These buffers belong to one slice reader
 /// and are reused immediately after reconstructing a macroblock.
 final class MacroblockCoefficients {
-  final luma = Int32List(256);
-  final lumaDc = Int32List(16);
-  final chroma = Int32List(256);
-  final chromaDc = Int32List(16);
-  final pcm = Uint16List(512);
+  MacroblockCoefficients(int chromaBlocks)
+    : levels = _planes(256, 16 * chromaBlocks),
+      dc = _planes(16, chromaBlocks),
+      pcm = Uint16List(256 + 32 * chromaBlocks);
+
+  final List<Int32List> levels, dc;
+  final Uint16List pcm;
+
+  static List<Int32List> _planes(int luma, int chroma) => [
+    Int32List(luma),
+    if (chroma != 0) ...[Int32List(chroma), Int32List(chroma)],
+  ];
 
   void clearResiduals() {
-    luma.fillRange(0, luma.length, 0);
-    lumaDc.fillRange(0, lumaDc.length, 0);
-    chroma.fillRange(0, chroma.length, 0);
-    chromaDc.fillRange(0, chromaDc.length, 0);
+    for (var plane = 0; plane < levels.length; plane++) {
+      levels[plane].fillRange(0, levels[plane].length, 0);
+      dc[plane].fillRange(0, dc[plane].length, 0);
+    }
   }
 }
 
 abstract class SliceData {
-  SliceData(this.header) : _qp = header.qp;
+  SliceData(this.header)
+    : _qp = header.qp,
+      coefficients = MacroblockCoefficients(header.pps.sps.chromaBlockCount);
 
   final SliceHeader header;
-  final coefficients = MacroblockCoefficients();
+  final MacroblockCoefficients coefficients;
   var _previousQpDelta = false;
   int _qp;
 
@@ -135,7 +146,7 @@ abstract class SliceData {
       }
       final sps = header.pps.sps;
       block.qp = -sps.lumaQpOffset;
-      final count = 256 + 16 * sps.chromaHeight;
+      final count = coefficients.pcm.length;
       for (var i = 0; i < count; i++) {
         coefficients.pcm[i] = bits.read(
           i < 256 ? sps.lumaDepth : sps.chromaDepth,
@@ -152,11 +163,11 @@ abstract class SliceData {
       _predictionModes(block, left, top);
     } else {
       block.lumaPattern = block.type >= 13 ? 15 : 0;
-      if (header.pps.sps.chromaFormat != 0) {
+      if (header.pps.sps.subsampledChroma) {
         block.chromaPattern = ((block.type - 1) ~/ 4) % 3;
       }
     }
-    if (header.pps.sps.chromaFormat != 0) {
+    if (header.pps.sps.subsampledChroma) {
       block.chromaMode = _chromaMode(left, top);
     }
     if (block.nxn) _patterns(block, left, top);

@@ -162,13 +162,17 @@ final class H264Sps {
   final (int, int)? timing; // frame ticks, ticks per second
   final List<H264ScalingList?>? scaling;
 
+  bool get fullChroma => chromaFormat == 3;
+  bool get subsampledChroma => chromaFormat == 1 || chromaFormat == 2;
+  int get chromaWidth => fullChroma ? 16 : (subsampledChroma ? 8 : 0);
+
   int get chromaHeight => switch (chromaFormat) {
     0 => 0,
     1 => 8,
     _ => 16,
   };
 
-  int get chromaBlockCount => chromaHeight ~/ 2;
+  int get chromaBlockCount => chromaWidth * chromaHeight ~/ 16;
 
   int get lumaQpOffset => 6 * (lumaDepth - 8);
   int get chromaQpOffset => 6 * (chromaDepth - 8);

@@ -89,8 +89,10 @@ BMP extraction preserves alpha from streams that carry it.
 HuffYUV MT (`HYMT`) in AVI and Matroska can reconstruct frames from
 horizontal slices, restarting prediction at each slice boundary.
 Matroska and MP4/MOV support progressive 8–10-bit H.264 I/P/B pictures
-with CABAC or CAVLC and 4:2:0, 4:2:2 or monochrome chroma, including
-lossless streams that use transform bypass. `extract` and `vcs` decode
+with CABAC or CAVLC in monochrome, 4:2:0, 4:2:2 and 4:4:4. This includes
+lossless streams that use transform bypass and 4:4:4 RGB streams signaled
+with an identity color matrix. H.264 streams that code the color planes
+as separate pictures are not supported. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
 same GOP, and schedule captures using the source frame durations and the
 Rust CLI's constant-frame-rate selection rules. `sample/input.mkv`

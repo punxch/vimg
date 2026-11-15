@@ -67,10 +67,9 @@ H264Picture _decodePicture(
   final first = slices.first;
   final sps = first.pps.sps;
   if (sps.lumaDepth > 10 ||
-      (sps.chromaFormat != 0 && sps.chromaDepth != sps.lumaDepth) ||
-      sps.chromaFormat > 2) {
+      (sps.chromaFormat != 0 && sps.chromaDepth != sps.lumaDepth)) {
     throw UnsupportedError(
-      'H.264 decoding supports progressive 8–10-bit 4:2:0, 4:2:2 and monochrome',
+      'H.264 decoding supports progressive 8–10-bit 4:2:0, 4:2:2, 4:4:4 and monochrome',
     );
   }
   if (sps.mbWidth * sps.mbHeight > 139264) {
@@ -203,63 +202,108 @@ final class _Reconstruction {
     int mbY,
     Neighbors available,
   ) {
-    final stride = picture.stride;
-    final yOffset = (mbY * stride + mbX) * 16;
-    final cStride = stride >> 1;
-    final chromaHeight = picture.sps.chromaHeight;
-    final cOffset = mbY * cStride * chromaHeight + mbX * 8;
-    if (block.pcm) {
-      _copyBlock(levels.pcm, 0, picture.y, yOffset, stride, 16);
-      if (picture.cb.isNotEmpty) {
+    final sps = picture.sps;
+    final lumaQp = block.qp + sps.lumaQpOffset;
+    final bypass = sps.transformBypass && lumaQp == 0;
+    for (var component = 0; component < levels.levels.length; component++) {
+      final (plane, stride, offset) = _target(component, mbX, mbY);
+      if (block.pcm) {
+        final samples = sps.chromaWidth * sps.chromaHeight;
         _copyBlock(
           levels.pcm,
-          256,
-          picture.cb,
-          cOffset,
-          cStride,
-          8,
-          height: chromaHeight,
+          component == 0 ? 0 : 256 + (component - 1) * samples,
+          plane,
+          offset,
+          stride,
+          component == 0 ? 16 : sps.chromaWidth,
+          height: component == 0 ? 16 : sps.chromaHeight,
         );
-        _copyBlock(
-          levels.pcm,
-          256 + 8 * chromaHeight,
-          picture.cr,
-          cOffset,
-          cStride,
-          8,
-          height: chromaHeight,
+      } else if (component == 0 || sps.fullChroma) {
+        _reconstructFullIntra(
+          block,
+          levels.levels[component],
+          levels.dc[component],
+          component,
+          plane,
+          stride,
+          offset,
+          component == 0 ? lumaQp : _chromaTransformQp(block, component - 1),
+          bypass,
+          available,
+        );
+      } else {
+        _predict.chroma(
+          plane,
+          stride,
+          offset,
+          block.chromaMode,
+          available,
+          sps.chromaHeight,
+        );
+        _reconstructChroma(
+          plane,
+          offset,
+          stride,
+          block,
+          levels,
+          component - 1,
+          bypass,
         );
       }
-      return;
     }
+  }
 
-    final lumaQp = block.qp + picture.sps.lumaQpOffset;
-    final bypass = picture.sps.transformBypass && lumaQp == 0;
+  (List<int>, int, int) _target(int component, int mbX, int mbY) {
+    final sps = picture.sps;
+    if (component == 0) {
+      final stride = picture.stride;
+      return (picture.y, stride, (mbY * stride + mbX) * 16);
+    }
+    final stride = picture.chromaStride;
+    return (
+      component == 1 ? picture.cb : picture.cr,
+      stride,
+      mbY * stride * sps.chromaHeight + mbX * sps.chromaWidth,
+    );
+  }
+
+  void _reconstructFullIntra(
+    Macroblock block,
+    Int32List levels,
+    Int32List dcLevels,
+    int component,
+    List<int> plane,
+    int stride,
+    int yOffset,
+    int qp,
+    bool bypass,
+    Neighbors available,
+  ) {
     if (block.intra16) {
       final mode = (block.type - 1) & 3;
-      _predict.luma(picture.y, stride, yOffset, 16, mode, available);
+      _predict.luma(plane, stride, yOffset, 16, mode, available);
       final dc = _transform.lumaDc(
-        levels.lumaDc,
-        lumaQp,
-        _scaling.four[0][0],
+        dcLevels,
+        qp,
+        _scaling.four[component][0],
         bypass: bypass,
       );
       if (bypass) {
-        _transform.bypassMacroblock(levels.luma, 0, dc, 16, 16, mode);
-        _add(picture.y, stride, yOffset, 16, 16, 0);
+        _transform.bypassMacroblock(levels, 0, dc, 16, 16, mode);
+        _add(plane, stride, yOffset, 16, 16, 0);
       } else {
         for (var i = 0; i < 16; i++) {
           final x = blockX(i);
           final row = blockY(i);
           _transform.block4(
-            levels.luma,
+            levels,
             i * 16,
-            lumaQp,
-            _scaling.four[0],
+            qp,
+            _scaling.four[component],
             dc: dc[row * 4 + x],
           );
           _add(
-            picture.y,
+            plane,
             stride,
             yOffset + 4 * (row * stride + x),
             4,
@@ -278,37 +322,16 @@ final class _Reconstruction {
         final offset = yOffset + 4 * (row * stride + x);
         final neighbors = _withinMb(x * 4, row * 4, size, available, i);
         final mode = block.predictionMode(x, row);
-        _predict.luma(picture.y, stride, offset, size, mode, neighbors);
+        _predict.luma(plane, stride, offset, size, mode, neighbors);
         if (bypass) {
-          _transform.bypassBlock(levels.luma, z * 16, size, mode: mode);
+          _transform.bypassBlock(levels, z * 16, size, mode: mode);
         } else if (block.transform8x8) {
-          _transform.block8(levels.luma, i * 64, lumaQp, _scaling.eight);
+          _transform.block8(levels, i * 64, qp, _scaling.eight[component]);
         } else {
-          _transform.block4(levels.luma, i * 16, lumaQp, _scaling.four[0]);
+          _transform.block4(levels, i * 16, qp, _scaling.four[component]);
         }
-        _add(picture.y, stride, offset, size, size, 0);
+        _add(plane, stride, offset, size, size, 0);
       }
-    }
-    if (picture.cb.isEmpty) return;
-    for (var component = 0; component < 2; component++) {
-      final plane = component == 0 ? picture.cb : picture.cr;
-      _predict.chroma(
-        plane,
-        cStride,
-        cOffset,
-        block.chromaMode,
-        available,
-        chromaHeight,
-      );
-      _reconstructChroma(
-        plane,
-        cOffset,
-        cStride,
-        block,
-        levels,
-        component,
-        bypass,
-      );
     }
   }
 
@@ -324,54 +347,14 @@ final class _Reconstruction {
   ) {
     final slice = block.slice;
     final owner = slice.firstMb + 1;
-    final stride = picture.stride;
-    final offset = (mbY * stride + mbX) * 16;
-    final lumaQp = block.qp + picture.sps.lumaQpOffset;
-    final bypass = picture.sps.transformBypass && lumaQp == 0;
-    predictInter(
-      _predict.pixels,
-      0,
-      mbX,
-      mbY,
-      owner,
-      motion,
-      motion1,
-      references,
-      slice,
-      poc,
-    );
-    _copyBlock(_predict.pixels, 0, picture.y, offset, stride, 16);
-    if (block.codedLuma != 0) {
-      final size = block.transform8x8 ? 8 : 4;
-      for (var z = 0; z < 16; z += block.transform8x8 ? 4 : 1) {
-        if ((block.codedLuma & (1 << z)) == 0) continue;
-        if (bypass) {
-          _transform.bypassBlock(levels.luma, z * 16, size);
-        } else if (block.transform8x8) {
-          _transform.block8(levels.luma, z * 16, lumaQp, _scaling.interEight);
-        } else {
-          _transform.block4(levels.luma, z * 16, lumaQp, _scaling.interFour[0]);
-        }
-        _add(
-          picture.y,
-          stride,
-          offset + 4 * (blockY(z) * stride + blockX(z)),
-          size,
-          16,
-          4 * (blockY(z) * 16 + blockX(z)),
-        );
-      }
-    }
-
-    if (picture.cb.isEmpty) return;
-    final chromaStride = stride >> 1;
-    final chromaOffset =
-        mbY * chromaStride * picture.sps.chromaHeight + mbX * 8;
-    for (var component = 0; component < 2; component++) {
-      final plane = component == 0 ? picture.cb : picture.cr;
+    final sps = picture.sps;
+    final lumaQp = block.qp + sps.lumaQpOffset;
+    final bypass = sps.transformBypass && lumaQp == 0;
+    for (var component = 0; component < levels.levels.length; component++) {
+      final (plane, stride, offset) = _target(component, mbX, mbY);
       predictInter(
         _predict.pixels,
-        component + 1,
+        component,
         mbX,
         mbY,
         owner,
@@ -381,14 +364,63 @@ final class _Reconstruction {
         slice,
         poc,
       );
-      _reconstructChroma(
+      if (component == 0 || sps.fullChroma) {
+        _copyBlock(_predict.pixels, 0, plane, offset, stride, 16);
+        final coded = block.codedPlane(component);
+        if (coded == 0) continue;
+        _addFullInterResiduals(
+          block,
+          levels.levels[component],
+          component,
+          plane,
+          stride,
+          offset,
+          coded,
+          component == 0 ? lumaQp : _chromaTransformQp(block, component - 1),
+          bypass,
+        );
+      } else {
+        _reconstructChroma(
+          plane,
+          offset,
+          stride,
+          block,
+          levels,
+          component - 1,
+          bypass,
+        );
+      }
+    }
+  }
+
+  void _addFullInterResiduals(
+    Macroblock block,
+    Int32List levels,
+    int component,
+    List<int> plane,
+    int stride,
+    int offset,
+    int coded,
+    int qp,
+    bool bypass,
+  ) {
+    final size = block.transform8x8 ? 8 : 4;
+    for (var z = 0; z < 16; z += block.transform8x8 ? 4 : 1) {
+      if ((coded & (1 << z)) == 0) continue;
+      if (bypass) {
+        _transform.bypassBlock(levels, z * 16, size);
+      } else if (block.transform8x8) {
+        _transform.block8(levels, z * 16, qp, _scaling.interEight[component]);
+      } else {
+        _transform.block4(levels, z * 16, qp, _scaling.interFour[component]);
+      }
+      _add(
         plane,
-        chromaOffset,
-        chromaStride,
-        block,
-        levels,
-        component,
-        bypass,
+        stride,
+        offset + 4 * (blockY(z) * stride + blockX(z)),
+        size,
+        16,
+        4 * (blockY(z) * 16 + blockX(z)),
       );
     }
   }
@@ -413,8 +445,8 @@ final class _Reconstruction {
         ? _scaling.four
         : _scaling.interFour)[component + 1];
     final dc = _transform.chromaDc(
-      levels.chromaDc,
-      component * count,
+      levels.dc[component + 1],
+      0,
       count,
       qp,
       weights[0],
@@ -426,8 +458,8 @@ final class _Reconstruction {
           ? 2 - block.chromaMode
           : 2;
       _transform.bypassMacroblock(
-        levels.chroma,
-        component * count * 16,
+        levels.levels[component + 1],
+        0,
         dc,
         8,
         height,
@@ -440,8 +472,8 @@ final class _Reconstruction {
       final x = (i & 1) * 4;
       final row = (i >> 1) * 4;
       _transform.block4(
-        levels.chroma,
-        (component * count + i) * 16,
+        levels.levels[component + 1],
+        i * 16,
         qp,
         weights,
         dc: dc[i],

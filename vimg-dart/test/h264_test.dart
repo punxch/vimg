@@ -235,6 +235,47 @@ const _chroma422LosslessPlanes = [
   [0x8ef07420, 0x10c9ebd4, 0xf18bf5df],
 ];
 
+// 4:4:4 reference samples from FFmpeg. The 8-bit CABAC sample uses
+// JVT scaling matrices and mixed 4×4 and 8×8 transforms.
+const _chroma444CabacPlanes = [
+  [0x1fcb8fed, 0x804f51bd, 0xe1062284],
+  [0x79fd4704, 0xde1b3ba4, 0x4836a45f],
+  [0x5aa819d9, 0xfd47d34f, 0x7012c000],
+  [0x1759a417, 0x3c7da023, 0xd48f3b43],
+  [0x45883462, 0x44b1b2ef, 0x623ff135],
+  [0xbd0bf559, 0x8aaba7e4, 0x9b01362c],
+  [0xd2fed06c, 0x804aaf27, 0xe34ebe05],
+  [0x36a6eb6e, 0xcb84fec3, 0x025d53be],
+  [0xf7fb1294, 0x770d7fef, 0x8f453fbb],
+  [0xe7deafc6, 0x59001e14, 0x589b8683],
+  [0xd6969de8, 0xc1acf672, 0xc7b8103b],
+  [0x19729f14, 0x659db31e, 0x94a339de],
+];
+
+const _chroma444CavlcPlanes = [
+  [0x6e0ec64a, 0xe2115618, 0x9b8b5df6],
+  [0x18b20ac5, 0x36077362, 0x285493ae],
+  [0x0abd1f80, 0x9a44bd54, 0xb9afcbd4],
+  [0x749db0d3, 0x9db16c4e, 0xad78fb03],
+  [0x95669da0, 0x4e18a926, 0x8dca2a96],
+  [0xdaee01ab, 0x31708a79, 0xfa06d839],
+  [0x353a5387, 0x137a92fd, 0x5ac551bd],
+  [0x169b7df7, 0x54fad8e4, 0x7f8bb979],
+  [0x8faa0a1a, 0x61755e9f, 0x9f15a484],
+  [0x5933332f, 0xccdafc6f, 0x0ecade3d],
+  [0x11804a0e, 0x6eb3cbf1, 0x1e4e37f5],
+  [0xb5034d08, 0x665b3533, 0x325d78b6],
+];
+
+// libx264rgb lossless; these reference planes also match the original GBR.
+const _chroma444LosslessRgbPlanes = [
+  [0xfc568344, 0x1b54dffb, 0x02f092e2],
+  [0x3d7de7a6, 0x7ec5489b, 0x49979094],
+  [0xe1e4d4a8, 0xd1554cc1, 0x93f927aa],
+  [0x576d91de, 0x34b646d9, 0xcef205bc],
+  [0x84aa0a24, 0xcb89a901, 0x67815f0a],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -244,6 +285,7 @@ void _checkPlanes(
   int depth = 8,
   int chromaFormat = 1,
   bool lossless = false,
+  bool rgb = false,
   (int, int) dimensions = (78, 50),
 }) {
   final handle = File(input).openSync();
@@ -274,6 +316,18 @@ void _checkPlanes(
       final frame = indexes[packet]!;
       final picture = decode(file.read(packet.offset, packet.size))!;
       final sps = picture.sps;
+      if (rgb) {
+        final converted = picture.rgb();
+        final p = converted.getPixel(25, 13);
+        final i = (13 + sps.cropTop) * picture.stride + 25 + sps.cropLeft;
+        check(
+          sps.color.matrix == 0 &&
+              p.r == picture.cr[i] &&
+              p.g == picture.y[i] &&
+              p.b == picture.cb[i],
+          'Expected identity GBR conversion in $input',
+        );
+      }
       check(
         sps.profile == profile &&
             sps.lumaDepth == depth &&
@@ -287,7 +341,7 @@ void _checkPlanes(
         (0, picture.y),
         if (chromaFormat != 0) ...[(1, picture.cb), (2, picture.cr)],
       ]) {
-        final shiftX = index == 0 ? 0 : 1;
+        final shiftX = index == 0 || chromaFormat == 3 ? 0 : 1;
         final shiftY = index != 0 && chromaFormat == 1 ? 1 : 0;
         final stride = picture.stride >> shiftX;
         final hash = _checksum(
@@ -336,6 +390,9 @@ Future<void> main(List<String> arguments) async {
   const cabac422 = 'test/fixtures/avc-422-cabac.mkv';
   const cavlc422 = 'test/fixtures/avc-422-cavlc.mp4';
   const lossless422 = 'test/fixtures/avc-422-lossless.mkv';
+  const cabac444 = 'test/fixtures/avc-444-cabac.mkv';
+  const cavlc444 = 'test/fixtures/avc-444-cavlc.mp4';
+  const losslessRgb = 'test/fixtures/avc-444-lossless-rgb.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -442,6 +499,35 @@ Future<void> main(List<String> arguments) async {
     dimensions: (94, 61),
   );
 
+  _checkPlanes(
+    cabac444,
+    _chroma444CabacPlanes,
+    inter: true,
+    profile: 244,
+    chromaFormat: 3,
+    dimensions: (93, 61),
+  );
+  _checkPlanes(
+    cavlc444,
+    _chroma444CavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 3,
+    dimensions: (93, 61),
+  );
+  _checkPlanes(
+    losslessRgb,
+    _chroma444LosslessRgbPlanes,
+    inter: true,
+    profile: 244,
+    chromaFormat: 3,
+    lossless: true,
+    rgb: true,
+    dimensions: (93, 61),
+  );
+
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
     final result = await Process.run(
@@ -461,6 +547,7 @@ Future<void> main(List<String> arguments) async {
       (high10Monochrome, 47, 31),
       (losslessCabac, 47, 31),
       (cabac422, 47, 31),
+      (cabac444, 47, 31),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -491,6 +578,7 @@ Future<void> main(List<String> arguments) async {
       (high10Cavlc, 94, 62),
       (losslessCavlc, 94, 62),
       (cavlc422, 94, 61),
+      (cavlc444, 93, 61),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -510,6 +598,7 @@ Future<void> main(List<String> arguments) async {
       ('high10', high10Cabac, 94, 62),
       ('lossless', losslessCavlc, 94, 62),
       ('422', cavlc422, 94, 61),
+      ('444-rgb', losslessRgb, 93, 61),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';

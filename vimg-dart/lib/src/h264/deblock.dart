@@ -19,8 +19,9 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
     final x = address % width;
     final row = address ~/ width;
     final start = (row * stride + x) * 16;
-    final chromaStride = stride >> 1;
-    final chromaStart = row * chromaStride * sps.chromaHeight + x * 8;
+    final chromaStride = picture.chromaStride;
+    final chromaStart =
+        row * chromaStride * sps.chromaHeight + x * sps.chromaWidth;
     final pps = slice.pps;
     for (final vertical in [true, false]) {
       final neighborAddress = vertical
@@ -56,6 +57,7 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
         strength,
       );
       if (cb.isNotEmpty) {
+        final chromaSpacing = sps.fullChroma && block.transform8x8 ? 8 : 4;
         final cbQp = chromaQp(block.qp, pps.chromaOffset, chromaQpOffset);
         final crQp = chromaQp(block.qp, pps.secondChromaOffset, chromaQpOffset);
         _edges(
@@ -63,10 +65,10 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
           chromaStart,
           chromaStride,
           vertical,
-          8,
+          sps.chromaWidth,
           sps.chromaHeight,
           sps.chromaDepth,
-          4,
+          chromaSpacing,
           cbQp,
           neighbor == null
               ? null
@@ -80,10 +82,10 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
           chromaStart,
           chromaStride,
           vertical,
-          8,
+          sps.chromaWidth,
           sps.chromaHeight,
           sps.chromaDepth,
-          4,
+          chromaSpacing,
           crQp,
           neighbor == null
               ? null

@@ -11,17 +11,18 @@ final class H264Picture {
     : stride = sps.mbWidth * 16,
       y = _samples(sps.mbWidth * sps.mbHeight * 256, sps.lumaDepth),
       cb = _samples(
-        sps.mbWidth * sps.mbHeight * 8 * sps.chromaHeight,
+        sps.mbWidth * sps.mbHeight * sps.chromaWidth * sps.chromaHeight,
         sps.chromaDepth,
       ),
       cr = _samples(
-        sps.mbWidth * sps.mbHeight * 8 * sps.chromaHeight,
+        sps.mbWidth * sps.mbHeight * sps.chromaWidth * sps.chromaHeight,
         sps.chromaDepth,
       );
 
   final H264Sps sps;
   final int stride;
   final List<int> y, cb, cr;
+  int get chromaStride => sps.mbWidth * sps.chromaWidth;
   MotionField? motionL0;
   MotionField? motionL1;
 
@@ -30,7 +31,8 @@ final class H264Picture {
     cb: cb,
     cr: cr,
     stride: stride,
-    chromaStride: stride >> 1,
+    chromaStride: chromaStride,
+    subsamplingX: sps.fullChroma ? 0 : 1,
     subsamplingY: sps.chromaFormat == 1 ? 1 : 0,
     width: sps.width,
     height: sps.height,

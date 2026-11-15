@@ -6,18 +6,33 @@ enum _Residual {
   luma4(93, 134, 195, 247),
   chromaDc(97, 149, 210, 257),
   chromaAc(101, 152, 213, 266),
-  luma8(0, 402, 417, 426);
+  luma8(1012, 402, 417, 426),
+  cbDc(460, 484, 572, 952),
+  cbAc(464, 499, 587, 962),
+  cb4(468, 513, 601, 972),
+  cb8(1016, 660, 690, 708),
+  crDc(472, 528, 616, 982),
+  crAc(476, 543, 631, 992),
+  cr4(480, 557, 645, 1002),
+  cr8(1020, 718, 748, 766);
 
   const _Residual(this.coded, this.significant, this.last, this.level);
 
   final int coded, significant, last, level;
 }
 
+const _fullCategories = [
+  (_Residual.lumaDc, _Residual.lumaAc, _Residual.luma4, _Residual.luma8),
+  (_Residual.cbDc, _Residual.cbAc, _Residual.cb4, _Residual.cb8),
+  (_Residual.crDc, _Residual.crAc, _Residual.cr4, _Residual.cr8),
+];
+
 final class CabacSlice extends SliceData {
   CabacSlice(SliceHeader header)
     : _cabac = Cabac(
         header.bits,
         header.qp,
+        fullChroma: header.pps.sps.fullChroma,
         interInit: header.kind == SliceKind.intra ? null : header.cabacInit,
       ),
       super(header);
@@ -216,7 +231,7 @@ final class CabacSlice extends SliceData {
       );
       block.lumaPattern |= _cabac.decision(73 + neighbors) << i;
     }
-    if (header.pps.sps.chromaFormat == 0) return;
+    if (!header.pps.sps.subsampledChroma) return;
     int pattern(Macroblock? block) =>
         block?.pcm == true ? 2 : block?.chromaPattern ?? 0;
     final a = pattern(left);
@@ -239,51 +254,9 @@ final class CabacSlice extends SliceData {
 
   void _residuals(Macroblock block, Macroblock? left, Macroblock? top) {
     coefficients.clearResiduals();
-    if (block.intra16 &&
-        _decode(
-          _Residual.lumaDc,
-          _pair(_dcFlag(left, 0, block.intra), _dcFlag(top, 0, block.intra)),
-          coefficients.lumaDc,
-          0,
-          16,
-        )) {
-      block.codedDc |= 1;
-    }
-    if (block.transform8x8) {
-      for (var i = 0; i < 4; i++) {
-        if (_set(block.lumaPattern, i)) {
-          _decode(_Residual.luma8, 0, coefficients.luma, 64 * i, 64);
-          block.codedLuma |= 15 << (4 * i);
-        }
-      }
-    } else {
-      for (var i = 0; i < 16; i++) {
-        if (!_set(block.lumaPattern, i >> 2)) continue;
-        final x = blockX(i);
-        final y = blockY(i);
-        final context = _pair(
-          _lumaFlag(
-            x == 0 ? left : block,
-            blockIndex((x - 1) & 3, y),
-            block.intra,
-          ),
-          _lumaFlag(
-            y == 0 ? top : block,
-            blockIndex(x, (y - 1) & 3),
-            block.intra,
-          ),
-        );
-        final ac = block.intra16;
-        if (_decode(
-          ac ? _Residual.lumaAc : _Residual.luma4,
-          context,
-          coefficients.luma,
-          i * 16 + (ac ? 1 : 0),
-          ac ? 15 : 16,
-        )) {
-          block.codedLuma |= 1 << i;
-        }
-      }
+    final fullChroma = header.pps.sps.fullChroma;
+    for (var plane = 0; plane < (fullChroma ? 3 : 1); plane++) {
+      _fullResiduals(block, left, top, plane, fullChroma);
     }
     if (block.chromaPattern == 0) return;
     final countPerPlane = header.pps.sps.chromaBlockCount;
@@ -294,8 +267,8 @@ final class CabacSlice extends SliceData {
           _dcFlag(left, plane + 1, block.intra),
           _dcFlag(top, plane + 1, block.intra),
         ),
-        coefficients.chromaDc,
-        plane * countPerPlane,
+        coefficients.dc[plane + 1],
+        0,
         countPerPlane,
       )) {
         block.codedDc |= 1 << (plane + 1);
@@ -305,21 +278,78 @@ final class CabacSlice extends SliceData {
     for (var i = 0; i < 2 * countPerPlane; i++) {
       final topEdge = i % countPerPlane < 2;
       final context = _pair(
-        _chromaFlag(i.isEven ? left : block, i ^ 1, block.intra),
-        _chromaFlag(
+        _blockFlag(i.isEven ? left : block, 16 + (i ^ 1), block.intra),
+        _blockFlag(
           topEdge ? top : block,
-          i + (topEdge ? countPerPlane - 2 : -2),
+          16 + i + (topEdge ? countPerPlane - 2 : -2),
           block.intra,
         ),
       );
       if (_decode(
         _Residual.chromaAc,
         context,
-        coefficients.chroma,
-        i * 16 + 1,
+        coefficients.levels[1 + i ~/ countPerPlane],
+        (i % countPerPlane) * 16 + 1,
         15,
       )) {
-        block.codedChroma |= 1 << i;
+        block.codedBlocks |= 1 << (16 + i);
+      }
+    }
+  }
+
+  void _fullResiduals(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    int plane,
+    bool fullChroma,
+  ) {
+    final (dc, ac, four, eight) = _fullCategories[plane];
+    final acOnly = block.intra16;
+    if (acOnly &&
+        _decode(
+          dc,
+          _pair(
+            _dcFlag(left, plane, block.intra),
+            _dcFlag(top, plane, block.intra),
+          ),
+          coefficients.dc[plane],
+          0,
+          16,
+        )) {
+      block.codedDc |= 1 << plane;
+    }
+
+    final start = plane * 16;
+    final large = block.transform8x8;
+    for (var i = 0; i < 16; i += large ? 4 : 1) {
+      if (!_set(block.lumaPattern, i >> 2)) continue;
+      final x = blockX(i);
+      final y = blockY(i);
+      final context = large && !fullChroma
+          ? 0
+          : _pair(
+              _blockFlag(
+                x == 0 ? left : block,
+                start + blockIndex((x - 1) & 3, y),
+                block.intra,
+                large: large,
+              ),
+              _blockFlag(
+                y == 0 ? top : block,
+                start + blockIndex(x, (y - 1) & 3),
+                block.intra,
+                large: large,
+              ),
+            );
+      if (_decode(
+        large ? eight : (acOnly ? ac : four),
+        context,
+        coefficients.levels[plane],
+        i * 16 + (acOnly ? 1 : 0),
+        large ? 64 : (acOnly ? 15 : 16),
+      )) {
+        block.codedBlocks |= (large ? 15 : 1) << (start + i);
       }
     }
   }
@@ -331,8 +361,11 @@ final class CabacSlice extends SliceData {
     int offset,
     int length,
   ) {
-    final large = category == _Residual.luma8;
-    if (!large && _cabac.decision(category.coded + context) == 0) return false;
+    final large = length == 64;
+    if ((!large || header.pps.sps.fullChroma) &&
+        _cabac.decision(category.coded + context) == 0) {
+      return false;
+    }
     final dc422 = category == _Residual.chromaDc && length == 8;
     var used = 0;
     for (var i = 0; i < length; i++) {
@@ -372,10 +405,15 @@ final class CabacSlice extends SliceData {
 
 bool _dcFlag(Macroblock? block, int index, bool intra) =>
     block == null ? intra : block.pcm || _set(block.codedDc, index);
-bool _lumaFlag(Macroblock? block, int index, bool intra) =>
-    block == null ? intra : block.pcm || _set(block.codedLuma, index);
-bool _chromaFlag(Macroblock? block, int index, bool intra) =>
-    block == null ? intra : block.pcm || _set(block.codedChroma, index);
+bool _blockFlag(
+  Macroblock? block,
+  int index,
+  bool intra, {
+  bool large = false,
+}) => block == null
+    ? intra
+    : block.pcm ||
+          ((!large || block.transform8x8) && _set(block.codedBlocks, index));
 bool _set(int flags, int index) => flags & (1 << index) != 0;
 int _count(bool a, bool b) => (a ? 1 : 0) + (b ? 1 : 0);
 int _pair(bool a, bool b) => (a ? 1 : 0) + (b ? 2 : 0);

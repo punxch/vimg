@@ -140,19 +140,24 @@ final class ScalingMatrices {
       return weights;
     }
 
-    List<int> eightGroup(int index, List<int> defaults) {
-      final sequence = seq == null
-          ? List.filled(64, 16)
-          : _resolve(seq, index, scan8, defaults, defaults);
-      return pic == null
-          ? sequence
-          : _resolve(
-              pic,
-              index,
-              scan8,
-              seq == null ? defaults : sequence,
-              defaults,
-            );
+    List<List<int>> eightGroup(int first, List<int> defaults) {
+      var sequence = seq == null ? List.filled(64, 16) : defaults;
+      var picture = defaults;
+      final weights = <List<int>>[];
+      for (var plane = 0; plane < (pps.sps.fullChroma ? 3 : 1); plane++) {
+        final index = first + 2 * plane;
+        if (seq != null) {
+          sequence = _resolve(seq, index, scan8, sequence, defaults);
+        }
+        if (pic == null) {
+          picture = sequence;
+        } else {
+          final fallback = plane == 0 && seq != null ? sequence : picture;
+          picture = _resolve(pic, index, scan8, fallback, defaults);
+        }
+        weights.add(picture);
+      }
+      return weights;
     }
 
     four = fourGroup(0, _raster(scan4, _default4Scan));
@@ -162,7 +167,7 @@ final class ScalingMatrices {
   }
 
   late final List<List<int>> four, interFour;
-  late final List<int> eight, interEight;
+  late final List<List<int>> eight, interEight;
 
   static List<int> _resolve(
     List<H264ScalingList?> matrices,

@@ -69,10 +69,10 @@ final class CavlcSlice extends SliceData {
 
   @override
   void _patterns(Macroblock block, Macroblock? left, Macroblock? top) {
-    final monochrome = header.pps.sps.chromaFormat == 0;
-    final table = monochrome
-        ? (block.intra ? _monoIntraPattern : _monoInterPattern)
-        : (block.intra ? _intraPattern : _interPattern);
+    final subsampled = header.pps.sps.subsampledChroma;
+    final table = subsampled
+        ? (block.intra ? _intraPattern : _interPattern)
+        : (block.intra ? _fullIntraPattern : _fullInterPattern);
     final pattern = table[header.bits.ue(table.length - 1)];
     block.lumaPattern = pattern & 15;
     block.chromaPattern = pattern >> 4;
@@ -90,44 +90,17 @@ final class CavlcSlice extends SliceData {
     }
     block.qp = _qp;
     coefficients.clearResiduals();
-    if (acOnly &&
-        _cavlc.residual(
-              coefficients.lumaDc,
-              0,
-              16,
-              _lumaContext(block, left, top, 0),
-            ) !=
-            0) {
-      block.codedDc |= 1;
-    }
-    if (block.lumaPattern != 0) {
-      final counts = block.totalCoefficients ??= Uint8List(
-        16 + 2 * header.pps.sps.chromaBlockCount,
-      );
-      for (var i = 0; i < 16; i++) {
-        if (!_set(block.lumaPattern, i >> 2)) continue;
-        final count = _cavlc.residual(
-          coefficients.luma,
-          block.transform8x8
-              ? (i >> 2) * 64 + (i & 3)
-              : i * 16 + (acOnly ? 1 : 0),
-          acOnly ? 15 : 16,
-          _lumaContext(block, left, top, i),
-          stride: block.transform8x8 ? 4 : 1,
-        );
-        counts[i] = count;
-        if (count != 0) {
-          block.codedLuma |= block.transform8x8 ? 15 << (i & ~3) : 1 << i;
-        }
-      }
+    final planes = header.pps.sps.fullChroma ? 3 : 1;
+    for (var plane = 0; plane < planes; plane++) {
+      _fullResiduals(block, left, top, plane);
     }
     if (block.chromaPattern == 0) return;
     final countPerPlane = header.pps.sps.chromaBlockCount;
     final dcContext = countPerPlane == 8 ? -2 : -1;
     for (var plane = 0; plane < 2; plane++) {
       if (_cavlc.residual(
-            coefficients.chromaDc,
-            plane * countPerPlane,
+            coefficients.dc[plane + 1],
+            0,
             countPerPlane,
             dcContext,
           ) !=
@@ -147,21 +120,69 @@ final class CavlcSlice extends SliceData {
         16 + i + (topEdge ? countPerPlane - 2 : -2),
       );
       final count = _cavlc.residual(
-        coefficients.chroma,
-        i * 16 + 1,
+        coefficients.levels[1 + i ~/ countPerPlane],
+        (i % countPerPlane) * 16 + 1,
         15,
         _context(a, b),
       );
       counts[16 + i] = count;
-      if (count != 0) block.codedChroma |= 1 << i;
+      if (count != 0) block.codedBlocks |= 1 << (16 + i);
+    }
+  }
+
+  void _fullResiduals(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    int plane,
+  ) {
+    final start = plane * 16;
+    final acOnly = block.intra16;
+    if (acOnly &&
+        _cavlc.residual(
+              coefficients.dc[plane],
+              0,
+              16,
+              _fullContext(block, left, top, start, 0),
+            ) !=
+            0) {
+      block.codedDc |= 1 << plane;
+    }
+    if (block.lumaPattern != 0) {
+      final counts = block.totalCoefficients ??= Uint8List(
+        16 + 2 * header.pps.sps.chromaBlockCount,
+      );
+      for (var i = 0; i < 16; i++) {
+        if (!_set(block.lumaPattern, i >> 2)) continue;
+        final count = _cavlc.residual(
+          coefficients.levels[plane],
+          block.transform8x8
+              ? (i >> 2) * 64 + (i & 3)
+              : i * 16 + (acOnly ? 1 : 0),
+          acOnly ? 15 : 16,
+          _fullContext(block, left, top, start, i),
+          stride: block.transform8x8 ? 4 : 1,
+        );
+        counts[start + i] = count;
+        if (count != 0) {
+          block.codedBlocks |=
+              (block.transform8x8 ? 15 << (i & ~3) : 1 << i) << start;
+        }
+      }
     }
   }
 }
 
-int _lumaContext(Macroblock block, Macroblock? left, Macroblock? top, int i) {
+int _fullContext(
+  Macroblock block,
+  Macroblock? left,
+  Macroblock? top,
+  int start,
+  int i,
+) {
   final x = blockX(i), y = blockY(i);
-  final a = _countAt(x == 0 ? left : block, blockIndex((x - 1) & 3, y));
-  final b = _countAt(y == 0 ? top : block, blockIndex(x, (y - 1) & 3));
+  final a = _countAt(x == 0 ? left : block, start + blockIndex((x - 1) & 3, y));
+  final b = _countAt(y == 0 ? top : block, start + blockIndex(x, (y - 1) & 3));
   return _context(a, b);
 }
 
@@ -174,8 +195,8 @@ int _context(int? a, int? b) =>
 
 // H.264 Table 9-4 mapped Exp-Golomb coded block patterns.
 // dart format off
-const _monoIntraPattern = [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
-const _monoInterPattern = [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
+const _fullIntraPattern = [15, 0, 7, 11, 13, 14, 3, 5, 10, 12, 1, 2, 4, 8, 6, 9];
+const _fullInterPattern = [0, 1, 2, 4, 8, 3, 5, 10, 12, 15, 7, 11, 13, 14, 6, 9];
 const _intraPattern = [
   47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46,
   16, 3, 5, 10, 12, 19, 21, 26, 28, 35, 37, 42, 44, 1, 2, 4,

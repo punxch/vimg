@@ -6,8 +6,8 @@ import 'cabac_tables.dart';
 
 /// H.264 probability initialization and coefficient escape codes (§9.3).
 final class Cabac extends CabacEngine {
-  Cabac(Rbsp bits, int qp, {int? interInit})
-    : super(bits, _models(qp, interInit));
+  Cabac(Rbsp bits, int qp, {int? interInit, bool fullChroma = false})
+    : super(bits, _models(qp, interInit, fullChroma));
 
   int coefficientSuffix() {
     var prefix = 0;
@@ -23,14 +23,20 @@ final class Cabac extends CabacEngine {
   }
 }
 
-Uint8List _models(int qp, int? interInit) {
+Uint8List _models(int qp, int? interInit, bool fullChroma) {
   final table = interInit == null
       ? intraContextInit
       : interContextInit[interInit];
-  final models = Uint8List(table.length ~/ 2);
+  final extra = fullChroma
+      ? chroma444ContextInit[interInit == null ? 0 : interInit + 1]
+      : const <int>[];
+  final models = Uint8List((table.length + extra.length) ~/ 2);
   final initialQp = qp.clamp(0, 51);
-  for (var i = 0; i < models.length; i++) {
-    models[i] = cabacModel(table[2 * i], table[2 * i + 1], initialQp);
+  var model = 0;
+  for (final init in [table, extra]) {
+    for (var i = 0; i < init.length; i += 2) {
+      models[model++] = cabacModel(init[i], init[i + 1], initialQp);
+    }
   }
   return models;
 }

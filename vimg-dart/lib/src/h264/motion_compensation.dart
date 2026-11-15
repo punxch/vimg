@@ -21,10 +21,11 @@ void predictInter(
   final depth = luma ? sps.lumaDepth : sps.chromaDepth;
   final maximum = (1 << depth) - 1;
   final offsetShift = depth - 8;
-  final blockWidth = luma ? 4 : 2;
-  final blockHeight = luma ? 4 : sps.chromaHeight ~/ 4;
+  final fullSize = luma || sps.fullChroma;
+  final blockWidth = fullSize ? 4 : 2;
+  final blockHeight = fullSize ? 4 : sps.chromaHeight ~/ 4;
   final size = blockWidth * 4;
-  final unit = luma ? 4 : 8;
+  final unit = fullSize ? 4 : 8;
   final weights = header.weights;
   final denominator = luma ? weights?.lumaShift : weights?.chromaShift;
   for (var py = 0; py < 4; py++) {
@@ -59,14 +60,20 @@ void predictInter(
           final dx = col * unit, dy = row * unit;
           final int sample;
           if (first == null || second == null) {
-            final raw = _interSample(first ?? second!, luma, dx, dy, maximum);
+            final raw = _interSample(
+              first ?? second!,
+              fullSize,
+              dx,
+              dy,
+              maximum,
+            );
             final weight = weight0 ?? weight1;
             sample = weight == null
                 ? raw
                 : _weighted(raw, weight, denominator!, offsetShift, maximum);
           } else {
-            final a = _interSample(first, luma, dx, dy, maximum);
-            final b = _interSample(second, luma, dx, dy, maximum);
+            final a = _interSample(first, fullSize, dx, dy, maximum);
+            final b = _interSample(second, fullSize, dx, dy, maximum);
             if (weight0 != null && weight1 != null) {
               final shift = denominator!;
               final offset = (weight0.offset + weight1.offset) << offsetShift;
@@ -113,7 +120,7 @@ _Source _source(
     1 => picture.cb,
     _ => picture.cr,
   };
-  final stride = plane == 0 ? picture.stride : picture.stride >> 1;
+  final stride = plane == 0 ? picture.stride : picture.chromaStride;
   final vector = field.vectorAt(x, y);
   return (
     ref: ref,
@@ -127,7 +134,8 @@ _Source _source(
   );
 }
 
-int _interSample(_Source source, bool luma, int dx, int dy, int maximum) => luma
+int _interSample(_Source source, bool fullSize, int dx, int dy, int maximum) =>
+    fullSize
     ? _luma(
         source.data,
         source.stride,
