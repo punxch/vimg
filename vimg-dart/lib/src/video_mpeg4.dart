@@ -56,7 +56,10 @@ extension _Mpeg4Timeline on Video {
             // An open GOP can still have a leading B picture after its I-VOP.
             forward = first;
             first = position;
-            configurations[first] = (bytes: unit.configuration, nal: null);
+            configurations[first] = _RunConfiguration(
+              bytes: unit.configuration,
+              mpeg4Clock: unit.clock,
+            );
             sections[first] = sectionStart;
           } else if (vop.coded && vop.type == Mpeg4PictureType.predictive) {
             forward = first;

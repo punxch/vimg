@@ -199,6 +199,8 @@ typedef Mpeg4Vop = ({
   int pts,
   bool coded,
   bool noRound,
+  bool topFieldFirst,
+  int? fieldInterval,
   bool alternateScan,
   int dcThreshold,
   int quant,
@@ -207,11 +209,14 @@ typedef Mpeg4Vop = ({
   Rbsp bits,
 });
 
+typedef Mpeg4Clock = ({int base, int? reference, int? fieldInterval});
+
 typedef Mpeg4CodedVop = ({
   Mpeg4Vop header,
   int offset,
   int length,
   Uint8List? configuration,
+  Mpeg4Clock? clock,
 });
 
 /// Tracks the VOL and VOP clock in coded order, including B pictures.
@@ -221,6 +226,13 @@ final class Mpeg4Headers {
   Mpeg4Signal _signal = _defaultSignal;
   Uint8List? _visualObject;
   var _base = 0, _previousBase = 0;
+  int? _lastReference, _previousReference, _fieldInterval;
+
+  void restoreClock(Mpeg4Clock clock) {
+    _base = clock.base;
+    _lastReference = clock.reference;
+    _fieldInterval = clock.fieldInterval;
+  }
 
   Iterable<Mpeg4CodedVop> read(Uint8List bytes) sync* {
     var start = 0;
@@ -236,7 +248,9 @@ final class Mpeg4Headers {
         final current = Mpeg4Volume.read(bits, _signal);
         if (volume != null && volume!.resolution != current.resolution) {
           _base = _previousBase = 0;
+          _lastReference = _previousReference = null;
         }
+        _fieldInterval = null;
         volume = current;
         configuration = Uint8List.fromList([
           ...?_visualObject,
@@ -246,12 +260,20 @@ final class Mpeg4Headers {
         final layer =
             volume ??
             (throw const FormatException('Missing MPEG-4 VOL header'));
+        final clock = layer.interlaced
+            ? (
+                base: _base,
+                reference: _lastReference,
+                fieldInterval: _fieldInterval,
+              )
+            : null;
         final header = _readVop(bits, layer);
         yield (
           header: header,
           offset: start,
           length: unit.end - start,
           configuration: configuration,
+          clock: clock,
         );
         start = unit.end;
       }
@@ -279,9 +301,20 @@ final class Mpeg4Headers {
     }
     final whole = bidirectional ? _previousBase + seconds : _base;
     final pts = whole * layer.resolution + increment;
-    var noRound = false, alternate = false;
+    var noRound = false, topFieldFirst = false, alternate = false;
     var threshold = 0, quant = 1, forward = 1, backward = 1;
     if (coded) {
+      if (!bidirectional) {
+        _previousReference = _lastReference;
+        _lastReference = pts;
+      } else if (_previousReference case final previous?
+          when layer.interlaced && _fieldInterval == null) {
+        // Field-direct temporal scaling uses the first B-VOP's lead over
+        // its past reference after the VOL.
+        if (pts > previous && pts < _lastReference!) {
+          _fieldInterval = pts - previous;
+        }
+      }
       noRound = type == Mpeg4PictureType.predictive && bits.flag();
       bits.skip(
         layer.complexityIntra +
@@ -290,7 +323,7 @@ final class Mpeg4Headers {
       );
       threshold = mpeg4DcThreshold[bits.read(3)];
       if (layer.interlaced) {
-        bits.skip(1); // top field first
+        topFieldFirst = bits.flag();
         alternate = bits.flag();
       }
       quant = bits.read(layer.quantBits);
@@ -308,6 +341,8 @@ final class Mpeg4Headers {
       pts: pts,
       coded: coded,
       noRound: noRound,
+      topFieldFirst: topFieldFirst,
+      fieldInterval: _fieldInterval,
       alternateScan: alternate,
       dcThreshold: threshold,
       quant: quant,

@@ -23,7 +23,7 @@ final class Mpeg4Picture {
       Uint8List(macroblocks * 64),
       Uint8List(macroblocks * 64),
     ];
-    motion = _PictureMotion(columns, rows);
+    motion = _PictureMotion(columns, rows, volume.interlaced);
   }
 
   final Mpeg4Volume volume;
@@ -52,8 +52,9 @@ final class Mpeg4Picture {
 
 /// Decodes pictures in coded order. Non-coded VOPs can repeat a reference.
 final class Mpeg4Decoder {
-  Mpeg4Decoder([Uint8List? configuration]) {
+  Mpeg4Decoder([Uint8List? configuration, Mpeg4Clock? clock]) {
     if (configuration != null) _headers.read(configuration).toList();
+    if (clock != null) _headers.restoreClock(clock);
   }
 
   final _headers = Mpeg4Headers();
@@ -77,8 +78,6 @@ final class Mpeg4Decoder {
       if (header.volume.partitioned && !bidirectional) {
         throw UnsupportedError('MPEG-4 data partitioning');
       }
-      if (header.volume.interlaced)
-        throw UnsupportedError('MPEG-4 interlaced pictures');
       final old = header.type == Mpeg4PictureType.intra
           ? null
           : bidirectional
@@ -137,13 +136,13 @@ final class _VopDecoder {
   final _coefficients = Int16List(64);
   Rbsp get _bits => header.bits;
   int get _columns => picture.columns;
-  final _rowVectors = List<_Vector>.filled(2, _zeroVector);
+  final _rowVectors = List<_Vector>.filled(4, _zeroVector);
   int _quant, _threshold, _forwardCode, _backwardCode;
   int _sliceStart = 0;
 
   void decode() {
     for (var y = 0; y < picture.rows; y++) {
-      _rowVectors.fillRange(0, 2, _zeroVector);
+      _rowVectors.fillRange(0, 4, _zeroVector);
       for (var x = 0; x < _columns; x++) {
         final index = y * _columns + x;
         if (index != 0 && header.volume.resync) _readPacketHeader(index);
@@ -191,7 +190,7 @@ final class _VopDecoder {
       throw const FormatException('Invalid MPEG-4 video packet address');
     }
     _sliceStart = index;
-    _rowVectors.fillRange(0, 2, _zeroVector);
+    _rowVectors.fillRange(0, 4, _zeroVector);
     final quant = _bits.read(header.volume.quantBits);
     if (quant != 0) _quant = quant;
     if (_bits.flag()) {
@@ -221,6 +220,7 @@ final class _VopDecoder {
     final pattern = (_lumaPattern.read(_bits) << 2) | (mode & 3);
     final separateDc = _quant < _threshold;
     if (changeQuant) _adjustQuant(_quantChange[_bits.read(2)]);
+    final fieldDct = header.volume.interlaced && _bits.flag();
     for (var block = 0; block < 6; block++) {
       _readBlock(
         x,
@@ -230,6 +230,7 @@ final class _VopDecoder {
         intra: true,
         separateDc: separateDc,
         acPrediction: acPrediction,
+        fieldDct: fieldDct,
       );
     }
   }
@@ -254,7 +255,37 @@ final class _VopDecoder {
     }
     final pattern = ((_lumaPattern.read(_bits) ^ 15) << 2) | (mode & 3);
     if (changeQuant) _adjustQuant(_quantChange[_bits.read(2)]);
+    final fieldDct = header.volume.interlaced && pattern != 0 && _bits.flag();
     final split = mode & 16 != 0;
+    if (header.volume.interlaced && !split && _bits.flag()) {
+      final selection = _readFieldSelection();
+      final prediction = _predictVector(x, y, 0);
+      final motion = _readFieldMotion(
+        selection,
+        prediction,
+        prediction,
+        _forwardCode,
+      );
+      picture.motion.fields![index] = motion;
+      final sumX = motion.top.x + motion.bottom.x;
+      final frameVector = (
+        x: (sumX >> 1) | (sumX & 1),
+        y: motion.top.y + motion.bottom.y,
+      );
+      for (var block = 0; block < 4; block++) {
+        picture.motion.store(x, y, block, frameVector);
+      }
+      _prediction.predictFields(
+        picture,
+        reference,
+        x,
+        y,
+        motion,
+        noRound: header.noRound,
+      );
+      _readResidual(x, y, pattern, fieldDct);
+      return;
+    }
     final vectors = <_Vector>[];
     for (var block = 0; block < (split ? 4 : 1); block++) {
       final vector = _motionVector(
@@ -280,7 +311,7 @@ final class _VopDecoder {
       vectors,
       noRound: header.noRound,
     );
-    _readResidual(x, y, pattern);
+    _readResidual(x, y, pattern, fieldDct);
   }
 
   void _readBidirectional(int x, int y, int index) {
@@ -296,55 +327,142 @@ final class _VopDecoder {
     if (mode != 0 && pattern != 0 && _bits.flag()) {
       _adjustQuant(_bits.flag() ? 2 : -2);
     }
+    final fieldDct = header.volume.interlaced && pattern != 0 && _bits.flag();
     if (mode == 0) {
-      final delta = directSkip
-          ? _zeroVector
-          : _motionVector(_bits, _zeroVector, 1);
-      final period = after.pts - before.pts, offset = header.pts - before.pts;
-      if (offset <= 0 || offset >= period)
-        throw const FormatException('Invalid MPEG-4 B picture timing');
-      final forward = <_Vector>[], backward = <_Vector>[];
-      final split = after.motion.split[index] != 0 || picture.volume.quarter;
-      for (var block = 0; block < (split ? 4 : 1); block++) {
-        final reference = after.motion.at(
-          x * 2 + (block & 1),
-          y * 2 + (block >> 1),
-        );
-        final vx = reference.x * offset ~/ period + delta.x;
-        final vy = reference.y * offset ~/ period + delta.y;
-        forward.add((x: vx, y: vy));
-        backward.add((
-          x: delta.x != 0
-              ? vx - reference.x
-              : reference.x * (offset - period) ~/ period,
-          y: delta.y != 0
-              ? vy - reference.y
-              : reference.y * (offset - period) ~/ period,
-        ));
-      }
-      _prediction.predict(picture, before, x, y, forward);
-      _prediction.predict(picture, after, x, y, backward, average: true);
+      _predictDirect(x, y, index, directSkip);
     } else {
       final forwards = mode == 1 || mode == 3;
       final backwards = mode == 1 || mode == 2;
+      final field = header.volume.interlaced && _bits.flag();
+      final forwardSelection = field && forwards ? _readFieldSelection() : null;
+      final backwardSelection = field && backwards
+          ? _readFieldSelection()
+          : null;
       if (forwards) {
-        _rowVectors[0] = _motionVector(_bits, _rowVectors[0], _forwardCode);
-        _prediction.predict(picture, before, x, y, [_rowVectors[0]]);
+        _predictFromRow(before, x, y, 0, _forwardCode, forwardSelection);
       }
       if (backwards) {
-        _rowVectors[1] = _motionVector(_bits, _rowVectors[1], _backwardCode);
-        _prediction.predict(picture, after, x, y, [
-          _rowVectors[1],
-        ], average: forwards);
+        _predictFromRow(
+          after,
+          x,
+          y,
+          2,
+          _backwardCode,
+          backwardSelection,
+          average: forwards,
+        );
       }
     }
-    _readResidual(x, y, pattern);
+    _readResidual(x, y, pattern, fieldDct);
   }
 
-  void _readResidual(int x, int y, int pattern) {
+  void _predictDirect(int x, int y, int index, bool skipped) {
+    final before = past!, after = future!;
+    final delta = skipped ? _zeroVector : _motionVector(_bits, _zeroVector, 1);
+    final period = after.pts - before.pts, offset = header.pts - before.pts;
+    if (offset <= 0 || offset >= period) {
+      throw const FormatException('Invalid MPEG-4 B picture timing');
+    }
+    if (after.motion.fields?[index] case final motion?) {
+      final interval =
+          header.fieldInterval ??
+          (throw const FormatException('Missing MPEG-4 field time interval'));
+      int fieldTime(int ticks) => 2 * ((ticks + (interval >> 1)) ~/ interval);
+      final fieldPeriod = fieldTime(after.pts) - fieldTime(before.pts);
+      final fieldOffset = fieldTime(header.pts) - fieldTime(before.pts);
+      final direction = header.topFieldFirst ? 1 : -1;
+      final topDelay = -motion.selection.top * direction;
+      final bottomDelay = (1 - motion.selection.bottom) * direction;
+      final top = _directVectors(
+        motion.top,
+        delta,
+        fieldOffset + topDelay,
+        fieldPeriod + topDelay,
+      );
+      final bottom = _directVectors(
+        motion.bottom,
+        delta,
+        fieldOffset + bottomDelay,
+        fieldPeriod + bottomDelay,
+      );
+      _prediction.predictFields(picture, before, x, y, (
+        selection: motion.selection,
+        top: top.forward,
+        bottom: bottom.forward,
+      ));
+      _prediction.predictFields(picture, after, x, y, (
+        selection: (top: 0, bottom: 1),
+        top: top.backward,
+        bottom: bottom.backward,
+      ), average: true);
+      return;
+    }
+    final forward = <_Vector>[], backward = <_Vector>[];
+    final split = after.motion.split[index] != 0 || picture.volume.quarter;
+    for (var block = 0; block < (split ? 4 : 1); block++) {
+      final reference = after.motion.at(
+        x * 2 + (block & 1),
+        y * 2 + (block >> 1),
+      );
+      final vectors = _directVectors(reference, delta, offset, period);
+      forward.add(vectors.forward);
+      backward.add(vectors.backward);
+    }
+    _prediction.predict(picture, before, x, y, forward);
+    _prediction.predict(picture, after, x, y, backward, average: true);
+  }
+
+  _FieldSelection _readFieldSelection() =>
+      (top: _bits.bit(), bottom: _bits.bit());
+
+  _FieldMotion _readFieldMotion(
+    _FieldSelection selection,
+    _Vector top,
+    _Vector bottom,
+    int code,
+  ) => (
+    selection: selection,
+    top: _motionVector(_bits, (x: top.x, y: top.y ~/ 2), code),
+    bottom: _motionVector(_bits, (x: bottom.x, y: bottom.y ~/ 2), code),
+  );
+
+  void _predictFromRow(
+    Mpeg4Picture reference,
+    int x,
+    int y,
+    int slot,
+    int code,
+    _FieldSelection? selection, {
+    bool average = false,
+  }) {
+    if (selection == null) {
+      final vector = _motionVector(_bits, _rowVectors[slot], code);
+      _rowVectors[slot] = _rowVectors[slot + 1] = vector;
+      _prediction.predict(picture, reference, x, y, [vector], average: average);
+    } else {
+      final motion = _readFieldMotion(
+        selection,
+        _rowVectors[slot],
+        _rowVectors[slot + 1],
+        code,
+      );
+      _rowVectors[slot] = (x: motion.top.x, y: motion.top.y * 2);
+      _rowVectors[slot + 1] = (x: motion.bottom.x, y: motion.bottom.y * 2);
+      _prediction.predictFields(
+        picture,
+        reference,
+        x,
+        y,
+        motion,
+        average: average,
+      );
+    }
+  }
+
+  void _readResidual(int x, int y, int pattern, bool fieldDct) {
     for (var block = 0; block < 6; block++) {
       if (pattern & (32 >> block) != 0) {
-        _readBlock(x, y, block, coded: true, intra: false);
+        _readBlock(x, y, block, coded: true, intra: false, fieldDct: fieldDct);
       }
     }
   }

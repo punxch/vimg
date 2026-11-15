@@ -1,19 +1,54 @@
 part of 'decoder.dart';
 
 typedef _Vector = ({int x, int y});
+typedef _FieldSelection = ({int top, int bottom});
+typedef _FieldMotion = ({
+  _FieldSelection selection,
+  _Vector top,
+  _Vector bottom,
+});
+typedef _FieldPair = ({int destination, int reference});
 const _zeroVector = (x: 0, y: 0);
 
+({_Vector forward, _Vector backward}) _directVectors(
+  _Vector reference,
+  _Vector delta,
+  int offset,
+  int period,
+) {
+  if (period <= 0 || offset <= 0 || offset >= period) {
+    throw const FormatException('Invalid MPEG-4 direct motion timing');
+  }
+  final forward = (
+    x: reference.x * offset ~/ period + delta.x,
+    y: reference.y * offset ~/ period + delta.y,
+  );
+  final backward = (
+    x: delta.x != 0
+        ? forward.x - reference.x
+        : reference.x * (offset - period) ~/ period,
+    y: delta.y != 0
+        ? forward.y - reference.y
+        : reference.y * (offset - period) ~/ period,
+  );
+  return (forward: forward, backward: backward);
+}
+
 final class _PictureMotion {
-  _PictureMotion(int columns, int rows)
+  _PictureMotion(int columns, int rows, bool interlaced)
     : _columns = columns * 2,
       _rows = rows * 2,
       _vectors = Int16List(columns * rows * 8),
       skipped = Uint8List(columns * rows),
-      split = Uint8List(columns * rows);
+      split = Uint8List(columns * rows),
+      fields = interlaced
+          ? List<_FieldMotion?>.filled(columns * rows, null)
+          : null;
 
   final int _columns, _rows;
   final Int16List _vectors;
   final Uint8List skipped, split;
+  final List<_FieldMotion?>? fields;
 
   _Vector at(int x, int y) {
     if (x < 0 || x >= _columns || y < 0 || y >= _rows) return _zeroVector;
@@ -111,6 +146,80 @@ final class _Mpeg4MotionCompensation {
     }
   }
 
+  void predictFields(
+    Mpeg4Picture output,
+    Mpeg4Picture reference,
+    int x,
+    int y,
+    _FieldMotion motion, {
+    bool noRound = false,
+    bool average = false,
+  }) {
+    final stride = output.stride, lines = output.rows * 16;
+    final quarter = output.volume.quarter;
+    for (final (parity, vector) in [motion.top, motion.bottom].indexed) {
+      final field = (
+        destination: parity,
+        reference: parity == 0 ? motion.selection.top : motion.selection.bottom,
+      );
+      if (quarter) {
+        for (var block = 0; block < 2; block++) {
+          _quarter(
+            output.planes[0],
+            reference.planes[0],
+            stride,
+            lines,
+            x * 16 + block * 8,
+            y * 8,
+            8,
+            vector.x,
+            vector.y,
+            noRound,
+            average,
+            field: field,
+          );
+        }
+      } else {
+        _half(
+          output.planes[0],
+          reference.planes[0],
+          stride,
+          lines,
+          x * 16,
+          y * 8,
+          16,
+          vector.x,
+          vector.y,
+          noRound,
+          average,
+          field: field,
+          rows: 8,
+        );
+      }
+      final mx = quarter ? vector.x ~/ 2 : vector.x;
+      final my = quarter ? vector.y >> 1 : vector.y;
+      final chromaX = (mx >> 1) | (mx & 1);
+      final chromaY = (my >> 1) | (my & 1);
+      for (var plane = 1; plane < 3; plane++) {
+        _half(
+          output.planes[plane],
+          reference.planes[plane],
+          stride >> 1,
+          lines >> 1,
+          x * 8,
+          y * 4,
+          8,
+          chromaX,
+          chromaY,
+          noRound,
+          average,
+          field: field,
+          rows: 4,
+        );
+      }
+    }
+  }
+
   void _quarter(
     Uint8List output,
     Uint8List reference,
@@ -122,8 +231,9 @@ final class _Mpeg4MotionCompensation {
     int mx,
     int my,
     bool noRound,
-    bool average,
-  ) {
+    bool average, {
+    _FieldPair? field,
+  }) {
     final dx = mx & 3, dy = my & 3;
     if (dx == 0 && dy == 0) {
       _half(
@@ -138,14 +248,19 @@ final class _Mpeg4MotionCompensation {
         my >> 1,
         noRound,
         average,
+        field: field,
       );
       return;
     }
     final sx = x + (mx >> 2), sy = y + (my >> 2);
     final round = noRound ? 0 : 1;
+    final step = field == null ? 1 : 2;
+    final sourceField = field?.reference ?? 0;
+    final destinationField = field?.destination ?? 0;
     final rows = dy == 0 ? size : size + 1;
     for (var row = 0; row < rows; row++) {
-      final referenceRow = (sy + row).clamp(0, height - 1) * stride;
+      final referenceRow =
+          ((sy + row) * step + sourceField).clamp(0, height - 1) * stride;
       final horizontalRow = row * size;
       if (dx == 0) {
         for (var column = 0; column < size; column++) {
@@ -171,7 +286,7 @@ final class _Mpeg4MotionCompensation {
       }
     }
     for (var row = 0; row < size; row++) {
-      final target = (y + row) * stride + x;
+      final target = ((y + row) * step + destinationField) * stride + x;
       for (var column = 0; column < size; column++) {
         final value = dy == 0
             ? _horizontal[row * size + column]
@@ -227,15 +342,21 @@ final class _Mpeg4MotionCompensation {
     int mx,
     int my,
     bool noRound,
-    bool average,
-  ) {
+    bool average, {
+    _FieldPair? field,
+    int? rows,
+  }) {
     final dx = mx & 1, dy = my & 1;
     final sx = x + (mx >> 1), sy = y + (my >> 1);
     final adjustment = noRound ? 0 : 1;
-    for (var j = 0; j < size; j++) {
-      final top = (sy + j).clamp(0, height - 1) * stride;
-      final bottom = (sy + j + dy).clamp(0, height - 1) * stride;
-      final target = (y + j) * stride + x;
+    final step = field == null ? 1 : 2;
+    final sourceField = field?.reference ?? 0;
+    final destinationField = field?.destination ?? 0;
+    for (var j = 0; j < (rows ?? size); j++) {
+      final source = (sy + j) * step + sourceField;
+      final top = source.clamp(0, height - 1) * stride;
+      final bottom = (source + dy * step).clamp(0, height - 1) * stride;
+      final target = ((y + j) * step + destinationField) * stride + x;
       for (var i = 0; i < size; i++) {
         final left = (sx + i).clamp(0, stride - 1);
         final right = (sx + i + dx).clamp(0, stride - 1);

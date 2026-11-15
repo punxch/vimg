@@ -96,7 +96,7 @@ extension _Vp9Timeline on Video {
         final position = decodeOrder.length;
         if (tag.key) {
           anchor = position;
-          configurations[position] = (bytes: null, nal: null);
+          configurations[position] = const _RunConfiguration();
           sections[position] = sample.section;
         }
         if (tag.existing == null) localKey = tag.key ? packet : null;

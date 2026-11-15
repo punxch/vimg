@@ -92,6 +92,7 @@ extension _DctBlocks on _VopDecoder {
     required bool intra,
     bool separateDc = false,
     bool acPrediction = false,
+    bool fieldDct = false,
   }) {
     final luma = block < 4;
     final plane = luma ? 0 : block - 3;
@@ -196,10 +197,12 @@ extension _DctBlocks on _VopDecoder {
     }
     if (matrix != null && !intra) values[63] ^= ((parity & 1) ^ 1);
     final stride = luma ? picture.stride : picture.stride >> 1;
+    final interleaved = luma && fieldDct;
+    final row = interleaved ? y * 16 + (block >> 1) : by * 8;
     _transform.write(
       picture.planes[plane],
-      by * 8 * stride + bx * 8,
-      stride,
+      row * stride + bx * 8,
+      interleaved ? stride * 2 : stride,
       values,
       intra,
     );

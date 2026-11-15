@@ -160,13 +160,14 @@ MPEG-2 PES packets omit some picture timestamps, capture reconstructs
 presentation order from the GOP and picture headers. Elementary streams
 start at zero and use sequence timing, including signalled repeated fields.
 
-MP4/MOV, Matroska and AVI support progressive MPEG-4 Visual (Part 2)
+MP4/MOV, Matroska and AVI support progressive and interlaced MPEG-4 Visual (Part 2)
 I/P/B pictures, including Xvid and DivX files. Capture handles half- and
 quarter-sample motion, MPEG and H.263 quantization, resynchronization
 packets and AVI chunks that pack multiple VOPs. The timeline orders B
 pictures by presentation time and restores earlier references across open
-GOPs. Interlaced MPEG-4 Visual, sprite motion and data partitioning remain
-pending.
+GOPs. Interlaced capture reconstructs both fields in the same frame with
+field DCT, motion prediction, and direct B-VOP prediction in either field
+order. Sprite motion and data partitioning remain pending.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS

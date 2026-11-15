@@ -394,7 +394,7 @@ final class Video {
                   if (ffv1Entry case final entry?) {
                     _isoDescriptionsByPacket[packet] = entry;
                   }
-                  configurations[start] = (bytes: description, nal: null);
+                  configurations[start] = _RunConfiguration(bytes: description);
                   sections[start] = sectionStart;
                 }
                 index[packet] = position;
@@ -677,9 +677,8 @@ final class Video {
             for (final frame in units.readSample(_read(packet))) {
               if (first && _av1RandomAccess(frame)) {
                 start = position;
-                configurations[start] = (
+                configurations[start] = _RunConfiguration(
                   bytes: units.sequenceConfiguration ?? configuration,
-                  nal: null,
                 );
               }
               first = false;
@@ -898,7 +897,7 @@ final class Video {
           previous = isHevc && type == 21 && !newDescription ? start : -1;
           start = position;
           if (newDescription) sectionStart = start;
-          configurations[start] = (bytes: null, nal: configuration!);
+          configurations[start] = _RunConfiguration(nal: configuration!);
           sections[start] = sectionStart;
         }
         index[packet] = position;
@@ -960,9 +959,8 @@ final class Video {
             flags,
           );
           if (picture.type == 1)
-            configurations[decodeOrder.length] = (
+            configurations[decodeOrder.length] = _RunConfiguration(
               bytes: headers.configuration(),
-              nal: null,
             );
         } else if (unit.code == 0xb8 && unit.end - unit.data >= 4) {
           flags = bytes[unit.data + 3];
@@ -1005,9 +1003,8 @@ final class Video {
                   start = position;
                   sections[start] = sectionStart;
                   if (systems != null) {
-                    configurations[position] = (
+                    configurations[position] = _RunConfiguration(
                       bytes: systems.configurationAt(packet)!,
-                      nal: null,
                     );
                   }
                 case 2:
@@ -1301,7 +1298,10 @@ final class Video {
     switch (run.codec) {
       case 'mpeg4':
         final reader = _SamplePayloadReader(this);
-        final decoder = Mpeg4Decoder(configuration.bytes);
+        final decoder = Mpeg4Decoder(
+          configuration.bytes,
+          configuration.mpeg4Clock,
+        );
         return (packet, selected, _) {
           final picture = decoder
               .decode(reader.read(packet), includeBidirectional: selected)
@@ -1676,7 +1676,15 @@ typedef _VideoTimeline = ({
 
 typedef _RenderPicture = image.Image Function({YuvImageScaler? scaler});
 typedef _NalConfiguration = ({Uint8List? record, Uint8List? parameterSets});
-typedef _RunConfiguration = ({Uint8List? bytes, _NalConfiguration? nal});
+
+final class _RunConfiguration {
+  const _RunConfiguration({this.bytes, this.nal, this.mpeg4Clock});
+
+  final Uint8List? bytes;
+  final _NalConfiguration? nal;
+  final Mpeg4Clock? mpeg4Clock;
+}
+
 typedef _IndexedVideo = ({
   _VideoTimeline timeline,
   Map<int, _RunConfiguration> configurations,
