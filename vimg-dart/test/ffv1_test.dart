@@ -15,11 +15,26 @@ import 'fixtures.dart';
 const _rice = 'test/fixtures/ffv1-rice.mkv';
 const _range16 = 'test/fixtures/ffv1-range16.avi';
 const _rgba = 'test/fixtures/ffv1-rgba.mov';
+const _v0 = 'test/fixtures/ffv1-v0.avi';
+const _v1 = 'test/fixtures/ffv1-v1.mp4';
+const _crc2 = 'test/fixtures/ffv1-crc2.mkv';
+const _v4Rgb10 = 'test/fixtures/ffv1-v4-rgb10.mkv';
+// Raw slices over the same source planes as the seeded-CRC fixture.
+const _v4Pcm = 'test/fixtures/ffv1-v4-pcm.mkv';
 
 Future<void> main(List<String> arguments) async {
-  await _checkVideo(_rice);
-  await _checkVideo(_range16);
-  await _checkVideo(_rgba);
+  for (final path in [
+    _rice,
+    _range16,
+    _rgba,
+    _v0,
+    _v1,
+    _crc2,
+    _v4Rgb10,
+    _v4Pcm,
+  ]) {
+    await _checkVideo(path);
+  }
   await _checkCli(arguments.firstOrNull);
 }
 
@@ -30,12 +45,18 @@ Future<void> _checkVideo(String path) async {
     final stream = video.metadata.streams.single;
     check(stream.codec == 'ffv1', '$path codec');
     final width = stream.width, height = stream.height;
-    check(width == 22 && height == 18, '$path dimensions');
-    final configuration = switch (path) {
-      _rice => matroskaVideoConfiguration(Matroska(video.file), 'ffv1')!,
-      _range16 => Avi(video.file).videoPrivateData()!,
-      _ => isoVideoConfiguration(IsoMedia(video.file), 'ffv1')!,
+    final odd = path == _crc2 || path == _v4Rgb10 || path == _v4Pcm;
+    check(
+      width == (odd ? 23 : 22) && height == (odd ? 19 : 18),
+      '$path dimensions',
+    );
+    final configuration = switch (path.split('.').last) {
+      'mkv' => matroskaVideoConfiguration(Matroska(video.file), 'ffv1'),
+      'avi' => Avi(video.file).videoPrivateData(),
+      _ => isoVideoConfiguration(IsoMedia(video.file), 'ffv1'),
     };
+    final legacy = path == _v0 || path == _v1;
+    check((configuration == null) == legacy, '$path configuration location');
     final decoder = Ffv1Decoder(width, height, configuration);
     final packets = video.packets().toList();
     check(packets.length == 5, '$path packet count');
@@ -45,6 +66,13 @@ Future<void> _checkVideo(String path) async {
       '$path FFV1 keyframe selection',
     );
 
+    if (legacy) {
+      final dependent = packets[1];
+      _formatError(
+        () => decoder.decode(video.file.read(dependent.offset, dependent.size)),
+        'keyframe',
+      );
+    }
     final expectedRgb = <Uint8List>[];
     for (final (frame, packet) in packets.indexed) {
       final picture = decoder.decode(
@@ -54,15 +82,15 @@ Future<void> _checkVideo(String path) async {
           ? [picture.cb, picture.y, picture.cr, picture.alpha!]
           : [picture.y, picture.cb, picture.cr];
       for (final (plane, samples) in planes.indexed) {
-        final length = path == _rgba || plane == 0
+        final length = path == _rgba || path == _v4Rgb10 || plane == 0
             ? width * height
-            : width * height ~/ 4;
+            : ((width + 1) ~/ 2) * ((height + 1) ~/ 2);
         check(samples.length == length, '$path plane dimensions $plane');
         for (final (i, sample) in samples.indexed) {
           final expected = switch (path) {
-            _range16 =>
+            _range16 || _v1 || _v4Rgb10 =>
               (i * 6013 + (i ~/ 7) * 3011 + frame * 19091 + plane * 5999) &
-                  65535,
+                  (path == _v4Rgb10 ? 1023 : 65535),
             _rgba =>
               (i * (plane + 1) + (i ~/ 3) * 29 + frame * 47 + plane * 69) & 255,
             _ when i % 25 < 9 => (frame * 21 + plane * 51) & 255,
@@ -95,12 +123,14 @@ Future<void> _checkVideo(String path) async {
     }
     check(decoded == 2, '$path capture count');
 
-    final badConfig = Uint8List.fromList(configuration)..[1] ^= 1;
-    _formatError(() => Ffv1Decoder(width, height, badConfig));
-    if (path != _range16) {
+    if (configuration != null) {
+      final badConfig = Uint8List.fromList(configuration)..[1] ^= 1;
+      _formatError(() => Ffv1Decoder(width, height, badConfig), 'CRC');
+    }
+    if (!legacy && path != _range16) {
       final damaged = video.file.read(packets[0].offset, packets[0].size)
         ..[2] ^= 1;
-      _formatError(() => decoder.decode(damaged));
+      _formatError(() => decoder.decode(damaged), 'CRC');
       final restart = packets[3];
       check(
         _equal(
@@ -127,14 +157,14 @@ bool _equal(Uint8List a, Uint8List b) {
   return true;
 }
 
-void _formatError(void Function() decode) {
+void _formatError(void Function() decode, String message) {
   try {
     decode();
   } on FormatException catch (error) {
-    check(error.message.contains('CRC'), 'FFV1 checksum error');
+    check(error.message.contains(message), 'FFV1 format error: $error');
     return;
   }
-  throw StateError('Expected an FFV1 checksum error');
+  throw StateError('Expected an FFV1 error mentioning $message');
 }
 
 Future<void> _checkCli(String? executable) async {
@@ -150,12 +180,12 @@ Future<void> _checkCli(String? executable) async {
   try {
     final preview = '${temp.path}/preview.jpg';
     final sheet = '${temp.path}/sheet.avif';
-    await run(['preview', '--output', preview, '--skip', '50', _range16]);
+    await run(['preview', '--output', preview, '--skip', '50', _v0]);
     check(
       image.decodeJpg(File(preview).readAsBytesSync())?.width == 22,
       'FFV1 JPEG preview',
     );
-    await run(['extract', '-n3', '--output-dir', '${temp.path}/frames', _rgba]);
+    await run(['extract', '-n3', '--output-dir', '${temp.path}/frames', _v1]);
     final frames = Directory('${temp.path}/frames').listSync();
     check(frames.length == 3, 'FFV1 BMP extraction');
     await run([

@@ -13,23 +13,50 @@ bool isFfv1Keyframe(Uint8List bytes) {
   return (bytes[0] << 8 | bytes[1]) >= 0x7f80;
 }
 
-/// FFV1 version 3. Slice contexts are carried across frames in a GOP.
+/// FFV1 integer video. Contexts are carried across frames in a GOP.
 final class Ffv1Decoder {
   Ffv1Decoder(this.width, this.height, Uint8List? configuration)
-    : _config = _Ffv1Configuration.read(configuration, width, height);
+    : _record = configuration == null
+          ? null
+          : _Ffv1Configuration.readRecord(configuration, width, height) {
+    if (width <= 0 || height <= 0 || width > (64 * 1024 * 1024) ~/ height) {
+      throw const FormatException('Invalid FFV1 frame dimensions');
+    }
+  }
 
   final int width;
   final int height;
-  final _Ffv1Configuration _config;
+  final _Ffv1Configuration? _record;
+  _Ffv1Configuration? _legacyConfiguration;
   var _previous = <(int, int, int, int), _SliceState>{};
 
   Ffv1Picture decode(Uint8List bytes) {
     final keyframe = isFfv1Keyframe(bytes);
     final previous = _previous;
     _previous = {};
-    final config = _config;
-    final covered = Uint8List(config.columns * config.rows);
-    final slices = _findSlices(bytes, covered.length);
+    final record = _record;
+    final legacyRange = record == null
+        ? _RangeDecoder(bytes, 0, bytes.length)
+        : null;
+    final legacyConfiguration = _legacyConfiguration;
+    _legacyConfiguration = null;
+    legacyRange?.bit(_initialStates(1), 0);
+    final config =
+        record ??
+        (keyframe
+            ? _Ffv1Configuration.readParameters(
+                legacyRange!,
+                width,
+                height,
+                hasRecord: false,
+              )
+            : legacyConfiguration ??
+                  (throw const FormatException('Missing FFV1 keyframe')));
+    final grid = config.columns * config.rows;
+    final covered = record == null ? null : Uint8List(grid);
+    final slices = record == null
+        ? [(0, bytes.length)]
+        : _findSlices(bytes, grid, crcSeed: config.sliceCrcSeed);
     final chromaWidth = _ceilShift(width, config.shiftX);
     final chromaHeight = _ceilShift(height, config.shiftY);
     final y = Uint16List(width * height);
@@ -38,34 +65,14 @@ final class Ffv1Decoder {
     final alpha = config.alpha ? Uint16List(y.length) : null;
     final next = <(int, int, int, int), _SliceState>{};
     for (final (start, end) in slices.reversed) {
-      final range = _RangeDecoder(bytes, start, end);
-      if (start == 0) range.bit(Uint8List.fromList([128]), 0);
+      final range = legacyRange ?? _RangeDecoder(bytes, start, end);
+      if (legacyRange == null && start == 0) range.bit(_initialStates(1), 0);
       range.transitions = config.transitions;
-      final header = _initialStates(32);
-      final sx = range.symbol(header), sy = range.symbol(header);
-      final sw = range.symbol(header) + 1, sh = range.symbol(header) + 1;
-      if (sx + sw > config.columns || sy + sh > config.rows) {
-        throw const FormatException('Invalid FFV1 slice bounds');
-      }
-      for (var row = sy; row < sy + sh; row++) {
-        for (var column = sx; column < sx + sw; column++) {
-          if (covered[row * config.columns + column]++ != 0) {
-            throw const FormatException('Overlapping FFV1 slices');
-          }
-        }
-      }
-      final tables = List.generate(2 + (config.alpha ? 1 : 0), (_) {
-        final index = range.symbol(header);
-        if (index >= config.tables.length) {
-          throw const FormatException('Invalid FFV1 quantization index');
-        }
-        return config.tables[index];
-      });
-      range.symbol(header); // Picture structure
-      range.symbol(header); // Sample aspect numerator
-      range.symbol(header); // Sample aspect denominator
-      final position = (sx, sy, sw, sh);
-      final state = keyframe
+      final header = _sliceHeader(range, config, covered);
+      final position = header.position;
+      final tables = header.tables;
+      final (sx, sy, sw, sh) = position;
+      final state = keyframe || header.reset
           ? _SliceState(tables, rice: config.rice)
           : previous[position] ??
                 (throw const FormatException('Missing FFV1 slice context'));
@@ -76,37 +83,72 @@ final class Ffv1Decoder {
       }
       next[position] = state;
 
-      final rice = config.rice
+      final rice = config.rice && !header.raw
           ? _RiceReader(bytes, range.riceStart(config.riceSentinel), end)
           : null;
-      final x = sx * width ~/ config.columns;
-      final top = sy * height ~/ config.rows;
-      final w = (sx + sw) * width ~/ config.columns - x;
-      final h = (sy + sh) * height ~/ config.rows - top;
+      final x = config.sliceCoordinate(
+        width,
+        sx,
+        config.columns,
+        config.shiftX,
+      );
+      final top = config.sliceCoordinate(
+        height,
+        sy,
+        config.rows,
+        config.shiftY,
+      );
+      final w =
+          config.sliceCoordinate(
+            width,
+            sx + sw,
+            config.columns,
+            config.shiftX,
+          ) -
+          x;
+      final h =
+          config.sliceCoordinate(height, sy + sh, config.rows, config.shiftY) -
+          top;
+      if (w <= 0 || h <= 0) {
+        throw const FormatException('Empty FFV1 slice');
+      }
       if (config.rgb) {
+        final indices = [0, 1, 1, if (alpha != null) 2];
         final planes = [
-          for (final index in [0, 1, 1, if (alpha != null) 2])
+          for (final index in indices)
             _ScanLines(
               w,
-              config.depth + 1,
+              config.depth +
+                  (!header.raw && (index == 1 || config.extraRgbBit) ? 1 : 0),
               range,
               tables[index],
               state.contexts[index],
               rice: rice,
+              raw: header.raw,
             ),
         ];
         final center = 1 << config.depth;
         final mask = center - 1;
+        // FFV1's 9–15-bit GBR exception uses blue as the RCT base.
+        final blueFirst =
+            config.depth > 8 && config.depth < 16 && alpha == null;
         for (var row = 0; row < h; row++) {
           final samples = [for (final plane in planes) plane.decode()];
           var offset = (top + row) * width + x;
           for (var column = 2; column < w + 2; column++, offset++) {
-            final b = samples[1][column] - center;
-            final r = samples[2][column] - center;
-            final g = samples[0][column] - ((b + r) >> 2);
-            y[offset] = g & mask;
-            cb[offset] = (g + b) & mask;
-            cr[offset] = (g + r) & mask;
+            var g = samples[0][column];
+            var b = samples[1][column];
+            var r = samples[2][column];
+            if (!header.raw) {
+              b -= center;
+              r -= center;
+              g -= (b * header.blueWeight + r * header.redWeight) >> 2;
+              b += g;
+              r += g;
+            }
+            y[offset] = (blueFirst ? b : g) & mask;
+            cb[offset] = (blueFirst ? g : b) & mask;
+            cr[offset] = r & mask;
             if (alpha != null) alpha[offset] = samples[3][column] & mask;
           }
         }
@@ -129,6 +171,7 @@ final class Ffv1Decoder {
             state.contexts[index],
             rice: rice,
             signedPredictor: config.depth == 16,
+            raw: header.raw,
           );
           var offset = (top >> shiftY) * stride + (x >> shiftX);
           for (var row = 0; row < rows; row++, offset += stride) {
@@ -141,19 +184,88 @@ final class Ffv1Decoder {
           plane(cb, 1, chromaWidth, config.shiftX, config.shiftY);
           plane(cr, 1, chromaWidth, config.shiftX, config.shiftY);
         }
-        if (alpha != null) plane(alpha, 2, width, 0, 0);
+        if (alpha != null) plane(alpha, tables.length - 1, width, 0, 0);
       }
     }
-    if (covered.contains(0)) {
+    if (covered?.contains(0) ?? false) {
       throw const FormatException('Incomplete FFV1 slice coverage');
     }
     _previous = next;
-    return Ffv1Picture._(width, height, y, cb, cr, alpha, _config);
+    if (record == null) _legacyConfiguration = config;
+    return Ffv1Picture._(width, height, y, cb, cr, alpha, config);
   }
 
-  List<(int, int)> _findSlices(Uint8List bytes, int limit) {
+  _SliceHeader _sliceHeader(
+    _RangeDecoder range,
+    _Ffv1Configuration config,
+    Uint8List? covered,
+  ) {
+    final planes =
+        1 +
+        (config.chroma || config.version < 4 ? 1 : 0) +
+        (config.alpha ? 1 : 0);
+    if (covered == null) {
+      return _SliceHeader((
+        0,
+        0,
+        1,
+        1,
+      ), List.filled(planes, config.tables.single));
+    }
+    final header = _initialStates(32);
+    final sx = range.symbol(header), sy = range.symbol(header);
+    final sw = range.symbol(header) + 1, sh = range.symbol(header) + 1;
+    if (sx + sw > config.columns || sy + sh > config.rows) {
+      throw const FormatException('Invalid FFV1 slice bounds');
+    }
+    for (var row = sy; row < sy + sh; row++) {
+      for (var column = sx; column < sx + sw; column++) {
+        if (covered[row * config.columns + column]++ != 0) {
+          throw const FormatException('Overlapping FFV1 slices');
+        }
+      }
+    }
+    final tables = List.generate(planes, (_) {
+      final index = range.symbol(header);
+      if (index >= config.tables.length) {
+        throw const FormatException('Invalid FFV1 quantization index');
+      }
+      return config.tables[index];
+    });
+    range.symbol(header); // Picture structure
+    range.symbol(header); // Sample aspect numerator
+    range.symbol(header); // Sample aspect denominator
+    final position = (sx, sy, sw, sh);
+    if (config.version < 4) return _SliceHeader(position, tables);
+    final reset = range.bit(header, 0) != 0;
+    final mode = range.symbol(header);
+    if (mode > 1) throw UnsupportedError('FFV1 slice coding mode $mode');
+    final raw = mode == 1;
+    final blueWeight = config.rgb && !raw ? range.symbol(header) : 1;
+    final redWeight = config.rgb && !raw ? range.symbol(header) : 1;
+    if (blueWeight + redWeight > 4) {
+      throw const FormatException('Invalid FFV1 color transform');
+    }
+    if (config.microVersion >= 4 && range.symbol(header) != 0) {
+      throw UnsupportedError('FFV1 slice sample remapping');
+    }
+    return _SliceHeader(
+      position,
+      tables,
+      reset: reset,
+      raw: raw,
+      blueWeight: blueWeight,
+      redWeight: redWeight,
+    );
+  }
+
+  List<(int, int)> _findSlices(
+    Uint8List bytes,
+    int limit, {
+    required int? crcSeed,
+  }) {
     final result = <(int, int)>[];
-    final footer = _config.crc ? 8 : 3;
+    final footer = crcSeed == null ? 3 : 8;
     var end = bytes.length;
     while (end > 0) {
       final payloadEnd = end - footer;
@@ -168,8 +280,9 @@ final class Ffv1Decoder {
       if (start < 0 || size < 2) {
         throw const FormatException('Invalid FFV1 slice size');
       }
-      if (_config.crc &&
-          (bytes[payloadEnd + 3] != 0 || _crc(bytes, start, end) != 0)) {
+      if (crcSeed != null &&
+          (bytes[payloadEnd + 3] != 0 ||
+              _crc(bytes, start, end, seed: crcSeed) != crcSeed)) {
         throw const FormatException('Invalid FFV1 slice CRC or error status');
       }
       result.add((start, payloadEnd));
@@ -177,6 +290,24 @@ final class Ffv1Decoder {
     }
     return result;
   }
+}
+
+final class _SliceHeader {
+  _SliceHeader(
+    this.position,
+    this.tables, {
+    this.reset = false,
+    this.raw = false,
+    this.blueWeight = 1,
+    this.redWeight = 1,
+  });
+
+  final (int, int, int, int) position;
+  final List<_Quantization> tables;
+  final bool reset;
+  final bool raw;
+  final int blueWeight;
+  final int redWeight;
 }
 
 final class Ffv1Picture {
@@ -230,6 +361,7 @@ final class _ScanLines {
     this.states, {
     this.rice,
     this.signedPredictor = false,
+    this.raw = false,
   }) : mask = (1 << bits) - 1,
        _current = Int32List(width + 3),
        _above = Int32List(width + 3),
@@ -243,12 +375,25 @@ final class _ScanLines {
   final _Quantization table;
   final _PlaneState states;
   final bool signedPredictor;
+  final bool raw;
   Int32List _current;
   Int32List _above;
   Int32List _twoUp;
 
   Int32List decode() {
     final current = _current, above = _above, twoUp = _twoUp;
+    if (raw) {
+      final state = _initialStates(1);
+      for (var i = 2; i < width + 2; i++) {
+        var sample = 0;
+        for (var bit = 0; bit < bits; bit++) {
+          state[0] = 128;
+          sample = (sample << 1) | range.bit(state, 0);
+        }
+        current[i] = sample;
+      }
+      return current;
+    }
     current[1] = above[2];
     final rice = this.rice;
     rice?.startLine();
@@ -341,6 +486,8 @@ final class _Quantization {
 
 final class _Ffv1Configuration {
   _Ffv1Configuration(
+    this.version,
+    this.microVersion,
     this.depth,
     this.rgb,
     this.chroma,
@@ -349,13 +496,15 @@ final class _Ffv1Configuration {
     this.shiftY,
     this.columns,
     this.rows,
-    this.crc,
+    this.sliceCrcSeed,
     this.rice,
     this.riceSentinel,
     this.transitions,
     this.tables,
   );
 
+  final int version;
+  final int microVersion;
   final int depth;
   final bool rgb;
   final bool chroma;
@@ -364,24 +513,50 @@ final class _Ffv1Configuration {
   final int shiftY;
   final int columns;
   final int rows;
-  final bool crc;
+  final int? sliceCrcSeed;
   final bool rice;
   final bool riceSentinel;
   final List<int> transitions;
   final List<_Quantization> tables;
 
-  factory _Ffv1Configuration.read(Uint8List? bytes, int width, int height) {
-    if (bytes == null) {
-      throw UnsupportedError('FFV1 without a version 3 configuration record');
-    }
-    if (bytes.length < 6 || _crc(bytes, 0, bytes.length) != 0) {
+  bool get extraRgbBit => version < 4 || microVersion < 8;
+
+  int sliceCoordinate(int length, int index, int count, int shift) {
+    if (version < 4 || microVersion < 3) return length * index ~/ count;
+    final units = _ceilShift(length, shift);
+    final coordinate = ((2 * units * index + count) ~/ (2 * count)) << shift;
+    return math.min(coordinate, length);
+  }
+
+  static _Ffv1Configuration readRecord(Uint8List bytes, int width, int height) {
+    final seed = bytes.length < 6 ? null : _configurationCrcSeed(bytes);
+    if (seed == null) {
       throw const FormatException('Invalid FFV1 configuration CRC');
     }
-    final range = _RangeDecoder(bytes, 0, bytes.length - 4);
+    final config = readParameters(
+      _RangeDecoder(bytes, 0, bytes.length - 4),
+      width,
+      height,
+      hasRecord: true,
+    );
+    if (seed != (config.sliceCrcSeed ?? 0)) {
+      throw const FormatException('FFV1 configuration CRC mode mismatch');
+    }
+    return config;
+  }
+
+  static _Ffv1Configuration readParameters(
+    _RangeDecoder range,
+    int width,
+    int height, {
+    required bool hasRecord,
+  }) {
     final state = _initialStates(32);
     final version = range.symbol(state);
-    if (version != 3) throw UnsupportedError('FFV1 version $version');
-    final microVersion = range.symbol(state);
+    if (hasRecord ? version != 3 && version != 4 : version > 1) {
+      throw UnsupportedError('FFV1 version $version');
+    }
+    final microVersion = hasRecord ? range.symbol(state) : 0;
     final coder = range.symbol(state);
     if (coder > 2) {
       throw UnsupportedError('FFV1 coder type $coder');
@@ -395,47 +570,62 @@ final class _Ffv1Configuration {
                   255,
           ];
     final colorspace = range.symbol(state);
-    final rawDepth = range.symbol(state);
+    final rawDepth = version == 0 ? 8 : range.symbol(state);
     final depth = rawDepth == 0 ? 8 : rawDepth;
+    if (colorspace == 2) throw UnsupportedError('FFV1 Bayer video');
+    if (depth > 16) throw UnsupportedError('FFV1 sample depth $depth');
     final chroma = range.bit(state, 0) != 0;
     final shiftX = range.symbol(state), shiftY = range.symbol(state);
     final alpha = range.bit(state, 0) != 0;
     if (colorspace > 1 ||
         depth < 8 ||
-        depth > 16 ||
         shiftX > 4 ||
         shiftY > 4 ||
         (colorspace == 1 && (!chroma || shiftX != 0 || shiftY != 0))) {
       throw const FormatException('Invalid FFV1 pixel format');
     }
-    final columns = range.symbol(state) + 1;
-    final rows = range.symbol(state) + 1;
-    if (columns > width ||
-        rows > height ||
-        columns * rows > 1024 ||
-        width > (64 * 1024 * 1024) ~/ height) {
-      throw const FormatException('Invalid FFV1 dimensions or slice grid');
+    final columns = hasRecord ? range.symbol(state) + 1 : 1;
+    final rows = hasRecord ? range.symbol(state) + 1 : 1;
+    if (columns > width || rows > height || columns * rows > 1024) {
+      throw const FormatException('Invalid FFV1 slice grid');
     }
-    final count = range.symbol(state);
+    final count = hasRecord ? range.symbol(state) : 1;
     if (count < 1 || count > 8) {
       throw const FormatException('Invalid FFV1 quantization table count');
     }
     final tables = List.generate(count, (_) => _Quantization.read(range));
-    final deltaStates = _initialStates(32 * 32);
-    for (final table in tables) {
-      if (range.bit(state, 0) == 0) continue;
-      final values = table.initial;
-      for (var i = 0; i < values.length; i++) {
-        final prediction = i < 32 ? 128 : values[i - 32];
-        values[i] =
-            prediction +
-            range.symbol(deltaStates, offset: (i % 32) * 32, signed: true);
+    int? sliceCrcSeed;
+    if (hasRecord) {
+      final deltaStates = _initialStates(32 * 32);
+      for (final table in tables) {
+        if (range.bit(state, 0) == 0) continue;
+        final values = table.initial;
+        for (var i = 0; i < values.length; i++) {
+          final prediction = i < 32 ? 128 : values[i - 32];
+          values[i] =
+              prediction +
+              range.symbol(deltaStates, offset: (i % 32) * 32, signed: true);
+        }
+      }
+      final ec = range.symbol(state);
+      sliceCrcSeed = switch (ec) {
+        0 => null,
+        1 => 0,
+        2 => _alternateCrcSeed,
+        _ => throw UnsupportedError('FFV1 error correction mode $ec'),
+      };
+      if (microVersion >= 3 || version >= 4)
+        range.symbol(state); // Intra-only flag
+      if (version >= 4 &&
+          microVersion >= 4 &&
+          range.symbol(state) != 0 &&
+          depth == 16) {
+        throw UnsupportedError('FFV1 floating-point samples');
       }
     }
-    final ec = range.symbol(state);
-    if (ec > 1) throw UnsupportedError('FFV1 error correction mode $ec');
-    if (microVersion >= 3) range.symbol(state); // Intra-only flag
     return _Ffv1Configuration(
+      version,
+      microVersion,
       depth,
       colorspace == 1,
       chroma,
@@ -444,7 +634,7 @@ final class _Ffv1Configuration {
       shiftY,
       columns,
       rows,
-      ec == 1,
+      sliceCrcSeed,
       coder == 0,
       microVersion >= 2,
       transitions,

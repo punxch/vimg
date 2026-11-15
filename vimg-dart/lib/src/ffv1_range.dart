@@ -68,8 +68,18 @@ final class _RangeDecoder {
   }
 }
 
-int _crc(Uint8List bytes, int start, int end) {
-  var value = 0;
+// FFmpeg's ec=2 uses a nonzero initial value and the same remainder.
+const _alternateCrcSeed = 0x79408c7a;
+
+int? _configurationCrcSeed(Uint8List bytes) {
+  for (final seed in [0, _alternateCrcSeed]) {
+    if (_crc(bytes, 0, bytes.length, seed: seed) == seed) return seed;
+  }
+  return null;
+}
+
+int _crc(Uint8List bytes, int start, int end, {required int seed}) {
+  var value = seed;
   for (var i = start; i < end; i++) {
     value = ((value << 8) & 0xffffffff) ^ _crcTable[(value >> 24) ^ bytes[i]];
   }
