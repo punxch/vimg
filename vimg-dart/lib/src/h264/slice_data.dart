@@ -18,6 +18,8 @@ int blockY(int block) => ((block >> 1) & 1) | ((block >> 2) & 2);
 int blockIndex(int x, int y) =>
     ((y & 2) << 2) | ((x & 2) << 1) | ((y & 1) << 1) | (x & 1);
 
+typedef SampleNeighbor = ({Macroblock? block, int x, int y});
+
 final class Macroblock {
   Macroblock(this.slice, this.type);
 
@@ -28,7 +30,8 @@ final class Macroblock {
   bool get nxn => type == 0;
   bool get intra16 => type > 0 && type < 25;
 
-  var transform8x8 = false;
+  var transform8x8 = false, mbaffField = false;
+  bool get field => slice.field || mbaffField;
   var skipped = false, direct = false;
   var lumaPattern = 0, chromaPattern = 0;
   var chromaMode = 0;
@@ -77,6 +80,43 @@ abstract class SliceData {
   final MacroblockCoefficients coefficients;
   var _previousQpDelta = false;
   int _qp;
+  var mbaffField = false;
+  SampleNeighbor Function(int x, int y, int width, int height)? mbaffNeighbor;
+
+  bool readMbaffField(Macroblock? leftPair, Macroblock? topPair);
+
+  SampleNeighbor _sampleNeighbor(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    int x,
+    int y, {
+    bool chroma = false,
+  }) {
+    final sps = header.pps.sps;
+    final width = chroma ? sps.chromaWidth : 16;
+    final height = chroma ? sps.chromaHeight : 16;
+    if (x >= 0 && y >= 0) return (block: block, x: x, y: y);
+    return mbaffNeighbor?.call(x, y, width, height) ??
+        (block: x < 0 ? left : top, x: x % width, y: y % height);
+  }
+
+  ({Macroblock? block, int index}) _residualNeighbor(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    int x,
+    int y,
+    int start, {
+    bool chroma = false,
+  }) {
+    final at = _sampleNeighbor(block, left, top, x, y, chroma: chroma);
+    final column = at.x ~/ 4, row = at.y ~/ 4;
+    return (
+      block: at.block,
+      index: start + (chroma ? 2 * row + column : blockIndex(column, row)),
+    );
+  }
 
   void _updateQp(int delta) {
     final offset = header.pps.sps.lumaQpOffset;
@@ -135,7 +175,8 @@ abstract class SliceData {
   }
 
   Macroblock readIntra(Macroblock? left, Macroblock? top, [int? type]) {
-    final block = Macroblock(header, _intraType(left, top, type));
+    final block = Macroblock(header, _intraType(left, top, type))
+      ..mbaffField = mbaffField;
     if (block.pcm) {
       final bits = header.bits;
       if (header.pps.cabac) {
@@ -182,8 +223,10 @@ abstract class SliceData {
     for (var index = 0; index < count; index++) {
       final x = blockX(index * step * step);
       final y = blockY(index * step * step);
-      var a = x == 0 ? left : block;
-      var b = y == 0 ? top : block;
+      final aSample = _sampleNeighbor(block, left, top, 4 * x - 1, 4 * y);
+      final bSample = _sampleNeighbor(block, left, top, 4 * x, 4 * y - 1);
+      var a = aSample.block;
+      var b = bSample.block;
       if (header.pps.constrainedIntra) {
         if (a?.intra == false) a = null;
         if (b?.intra == false) b = null;
@@ -191,8 +234,8 @@ abstract class SliceData {
       var mode = a == null || b == null
           ? 2
           : math.min(
-              a.predictionMode((x - 1) & 3, y),
-              b.predictionMode(x, (y - 1) & 3),
+              a.predictionMode(aSample.x ~/ 4, aSample.y ~/ 4),
+              b.predictionMode(bSample.x ~/ 4, bSample.y ~/ 4),
             );
       final remainder = _intraRemainder();
       if (remainder != null)

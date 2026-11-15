@@ -90,11 +90,6 @@ final class SliceHeader {
     frameNum = bits.read(sps.frameNumBits);
     final field = !sps.frameOnly && bits.flag();
     bottomField = field ? bits.flag() : null;
-    if (!field && sps.mbAdaptive) {
-      throw UnsupportedError(
-        'H.264 macroblock-adaptive field coding is unavailable',
-      );
-    }
     if (idr) idrId = bits.ue(65535);
     if (sps.pocType == 0) {
       pocLsb = bits.read(sps.pocLsbBits);
@@ -124,7 +119,7 @@ final class SliceHeader {
     qp = pps.initialQp + bits.se();
     if (qp < -sps.lumaQpOffset ||
         qp > 51 ||
-        firstMb >= sps.mbWidth * mbHeight) {
+        firstMbAddress >= sps.mbWidth * mbHeight) {
       throw const FormatException(
         'Invalid H.264 slice QP or macroblock address',
       );
@@ -150,6 +145,8 @@ final class SliceHeader {
   late final bool? bottomField;
 
   bool get field => bottomField != null;
+  bool get mbaff => !field && pps.sps.mbAdaptive;
+  int get firstMbAddress => firstMb * (mbaff ? 2 : 1);
   int get mbHeight => pps.sps.mbHeight >> (field ? 1 : 0);
   int get maxPicNum => 1 << (pps.sps.frameNumBits + (field ? 1 : 0));
   int get currPicNum => field ? 2 * frameNum + 1 : frameNum;

@@ -7,6 +7,10 @@ final class CavlcSlice extends SliceData {
   int? _skipRun;
 
   @override
+  bool readMbaffField(Macroblock? leftPair, Macroblock? topPair) =>
+      header.bits.flag();
+
+  @override
   bool endOfSlice() {
     final bits = header.bits;
     if ((_skipRun ?? 0) > 0 || bits.remaining > 8 || bits.hasMoreData)
@@ -114,17 +118,21 @@ final class CavlcSlice extends SliceData {
       16 + 2 * header.pps.sps.chromaBlockCount,
     );
     for (var i = 0; i < 2 * countPerPlane; i++) {
-      final topEdge = i % countPerPlane < 2;
-      final a = _countAt(i.isEven ? left : block, 16 + (i ^ 1));
-      final b = _countAt(
-        topEdge ? top : block,
-        16 + i + (topEdge ? countPerPlane - 2 : -2),
+      final local = i % countPerPlane;
+      final context = _coefficientContext(
+        block,
+        left,
+        top,
+        4 * (local & 1),
+        4 * (local >> 1),
+        16 + i - local,
+        chroma: true,
       );
       final count = _cavlc.residual(
         coefficients.levels[1 + i ~/ countPerPlane],
         (i % countPerPlane) * 16 + 1,
         15,
-        _context(a, b),
+        context,
       );
       counts[16 + i] = count;
       if (count != 0) block.codedBlocks |= 1 << (16 + i);
@@ -144,7 +152,7 @@ final class CavlcSlice extends SliceData {
               coefficients.dc[plane],
               0,
               16,
-              _fullContext(block, left, top, start, 0),
+              _coefficientContext(block, left, top, 0, 0, start),
             ) !=
             0) {
       block.codedDc |= 1 << plane;
@@ -161,7 +169,14 @@ final class CavlcSlice extends SliceData {
               ? (i >> 2) * 64 + (i & 3)
               : i * 16 + (acOnly ? 1 : 0),
           acOnly ? 15 : 16,
-          _fullContext(block, left, top, start, i),
+          _coefficientContext(
+            block,
+            left,
+            top,
+            4 * blockX(i),
+            4 * blockY(i),
+            start,
+          ),
           stride: block.transform8x8 ? 4 : 1,
         );
         counts[start + i] = count;
@@ -172,19 +187,36 @@ final class CavlcSlice extends SliceData {
       }
     }
   }
-}
 
-int _fullContext(
-  Macroblock block,
-  Macroblock? left,
-  Macroblock? top,
-  int start,
-  int i,
-) {
-  final x = blockX(i), y = blockY(i);
-  final a = _countAt(x == 0 ? left : block, start + blockIndex((x - 1) & 3, y));
-  final b = _countAt(y == 0 ? top : block, start + blockIndex(x, (y - 1) & 3));
-  return _context(a, b);
+  int _coefficientContext(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    int x,
+    int y,
+    int start, {
+    bool chroma = false,
+  }) {
+    final a = _residualNeighbor(
+      block,
+      left,
+      top,
+      x - 1,
+      y,
+      start,
+      chroma: chroma,
+    );
+    final b = _residualNeighbor(
+      block,
+      left,
+      top,
+      x,
+      y - 1,
+      start,
+      chroma: chroma,
+    );
+    return _context(_countAt(a.block, a.index), _countAt(b.block, b.index));
+  }
 }
 
 int? _countAt(Macroblock? block, int index) => block == null

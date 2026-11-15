@@ -4,6 +4,7 @@ import 'access_unit.dart';
 import 'b_motion.dart';
 import 'deblock.dart';
 import 'intra_prediction.dart';
+import 'mbaff.dart';
 import 'motion.dart';
 import 'motion_compensation.dart';
 import 'parameters.dart';
@@ -179,6 +180,7 @@ final class _Reconstruction {
   final H264Picture picture;
   final int width;
   final List<Macroblock?> blocks;
+  late final _mbaff = MbaffLayout(blocks, width);
   final ScalingMatrices _scaling;
   final int _colorPlane;
   late final _lumaPrediction = IntraPrediction(picture.sps.lumaDepth);
@@ -186,10 +188,15 @@ final class _Reconstruction {
       picture.sps.chromaDepth == picture.sps.lumaDepth
       ? _lumaPrediction
       : IntraPrediction(picture.sps.chromaDepth);
-  late final _transform = IntraTransform(field: picture.bottomField != null);
+  late final _fieldTransform = IntraTransform(field: true);
+  late final _frameTransform = IntraTransform();
+  late IntraTransform _transform;
   var decoded = 0;
 
   void decode(SliceHeader slice, PendingPicture? pending) {
+    if (slice.mbaff && slice.kind != SliceKind.intra) {
+      throw UnsupportedError('H.264 MBAFF inter prediction is unavailable');
+    }
     final SliceData reader = slice.pps.cabac
         ? CabacSlice(slice)
         : CavlcSlice(slice);
@@ -209,26 +216,47 @@ final class _Reconstruction {
     final b = slice.kind == SliceKind.b
         ? BDirect(slice, pending!.poc, references, motion!, motion1!)
         : null;
-    var address = slice.firstMb;
+    var address = slice.firstMbAddress;
     while (true) {
       if (address >= blocks.length || blocks[address] != null) {
         throw const FormatException('Overlapping or oversized H.264 slices');
       }
-      final x = address % width;
-      final row = address ~/ width;
-      final left = x == 0 ? null : _neighbor(address - 1, slice);
-      final top = row == 0 ? null : _neighbor(address - width, slice);
-      final corner = row == 0 || x == 0
-          ? null
-          : _neighbor(address - width - 1, slice);
-      final topRight = row == 0 || x + 1 == width
-          ? null
-          : _neighbor(address - width + 1, slice);
+      final x = slice.mbaff ? _mbaff.column(address) : address % width;
+      final row = slice.mbaff ? _mbaff.row(address) : address ~/ width;
+      final Macroblock? left, top, corner, topRight;
+      if (slice.mbaff) {
+        if (address.isEven) {
+          reader.mbaffField = reader.readMbaffField(
+            x == 0 ? null : _neighbor(address - 2, slice),
+            row == 0 ? null : _neighbor(address - 2 * width, slice),
+          );
+        }
+        SampleNeighbor neighbor(int dx, int dy, int w, int h) {
+          final at = _mbaff.neighbor(address, reader.mbaffField, dx, dy, w, h);
+          return at.block?.slice == slice ? at : (block: null, x: 0, y: 0);
+        }
+
+        reader.mbaffNeighbor = neighbor;
+        left = neighbor(-1, 0, 16, 16).block;
+        top = neighbor(0, -1, 16, 16).block;
+        corner = neighbor(-1, -1, 16, 16).block;
+        topRight = neighbor(16, -1, 16, 16).block;
+      } else {
+        left = x == 0 ? null : _neighbor(address - 1, slice);
+        top = row == 0 ? null : _neighbor(address - width, slice);
+        corner = row == 0 || x == 0
+            ? null
+            : _neighbor(address - width - 1, slice);
+        topRight = row == 0 || x + 1 == width
+            ? null
+            : _neighbor(address - width + 1, slice);
+      }
       final block = switch (slice.kind) {
         SliceKind.intra => reader.readIntra(left, top),
         SliceKind.p => reader.readP(left, top, motion!, x, row, references.l0),
         SliceKind.b => reader.readB(left, top, b!, x, row),
       };
+      _transform = block.field ? _fieldTransform : _frameTransform;
       if (block.intra) {
         if (slice.kind == SliceKind.intra && motion != null) {
           final whole = (x: x * 4, y: row * 4, width: 4, height: 4);
@@ -258,7 +286,7 @@ final class _Reconstruction {
       }
       blocks[address++] = block;
       decoded++;
-      if (reader.endOfSlice()) return;
+      if ((!slice.mbaff || address.isEven) && reader.endOfSlice()) return;
     }
   }
 
@@ -278,7 +306,12 @@ final class _Reconstruction {
     final lumaQp = block.qp + sps.lumaQpOffset;
     final bypass = sps.transformBypass && lumaQp == 0;
     for (var component = 0; component < levels.levels.length; component++) {
-      final (plane, stride, offset) = _target(component, mbX, mbY);
+      final (plane, stride, offset) = _target(
+        component,
+        mbX,
+        mbY,
+        mbaffField: block.mbaffField,
+      );
       if (block.pcm) {
         final samples = sps.chromaWidth * sps.chromaHeight;
         _copyBlock(
@@ -325,17 +358,25 @@ final class _Reconstruction {
     }
   }
 
-  (List<int>, int, int) _target(int component, int mbX, int mbY) {
+  (List<int>, int, int) _target(
+    int component,
+    int mbX,
+    int mbY, {
+    bool mbaffField = false,
+  }) {
     final sps = picture.sps;
+    final step = mbaffField ? 2 : 1;
     if (component == 0) {
       final stride = picture.stride;
-      return (picture.y, stride, (mbY * stride + mbX) * 16);
+      final firstRow = MbaffLayout.firstRow(mbY, 16, mbaffField);
+      return (picture.y, step * stride, firstRow * stride + 16 * mbX);
     }
     final stride = picture.chromaStride;
+    final firstRow = MbaffLayout.firstRow(mbY, sps.chromaHeight, mbaffField);
     return (
       component == 1 ? picture.cb : picture.cr,
-      stride,
-      mbY * stride * sps.chromaHeight + mbX * sps.chromaWidth,
+      step * stride,
+      firstRow * stride + mbX * sps.chromaWidth,
     );
   }
 

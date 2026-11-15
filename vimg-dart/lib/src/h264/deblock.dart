@@ -1,4 +1,5 @@
 import 'deblock_tables.dart';
+import 'mbaff.dart';
 import 'motion.dart';
 import 'picture.dart';
 import 'slice_data.dart';
@@ -8,6 +9,10 @@ import 'transforms.dart';
 /// residual and reference information to choose the boundary strength.
 void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
   final sps = picture.sps;
+  if (blocks.first!.slice.mbaff) {
+    _deblockMbaff(MbaffLayout(blocks, sps.mbWidth), picture);
+    return;
+  }
   final width = sps.mbWidth, stride = picture.stride;
   final chromaQpOffset = sps.chromaQpOffset;
   final motion = picture.motionL0, motion1 = picture.motionL1;
@@ -95,6 +100,115 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
           strength,
         );
       }
+    }
+  }
+}
+
+void _deblockMbaff(MbaffLayout layout, H264Picture picture) {
+  final sps = picture.sps;
+  final planes = [picture.y, picture.cb, picture.cr];
+  for (var address = 0; address < layout.blocks.length; address++) {
+    final block = layout.blocks[address]!;
+    final slice = block.slice;
+    if (slice.deblocking == 1) continue;
+    final field = block.mbaffField;
+    final column = layout.column(address), row = layout.row(address);
+    for (var component = 0; component < planes.length; component++) {
+      final plane = planes[component];
+      if (plane.isEmpty) continue;
+      final luma = component == 0;
+      final width = luma ? 16 : sps.chromaWidth;
+      final height = luma ? 16 : sps.chromaHeight;
+      final depth = luma ? sps.lumaDepth : sps.chromaDepth;
+      final stride = luma ? picture.stride : picture.chromaStride;
+      final step = field ? 2 * stride : stride;
+      final start =
+          MbaffLayout.firstRow(row, height, field) * stride + column * width;
+      final spacing = width == 16 && block.transform8x8 ? 8 : 4;
+      final chromaOffset = component == 1
+          ? slice.pps.chromaOffset
+          : slice.pps.secondChromaOffset;
+      int qp(Macroblock other) => luma
+          ? other.qp
+          : chromaQp(other.qp, chromaOffset, sps.chromaQpOffset);
+      final currentQp = qp(block);
+      Macroblock? neighbor(int x, int y) {
+        final other = layout
+            .neighbor(address, field, x, y, width, height)
+            .block;
+        return slice.deblocking == 2 && other?.slice != slice ? null : other;
+      }
+
+      void boundary(
+        Macroblock other,
+        int offset,
+        int across,
+        int along,
+        int count,
+        int strength,
+      ) {
+        final shift = depth - 8;
+        final average = (currentQp + qp(other) + 1) >> 1;
+        final index = (average + slice.alphaOffset).clamp(0, 51);
+        final alpha = deblockAlpha[index] << shift;
+        final beta =
+            deblockBeta[(average + slice.betaOffset).clamp(0, 51)] << shift;
+        if (alpha == 0 || beta == 0) return;
+        final limit = strength == 4
+            ? 0
+            : deblockLimit[strength - 1][index] << shift;
+        for (var i = 0; i < count; i++) {
+          _filter(
+            plane,
+            offset + i * along,
+            across,
+            alpha,
+            beta,
+            limit,
+            (1 << depth) - 1,
+            chroma: width == 8,
+            boundary: strength == 4,
+          );
+        }
+      }
+
+      void interior(bool vertical) {
+        _edges(
+          plane,
+          start,
+          step,
+          vertical,
+          width,
+          height,
+          depth,
+          spacing,
+          currentQp,
+          null,
+          slice.alphaOffset,
+          slice.betaOffset,
+          (_, _) => 3,
+        );
+      }
+
+      for (var y = 0; y < height; y++) {
+        final left = neighbor(-1, y);
+        if (left != null) boundary(left, start + y * step, 1, step, 1, 4);
+      }
+      interior(true);
+
+      final top = neighbor(0, -1);
+      if (top != null) {
+        if (!field && top.mbaffField) {
+          // A frame below two fields has a separate boundary for each parity.
+          final evenTop = neighbor(0, -2);
+          if (evenTop != null)
+            boundary(evenTop, start, 2 * stride, 1, width, 3);
+          boundary(top, start + stride, 2 * stride, 1, width, 3);
+        } else {
+          boundary(top, start, step, 1, width, field ? 3 : 4);
+        }
+      }
+      interior(false);
     }
   }
 }

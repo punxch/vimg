@@ -428,6 +428,22 @@ const _paff422Planes = [
   [0x036dbf18, 0x79e44753, 0x67b830da],
 ];
 
+// JM all-intra MBAFF encodes with both frame and field pairs in each
+// picture. Checksums use FFmpeg samples with deblocking enabled.
+const _mbaffCavlcPlanes = [
+  [0x5196d053, 0x9a024dc2, 0x7b859125],
+  [0x4592bbd4, 0xbd2e3b2e, 0xe306db9a],
+  [0xe9f6308c, 0x358cba0c, 0xb81cd7a1],
+  [0xd521aea8, 0x10beaf52, 0x52117145],
+];
+
+const _mbaff422Planes = [
+  [0xb19fefc4, 0x0227f2e3, 0x88b968c0],
+  [0xd3bcf688, 0xff379ba1, 0x57bef80e],
+  [0x7a08b6b6, 0x4e206267, 0x84114e1e],
+  [0xb0c13729, 0xabc9fbc8, 0xce483441],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -440,6 +456,7 @@ void _checkPlanes(
   bool lossless = false,
   bool separate = false,
   bool field = false,
+  bool mbaff = false,
   bool rgb = false,
   (int, int) dimensions = (78, 50),
 }) {
@@ -499,7 +516,8 @@ void _checkPlanes(
             sps.chromaDepth == (chromaDepth ?? depth) &&
             sps.chromaFormat == chromaFormat &&
             sps.separateColorPlane == separate &&
-            sps.frameOnly != field &&
+            sps.frameOnly == !(field || mbaff) &&
+            sps.mbAdaptive == mbaff &&
             sps.transformBypass == lossless &&
             (sps.width, sps.height) == dimensions,
         'H.264 dimensions, bit depth and profile',
@@ -577,6 +595,8 @@ Future<void> main(List<String> arguments) async {
   const paffCavlc = 'test/fixtures/avc-paff-cavlc.mkv';
   const paff422 = 'test/fixtures/avc-paff-cabac422.mkv';
   const paffTs = 'test/fixtures/avc-paff-cabac.ts';
+  const mbaffCavlc = 'test/fixtures/avc-mbaff-cavlc.mkv';
+  const mbaff422 = 'test/fixtures/avc-mbaff-cabac422.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -855,6 +875,25 @@ Future<void> main(List<String> arguments) async {
     dimensions: (64, 64),
   );
   await _checkFieldRemux(paffCabac, paffTs);
+  _checkPlanes(
+    mbaffCavlc,
+    _mbaffCavlcPlanes,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    mbaff: true,
+    dimensions: (96, 64),
+  );
+  _checkPlanes(
+    mbaff422,
+    _mbaff422Planes,
+    inter: true,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 2,
+    mbaff: true,
+    dimensions: (96, 64),
+  );
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -879,6 +918,7 @@ Future<void> main(List<String> arguments) async {
       (mixedGbr, 32, 24),
       (separateLossless, 32, 24),
       (fieldMp4, 32, 32),
+      (mbaffCavlc, 48, 32),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -913,6 +953,7 @@ Future<void> main(List<String> arguments) async {
       (cavlc12, 64, 48),
       (separateCavlc, 64, 48),
       (fieldMp4, 64, 64),
+      (mbaff422, 96, 64),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -937,6 +978,7 @@ Future<void> main(List<String> arguments) async {
       ('separate-planes', separateCabac, 64, 48),
       ('field', fieldTs, 64, 64),
       ('paff', paffTs, 64, 64),
+      ('mbaff', mbaff422, 96, 64),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';
@@ -959,7 +1001,7 @@ Future<void> main(List<String> arguments) async {
         'H.264 animated contact sheet',
       );
       final captures = Directory(kept).listSync().cast<File>();
-      check(captures.length == 6, 'H.264 kept B-frame captures');
+      check(captures.length == 6, 'H.264 kept contact sheet captures');
       for (final capture in captures) {
         final frame = image.decodeBmp(capture.readAsBytesSync())!;
         check(

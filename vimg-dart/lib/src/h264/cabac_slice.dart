@@ -48,6 +48,13 @@ final class CabacSlice extends SliceData {
   final _positions = Uint8List(64);
 
   @override
+  bool readMbaffField(Macroblock? leftPair, Macroblock? topPair) =>
+      _cabac.decision(
+        70 + _count(leftPair?.mbaffField == true, topPair?.mbaffField == true),
+      ) !=
+      0;
+
+  @override
   bool endOfSlice() => _cabac.terminate();
 
   @override
@@ -230,12 +237,9 @@ final class CabacSlice extends SliceData {
     for (var i = 0; i < 4; i++) {
       final x = i & 1;
       final y = i >> 1;
-      final a = x == 0 ? left : block;
-      final b = y == 0 ? top : block;
-      final neighbors = _pair(
-        a != null && !a.pcm && !_set(a.lumaPattern, (y << 1) | (x ^ 1)),
-        b != null && !b.pcm && !_set(b.lumaPattern, ((y ^ 1) << 1) | x),
-      );
+      final a = _sampleNeighbor(block, left, top, 8 * x - 1, 8 * y);
+      final b = _sampleNeighbor(block, left, top, 8 * x, 8 * y - 1);
+      final neighbors = _pair(_missingPattern(a), _missingPattern(b));
       block.lumaPattern |= _cabac.decision(73 + neighbors) << i;
     }
     if (!header.pps.sps.subsampledChroma) return;
@@ -283,14 +287,15 @@ final class CabacSlice extends SliceData {
     }
     if (block.chromaPattern == 1) return;
     for (var i = 0; i < 2 * countPerPlane; i++) {
-      final topEdge = i % countPerPlane < 2;
-      final context = _pair(
-        _blockFlag(i.isEven ? left : block, 16 + (i ^ 1), block.intra),
-        _blockFlag(
-          topEdge ? top : block,
-          16 + i + (topEdge ? countPerPlane - 2 : -2),
-          block.intra,
-        ),
+      final local = i % countPerPlane;
+      final context = _blockContext(
+        block,
+        left,
+        top,
+        4 * (local & 1),
+        4 * (local >> 1),
+        16 + i - local,
+        chroma: true,
       );
       if (_decode(
         _Residual.chromaAc,
@@ -331,23 +336,16 @@ final class CabacSlice extends SliceData {
     final large = block.transform8x8;
     for (var i = 0; i < 16; i += large ? 4 : 1) {
       if (!_set(block.lumaPattern, i >> 2)) continue;
-      final x = blockX(i);
-      final y = blockY(i);
       final context = large && !fullChroma
           ? 0
-          : _pair(
-              _blockFlag(
-                x == 0 ? left : block,
-                start + blockIndex((x - 1) & 3, y),
-                block.intra,
-                large: large,
-              ),
-              _blockFlag(
-                y == 0 ? top : block,
-                start + blockIndex(x, (y - 1) & 3),
-                block.intra,
-                large: large,
-              ),
+          : _blockContext(
+              block,
+              left,
+              top,
+              4 * blockX(i),
+              4 * blockY(i),
+              start,
+              large: large,
             );
       if (_decode(
         large ? eight : (acOnly ? ac : four),
@@ -359,6 +357,40 @@ final class CabacSlice extends SliceData {
         block.codedBlocks |= (large ? 15 : 1) << (start + i);
       }
     }
+  }
+
+  int _blockContext(
+    Macroblock block,
+    Macroblock? left,
+    Macroblock? top,
+    int x,
+    int y,
+    int start, {
+    bool chroma = false,
+    bool large = false,
+  }) {
+    final a = _residualNeighbor(
+      block,
+      left,
+      top,
+      x - 1,
+      y,
+      start,
+      chroma: chroma,
+    );
+    final b = _residualNeighbor(
+      block,
+      left,
+      top,
+      x,
+      y - 1,
+      start,
+      chroma: chroma,
+    );
+    return _pair(
+      _blockFlag(a.block, a.index, block.intra, large: large),
+      _blockFlag(b.block, b.index, block.intra, large: large),
+    );
   }
 
   bool _decode(
@@ -373,7 +405,7 @@ final class CabacSlice extends SliceData {
         _cabac.decision(category.coded + context) == 0) {
       return false;
     }
-    final field = header.field;
+    final field = header.field || mbaffField;
     final significantBase = field
         ? category.fieldSignificant
         : category.significant;
@@ -414,6 +446,13 @@ final class CabacSlice extends SliceData {
     }
     return true;
   }
+}
+
+bool _missingPattern(SampleNeighbor at) {
+  final block = at.block;
+  return block != null &&
+      !block.pcm &&
+      !_set(block.lumaPattern, 2 * (at.y ~/ 8) + at.x ~/ 8);
 }
 
 bool _dcFlag(Macroblock? block, int index, bool intra) =>
