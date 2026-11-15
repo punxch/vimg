@@ -1,24 +1,31 @@
 part of 'slice_data.dart';
 
 enum _Residual {
-  lumaDc(85, 105, 166, 227),
-  lumaAc(89, 120, 181, 237),
-  luma4(93, 134, 195, 247),
-  chromaDc(97, 149, 210, 257),
-  chromaAc(101, 152, 213, 266),
-  luma8(1012, 402, 417, 426),
-  cbDc(460, 484, 572, 952),
-  cbAc(464, 499, 587, 962),
-  cb4(468, 513, 601, 972),
-  cb8(1016, 660, 690, 708),
-  crDc(472, 528, 616, 982),
-  crAc(476, 543, 631, 992),
-  cr4(480, 557, 645, 1002),
-  cr8(1020, 718, 748, 766);
+  lumaDc(85, 105, 166, 227, 277, 338),
+  lumaAc(89, 120, 181, 237, 292, 353),
+  luma4(93, 134, 195, 247, 306, 367),
+  chromaDc(97, 149, 210, 257, 321, 382),
+  chromaAc(101, 152, 213, 266, 324, 385),
+  luma8(1012, 402, 417, 426, 436, 451),
+  cbDc(460, 484, 572, 952, 776, 864),
+  cbAc(464, 499, 587, 962, 791, 879),
+  cb4(468, 513, 601, 972, 805, 893),
+  cb8(1016, 660, 690, 708, 675, 699),
+  crDc(472, 528, 616, 982, 820, 908),
+  crAc(476, 543, 631, 992, 835, 923),
+  cr4(480, 557, 645, 1002, 849, 937),
+  cr8(1020, 718, 748, 766, 733, 757);
 
-  const _Residual(this.coded, this.significant, this.last, this.level);
+  const _Residual(
+    this.coded,
+    this.significant,
+    this.last,
+    this.level,
+    this.fieldSignificant,
+    this.fieldLast,
+  );
 
-  final int coded, significant, last, level;
+  final int coded, significant, last, level, fieldSignificant, fieldLast;
 }
 
 const _fullCategories = [
@@ -366,6 +373,12 @@ final class CabacSlice extends SliceData {
         _cabac.decision(category.coded + context) == 0) {
       return false;
     }
+    final field = header.field;
+    final significantBase = field
+        ? category.fieldSignificant
+        : category.significant;
+    final lastBase = field ? category.fieldLast : category.last;
+    final significant8 = field ? _fieldSignificant8 : _significant8;
     final dc422 = category == _Residual.chromaDc && length == 8;
     var used = 0;
     for (var i = 0; i < length; i++) {
@@ -374,10 +387,10 @@ final class CabacSlice extends SliceData {
         break;
       }
       final dcOffset = dc422 ? (i >= 4 ? 2 : i >> 1) : i;
-      final significant = large ? _significant8[i] : dcOffset;
-      if (_cabac.decision(category.significant + significant) == 0) continue;
+      final significant = large ? significant8[i] : dcOffset;
+      if (_cabac.decision(significantBase + significant) == 0) continue;
       _positions[used++] = i;
-      if (_cabac.decision(category.last + (large ? _last8[i] : dcOffset)) != 0)
+      if (_cabac.decision(lastBase + (large ? _last8[i] : dcOffset)) != 0)
         break;
     }
     var node = 0;
@@ -488,6 +501,72 @@ const _significant8 = [
   14,
   10,
   12,
+];
+// Significant coefficient contexts in the field 8×8 scan.
+const _fieldSignificant8 = [
+  0,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  4,
+  5,
+  6,
+  7,
+  7,
+  7,
+  8,
+  4,
+  5,
+  6,
+  9,
+  10,
+  10,
+  8,
+  11,
+  12,
+  11,
+  9,
+  9,
+  10,
+  10,
+  8,
+  11,
+  12,
+  11,
+  9,
+  9,
+  10,
+  10,
+  8,
+  11,
+  12,
+  11,
+  9,
+  9,
+  10,
+  10,
+  8,
+  13,
+  13,
+  9,
+  9,
+  10,
+  10,
+  8,
+  13,
+  13,
+  9,
+  9,
+  10,
+  10,
+  14,
+  14,
+  14,
+  14,
+  14,
 ];
 const _last8 = [
   0,

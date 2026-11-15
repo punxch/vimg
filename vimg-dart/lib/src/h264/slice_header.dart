@@ -80,23 +80,28 @@ final class SliceHeader {
       throw const FormatException('H.264 slice references a missing PPS');
     pps = picture;
     final sps = pps.sps;
-    if (!sps.frameOnly || pps.sliceGroups != 1) {
-      throw UnsupportedError(
-        'Interlaced and slice-group H.264 pictures are unavailable',
-      );
+    if (pps.sliceGroups != 1) {
+      throw UnsupportedError('H.264 coded slice groups are unavailable');
     }
     colorPlane = sps.separateColorPlane ? bits.read(2) : 0;
     if (colorPlane == 3) {
       throw const FormatException('Invalid H.264 slice color plane');
     }
     frameNum = bits.read(sps.frameNumBits);
+    final field = !sps.frameOnly && bits.flag();
+    bottomField = field ? bits.flag() : null;
+    if (!field && sps.mbAdaptive) {
+      throw UnsupportedError(
+        'H.264 macroblock-adaptive field coding is unavailable',
+      );
+    }
     if (idr) idrId = bits.ue(65535);
     if (sps.pocType == 0) {
       pocLsb = bits.read(sps.pocLsbBits);
-      if (pps.bottomFieldPocPresent) deltaBottom = bits.se();
+      if (pps.bottomFieldPocPresent && !field) deltaBottom = bits.se();
     } else if (sps.pocType == 1 && !sps.deltaPocAlwaysZero) {
       delta0 = bits.se();
-      if (pps.bottomFieldPocPresent) delta1 = bits.se();
+      if (pps.bottomFieldPocPresent && !field) delta1 = bits.se();
     }
     if (pps.redundantPicCount && bits.ue(127) != 0) {
       throw UnsupportedError('Redundant H.264 slices are unavailable');
@@ -119,7 +124,7 @@ final class SliceHeader {
     qp = pps.initialQp + bits.se();
     if (qp < -sps.lumaQpOffset ||
         qp > 51 ||
-        firstMb >= sps.mbWidth * sps.mbHeight) {
+        firstMb >= sps.mbWidth * mbHeight) {
       throw const FormatException(
         'Invalid H.264 slice QP or macroblock address',
       );
@@ -142,6 +147,20 @@ final class SliceHeader {
   late final H264Pps pps;
   late final SliceKind kind;
   late final bool idr, reference;
+  late final bool? bottomField;
+
+  bool get field => bottomField != null;
+  int get mbHeight => pps.sps.mbHeight >> (field ? 1 : 0);
+  int get maxPicNum => 1 << (pps.sps.frameNumBits + (field ? 1 : 0));
+  int get currPicNum => field ? 2 * frameNum + 1 : frameNum;
+
+  bool complements(SliceHeader other) =>
+      field &&
+      other.field &&
+      bottomField != other.bottomField &&
+      frameNum == other.frameNum &&
+      reference == other.reference &&
+      pps.sps == other.pps.sps;
 
   var idrId = 0, pocLsb = 0, deltaBottom = 0, delta0 = 0, delta1 = 0;
   var deblocking = 0, alphaOffset = 0, betaOffset = 0;
@@ -155,6 +174,7 @@ final class SliceHeader {
   bool samePicture(SliceHeader other) =>
       pps == other.pps &&
       frameNum == other.frameNum &&
+      bottomField == other.bottomField &&
       idr == other.idr &&
       idrId == other.idrId &&
       pocLsb == other.pocLsb &&
@@ -173,7 +193,7 @@ final class SliceHeader {
         throw const FormatException(
           'Too many H.264 reference list modifications',
         );
-      final maximum = op == 2 ? 15 : (1 << pps.sps.frameNumBits) - 1;
+      final maximum = op == 2 ? (field ? 31 : 15) : maxPicNum - 1;
       result.add((op: op, value: bits.ue(maximum)));
     }
   }
@@ -191,10 +211,10 @@ final class SliceHeader {
       if (op == 0) return;
       if (operations.length >= 32)
         throw const FormatException('Too many H.264 reference markings');
-      final maximum = (1 << pps.sps.frameNumBits) - 1;
       final first = switch (op) {
-        1 || 3 => bits.ue(maximum),
-        2 || 6 => bits.ue(15),
+        1 || 3 => bits.ue(maxPicNum - 1),
+        2 => bits.ue(field ? 31 : 15),
+        6 => bits.ue(15),
         4 => bits.ue(16),
         _ => 0,
       };

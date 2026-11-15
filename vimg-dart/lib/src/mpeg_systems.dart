@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'binary_file.dart';
 import 'frame_packet.dart';
+import 'h264/access_unit.dart';
 import 'h264/parameters.dart';
 import 'hevc/nal.dart';
 import 'hevc/parameters.dart';
@@ -416,9 +417,11 @@ final class _AccessUnits {
   final configurations = <int, Uint8List>{};
   final mpegPictures = <int, MpegPictureInfo>{};
   final _parameters = NalParameterSets();
-  final _avcSeparateSequences = <int>{};
+  final _avcSequences = <int, H264Sps>{};
   final _avcPpsSequences = <int, int>{};
   var _avcPlanes = 0;
+  H264FieldKey? _avcField;
+  (int, int)? _avcPrefix;
   String? bitstreamCodec;
   (int, int)? dimensions;
   (int, int)? timing;
@@ -483,7 +486,7 @@ final class _AccessUnits {
         ? (_parameter ? 512 : 5)
         : _parameter
         ? 65535
-        : (_avcSeparateSequences.isEmpty ? 4 : 16);
+        : (_avcSequences.isEmpty ? 4 : 16);
     final count = math.min(end - start, limit - _prefix.length);
     if (count > 0)
       _prefix.add(Uint8List.sublistView(bytes, start, start + count));
@@ -506,9 +509,10 @@ final class _AccessUnits {
         (_hevc
             ? bytes.length >= 3 && bytes[2] & 0x80 != 0
             : bytes.length >= 2 && bytes[1] & 0x80 != 0);
-    final plane = firstSlice && !_hevc && _avcSeparateSequences.isNotEmpty
-        ? _firstAvcColorPlane(bytes)
+    final avc = firstSlice && !_hevc && _avcSequences.isNotEmpty
+        ? probeAvcSlice(bytes, (id) => _avcSequences[_avcPpsSequences[id]])
         : null;
+    final plane = avc?.colorPlane;
     // Each independent plane starts at macroblock zero. A repeated plane
     // starts the next picture when there is no access unit delimiter.
     final startsPicture =
@@ -519,29 +523,41 @@ final class _AccessUnits {
               type >= 41 && type <= 44 ||
               type >= 48 && type <= 55
         : type >= 6 && type <= 9 || type >= 14 && type <= 18;
-    if (_frameType != null && (prefix || startsPicture)) _frame(_nalStart);
+    if (prefix && _avcField != null) {
+      // An AUD may delimit the second field of the same output frame.
+      _avcPrefix ??= (_nalStart, _nalPosition);
+      if (_parameter) _parameterSet(bytes);
+      return;
+    }
+    if (_frameType != null && (prefix || startsPicture)) {
+      final pendingPrefix = _avcPrefix;
+      _avcPrefix = null;
+      final firstField = _avcField, secondField = avc?.field;
+      if (firstField != null &&
+          secondField != null &&
+          complementaryH264Fields(firstField, secondField)) {
+        final secondTime = _takeTime(pendingPrefix?.$1 ?? _nalStart);
+        _frameTime ??= secondTime;
+        _avcField = null;
+        _avcPlanes = 0;
+      } else {
+        _frame(pendingPrefix?.$1 ?? _nalStart);
+        if (pendingPrefix != null) {
+          _frameStart = pendingPrefix.$1;
+          _framePosition = pendingPrefix.$2;
+        }
+      }
+    }
     _beginUnit();
     if (_parameter) _parameterSet(bytes);
     if (plane != null) _avcPlanes |= 1 << plane;
     if (slice && _frameType == null) {
       _beginPicture(type);
+      _avcField = avc?.field;
       if ((_hevc && type >= 16 && type <= 21) || (!_hevc && type == 5)) {
         configurations[_framePosition] = _parameters.snapshot() ?? Uint8List(0);
       }
     }
-  }
-
-  int? _firstAvcColorPlane(Uint8List bytes) {
-    final bits = Rbsp.fromNal(bytes);
-    bits.bit(); // first_mb_in_slice = 0
-    bits.ue(9); // slice_type
-    final sequence = _avcPpsSequences[bits.ue(255)];
-    if (!_avcSeparateSequences.contains(sequence)) return null;
-    final plane = bits.read(2);
-    if (plane == 3) {
-      throw const FormatException('Invalid H.264 slice color plane');
-    }
-    return plane;
   }
 
   void _mpegUnit(MpegHeaders headers, Uint8List bytes) {
@@ -677,10 +693,10 @@ final class _AccessUnits {
       type = nal[0] & 31;
       if (type == 7) {
         final sps = H264Sps.parse(nal);
-        if (sps.separateColorPlane) {
-          _avcSeparateSequences.add(sps.id);
+        if (sps.separateColorPlane || !sps.frameOnly) {
+          _avcSequences[sps.id] = sps;
         } else {
-          _avcSeparateSequences.remove(sps.id);
+          _avcSequences.remove(sps.id);
         }
         dimensions ??= (sps.width, sps.height);
         timing ??= sps.timing;
@@ -697,7 +713,7 @@ final class _AccessUnits {
   void _frame(int end) {
     final type = _frameType;
     if (type == null) return;
-    if (_mpegStructure == 3) {
+    if (_mpegStructure == 3 && _avcField == null) {
       final info = mpegPictures[_framePosition];
       frames.add((
         offset: _framePosition,
@@ -723,6 +739,8 @@ final class _AccessUnits {
   void _clearPicture() {
     _frameType = null;
     _avcPlanes = 0;
+    _avcField = null;
+    _avcPrefix = null;
     _frameTime = null;
     _fields = 2;
     _mpegStructure = 3;
@@ -740,7 +758,7 @@ final class _AccessUnits {
 
   void finish() {
     _nal();
-    _frame(_length);
+    _frame(_avcPrefix?.$1 ?? _length);
   }
 }
 

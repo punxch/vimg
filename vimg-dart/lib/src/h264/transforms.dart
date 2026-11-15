@@ -71,6 +71,19 @@ const scan8 = [
   63,
 ];
 
+// Field coefficient scans (H.264 §8.5).
+// dart format off
+const _fieldScan4 = [
+  0, 4, 1, 8, 12, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15,
+];
+const _fieldScan8 = [
+  0, 8, 16, 1, 9, 24, 32, 17, 2, 25, 40, 48, 56, 33, 10, 3,
+  18, 41, 49, 57, 26, 11, 4, 19, 34, 42, 50, 58, 27, 12, 5, 20,
+  35, 43, 51, 59, 28, 13, 6, 21, 36, 44, 52, 60, 29, 14, 22, 37,
+  45, 53, 61, 30, 7, 15, 38, 46, 54, 62, 23, 31, 39, 47, 55, 63,
+];
+// dart format on
+
 const _scale4 = [
   [10, 13, 16],
   [11, 14, 18],
@@ -295,12 +308,17 @@ const _defaultInter8 = [
 /// Inverse scanning, scaling and transforms (§8.5). The residual buffer is
 /// reused for each block to keep the frame's working set proportional to pixels.
 final class IntraTransform {
+  IntraTransform({bool field = false})
+    : _scan4 = field ? _fieldScan4 : scan4,
+      _scan8 = field ? _fieldScan8 : scan8;
+
+  final List<int> _scan4, _scan8;
   final residual = Int32List(256);
   final _lumaDc = Int32List(16);
   final _chromaDc = Int32List(8);
 
   void bypassBlock(Int32List levels, int offset, int size, {int mode = 2}) {
-    _unscan(levels, offset, size == 8 ? scan8 : scan4, 0, size, size);
+    _unscan(levels, offset, size == 8 ? _scan8 : _scan4, 0, size, size);
     _undoResidualPrediction(size, size, mode);
   }
 
@@ -317,7 +335,7 @@ final class IntraTransform {
       final x = width == 16 ? blockX(i) : i & 1;
       final y = width == 16 ? blockY(i) : i >> 1;
       final start = 4 * (y * width + x);
-      _unscan(levels, offset + i * 16, scan4, start, 4, width);
+      _unscan(levels, offset + i * 16, _scan4, start, 4, width);
       residual[start] = dc[y * blocksAcross + x];
     }
     _undoResidualPrediction(width, height, mode);
@@ -361,7 +379,7 @@ final class IntraTransform {
     final scale = _scale4[qp % 6];
     final shift = 4 - qp ~/ 6;
     for (var i = 0; i < 16; i++) {
-      final pos = scan4[i];
+      final pos = _scan4[i];
       final group = (pos & 1) + ((pos >> 2) & 1);
       residual[pos] = _shift(
         levels[offset + i] * scale[group] * weights[pos],
@@ -382,7 +400,7 @@ final class IntraTransform {
     final scale = _scale8[qp % 6];
     final shift = 6 - qp ~/ 6;
     for (var i = 0; i < 64; i++) {
-      final pos = scan8[i];
+      final pos = _scan8[i];
       final group = _adjust8[(((pos >> 3) & 3) << 2) | (pos & 3)];
       residual[pos] = _shift(
         levels[offset + i] * scale[group] * weights[pos],
@@ -405,7 +423,7 @@ final class IntraTransform {
     bool bypass = false,
   }) {
     for (var i = 0; i < 16; i++) {
-      _lumaDc[scan4[i]] = levels[i];
+      _lumaDc[_scan4[i]] = levels[i];
     }
     if (bypass) return _lumaDc;
     for (var i = 0; i < 4; i++) {
@@ -436,9 +454,9 @@ final class IntraTransform {
     int weight, {
     required bool bypass,
   }) {
-    const scan422 = [0, 2, 1, 4, 6, 3, 5, 7];
+    const _scan422 = [0, 2, 1, 4, 6, 3, 5, 7];
     for (var i = 0; i < count; i++) {
-      _chromaDc[count == 8 ? scan422[i] : i] = levels[start + i];
+      _chromaDc[count == 8 ? _scan422[i] : i] = levels[start + i];
     }
     if (bypass) return _chromaDc;
 

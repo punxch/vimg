@@ -141,6 +141,7 @@ final class Video {
 
   late final _nalTimeline = _indexNalVideo();
   final _previewNalConfigurations = <FramePacket, _NalConfiguration>{};
+  final _avcFieldPairKeys = <FramePacket>{};
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
   late final _av1Timeline = _indexAv1();
   late final _mpegTimeline = _indexMpeg();
@@ -422,9 +423,10 @@ final class Video {
         packets.addAll(
           indexed.timeline.presentation.where((packet) {
             if (!preview) return true;
-            return indexed.configurations.containsKey(
-              indexed.timeline.index[packet],
-            );
+            return _avcFieldPairKeys.contains(packet) ||
+                indexed.configurations.containsKey(
+                  indexed.timeline.index[packet],
+                );
           }),
         );
       } else {
@@ -590,6 +592,7 @@ final class Video {
     AvcConfiguration? avc;
     var parameters = NalParameterSets();
     var newDescription = false, hasPicture = false;
+    ({FramePacket packet, H264FieldKey field, bool keyframe})? pendingField;
     void configure([MediaBox? description]) {
       record = _configuration(name, description);
       if (isHevc) {
@@ -601,6 +604,7 @@ final class Video {
         lengthBytes: hevc?.lengthBytes ?? avc!.lengthBytes,
       );
       newDescription = hasPicture || section?.restart == true;
+      pendingField = null;
     }
 
     if (_matroska != null) configure();
@@ -612,8 +616,10 @@ final class Video {
 
     int? type;
     var keyframe = false;
+    FramePacket? display;
+    var fieldPair = false;
     _NalConfiguration? configuration;
-    for (final packet in _containerPackets(
+    for (final _ in _containerPackets(
       false,
       section: section,
       onDescription: configure,
@@ -625,21 +631,44 @@ final class Video {
           file.unsigned,
           onParameterSet: parameterSet,
         );
-        type =
-            systems?.nalType(packet) ??
-            header?.type ??
-            avc?.pictureType(
-              packet.offset,
-              packet.size,
-              file.unsigned,
-              onParameterSet: parameterSet,
-            );
-        final random = systems != null
+        final avcSample = avc?.sampleHeader(
+          packet.offset,
+          packet.size,
+          file.unsigned,
+          readBytes: file.read,
+          onParameterSet: parameterSet,
+        );
+        type = systems?.nalType(packet) ?? header?.type ?? avcSample?.type;
+        var random = systems != null
             ? sync
             : isHevc
             ? header?.randomAccess == true
             : sync && type == 5;
         keyframe = sync && random;
+        display = packet;
+        fieldPair = false;
+        final field = avcSample?.field;
+        if (field != null) {
+          final previous = pendingField;
+          if (previous != null &&
+              complementaryH264Fields(previous.field, field)) {
+            final paired = _avcFieldPacket(previous.packet, packet);
+            display = paired;
+            fieldPair = true;
+            keyframe = previous.keyframe;
+            random = false; // decoding starts with the first field
+            pendingField = null;
+            if (keyframe) _avcFieldPairKeys.add(paired);
+            if (section != null) _isoSectionByPacket[paired] = section;
+            if (_isoAspects[packet] case final aspect?)
+              _isoAspects[paired] = aspect;
+          } else {
+            pendingField = (packet: packet, field: field, keyframe: keyframe);
+            display = null;
+          }
+        } else if (type != null) {
+          pendingField = null;
+        }
         configuration = random
             ? (
                 record: record,
@@ -652,7 +681,13 @@ final class Video {
               'AVC or HEVC sample description changes outside a random-access picture',
             );
           }
-          onSample?.call(packet, type, random, configuration, newDescription);
+          onSample?.call(
+            display ?? packet,
+            type,
+            random,
+            configuration,
+            newDescription,
+          );
           newDescription = false;
           hasPicture = true;
         } else {
@@ -660,9 +695,11 @@ final class Video {
         }
       },
     )) {
+      final packet = display;
+      if (packet == null) continue;
       if (preview) {
         if (!keyframe) continue;
-        _previewNalConfigurations[packet] = configuration!;
+        if (!fieldPair) _previewNalConfigurations[packet] = configuration!;
       } else if (type == null) {
         continue;
       }
@@ -1351,6 +1388,32 @@ typedef _DecodeRun = ({
   Map<FramePacket, double>? sampleAspects,
   Map<int, List<int>>? aviPalettes,
 });
+
+FramePacket _avcFieldPacket(FramePacket first, FramePacket second) {
+  final earliest = first.seconds <= second.seconds ? first : second;
+  var timestamp = earliest.timestamp;
+  final a = first.timestamp, b = second.timestamp;
+  if (a != null &&
+      b != null &&
+      a.numerator == b.numerator &&
+      a.denominator == b.denominator) {
+    final endA = a.pts + (a.duration ?? 0);
+    final endB = b.pts + (b.duration ?? 0);
+    final start = timestamp!;
+    timestamp = frameTimestamp(
+      start.pts,
+      start.numerator,
+      start.denominator,
+      duration: (endA > endB ? endA : endB) - start.pts,
+    );
+  }
+  return (
+    offset: second.offset,
+    size: second.size,
+    seconds: earliest.seconds,
+    timestamp: timestamp,
+  );
+}
 
 bool _usesReferences(String codec) =>
     codec == 'h264' ||

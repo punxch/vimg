@@ -44,6 +44,7 @@ final class H264Sps {
     required this.mbWidth,
     required this.mbHeight,
     required this.frameOnly,
+    required this.mbAdaptive,
     required this.cropLeft,
     required this.cropTop,
     required this.width,
@@ -96,7 +97,7 @@ final class H264Sps {
     final mbWidth = bits.ue(4095) + 1;
     final mapHeight = bits.ue(4095) + 1;
     final frameOnly = bits.flag();
-    if (!frameOnly) bits.bit(); // mb_adaptive_frame_field_flag
+    final mbAdaptive = !frameOnly && bits.flag();
     final mbHeight = mapHeight * (frameOnly ? 1 : 2);
     final direct8x8 = bits.flag();
     var left = 0, top = 0, right = 0, bottom = 0;
@@ -136,6 +137,7 @@ final class H264Sps {
       mbWidth: mbWidth,
       mbHeight: mbHeight,
       frameOnly: frameOnly,
+      mbAdaptive: mbAdaptive,
       cropLeft: left,
       cropTop: top,
       width: width,
@@ -155,7 +157,7 @@ final class H264Sps {
   final int nonReferenceOffset, bottomOffset, maxReferences;
   final bool allowGaps, direct8x8;
   final int mbWidth, mbHeight;
-  final bool frameOnly;
+  final bool frameOnly, mbAdaptive;
   final int cropLeft, cropTop, width, height;
   final H264Color color;
   final double sampleAspect;

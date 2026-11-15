@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/binary_file.dart';
 import 'package:vimg_dart/src/h264/access_unit.dart';
+import 'package:vimg_dart/src/video.dart';
 import 'package:vimg_dart/src/video_configuration.dart';
 import 'package:vimg_dart/src/h264/idr_picture.dart';
 import 'package:vimg_dart/src/iso_media.dart';
@@ -351,6 +352,49 @@ const _separateLosslessPlanes = [
   [0x23353905, 0x1a39a085, 0x4d29cc64],
 ];
 
+// JM field-coded samples with two slices per field. The FFmpeg plane
+// hashes cover complete frames after weaving and in presentation order.
+const _fieldCabacPlanes = [
+  [0x7d022f7b, 0xbc071c52, 0x1759a6a0],
+  [0x686476d9, 0xe2f3534d, 0x05b8ea02],
+  [0xa8a9ca9d, 0x133c0f13, 0x9c8aaee1],
+  [0x8d4994c5, 0xef3364b1, 0xd77abd35],
+  [0x70554e50, 0xe8863520, 0x2e47a7ce],
+  [0x52c6ca2e, 0xf62f7c4c, 0xc929b328],
+  [0x553d306e, 0xeda44ed4, 0x37af3a51],
+];
+
+const _fieldCavlcPlanes = [
+  [0x1efd82e6, 0xa6ad4dd1, 0x7164eb76],
+  [0xc140e54e, 0xc9b14b13, 0x48785ea9],
+  [0xebb6248f, 0xd1962676, 0x0d617362],
+  [0x848e4dd1, 0x88e75a3a, 0x8047fc6a],
+  [0x9256fdb3, 0x673d9bc4, 0xf64e4678],
+  [0xb48b7dab, 0xa971f4da, 0x8fdc55ca],
+  [0x95223df6, 0xcdcf96f7, 0xd25fd01b],
+];
+
+const _field422Planes = [
+  [0x6cfa582e, 0x16ad58a9, 0xb217e7b4],
+  [0x6678c7e5, 0x7b7a8d73, 0x319f46f9],
+  [0x89b35f6e, 0xa9b01a45, 0x6a514a7c],
+  [0x43243037, 0x00844278, 0xdd8194b2],
+  [0xc5aa54d6, 0x792777c4, 0xd823d47a],
+  [0x82a9f8e3, 0xdbcc8f8a, 0x186cbca0],
+  [0x6fb009d8, 0x7a2128b8, 0x29e183a7],
+];
+
+// 4:4:4 uses temporal direct prediction and picture order count type 1.
+const _field444Planes = [
+  [0x63c96976, 0x3eefddb4, 0x74dae77e],
+  [0xa77109aa, 0xa6d04cc0, 0xff8fd4c8],
+  [0x8e6d6a9a, 0xdecb2797, 0x8d28396f],
+  [0x1dfcdb7c, 0x5edc67fa, 0xe1be7197],
+  [0xd2504ee8, 0xc3c07643, 0x8e3408b5],
+  [0x494e2dbd, 0xbc7c13aa, 0x62dab2af],
+  [0xaee9e2af, 0x16e2ac20, 0xc9e0b558],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -362,6 +406,7 @@ void _checkPlanes(
   int chromaFormat = 1,
   bool lossless = false,
   bool separate = false,
+  bool field = false,
   bool rgb = false,
   (int, int) dimensions = (78, 50),
 }) {
@@ -421,6 +466,7 @@ void _checkPlanes(
             sps.chromaDepth == (chromaDepth ?? depth) &&
             sps.chromaFormat == chromaFormat &&
             sps.separateColorPlane == separate &&
+            sps.frameOnly != field &&
             sps.transformBypass == lossless &&
             (sps.width, sps.height) == dimensions,
         'H.264 dimensions, bit depth and profile',
@@ -488,6 +534,12 @@ Future<void> main(List<String> arguments) async {
   const separateCabac = 'test/fixtures/avc-separate-cabac.mkv';
   const separateCavlc = 'test/fixtures/avc-separate-cavlc.mkv';
   const separateLossless = 'test/fixtures/avc-separate-lossless.mkv';
+  const fieldCabac = 'test/fixtures/avc-field-cabac.mkv';
+  const fieldCavlc = 'test/fixtures/avc-field-cavlc.mkv';
+  const field422 = 'test/fixtures/avc-field-cabac422.mkv';
+  const field444 = 'test/fixtures/avc-field-cabac444.mkv';
+  const fieldTs = 'test/fixtures/avc-field-cabac.ts';
+  const fieldMp4 = 'test/fixtures/avc-field-cavlc.mp4';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -697,6 +749,47 @@ Future<void> main(List<String> arguments) async {
     dimensions: (64, 48),
   );
 
+  _checkPlanes(
+    fieldCabac,
+    _fieldCabacPlanes,
+    inter: true,
+    profile: 244,
+    field: true,
+    dimensions: (64, 64),
+  );
+  _checkPlanes(
+    fieldCavlc,
+    _fieldCavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    field: true,
+    dimensions: (64, 64),
+  );
+  _checkPlanes(
+    field422,
+    _field422Planes,
+    inter: true,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 2,
+    field: true,
+    dimensions: (64, 64),
+  );
+  _checkPlanes(
+    field444,
+    _field444Planes,
+    inter: true,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 3,
+    field: true,
+    dimensions: (64, 64),
+  );
+  await _checkFieldRemux(fieldCavlc, fieldMp4);
+  await _checkFieldRemux(fieldCabac, fieldTs);
+
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
     final result = await Process.run(
@@ -719,6 +812,7 @@ Future<void> main(List<String> arguments) async {
       (cabac444, 47, 31),
       (mixedGbr, 32, 24),
       (separateLossless, 32, 24),
+      (fieldMp4, 32, 32),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -752,6 +846,7 @@ Future<void> main(List<String> arguments) async {
       (cavlc444, 93, 61),
       (cavlc12, 64, 48),
       (separateCavlc, 64, 48),
+      (fieldMp4, 64, 64),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -774,6 +869,7 @@ Future<void> main(List<String> arguments) async {
       ('444-rgb', losslessRgb, 93, 61),
       ('12-bit', cabac12, 64, 48),
       ('separate-planes', separateCabac, 64, 48),
+      ('field', fieldTs, 64, 64),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';
@@ -807,5 +903,49 @@ Future<void> main(List<String> arguments) async {
     }
   } finally {
     directory.deleteSync(recursive: true);
+  }
+}
+
+// The MP4 stores each field in its own sample. The TS puts each field in a
+// separate PES and sends an access unit delimiter before it.
+Future<void> _checkFieldRemux(String bundled, String split) async {
+  final original = Video(bundled);
+  final remux = Video(split);
+  final decoder = VideoCaptureDecoder(remux, threads: 2);
+  try {
+    final packets = remux.packets().toList();
+    check(packets.length == 7, 'Expose one capture packet per field pair');
+    for (final (i, packet) in packets.indexed) {
+      final time = packet.timestamp!;
+      check(
+        (packet.seconds - i / 6).abs() < 0.00001 &&
+            (time.duration! * time.numerator / time.denominator - 1 / 6).abs() <
+                0.00001,
+        'Keep the field pair presentation time and duration',
+      );
+    }
+    final expected = original.decodeSelected(original.packets()).toList();
+    final key = remux.packets(preview: true).single;
+    void same(image.Image frame, image.Image reference) {
+      final a = frame.getBytes(), b = reference.getBytes();
+      check(
+        frame.width == 64 &&
+            frame.height == 64 &&
+            a.length == b.length &&
+            a.indexed.every((p) => p.$2 == b[p.$1]),
+        'Weave all samples from both fields in $split',
+      );
+    }
+
+    same(remux.decode(key, preview: true), expected.first.frame);
+    var i = 0;
+    await for (final frame in decoder.decode(packets)) {
+      same(frame.frame, expected[i++].frame);
+    }
+    check(i == packets.length, 'Decode the complete field sequence');
+  } finally {
+    await decoder.close();
+    remux.close();
+    original.close();
   }
 }

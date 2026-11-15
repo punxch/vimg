@@ -88,12 +88,15 @@ scaling and filters, including up to 16 bits per component in FFVHUFF.
 BMP extraction preserves alpha from streams that carry it.
 HuffYUV MT (`HYMT`) in AVI and Matroska can reconstruct frames from
 horizontal slices, restarting prediction at each slice boundary.
-Matroska and MP4/MOV support progressive 8–14-bit H.264 I/P/B pictures
+Matroska and MP4/MOV support 8–14-bit H.264 I/P/B pictures
 with CABAC or CAVLC in monochrome, 4:2:0, 4:2:2 and 4:4:4. This includes
 lossless streams that use transform bypass and 4:4:4 RGB streams signaled
 with an identity color matrix. The decoder handles both jointly and
-independently coded 4:4:4 color planes. Interlaced H.264 remains pending.
-`extract` and `vcs` decode
+independently coded 4:4:4 color planes. It also combines separately coded
+top and bottom fields into full frames, including fields stored in separate
+MP4 samples or MPEG transport PES packets. Macroblock-adaptive frame and
+field coding (MBAFF) and prediction between frame and field pictures remain
+pending. `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
 same GOP, and schedule captures using the source frame durations and the
 Rust CLI's constant-frame-rate selection rules. `sample/input.mkv`

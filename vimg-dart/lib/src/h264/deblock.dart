@@ -111,7 +111,10 @@ int _strength(
   int segment,
 ) {
   final other = edge == 0 ? neighbor! : block;
-  if (block.intra || other.intra) return edge == 0 ? 4 : 3;
+  final field = block.slice.field;
+  if (block.intra || other.intra) {
+    return edge == 0 && (!field || vertical) ? 4 : 3;
+  }
   final x = mbX * 4 + (vertical ? edge : segment);
   final y = mbY * 4 + (vertical ? segment : edge);
   final px = x - (vertical ? 1 : 0);
@@ -124,7 +127,7 @@ int _strength(
     if (first.identityAt(px, py) != second.identityAt(x, y)) return false;
     final a = first.vectorAt(px, py);
     final b = second.vectorAt(x, y);
-    return (a.x - b.x).abs() < 4 && (a.y - b.y).abs() < 4;
+    return (a.x - b.x).abs() < 4 && (a.y - b.y).abs() < (field ? 2 : 4);
   }
 
   final primary = same(motion!, motion);

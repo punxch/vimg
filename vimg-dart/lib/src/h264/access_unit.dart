@@ -1,6 +1,49 @@
 import 'dart:typed_data';
 
+import '../rbsp.dart';
 import 'parameters.dart';
+
+typedef H264FieldKey = ({
+  int sequence,
+  int frameNum,
+  bool bottom,
+  bool reference,
+});
+
+bool complementaryH264Fields(H264FieldKey a, H264FieldKey b) =>
+    a.sequence == b.sequence &&
+    a.frameNum == b.frameNum &&
+    a.reference == b.reference &&
+    a.bottom != b.bottom;
+
+/// Read just the picture boundary fields from a slice NAL prefix.
+({int? colorPlane, H264FieldKey? field})? probeAvcSlice(
+  Uint8List nal,
+  H264Sps? Function(int) sequence,
+) {
+  final bits = Rbsp.fromNal(nal);
+  bits.ue(); // first_mb_in_slice
+  bits.ue(9); // slice_type
+  final sps = sequence(bits.ue(255));
+  if (sps == null) return null;
+  final plane = sps.separateColorPlane ? bits.read(2) : null;
+  if (plane == 3) {
+    throw const FormatException('Invalid H.264 slice color plane');
+  }
+  H264FieldKey? field;
+  if (!sps.frameOnly) {
+    final frameNum = bits.read(sps.frameNumBits);
+    if (bits.flag()) {
+      field = (
+        sequence: sps.id,
+        frameNum: frameNum,
+        bottom: bits.flag(),
+        reference: nal[0] & 0x60 != 0,
+      );
+    }
+  }
+  return (colorPlane: plane, field: field);
+}
 
 /// AVCDecoderConfigurationRecord and length-prefixed samples used by AVC in
 /// Matroska and ISO BMFF. Parameter sets carried in avc3 samples can replace
@@ -57,6 +100,7 @@ final class AvcConfiguration {
   late final int lengthBytes;
   final sequences = <int, H264Sps>{};
   final pictures = <int, H264Pps>{};
+  final _sequenceNals = <int, Uint8List>{};
 
   (int, int)? store(Uint8List nal) {
     if (nal.isEmpty) throw const FormatException('Empty H.264 NAL unit');
@@ -64,7 +108,13 @@ final class AvcConfiguration {
     switch (type) {
       case 7:
         final sps = H264Sps.parse(nal);
-        sequences[sps.id] = sps;
+        final previous = _sequenceNals[sps.id];
+        if (previous == null ||
+            previous.length != nal.length ||
+            nal.indexed.any((entry) => entry.$2 != previous[entry.$1])) {
+          _sequenceNals[sps.id] = Uint8List.fromList(nal);
+          sequences[sps.id] = sps;
+        }
         return (type, sps.id);
       case 8:
         final pps = H264Pps.parse(nal, sequences);
@@ -88,21 +138,40 @@ final class AvcConfiguration {
     }
   }
 
-  int? pictureType(
+  ({int type, H264FieldKey? field})? sampleHeader(
     int start,
     int length,
     int Function(int offset, int width) read, {
+    required Uint8List Function(int, int) readBytes,
     void Function(int start, int length)? onParameterSet,
   }) {
+    int? type;
+    H264FieldKey? field;
     for (final nal in _extents(start, length, read)) {
       switch (nal.type) {
         case 7 || 8:
           onParameterSet?.call(nal.start, nal.end - nal.start);
         case 1 || 2 || 5:
-          return nal.type;
+          if (type == null && sequences.values.every((sps) => sps.frameOnly)) {
+            return (type: nal.type, field: null);
+          }
+          final length = nal.end - nal.start;
+          final header = probeAvcSlice(
+            readBytes(nal.start, length < 16 ? length : 16),
+            (id) => pictures[id]?.sps,
+          );
+          if (type == null) {
+            type = nal.type;
+            field = header?.field;
+            if (field == null) return (type: type, field: null);
+          } else if (header?.field case final other?) {
+            if (complementaryH264Fields(field!, other)) {
+              return (type: type, field: null);
+            }
+          }
       }
     }
-    return null;
+    return type == null ? null : (type: type, field: field);
   }
 
   Iterable<({int start, int end, int type})> _extents(

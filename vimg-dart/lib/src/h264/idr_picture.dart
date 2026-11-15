@@ -26,11 +26,16 @@ final class H264IdrDecoder {
       switch (nal[0] & 31) {
         case 7 || 8:
           configuration.store(nal);
+        case 1 when slices.firstOrNull?.field == true:
+          slices.add(SliceHeader(nal, configuration.pictures));
         case 5:
           slices.add(SliceHeader(nal, configuration.pictures));
       }
     }
-    return slices.isEmpty ? null : _decodeAccessUnit(slices);
+    if (slices.isEmpty) return null;
+    return slices.first.field
+        ? H264StreamDecoder(configuration)._decodeSlices(slices)
+        : _decodeAccessUnit(slices);
   }
 }
 
@@ -41,6 +46,7 @@ final class H264StreamDecoder {
 
   final AvcConfiguration configuration;
   var _references = [ReferenceState()];
+  (SliceHeader, H264Picture)? _field;
 
   H264Picture? decode(Uint8List sample) {
     final slices = <SliceHeader>[];
@@ -53,11 +59,40 @@ final class H264StreamDecoder {
       }
     }
     if (slices.isEmpty) return null;
+    return _decodeSlices(slices);
+  }
+
+  H264Picture? _decodeSlices(List<SliceHeader> slices) {
     final planeCount = slices.first.pps.sps.separateColorPlane ? 3 : 1;
     if (_references.length != planeCount) {
       _references = List.generate(planeCount, (_) => ReferenceState());
     }
-    return _decodeAccessUnit(slices, _references);
+    final first = slices.first;
+    if (!first.field) {
+      _field = null;
+      return _decodeAccessUnit(slices, _references);
+    }
+    final split = slices.indexWhere((slice) => !first.samePicture(slice));
+    if (split < 0) return _decodeField(slices);
+    if (!first.complements(slices[split])) {
+      throw const FormatException('H.264 sample contains unrelated fields');
+    }
+    _decodeField(slices.sublist(0, split));
+    return _decodeField(slices.sublist(split));
+  }
+
+  H264Picture? _decodeField(List<SliceHeader> slices) {
+    final header = slices.first;
+    final picture = _decodeAccessUnit(slices, _references);
+    final previous = _field;
+    if (previous == null || !header.complements(previous.$1)) {
+      _field = (header, picture);
+      return null;
+    }
+    _field = null;
+    return header.bottomField!
+        ? H264Picture.fromFields(previous.$2, picture)
+        : H264Picture.fromFields(picture, previous.$2);
   }
 }
 
@@ -108,17 +143,18 @@ H264Picture _decodePicture(
 }) {
   final first = slices.first;
   final sps = first.pps.sps;
+  final height = first.mbHeight;
   if (sps.mbWidth * sps.mbHeight > 139264) {
     throw const FormatException(
       'H.264 picture exceeds the maximum macroblock count',
     );
   }
-  final picture = H264Picture(sps);
+  final picture = H264Picture(sps, bottomField: first.bottomField);
   if (slices.any((slice) => slice.kind != SliceKind.intra)) {
-    picture.motionL0 = MotionField(sps.mbWidth * 4, sps.mbHeight * 4);
+    picture.motionL0 = MotionField(sps.mbWidth * 4, height * 4);
   }
   if (slices.any((slice) => slice.kind == SliceKind.b)) {
-    picture.motionL1 = MotionField(sps.mbWidth * 4, sps.mbHeight * 4);
+    picture.motionL1 = MotionField(sps.mbWidth * 4, height * 4);
   }
   final decoder = _Reconstruction(picture, first.pps, first.colorPlane);
   for (final slice in slices) {
@@ -136,7 +172,7 @@ final class _Reconstruction {
     : _scaling = ScalingMatrices(pps),
       width = picture.sps.mbWidth,
       blocks = List<Macroblock?>.filled(
-        picture.sps.mbWidth * picture.sps.mbHeight,
+        picture.sps.mbWidth * picture.mbHeight,
         null,
       );
 
@@ -150,7 +186,7 @@ final class _Reconstruction {
       picture.sps.chromaDepth == picture.sps.lumaDepth
       ? _lumaPrediction
       : IntraPrediction(picture.sps.chromaDepth);
-  final _transform = IntraTransform();
+  late final _transform = IntraTransform(field: picture.bottomField != null);
   var decoded = 0;
 
   void decode(SliceHeader slice, PendingPicture? pending) {

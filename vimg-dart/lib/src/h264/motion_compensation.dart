@@ -35,10 +35,24 @@ void predictInter(
       final index1 = motion1?.referenceAt(x, y, owner) ?? -1;
       final first = index0 < 0
           ? null
-          : _source(getReference(references.l0, index0), plane, x, y, motion0);
+          : _source(
+              getReference(references.l0, index0),
+              plane,
+              x,
+              y,
+              motion0,
+              header.bottomField,
+            );
       final second = index1 < 0
           ? null
-          : _source(getReference(references.l1, index1), plane, x, y, motion1!);
+          : _source(
+              getReference(references.l1, index1),
+              plane,
+              x,
+              y,
+              motion1!,
+              header.bottomField,
+            );
       if (first == null && second == null) {
         throw const FormatException('H.264 inter block has no reference');
       }
@@ -113,6 +127,7 @@ _Source _source(
   int x,
   int y,
   MotionField field,
+  bool? bottomField,
 ) {
   final picture = ref.picture!;
   final data = switch (plane) {
@@ -122,6 +137,10 @@ _Source _source(
   };
   final stride = plane == 0 ? picture.stride : picture.chromaStride;
   final vector = field.vectorAt(x, y);
+  final chroma420 = plane != 0 && picture.sps.chromaFormat == 1;
+  final correction = chroma420 && bottomField != picture.bottomField
+      ? (bottomField == true ? 2 : -2)
+      : 0;
   return (
     ref: ref,
     data: data,
@@ -129,7 +148,7 @@ _Source _source(
     height: data.length ~/ stride,
     x: 16 * x + vector.x,
     y:
-        (16 * y + vector.y) <<
+        (16 * y + vector.y + correction) <<
         (plane != 0 && picture.sps.chromaFormat == 2 ? 1 : 0),
   );
 }

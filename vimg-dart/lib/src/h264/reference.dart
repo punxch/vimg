@@ -10,14 +10,24 @@ final class ReferencePicture {
     this.frameNum,
     this.poc, {
     this.longIndex,
-  });
+    int? frameIdentity,
+    this.bottomField,
+  }) : frameIdentity = frameIdentity ?? identity;
 
   final H264Picture? picture;
-  final int identity, frameNum, poc;
+  final int identity, frameNum, poc, frameIdentity;
+  final bool? bottomField;
   final int? longIndex;
 
-  ReferencePicture asLongTerm(int index) =>
-      ReferencePicture(picture, identity, frameNum, poc, longIndex: index);
+  ReferencePicture asLongTerm(int index) => ReferencePicture(
+    picture,
+    identity,
+    frameNum,
+    poc,
+    longIndex: index,
+    frameIdentity: frameIdentity,
+    bottomField: bottomField,
+  );
 }
 
 typedef _History = ({int frame, int wrap, int msb, int lsb});
@@ -41,11 +51,19 @@ ReferencePicture getReference(List<ReferencePicture?> references, int index) {
 /// A staged picture shares the decoded reference store across its slices.
 /// Each slice independently builds its active reference lists.
 final class PendingPicture {
-  const PendingPicture(this.header, this._store, this.identity, this._order);
+  const PendingPicture(
+    this.header,
+    this._store,
+    this.identity,
+    this._order,
+    this.frameIdentity,
+    this.idrStart,
+  );
 
   final SliceHeader header;
   final List<ReferencePicture> _store;
-  final int identity;
+  final int identity, frameIdentity;
+  final bool idrStart;
   final _Order _order;
 
   int get poc => math.min(_order.top, _order.bottom);
@@ -61,7 +79,7 @@ final class PendingPicture {
       ).compareTo(_shortNumber(a, slice.frameNum, max)),
     );
     return _modified(
-      [...short, ..._longReferences()],
+      [..._fieldOrder(short, slice), ..._fieldOrder(_longReferences(), slice)],
       slice,
       slice.activeL0,
       slice.list0,
@@ -71,14 +89,32 @@ final class PendingPicture {
   ReferenceLists bLists(SliceHeader slice) {
     final past = <ReferencePicture>[];
     final future = <ReferencePicture>[];
-    for (final ref in _store.where((ref) => ref.longIndex == null)) {
-      (ref.poc < poc ? past : future).add(ref);
+    final frameOrders = <int, int>{};
+    if (slice.field) {
+      for (final ref in _store) {
+        frameOrders.update(
+          ref.frameIdentity,
+          (old) => math.min(old, ref.poc),
+          ifAbsent: () => ref.poc,
+        );
+      }
     }
-    past.sort((a, b) => b.poc.compareTo(a.poc));
-    future.sort((a, b) => a.poc.compareTo(b.poc));
-    final long = _longReferences();
-    final initial0 = [...past, ...future, ...long];
-    final initial1 = [...future, ...past, ...long];
+    int order(ReferencePicture ref) =>
+        frameOrders[ref.frameIdentity] ?? ref.poc;
+    for (final ref in _store.where((ref) => ref.longIndex == null)) {
+      (order(ref) < poc ? past : future).add(ref);
+    }
+    past.sort((a, b) => order(b).compareTo(order(a)));
+    future.sort((a, b) => order(a).compareTo(order(b)));
+    final long = _fieldOrder(_longReferences(), slice);
+    final initial0 = [
+      ..._fieldOrder([...past, ...future], slice),
+      ...long,
+    ];
+    final initial1 = [
+      ..._fieldOrder([...future, ...past], slice),
+      ...long,
+    ];
     if (initial1.length > 1 &&
         Iterable<int>.generate(
           initial1.length,
@@ -107,22 +143,28 @@ final class PendingPicture {
       count,
       (i) => i < initial.length ? initial[i] : null,
     );
-    final maximum = 1 << slice.pps.sps.frameNumBits;
-    var predicted = slice.frameNum;
+    final maximum = slice.maxPicNum;
+    var predicted = slice.currPicNum;
     for (var i = 0; i < modifications.length; i++) {
       final operation = modifications[i];
       final ReferencePicture? selected;
       if (operation.op == 2) {
         selected = _store
-            .where((ref) => ref.longIndex == operation.value)
+            .where((ref) => _longPicNum(ref, slice) == operation.value)
             .firstOrNull;
       } else {
         final difference = operation.value + 1;
         predicted =
             (predicted + (operation.op == 0 ? -difference : difference)) %
             maximum;
+        final target = predicted > slice.currPicNum
+            ? predicted - maximum
+            : predicted;
         selected = _store
-            .where((ref) => ref.longIndex == null && ref.frameNum == predicted)
+            .where(
+              (ref) =>
+                  ref.longIndex == null && _shortPicNum(ref, slice) == target,
+            )
             .firstOrNull;
       }
       if (selected == null)
@@ -146,11 +188,20 @@ final class ReferenceState {
   int? _previousReference;
   var _longMaximum = -1;
   var _identity = 0;
+  ({SliceHeader header, int frameIdentity})? _previousPicture;
 
   PendingPicture begin(SliceHeader header) {
     final sps = header.pps.sps;
-    final store = header.idr ? <ReferencePicture>[] : [..._references];
-    var history = header.idr ? _initialHistory : _history;
+    final last = _previousPicture;
+    final paired = last != null && header.complements(last.header);
+    final idrStart = header.idr && !paired;
+    final store = idrStart ? <ReferencePicture>[] : [..._references];
+    if (store.isNotEmpty && (store.first.bottomField != null) != header.field) {
+      throw UnsupportedError(
+        'H.264 mixed frame and field references are unavailable',
+      );
+    }
+    var history = idrStart ? _initialHistory : _history;
     final previous = _previousReference;
     if (!header.idr && previous == null) {
       throw const FormatException(
@@ -167,38 +218,65 @@ final class ReferenceState {
         history = order.next;
         if (sps.maxReferences > 0) {
           _evictOldest(store, sps.maxReferences, gap, maximum);
-          store.add(
-            ReferencePicture(null, -1, gap, math.min(order.top, order.bottom)),
-          );
+          final poc = math.min(order.top, order.bottom);
+          if (header.field) {
+            for (final bottom in [false, true]) {
+              store.add(
+                ReferencePicture(
+                  null,
+                  -1,
+                  gap,
+                  poc,
+                  frameIdentity: -2 - gap,
+                  bottomField: bottom,
+                ),
+              );
+            }
+          } else {
+            store.add(
+              ReferencePicture(null, -1, gap, poc, frameIdentity: -2 - gap),
+            );
+          }
         }
         gap = (gap + 1) % maximum;
       }
     }
-    return PendingPicture(header, store, _identity, _order(header, history));
+    return PendingPicture(
+      header,
+      store,
+      _identity,
+      _order(header, history),
+      paired ? last.frameIdentity : _identity,
+      idrStart,
+    );
   }
 
   void commit(PendingPicture pending, H264Picture picture) {
     final header = pending.header;
     final sps = header.pps.sps;
     final next = [...pending._store];
-    var longMaximum = header.idr ? (header.longTermIdr ? 0 : -1) : _longMaximum;
+    var longMaximum = pending.idrStart
+        ? (header.longTermIdr ? 0 : -1)
+        : _longMaximum;
     var longIndex = header.longTermIdr ? 0 : null;
     var clearNumber = false;
     final maximum = 1 << sps.frameNumBits;
     if (header.reference && !header.idr) {
       final marking = header.marking;
       if (marking == null) {
-        if (sps.maxReferences > 0)
+        if (sps.maxReferences > 0 &&
+            !next.any((ref) => ref.frameIdentity == pending.frameIdentity)) {
           _evictOldest(next, sps.maxReferences, header.frameNum, maximum);
+        }
       } else {
         for (final operation in marking) {
           switch (operation.op) {
             case 1 || 3:
-              final target = header.frameNum - operation.first - 1;
+              final target = header.currPicNum - operation.first - 1;
               final entry = next.indexWhere(
                 (ref) =>
                     ref.longIndex == null &&
-                    _shortNumber(ref, header.frameNum, maximum) == target,
+                    _shortPicNum(ref, header) == target,
               );
               if (entry < 0)
                 throw const FormatException(
@@ -210,11 +288,17 @@ final class ReferenceState {
                   throw const FormatException(
                     'Invalid H.264 long-term reference index',
                   );
-                next.removeWhere((ref) => ref.longIndex == operation.second);
+                next.removeWhere(
+                  (other) =>
+                      other.longIndex == operation.second &&
+                      other.frameIdentity != ref.frameIdentity,
+                );
                 next.add(ref.asLongTerm(operation.second));
               }
             case 2:
-              next.removeWhere((ref) => ref.longIndex == operation.first);
+              next.removeWhere(
+                (ref) => _longPicNum(ref, header) == operation.first,
+              );
             case 4:
               longMaximum = operation.first - 1;
               next.removeWhere(
@@ -229,15 +313,21 @@ final class ReferenceState {
                 throw const FormatException(
                   'Invalid H.264 long-term reference index',
                 );
-              next.removeWhere((ref) => ref.longIndex == operation.first);
+              next.removeWhere(
+                (ref) =>
+                    ref.longIndex == operation.first &&
+                    ref.frameIdentity != pending.frameIdentity,
+              );
               longIndex = operation.first;
           }
         }
       }
     }
     if (header.reference && sps.maxReferences > 0) {
-      if (next.length >= sps.maxReferences)
+      if (_frameCount(next) >= sps.maxReferences &&
+          !next.any((ref) => ref.frameIdentity == pending.frameIdentity)) {
         throw const FormatException('H.264 decoded picture buffer is full');
+      }
       next.add(
         ReferencePicture(
           picture,
@@ -245,12 +335,17 @@ final class ReferenceState {
           clearNumber ? 0 : header.frameNum,
           clearNumber ? 0 : pending.poc,
           longIndex: longIndex,
+          frameIdentity: pending.frameIdentity,
+          bottomField: header.bottomField,
         ),
       );
     }
     _references = next;
     _longMaximum = longMaximum;
     _identity++;
+    _previousPicture = header.field
+        ? (header: header, frameIdentity: pending.frameIdentity)
+        : null;
     _history = clearNumber
         ? (frame: 0, wrap: 0, msb: 0, lsb: pending._order.top - pending.poc)
         : pending._order.next;
@@ -258,6 +353,46 @@ final class ReferenceState {
       _previousReference = clearNumber ? 0 : header.frameNum;
   }
 }
+
+// Each parity advances independently through the ordered frame list (§8.2.4.2.5).
+List<ReferencePicture> _fieldOrder(
+  List<ReferencePicture> list,
+  SliceHeader slice,
+) {
+  if (!slice.field) return list;
+  final same = <ReferencePicture>[], opposite = <ReferencePicture>[];
+  for (final ref in list) {
+    (ref.bottomField == slice.bottomField ? same : opposite).add(ref);
+  }
+  return [
+    for (var i = 0; i < math.max(same.length, opposite.length); i++) ...[
+      if (i < same.length) same[i],
+      if (i < opposite.length) opposite[i],
+    ],
+  ];
+}
+
+int _shortPicNum(ReferencePicture ref, SliceHeader slice) {
+  final number = _shortNumber(
+    ref,
+    slice.frameNum,
+    1 << slice.pps.sps.frameNumBits,
+  );
+  return slice.field
+      ? 2 * number + (ref.bottomField == slice.bottomField ? 1 : 0)
+      : number;
+}
+
+int? _longPicNum(ReferencePicture ref, SliceHeader slice) {
+  final number = ref.longIndex;
+  if (number == null || !slice.field) return number;
+  return 2 * number + (ref.bottomField == slice.bottomField ? 1 : 0);
+}
+
+int _frameCount(List<ReferencePicture> store) =>
+    store.isEmpty || store.first.bottomField == null
+    ? store.length
+    : {for (final ref in store) ref.frameIdentity}.length;
 
 int _shortNumber(ReferencePicture ref, int current, int maximum) =>
     ref.frameNum > current ? ref.frameNum - maximum : ref.frameNum;
@@ -268,7 +403,7 @@ void _evictOldest(
   int current,
   int maximum,
 ) {
-  if (store.length < capacity) return;
+  if (_frameCount(store) < capacity) return;
   ReferencePicture? oldest;
   var minimum = maximum;
   for (final ref in store) {
@@ -283,7 +418,10 @@ void _evictOldest(
     throw const FormatException(
       'H.264 reference buffer has no short-term slot',
     );
-  store.remove(oldest);
+  store.removeWhere(
+    (ref) =>
+        ref.longIndex == null && ref.frameIdentity == oldest!.frameIdentity,
+  );
 }
 
 _Order _order(SliceHeader header, _History previous, {int? missingFrame}) {
@@ -332,10 +470,12 @@ _Order _order(SliceHeader header, _History previous, {int? missingFrame}) {
       top = expected + (missingFrame == null ? header.delta0 : 0);
       bottom =
           top + sps.bottomOffset + (missingFrame == null ? header.delta1 : 0);
+      if (missingFrame == null && header.bottomField == true) top = bottom;
     default:
       top = header.idr ? 0 : 2 * (wrap + frame) - (reference ? 0 : 1);
       bottom = top;
   }
+  if (header.field && missingFrame == null) bottom = top;
   if (top < -0x80000000 ||
       top > 0x7fffffff ||
       bottom < -0x80000000 ||
