@@ -21,6 +21,7 @@ import 'hevc/access_unit.dart';
 import 'hevc/decode_picture.dart';
 import 'hevc/nal.dart';
 import 'iso_media.dart';
+import 'ivf.dart';
 import 'matroska.dart';
 import 'matroska_frames.dart';
 import 'metadata.dart';
@@ -56,6 +57,8 @@ final class Video {
         _matroska = Matroska(file);
       } else if (signature == 0x52494646) {
         _avi = Avi(file);
+      } else if (signature == 0x444b4946) {
+        _ivf = Ivf(file);
       } else {
         _systems = MpegSystemsVideo.detect(file);
         if (_systems == null) _iso = IsoMedia(file);
@@ -72,11 +75,13 @@ final class Video {
   Matroska? _matroska;
   IsoMedia? _iso;
   Avi? _avi;
+  Ivf? _ivf;
   MpegSystemsVideo? _systems;
 
   late final VideoMetadata metadata =
       _matroska?.metadata() ??
       _avi?.metadata() ??
+      _ivf?.metadata() ??
       _systems?.metadata() ??
       _iso!.metadata();
 
@@ -381,12 +386,12 @@ final class Video {
     }
     if (codec == 'h264' || codec == 'hevc') {
       return preview
-          ? _orderedIfOverlapping(_nalPackets(preview: true))
+          ? _orderedIfNeeded(_nalPackets(preview: true))
           : _nalTimeline.timeline.presentation;
     }
     if (codec == 'av1') {
       return preview
-          ? _orderedIfOverlapping(_av1PreviewPackets())
+          ? _orderedIfNeeded(_av1PreviewPackets())
           : _av1Timeline.timeline.presentation;
     }
     if (_isDeltaBitmapCodec(codec)) {
@@ -401,15 +406,15 @@ final class Video {
     final avi = _avi;
     _checkIndependentCodec(codec, preview: preview);
     if (avi != null) return avi.packets();
-    return _orderedIfOverlapping(
+    return _orderedIfNeeded(
       _iso != null && isQuickTimeRawCodec(codec)
           ? _quickTimePackets()
           : _containerPackets(keyframes),
     );
   }
 
-  Iterable<FramePacket> _orderedIfOverlapping(Iterable<FramePacket> packets) =>
-      _iso?.hasOverlappingVideoFragments == true
+  Iterable<FramePacket> _orderedIfNeeded(Iterable<FramePacket> packets) =>
+      _iso?.hasOverlappingVideoFragments == true || _ivf?.outOfOrder == true
       ? _presentationOrder(packets)
       : packets;
 
@@ -465,7 +470,7 @@ final class Video {
         name == 'prores' ||
         isHuffYuvCodec(name) ||
         (_iso != null && isQuickTimeRawCodec(name)) ||
-        (preview && name == 'vp8') ||
+        (name == 'vp8' && (preview || _ivf?.supportsVp8Capture == true)) ||
         (name == 'rawvideo' &&
             (_avi?.supportsBitmap == true || _rawVideoFormat != null))) {
       return;
@@ -486,6 +491,7 @@ final class Video {
     final systems = _systems;
     if (systems != null) return systems.packets(keyframes, onSample: onSample);
     if (_avi case final avi?) return avi.packets(onSample: onSample);
+    if (_ivf case final ivf?) return ivf.packets(keyframes, onSample: onSample);
     final matroska = _matroska;
     if (matroska != null) {
       return matroskaFrames(matroska, keyframes: keyframes, onSample: onSample);
@@ -515,6 +521,22 @@ final class Video {
   }
 
   Iterable<FramePacket> _av1PreviewPackets() sync* {
+    if (_ivf case final ivf?) {
+      final units = Av1AccessUnits();
+      for (final packet in ivf.packets(false)) {
+        Uint8List? configuration;
+        for (final (i, frame) in units.readSample(_read(packet)).indexed) {
+          if (i == 0 && _av1RandomAccess(frame)) {
+            configuration = units.sequenceConfiguration;
+          }
+        }
+        if (configuration != null) {
+          _previewAv1Configurations[packet] = configuration;
+          yield packet;
+        }
+      }
+      return;
+    }
     var configuration = _iso == null ? _av1Configuration() : Uint8List(0);
     for (final packet in _containerPackets(
       true,
@@ -547,10 +569,7 @@ final class Video {
             final position = decodeOrder.length;
             var first = true, displays = 0;
             for (final frame in units.readSample(_read(packet))) {
-              if (first &&
-                  frame.header.type == Av1FrameType.key &&
-                  frame.shown &&
-                  frame.syntax.existingSlot == null) {
+              if (first && _av1RandomAccess(frame)) {
                 start = position;
                 configurations[start] = (
                   bytes: units.sequenceConfiguration ?? configuration,
@@ -1416,6 +1435,11 @@ typedef _DecodeRun = ({
   Map<FramePacket, double>? sampleAspects,
   Map<int, List<int>>? aviPalettes,
 });
+
+bool _av1RandomAccess(Av1CodedFrame frame) =>
+    frame.header.type == Av1FrameType.key &&
+    frame.shown &&
+    frame.syntax.existingSlot == null;
 
 FramePacket _avcFieldPacket(FramePacket first, FramePacket second) {
   final earliest = first.seconds <= second.seconds ? first : second;

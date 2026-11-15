@@ -157,7 +157,10 @@ navigation remain pending.
 Matroska and WebM capture apply the selected track's pixel crop and rectangular
 projection roll or mirror before user filters and tile sizing.
 
-`preview`, `extract` and `vcs` decode AV1 from Matroska and MP4. The
+`preview`, `extract` and `vcs` decode AV1 from Matroska, MP4 and IVF. IVF
+uses packet timestamps to derive playback duration and retains coded order
+for reference pictures. IVF also supports VP8 keyframe previews, extraction
+from all-intra VP8 streams and VP9 metadata probing. The
 AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and
