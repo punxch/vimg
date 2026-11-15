@@ -21,8 +21,9 @@ void predictInter(
   final depth = luma ? sps.lumaDepth : sps.chromaDepth;
   final maximum = (1 << depth) - 1;
   final offsetShift = depth - 8;
-  final block = luma ? 4 : 2;
-  final size = block * 4;
+  final blockWidth = luma ? 4 : 2;
+  final blockHeight = luma ? 4 : sps.chromaHeight ~/ 4;
+  final size = blockWidth * 4;
   final unit = luma ? 4 : 8;
   final weights = header.weights;
   final denominator = luma ? weights?.lumaShift : weights?.chromaShift;
@@ -42,7 +43,7 @@ void predictInter(
       }
       final weight0 = index0 < 0 ? null : weights?.l0[index0][plane];
       final weight1 = index1 < 0 ? null : weights?.l1[index1][plane];
-      final targetX = px * block, targetY = py * block;
+      final targetX = px * blockWidth, targetY = py * blockHeight;
       var implicit = 32;
       if (first != null &&
           second != null &&
@@ -53,8 +54,8 @@ void predictInter(
         final scale = distanceScale(first.ref.poc, second.ref.poc, poc) >> 2;
         if (scale >= -64 && scale <= 128) implicit = scale;
       }
-      for (var row = 0; row < block; row++) {
-        for (var col = 0; col < block; col++) {
+      for (var row = 0; row < blockHeight; row++) {
+        for (var col = 0; col < blockWidth; col++) {
           final dx = col * unit, dy = row * unit;
           final int sample;
           if (first == null || second == null) {
@@ -120,7 +121,9 @@ _Source _source(
     stride: stride,
     height: data.length ~/ stride,
     x: 16 * x + vector.x,
-    y: 16 * y + vector.y,
+    y:
+        (16 * y + vector.y) <<
+        (plane != 0 && picture.sps.chromaFormat == 2 ? 1 : 0),
   );
 }
 

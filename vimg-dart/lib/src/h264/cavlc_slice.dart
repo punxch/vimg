@@ -101,7 +101,9 @@ final class CavlcSlice extends SliceData {
       block.codedDc |= 1;
     }
     if (block.lumaPattern != 0) {
-      final counts = block.totalCoefficients ??= Uint8List(24);
+      final counts = block.totalCoefficients ??= Uint8List(
+        16 + 2 * header.pps.sps.chromaBlockCount,
+      );
       for (var i = 0; i < 16; i++) {
         if (!_set(block.lumaPattern, i >> 2)) continue;
         final count = _cavlc.residual(
@@ -120,16 +122,30 @@ final class CavlcSlice extends SliceData {
       }
     }
     if (block.chromaPattern == 0) return;
+    final countPerPlane = header.pps.sps.chromaBlockCount;
+    final dcContext = countPerPlane == 8 ? -2 : -1;
     for (var plane = 0; plane < 2; plane++) {
-      if (_cavlc.residual(coefficients.chromaDc, plane * 4, 4, -1) != 0) {
+      if (_cavlc.residual(
+            coefficients.chromaDc,
+            plane * countPerPlane,
+            countPerPlane,
+            dcContext,
+          ) !=
+          0) {
         block.codedDc |= 1 << (plane + 1);
       }
     }
     if (block.chromaPattern == 1) return;
-    final counts = block.totalCoefficients ??= Uint8List(24);
-    for (var i = 0; i < 8; i++) {
-      final a = _countAt(i & 1 == 0 ? left : block, 16 + (i ^ 1));
-      final b = _countAt(i & 2 == 0 ? top : block, 16 + (i ^ 2));
+    final counts = block.totalCoefficients ??= Uint8List(
+      16 + 2 * header.pps.sps.chromaBlockCount,
+    );
+    for (var i = 0; i < 2 * countPerPlane; i++) {
+      final topEdge = i % countPerPlane < 2;
+      final a = _countAt(i.isEven ? left : block, 16 + (i ^ 1));
+      final b = _countAt(
+        topEdge ? top : block,
+        16 + i + (topEdge ? countPerPlane - 2 : -2),
+      );
       final count = _cavlc.residual(
         coefficients.chroma,
         i * 16 + 1,

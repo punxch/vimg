@@ -11,11 +11,11 @@ final class H264Picture {
     : stride = sps.mbWidth * 16,
       y = _samples(sps.mbWidth * sps.mbHeight * 256, sps.lumaDepth),
       cb = _samples(
-        sps.chromaFormat == 0 ? 0 : sps.mbWidth * sps.mbHeight * 64,
+        sps.mbWidth * sps.mbHeight * 8 * sps.chromaHeight,
         sps.chromaDepth,
       ),
       cr = _samples(
-        sps.chromaFormat == 0 ? 0 : sps.mbWidth * sps.mbHeight * 64,
+        sps.mbWidth * sps.mbHeight * 8 * sps.chromaHeight,
         sps.chromaDepth,
       );
 
@@ -31,6 +31,7 @@ final class H264Picture {
     cr: cr,
     stride: stride,
     chromaStride: stride >> 1,
+    subsamplingY: sps.chromaFormat == 1 ? 1 : 0,
     width: sps.width,
     height: sps.height,
     cropLeft: sps.cropLeft,

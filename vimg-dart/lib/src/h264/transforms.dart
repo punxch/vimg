@@ -292,28 +292,30 @@ const _defaultInter8 = [
 final class IntraTransform {
   final residual = Int32List(256);
   final _lumaDc = Int32List(16);
+  final _chromaDc = Int32List(8);
 
   void bypassBlock(Int32List levels, int offset, int size, {int mode = 2}) {
     _unscan(levels, offset, size == 8 ? scan8 : scan4, 0, size, size);
-    _undoResidualPrediction(size, mode);
+    _undoResidualPrediction(size, size, mode);
   }
 
   void bypassMacroblock(
     Int32List levels,
     int offset,
     List<int> dc,
-    int size,
-    int mode, {
-    int dcStart = 0,
-  }) {
-    final blocksAcross = size ~/ 4;
-    for (var i = 0; i < blocksAcross * blocksAcross; i++) {
-      final x = blockX(i), y = blockY(i);
-      final start = 4 * (y * size + x);
-      _unscan(levels, offset + i * 16, scan4, start, 4, size);
-      residual[start] = dc[dcStart + y * blocksAcross + x];
+    int width,
+    int height,
+    int mode,
+  ) {
+    final blocksAcross = width ~/ 4;
+    for (var i = 0; i < blocksAcross * (height ~/ 4); i++) {
+      final x = width == 16 ? blockX(i) : i & 1;
+      final y = width == 16 ? blockY(i) : i >> 1;
+      final start = 4 * (y * width + x);
+      _unscan(levels, offset + i * 16, scan4, start, 4, width);
+      residual[start] = dc[y * blocksAcross + x];
     }
-    _undoResidualPrediction(size, mode);
+    _undoResidualPrediction(width, height, mode);
   }
 
   void _unscan(
@@ -333,12 +335,12 @@ final class IntraTransform {
 
   // Intra horizontal and vertical modes predict from the preceding sample
   // in the bypass residual, including across 4×4 boundaries in a macroblock.
-  void _undoResidualPrediction(int size, int mode) {
+  void _undoResidualPrediction(int width, int height, int mode) {
     if (mode > 1) return;
-    final step = mode == 0 ? size : 1;
-    for (var y = mode == 0 ? 1 : 0; y < size; y++) {
-      for (var x = mode == 1 ? 1 : 0; x < size; x++) {
-        final index = y * size + x;
+    final step = mode == 0 ? width : 1;
+    for (var y = mode == 0 ? 1 : 0; y < height; y++) {
+      for (var x = mode == 1 ? 1 : 0; x < width; x++) {
+        final index = y * width + x;
         residual[index] += residual[index - step];
       }
     }
@@ -421,22 +423,45 @@ final class IntraTransform {
     }
   }
 
-  static List<int> chromaDc(Int32List levels, int start, int qp, int weight) {
-    final a = levels[start];
-    final b = levels[start + 1];
-    final c = levels[start + 2];
-    final d = levels[start + 3];
-    final scale = _scale4[qp % 6][0] * weight;
-    final shift = 5 - qp ~/ 6;
-    return [
-      for (final dc in [
-        a + b + c + d,
-        a - b + c - d,
-        a + b - c - d,
-        a - b - c + d,
-      ])
-        shift <= 0 ? (dc * scale) << -shift : (dc * scale) >> shift,
-    ];
+  List<int> chromaDc(
+    Int32List levels,
+    int start,
+    int count,
+    int qp,
+    int weight, {
+    required bool bypass,
+  }) {
+    const scan422 = [0, 2, 1, 4, 6, 3, 5, 7];
+    for (var i = 0; i < count; i++) {
+      _chromaDc[count == 8 ? scan422[i] : i] = levels[start + i];
+    }
+    if (bypass) return _chromaDc;
+
+    for (var i = 0; i < count; i += 2) {
+      final a = _chromaDc[i], b = _chromaDc[i + 1];
+      _chromaDc[i] = a + b;
+      _chromaDc[i + 1] = a - b;
+    }
+    if (count == 8) {
+      _hadamard4(_chromaDc, 0, 2);
+      _hadamard4(_chromaDc, 1, 2);
+      final dcQp = qp + 3;
+      final scale = _scale4[dcQp % 6][0] * weight;
+      final shift = 6 - dcQp ~/ 6;
+      for (var i = 0; i < 8; i++) {
+        _chromaDc[i] = _shift(_chromaDc[i] * scale, shift);
+      }
+    } else {
+      final shift = 5 - qp ~/ 6;
+      final scale = (_scale4[qp % 6][0] * weight) << (shift < 0 ? -shift : 0);
+      final fractionBits = shift > 0 ? shift : 0;
+      for (var i = 0; i < 2; i++) {
+        final a = _chromaDc[i], b = _chromaDc[i + 2];
+        _chromaDc[i] = ((a + b) * scale) >> fractionBits;
+        _chromaDc[i + 2] = ((a - b) * scale) >> fractionBits;
+      }
+    }
+    return _chromaDc;
   }
 }
 

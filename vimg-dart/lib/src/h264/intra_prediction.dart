@@ -37,7 +37,7 @@ final class IntraPrediction {
     if (mode == 2) {
       pixels.fillRange(0, size * size, _dc(size, available));
     } else if (size == 16) {
-      _large(size, mode, available);
+      _large(size, size, mode, available);
     } else {
       for (var y = 0; y < size; y++) {
         for (var x = 0; x < size; x++) {
@@ -69,15 +69,16 @@ final class IntraPrediction {
     int start,
     int mode,
     Neighbors available,
+    int height,
   ) {
     const size = 8;
-    _references(plane, stride, start, size, available);
+    _references(plane, stride, start, size, available, height: height);
     if (mode != 0) {
-      _large(size, mode == 2 ? 0 : mode, available);
+      _large(size, height, mode == 2 ? 0 : mode, available);
       return;
     }
-    // A chroma macroblock has one DC predictor per 4×4 quadrant.
-    for (var by = 0; by < 8; by += 4) {
+    // A chroma macroblock has one DC predictor per 4×4 block.
+    for (var by = 0; by < height; by += 4) {
       for (var bx = 0; bx < 8; bx += 4) {
         final useTop = available.top && (bx != 0 || by == 0 || !available.left);
         final useLeft =
@@ -110,6 +111,7 @@ final class IntraPrediction {
     Neighbors available, {
     bool directional = false,
     bool filtered = false,
+    int? height,
   }) {
     final corner = available.corner ? plane[start - stride - 1] : 0;
     if (available.top) {
@@ -124,7 +126,7 @@ final class IntraPrediction {
       }
     }
     if (available.left) {
-      for (var i = 0; i < size; i++) {
+      for (var i = 0; i < (height ?? size); i++) {
         _left[i] = plane[start - 1 + i * stride];
       }
     }
@@ -164,7 +166,7 @@ final class IntraPrediction {
     return count == 0 ? _midpoint : (sum + count ~/ 2) ~/ count;
   }
 
-  void _large(int size, int mode, Neighbors available) {
+  void _large(int width, int height, int mode, Neighbors available) {
     if ((mode == 0 && !available.top) ||
         (mode == 1 && !available.left) ||
         (mode == 3 && !(available.left && available.top && available.corner))) {
@@ -173,35 +175,35 @@ final class IntraPrediction {
       );
     }
     var a = 0, b = 0, c = 0;
-    final half = size ~/ 2;
+    final halfWidth = width ~/ 2, halfHeight = height ~/ 2;
     if (mode == 3) {
-      var h = 0, v = 0;
-      for (var i = 1; i <= half; i++) {
-        final lo = half - 1 - i;
-        final hi = half - 1 + i;
-        h += i * (_top[hi] - (lo < 0 ? _corner : _top[lo]));
-        v += i * (_left[hi] - (lo < 0 ? _corner : _left[lo]));
-      }
-      final scale = size == 16 ? 5 : 34;
-      a = 16 * (_top[size - 1] + _left[size - 1]);
-      b = (scale * h + 32) >> 6;
-      c = (scale * v + 32) >> 6;
+      a = 16 * (_top[width - 1] + _left[height - 1]);
+      b = _planeGradient(_top, halfWidth);
+      c = _planeGradient(_left, halfHeight);
     }
-    for (var y = 0; y < size; y++) {
-      for (var x = 0; x < size; x++) {
-        pixels[y * size + x] = switch (mode) {
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        pixels[y * width + x] = switch (mode) {
           0 => _top[x],
           1 => _left[y],
-          3 => ((a + b * (x - half + 1) + c * (y - half + 1) + 16) >> 5).clamp(
-            0,
-            maximum,
-          ),
+          3 =>
+            ((a + b * (x - halfWidth + 1) + c * (y - halfHeight + 1) + 16) >> 5)
+                .clamp(0, maximum),
           _ => throw const FormatException(
             'Invalid H.264 block prediction mode',
           ),
         };
       }
     }
+  }
+
+  int _planeGradient(Uint16List edge, int half) {
+    var sum = 0;
+    for (var i = 1; i <= half; i++) {
+      final low = half - 1 - i, high = half - 1 + i;
+      sum += i * (edge[high] - (low < 0 ? _corner : edge[low]));
+    }
+    return ((half == 8 ? 5 : 34) * sum + 32) >> 6;
   }
 
   int _diagonal(int position, bool transpose) {

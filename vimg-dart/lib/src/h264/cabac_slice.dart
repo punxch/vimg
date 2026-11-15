@@ -216,7 +216,7 @@ final class CabacSlice extends SliceData {
       );
       block.lumaPattern |= _cabac.decision(73 + neighbors) << i;
     }
-    if (header.pps.sps.chromaFormat != 1) return;
+    if (header.pps.sps.chromaFormat == 0) return;
     int pattern(Macroblock? block) =>
         block?.pcm == true ? 2 : block?.chromaPattern ?? 0;
     final a = pattern(left);
@@ -286,6 +286,7 @@ final class CabacSlice extends SliceData {
       }
     }
     if (block.chromaPattern == 0) return;
+    final countPerPlane = header.pps.sps.chromaBlockCount;
     for (var plane = 0; plane < 2; plane++) {
       if (_decode(
         _Residual.chromaDc,
@@ -294,19 +295,22 @@ final class CabacSlice extends SliceData {
           _dcFlag(top, plane + 1, block.intra),
         ),
         coefficients.chromaDc,
-        plane * 4,
-        4,
+        plane * countPerPlane,
+        countPerPlane,
       )) {
         block.codedDc |= 1 << (plane + 1);
       }
     }
     if (block.chromaPattern == 1) return;
-    for (var i = 0; i < 8; i++) {
-      final x = i & 1;
-      final y = (i >> 1) & 1;
+    for (var i = 0; i < 2 * countPerPlane; i++) {
+      final topEdge = i % countPerPlane < 2;
       final context = _pair(
-        _chromaFlag(x == 0 ? left : block, i ^ 1, block.intra),
-        _chromaFlag(y == 0 ? top : block, i ^ 2, block.intra),
+        _chromaFlag(i.isEven ? left : block, i ^ 1, block.intra),
+        _chromaFlag(
+          topEdge ? top : block,
+          i + (topEdge ? countPerPlane - 2 : -2),
+          block.intra,
+        ),
       );
       if (_decode(
         _Residual.chromaAc,
@@ -329,18 +333,19 @@ final class CabacSlice extends SliceData {
   ) {
     final large = category == _Residual.luma8;
     if (!large && _cabac.decision(category.coded + context) == 0) return false;
+    final dc422 = category == _Residual.chromaDc && length == 8;
     var used = 0;
     for (var i = 0; i < length; i++) {
       if (i == length - 1) {
         _positions[used++] = i;
-      } else if (_cabac.decision(
-            category.significant + (large ? _significant8[i] : i),
-          ) !=
-          0) {
-        _positions[used++] = i;
-        if (_cabac.decision(category.last + (large ? _last8[i] : i)) != 0)
-          break;
+        break;
       }
+      final dcOffset = dc422 ? (i >= 4 ? 2 : i >> 1) : i;
+      final significant = large ? _significant8[i] : dcOffset;
+      if (_cabac.decision(category.significant + significant) == 0) continue;
+      _positions[used++] = i;
+      if (_cabac.decision(category.last + (large ? _last8[i] : dcOffset)) != 0)
+        break;
     }
     var node = 0;
     for (var i = used - 1; i >= 0; i--) {
@@ -348,7 +353,8 @@ final class CabacSlice extends SliceData {
       if (_cabac.decision(category.level + _levelOne[node]) == 0) {
         node = _nextOne[node];
       } else {
-        final levelContext = category.level + _levelMore[node];
+        final levelContext =
+            category.level + (dc422 && node == 7 ? 8 : _levelMore[node]);
         node = _nextMore[node];
         magnitude = 2;
         while (magnitude < 15 && _cabac.decision(levelContext) != 0) {

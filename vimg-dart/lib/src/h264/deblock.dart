@@ -20,7 +20,7 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
     final row = address ~/ width;
     final start = (row * stride + x) * 16;
     final chromaStride = stride >> 1;
-    final chromaStart = (row * chromaStride + x) * 8;
+    final chromaStart = row * chromaStride * sps.chromaHeight + x * 8;
     final pps = slice.pps;
     for (final vertical in [true, false]) {
       final neighborAddress = vertical
@@ -46,6 +46,7 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
         stride,
         vertical,
         16,
+        16,
         sps.lumaDepth,
         block.transform8x8 ? 8 : 4,
         block.qp,
@@ -63,6 +64,7 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
           chromaStride,
           vertical,
           8,
+          sps.chromaHeight,
           sps.chromaDepth,
           4,
           cbQp,
@@ -79,6 +81,7 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
           chromaStride,
           vertical,
           8,
+          sps.chromaHeight,
           sps.chromaDepth,
           4,
           crQp,
@@ -136,6 +139,7 @@ void _edges(
   int stride,
   bool vertical,
   int width,
+  int height,
   int depth,
   int spacing,
   int qp,
@@ -149,10 +153,11 @@ void _edges(
   final chroma = width == 8;
   final shift = depth - 8;
   final maximum = (1 << depth) - 1;
-  final segmentWidth = width ~/ 4;
+  final extent = vertical ? width : height;
+  final segmentWidth = (vertical ? height : width) ~/ 4;
   for (
     var edge = neighborQp == null ? spacing : 0;
-    edge < width;
+    edge < extent;
     edge += spacing
   ) {
     final averaged = edge == 0 ? (qp + neighborQp! + 1) >> 1 : qp;
@@ -161,7 +166,7 @@ void _edges(
     final beta = deblockBeta[(averaged + betaOffset).clamp(0, 51)] << shift;
     if (alpha == 0 || beta == 0) continue;
     for (var segment = 0; segment < 4; segment++) {
-      final strength = strengthAt(edge ~/ segmentWidth, segment);
+      final strength = strengthAt(edge * 4 ~/ extent, segment);
       if (strength == 0) continue;
       final limit = strength == 4
           ? 0

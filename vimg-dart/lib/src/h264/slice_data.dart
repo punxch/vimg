@@ -47,9 +47,9 @@ final class Macroblock {
 final class MacroblockCoefficients {
   final luma = Int32List(256);
   final lumaDc = Int32List(16);
-  final chroma = Int32List(128);
-  final chromaDc = Int32List(8);
-  final pcm = Uint16List(384);
+  final chroma = Int32List(256);
+  final chromaDc = Int32List(16);
+  final pcm = Uint16List(512);
 
   void clearResiduals() {
     luma.fillRange(0, luma.length, 0);
@@ -127,10 +127,15 @@ abstract class SliceData {
     final block = Macroblock(header, _intraType(left, top, type));
     if (block.pcm) {
       final bits = header.bits;
-      bits.align(0);
+      if (header.pps.cabac) {
+        // The terminating bin can leave arithmetic flush bits in this byte.
+        bits.skip(-bits.position & 7);
+      } else {
+        bits.align(0);
+      }
       final sps = header.pps.sps;
       block.qp = -sps.lumaQpOffset;
-      final count = sps.chromaFormat == 0 ? 256 : 384;
+      final count = 256 + 16 * sps.chromaHeight;
       for (var i = 0; i < count; i++) {
         coefficients.pcm[i] = bits.read(
           i < 256 ? sps.lumaDepth : sps.chromaDepth,
@@ -151,7 +156,7 @@ abstract class SliceData {
         block.chromaPattern = ((block.type - 1) ~/ 4) % 3;
       }
     }
-    if (header.pps.sps.chromaFormat == 1) {
+    if (header.pps.sps.chromaFormat != 0) {
       block.chromaMode = _chromaMode(left, top);
     }
     if (block.nxn) _patterns(block, left, top);

@@ -68,9 +68,9 @@ H264Picture _decodePicture(
   final sps = first.pps.sps;
   if (sps.lumaDepth > 10 ||
       (sps.chromaFormat != 0 && sps.chromaDepth != sps.lumaDepth) ||
-      sps.chromaFormat > 1) {
+      sps.chromaFormat > 2) {
     throw UnsupportedError(
-      'H.264 decoding supports progressive 8–10-bit 4:2:0 and monochrome',
+      'H.264 decoding supports progressive 8–10-bit 4:2:0, 4:2:2 and monochrome',
     );
   }
   if (sps.mbWidth * sps.mbHeight > 139264) {
@@ -206,12 +206,29 @@ final class _Reconstruction {
     final stride = picture.stride;
     final yOffset = (mbY * stride + mbX) * 16;
     final cStride = stride >> 1;
-    final cOffset = (mbY * cStride + mbX) * 8;
+    final chromaHeight = picture.sps.chromaHeight;
+    final cOffset = mbY * cStride * chromaHeight + mbX * 8;
     if (block.pcm) {
       _copyBlock(levels.pcm, 0, picture.y, yOffset, stride, 16);
       if (picture.cb.isNotEmpty) {
-        _copyBlock(levels.pcm, 256, picture.cb, cOffset, cStride, 8);
-        _copyBlock(levels.pcm, 320, picture.cr, cOffset, cStride, 8);
+        _copyBlock(
+          levels.pcm,
+          256,
+          picture.cb,
+          cOffset,
+          cStride,
+          8,
+          height: chromaHeight,
+        );
+        _copyBlock(
+          levels.pcm,
+          256 + 8 * chromaHeight,
+          picture.cr,
+          cOffset,
+          cStride,
+          8,
+          height: chromaHeight,
+        );
       }
       return;
     }
@@ -228,7 +245,7 @@ final class _Reconstruction {
         bypass: bypass,
       );
       if (bypass) {
-        _transform.bypassMacroblock(levels.luma, 0, dc, 16, mode);
+        _transform.bypassMacroblock(levels.luma, 0, dc, 16, 16, mode);
         _add(picture.y, stride, yOffset, 16, 16, 0);
       } else {
         for (var i = 0; i < 16; i++) {
@@ -275,7 +292,14 @@ final class _Reconstruction {
     if (picture.cb.isEmpty) return;
     for (var component = 0; component < 2; component++) {
       final plane = component == 0 ? picture.cb : picture.cr;
-      _predict.chroma(plane, cStride, cOffset, block.chromaMode, available);
+      _predict.chroma(
+        plane,
+        cStride,
+        cOffset,
+        block.chromaMode,
+        available,
+        chromaHeight,
+      );
       _reconstructChroma(
         plane,
         cOffset,
@@ -341,7 +365,8 @@ final class _Reconstruction {
 
     if (picture.cb.isEmpty) return;
     final chromaStride = stride >> 1;
-    final chromaOffset = (mbY * chromaStride + mbX) * 8;
+    final chromaOffset =
+        mbY * chromaStride * picture.sps.chromaHeight + mbX * 8;
     for (var component = 0; component < 2; component++) {
       final plane = component == 0 ? picture.cb : picture.cr;
       predictInter(
@@ -377,10 +402,24 @@ final class _Reconstruction {
     int component,
     bool bypass,
   ) {
+    final height = picture.sps.chromaHeight;
     if (block.chromaPattern == 0) {
-      _copyBlock(_predict.pixels, 0, plane, offset, stride, 8);
+      _copyBlock(_predict.pixels, 0, plane, offset, stride, 8, height: height);
       return;
     }
+    final count = picture.sps.chromaBlockCount;
+    final qp = _chromaTransformQp(block, component);
+    final weights = (block.intra
+        ? _scaling.four
+        : _scaling.interFour)[component + 1];
+    final dc = _transform.chromaDc(
+      levels.chromaDc,
+      component * count,
+      count,
+      qp,
+      weights[0],
+      bypass: bypass,
+    );
     if (bypass) {
       final mode =
           block.intra && (block.chromaMode == 1 || block.chromaMode == 2)
@@ -388,31 +427,21 @@ final class _Reconstruction {
           : 2;
       _transform.bypassMacroblock(
         levels.chroma,
-        component * 64,
-        levels.chromaDc,
+        component * count * 16,
+        dc,
         8,
+        height,
         mode,
-        dcStart: component * 4,
       );
-      _add(plane, stride, offset, 8, 8, 0);
+      _add(plane, stride, offset, 8, 8, 0, height: height);
       return;
     }
-    final qp = _chromaTransformQp(block, component);
-    final weights = (block.intra
-        ? _scaling.four
-        : _scaling.interFour)[component + 1];
-    final dc = IntraTransform.chromaDc(
-      levels.chromaDc,
-      component * 4,
-      qp,
-      weights[0],
-    );
-    for (var i = 0; i < 4; i++) {
+    for (var i = 0; i < count; i++) {
       final x = (i & 1) * 4;
       final row = (i >> 1) * 4;
       _transform.block4(
         levels.chroma,
-        (component * 4 + i) * 16,
+        (component * count + i) * 16,
         qp,
         weights,
         dc: dc[i],
@@ -434,10 +463,11 @@ final class _Reconstruction {
     int start,
     int size,
     int predStride,
-    int predStart,
-  ) {
+    int predStart, {
+    int? height,
+  }) {
     final maximum = _predict.maximum;
-    for (var row = 0; row < size; row++) {
+    for (var row = 0; row < (height ?? size); row++) {
       for (var x = 0; x < size; x++) {
         plane[start + row * stride + x] =
             (_predict.pixels[predStart + row * predStride + x] +
@@ -471,9 +501,10 @@ void _copyBlock(
   List<int> target,
   int targetStart,
   int stride,
-  int size,
-) {
-  for (var row = 0; row < size; row++) {
+  int size, {
+  int? height,
+}) {
+  for (var row = 0; row < (height ?? size); row++) {
     final start = targetStart + row * stride;
     target.setRange(start, start + size, source, sourceStart + row * size);
   }

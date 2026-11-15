@@ -41,7 +41,11 @@ final class Cavlc {
       }
     }
 
-    final zeroTable = length == 4 ? _chromaZeros : _totalZeros;
+    final zeroTable = switch (length) {
+      4 => _chromaZeros,
+      8 => _chroma422Zeros,
+      _ => _totalZeros,
+    };
     var zeros = total == length ? 0 : zeroTable[total - 1].read(bits);
     if (total + zeros > length) {
       throw const FormatException('Invalid H.264 CAVLC zero count');
@@ -64,6 +68,7 @@ final class Cavlc {
       final word = bits.read(6);
       return word == 3 ? 0 : word + 4;
     }
+    if (context == -2) return _chroma422Token.read(bits);
     final table = switch (context) {
       -1 => 3, // 4:2:0 chroma DC
       < 2 => 0,
@@ -94,6 +99,8 @@ final class Cavlc {
 final _coeffTokens = coeffTokenWords.map(_Vlc.new).toList();
 final _totalZeros = totalZeroWords.map(_Vlc.new).toList();
 final _chromaZeros = chromaZeroWords.map(_Vlc.new).toList();
+final _chroma422Token = _Vlc(chroma422TokenWords);
+final _chroma422Zeros = chroma422ZeroWords.map(_Vlc.new).toList();
 final _runBefore = runBeforeWords.map(_Vlc.new).toList();
 
 final class _Vlc {
