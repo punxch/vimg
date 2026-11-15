@@ -497,12 +497,19 @@ final class _Scale extends _FrameSpatialFilter {
       ],
       {'width': 'w', 'height': 'h'},
     );
-    final (nearest, fullChromaInput) = switch (options['flags']) {
-      null || 'bicubic' => (false, false),
-      'neighbor' => (true, false),
-      'neighbor+full_chroma_inp' || 'full_chroma_inp+neighbor' => (true, true),
+    final (algorithm, fullChromaInput) = switch (options['flags']) {
+      null || 'bicubic' => (_ScaleAlgorithm.bicubic, false),
+      'bilinear' => (_ScaleAlgorithm.bilinear, false),
+      'bilinear+full_chroma_inp' ||
+      'full_chroma_inp+bilinear' => (_ScaleAlgorithm.bilinear, true),
+      'bicublin' => (_ScaleAlgorithm.bicublin, false),
+      'bicublin+full_chroma_inp' ||
+      'full_chroma_inp+bicublin' => (_ScaleAlgorithm.bicublin, true),
+      'neighbor' => (_ScaleAlgorithm.neighbor, false),
+      'neighbor+full_chroma_inp' ||
+      'full_chroma_inp+neighbor' => (_ScaleAlgorithm.neighbor, true),
       _ => throw const FormatException(
-        'Supported scale flags are bicubic and neighbor',
+        'Supported scale flags are bicubic, bilinear, bicublin and neighbor',
       ),
     };
     final perFrame = switch (options['eval']) {
@@ -543,7 +550,7 @@ final class _Scale extends _FrameSpatialFilter {
     return _Scale._(
       width,
       height,
-      nearest,
+      algorithm,
       fullChromaInput,
       dynamicSize,
       aspect,
@@ -555,7 +562,7 @@ final class _Scale extends _FrameSpatialFilter {
   _Scale._(
     this.width,
     this.height,
-    this.nearest,
+    this.algorithm,
     this.fullChromaInput,
     this.usesFramePosition,
     this.aspect,
@@ -563,12 +570,15 @@ final class _Scale extends _FrameSpatialFilter {
     this.resetSar,
   );
   final FilterExpression width, height;
-  final bool nearest, fullChromaInput, resetSar;
+  final _ScaleAlgorithm algorithm;
+  final bool fullChromaInput, resetSar;
   final _ScaleAspect aspect;
   final int divisibleBy;
   @override
   final bool usesFramePosition;
-  final _scalers = <(int, int, int, int), _PlaneScaler>{};
+  final _scalers = <(int, int, int, int, _ScaleKernel), _PlaneScaler>{};
+
+  bool get nearest => algorithm == _ScaleAlgorithm.neighbor;
 
   @override
   _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) {
@@ -577,7 +587,7 @@ final class _Scale extends _FrameSpatialFilter {
   }
 
   bool _subsamplesRgb(_VideoPlanes frame, int width) =>
-      nearest &&
+      algorithm != _ScaleAlgorithm.bicubic &&
       !fullChromaInput &&
       frame.packedRgb &&
       frame.width.isEven &&
@@ -588,7 +598,9 @@ final class _Scale extends _FrameSpatialFilter {
         ? 1.0
         : frame.sampleAspect * frame.width * height / (frame.height * width);
     if (_subsamplesRgb(frame, width)) {
-      return _pointScalePackedRgb(frame, width, height, sampleAspect);
+      return nearest
+          ? _pointScalePackedRgb(frame, width, height, sampleAspect)
+          : _scaleSubsampledRgb(frame, width, height, sampleAspect, this);
     }
     return frame.mapComponents(
       (plane, sx, sy, component) => _resize(
@@ -596,6 +608,9 @@ final class _Scale extends _FrameSpatialFilter {
         _subSize(width, sx),
         _subSize(height, sy),
         packedAlpha: frame.packedRgb && component == 3,
+        kernel: algorithm.kernel(
+          chroma: !frame.rgb && (component == 1 || component == 2),
+        ),
       ),
       sampleAspect: sampleAspect,
     );
@@ -662,11 +677,40 @@ final class _Scale extends _FrameSpatialFilter {
     return (w, h);
   }
 
+  _PlaneScaler _planeScaler(
+    int sourceWidth,
+    int sourceHeight,
+    int width,
+    int height,
+    _ScaleKernel kernel,
+  ) {
+    if (width * sourceHeight > 100000000) {
+      throw const FormatException(
+        'Video filter scaling exceeds 100 million intermediate samples',
+      );
+    }
+    final geometry = (sourceWidth, sourceHeight, width, height, kernel);
+    if (_scalers.length >= 4 && !_scalers.containsKey(geometry)) {
+      _scalers.clear();
+    }
+    return _scalers.putIfAbsent(
+      geometry,
+      () => _PlaneScaler(
+        sourceWidth,
+        sourceHeight,
+        width,
+        height,
+        kernel: kernel,
+      ),
+    );
+  }
+
   _FilterPlane _resize(
     _FilterPlane source,
     int width,
     int height, {
     required bool packedAlpha,
+    required _ScaleKernel kernel,
   }) {
     if (source.width == width && source.height == height) return source;
     if (nearest) {
@@ -684,20 +728,14 @@ final class _Scale extends _FrameSpatialFilter {
       }
       return _FilterPlane(samples, width, height, source.depth, rowStep: width);
     }
-    if (width * source.height > 100000000) {
-      throw const FormatException(
-        'Video filter scaling exceeds 100 million intermediate samples',
-      );
-    }
-    final plane = source.forward;
-    final geometry = (plane.width, plane.height, width, height);
-    if (_scalers.length >= 4 && !_scalers.containsKey(geometry)) {
-      _scalers.clear();
-    }
-    final scaler = _scalers.putIfAbsent(
-      geometry,
-      () => _PlaneScaler(plane.width, plane.height, width, height),
+    final scaler = _planeScaler(
+      source.width,
+      source.height,
+      width,
+      height,
+      kernel,
     );
+    final plane = source.forward;
     final samples = scaler.resize(
       plane.samples,
       plane.rowStep,

@@ -14,10 +14,10 @@ typedef _YuvGeometry = ({
 final class YuvImageScaler {
   YuvImageScaler({this.width, this.height, this.filters})
     : _exact = false,
-      _nearest = false,
+      _algorithm = _ScaleAlgorithm.bicubic,
       _sampleAspect = null;
 
-  YuvImageScaler._fixed(int this.width, int this.height, this._nearest)
+  YuvImageScaler._fixed(int this.width, int this.height, this._algorithm)
     : _exact = true,
       _sampleAspect = null,
       filters = null;
@@ -28,7 +28,7 @@ final class YuvImageScaler {
     this.filters,
     this._sampleAspect,
   ) : _exact = false,
-      _nearest = false;
+      _algorithm = _ScaleAlgorithm.bicubic;
 
   factory YuvImageScaler.presentation(
     YuvImageScaler? scaler, {
@@ -47,7 +47,8 @@ final class YuvImageScaler {
   final int? width, height;
   final VideoFilterChain? filters;
   final double? _sampleAspect;
-  final bool _exact, _nearest;
+  final bool _exact;
+  final _ScaleAlgorithm _algorithm;
   YuvImageScaler? _outputScale;
   late final YuvImageScaler? unscaled = filters == null
       ? null
@@ -129,11 +130,11 @@ final class YuvImageScaler {
         frame,
         scale.usesFramePosition ? _positions.lastOrNull : null,
       );
-      if (scale.nearest && frame.packedRgb) {
+      if (frame.packedRgb && scale.algorithm != _ScaleAlgorithm.bicubic) {
         frame = scale.resize(frame, w, h);
       } else {
         if (_outputScale?.width != w || _outputScale?.height != h) {
-          _outputScale = YuvImageScaler._fixed(w, h, scale.nearest);
+          _outputScale = YuvImageScaler._fixed(w, h, scale.algorithm);
         }
         outputScale = _outputScale;
       }
@@ -231,7 +232,7 @@ final class YuvImageScaler {
         sourceHeight,
         width,
         height,
-        nearest: _nearest,
+        kernel: _algorithm.kernel(chroma: false),
       );
       _chroma = cb.isEmpty
           ? null
@@ -240,7 +241,7 @@ final class YuvImageScaler {
               geometry.chromaHeight,
               geometry.outputChromaWidth,
               height,
-              nearest: _nearest,
+              kernel: _algorithm.kernel(chroma: !gbr),
             );
       _geometry = geometry;
     }
@@ -315,15 +316,31 @@ final class YuvImageScaler {
   }
 }
 
+enum _ScaleAlgorithm {
+  neighbor,
+  bilinear,
+  bicubic,
+  bicublin;
+
+  _ScaleKernel kernel({required bool chroma}) => switch (this) {
+    neighbor => _ScaleKernel.point,
+    bilinear => _ScaleKernel.triangle,
+    bicublin when chroma => _ScaleKernel.triangle,
+    bicubic || bicublin => _ScaleKernel.cubic,
+  };
+}
+
+enum _ScaleKernel { point, triangle, cubic }
+
 final class _PlaneScaler {
   _PlaneScaler(
     int sourceWidth,
     int sourceHeight,
     this.width,
     int height, {
-    bool nearest = false,
-  }) : horizontal = _axisTaps(sourceWidth, width, 14, nearest),
-       vertical = _axisTaps(sourceHeight, height, 12, nearest),
+    required _ScaleKernel kernel,
+  }) : horizontal = _axisTaps(sourceWidth, width, 14, kernel),
+       vertical = _axisTaps(sourceHeight, height, 12, kernel),
        intermediate = Int16List(sourceHeight * width);
 
   final int width;
@@ -379,11 +396,11 @@ List<({int start, Int16List weights})> _axisTaps(
   int from,
   int to,
   int bits,
-  bool nearest,
+  _ScaleKernel kernel,
 ) {
   final unit = 1 << bits;
   final step = _scaleStep(from, to);
-  if (from == to || from == 1 || nearest) {
+  if (from == to || from == 1 || kernel == _ScaleKernel.point) {
     final identity = Int16List.fromList([unit]);
     return List.generate(
       to,
@@ -391,9 +408,10 @@ List<({int start, Int16List weights})> _axisTaps(
     );
   }
   final scale = math.min(1.0, to / from);
-  final count = math.min(math.max(1, from - 2), 1 + (4 / scale).ceil());
+  final support = kernel == _ScaleKernel.triangle ? 2 : 4;
+  final count = math.min(math.max(1, from - 2), 1 + (support / scale).ceil());
   return List.generate(to, (x) {
-    // A pixel center is at x + 0.5. Widen the cubic kernel when shrinking.
+    // A pixel center is at x + 0.5. Widen the kernel when shrinking.
     final center = (2 * x + 1) * step - 65536;
     final start = (center - (count - 2) * 65536) ~/ 131072;
     final left = start.clamp(0, from - 1);
@@ -404,6 +422,7 @@ List<({int start, Int16List weights})> _axisTaps(
       final source = start + i;
       final d = (source * 131072 - center).abs() / 131072 * scale;
       final weight = switch (d) {
+        _ when kernel == _ScaleKernel.triangle => math.max(0.0, 1 - d),
         < 1 => (1.4 * d - 2.4) * d * d + 1,
         < 2 => ((-0.6 * d + 3) * d - 4.8) * d + 2.4,
         _ => 0.0,

@@ -12,7 +12,7 @@ part 'video_filters.dart';
 part 'video_filter_colors.dart';
 part 'video_paint_filters.dart';
 part 'video_timing_filters.dart';
-part 'rgb_point_scale.dart';
+part 'rgb_scale.dart';
 part 'yuv_scaler.dart';
 
 /// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.

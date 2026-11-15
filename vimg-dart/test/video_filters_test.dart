@@ -9,6 +9,7 @@ import 'fixtures.dart';
 Future<void> main(List<String> arguments) async {
   _checkRgb();
   _checkYuv();
+  _checkLinearScale();
   _checkScaleAspect();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
@@ -161,6 +162,79 @@ void _checkYuv() {
   check(deep.width == 4 && deep.height == 3, 'Scaled 10-bit dimensions');
   for (final p in deep) {
     check(p.r == 191 && p.g == 191 && p.b == 191, 'Scaled 10-bit intensity');
+  }
+}
+
+void _checkLinearScale() {
+  int checksum(image.Image frame, image.ChannelOrder order) {
+    var low = 0, high = 0;
+    for (final sample in frame.getBytes(order: order)) {
+      low = (low + sample) % 65521;
+      high = (high + low) % 65521;
+    }
+    return high << 16 | low;
+  }
+
+  // FFmpeg 8.1.2 output for a packed RGBA gradient. Both sizes reduce the
+  // source width by at least half, using paired source chroma and full alpha.
+  final rgba = image.Image(width: 32, height: 24, numChannels: 4);
+  for (final p in rgba) {
+    p.setRgba(
+      (13 * p.x + 7 * p.y) & 255,
+      (5 * p.x + 19 * p.y) & 255,
+      (27 * p.x + 13 * p.y) & 255,
+      (43 * p.x + 29 * p.y) & 255,
+    );
+  }
+  for (final (width, height, suffix, expected) in [
+    (15, 11, '', 0x45204bdf),
+    (16, 12, '', 0x6b318276),
+    (16, 12, ',hflip', 0x8e9c8276),
+  ]) {
+    final filter = 'scale=$width:$height:flags=bilinear$suffix';
+    final output = YuvImageScaler(
+      filters: VideoFilterChain.parse(filter),
+    ).filterRgb(rgba);
+    check((output.width, output.height) == (width, height), filter);
+    check(
+      checksum(output, image.ChannelOrder.rgba) == expected,
+      '$filter RGBA',
+    );
+  }
+
+  Uint8List plane(int width, int height, int dx, int dy, int range) =>
+      Uint8List.fromList([
+        for (var y = 0; y < height; y++)
+          for (var x = 0; x < width; x++) 16 + (x * dx + y * dy) % range,
+      ]);
+  final y = plane(32, 24, 13, 7, 220);
+  final u = plane(16, 12, 5, 19, 225);
+  final v = plane(16, 12, 27, 13, 225);
+  for (final (flag, expected) in [
+    ('bilinear', 0x77af208e),
+    ('bicublin', 0x22e81fdf),
+  ]) {
+    final output = yuvImage(
+      y: y,
+      cb: u,
+      cr: v,
+      stride: 32,
+      chromaStride: 16,
+      width: 32,
+      height: 24,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: 6,
+      fullRange: false,
+      scaler: YuvImageScaler(
+        filters: VideoFilterChain.parse('scale=16:12:flags=$flag'),
+      ),
+    );
+    check((output.width, output.height) == (16, 12), '$flag YUV dimensions');
+    check(
+      checksum(output, image.ChannelOrder.rgb) == expected,
+      '$flag YUV pixels',
+    );
   }
 }
 

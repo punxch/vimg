@@ -184,18 +184,21 @@ and are skipped during presentation. Encrypted tracks remain pending.
 `crop`, `scale`, `pad`, `drawbox`, `negate`, `setsar`, `setdar`, `hflip`,
 `vflip`, `transpose` and `null`. Crop and scale
 accept static dimension expressions with arithmetic and functions such as
-`min`, `max` and `trunc`. Scale supports `flags=bicubic` (default) and
-`flags=neighbor`. Crop aligns to chroma samples by default and accepts
-`exact=1` for odd coordinates and dimensions.
+`min`, `max` and `trunc`. Scale supports `flags=bicubic` (default), `bilinear`,
+`bicublin` and `neighbor`. `bicublin` scales luma and alpha with a bicubic
+kernel and YUV chroma with a bilinear kernel. Crop aligns to chroma samples by
+default and accepts `exact=1` for odd coordinates and dimensions.
 
 Use `scale=400:300:force_original_aspect_ratio=decrease:force_divisible_by=2`
 to fit inside a bounding box with even dimensions. `increase` scales to cover
 the box. Add `reset_sar=1` to use the input display aspect ratio for
 proportional scaling and set square pixels for downstream filters.
 
-For packed RGB, `flags=neighbor` follows FFmpeg's chroma sampling when
-reducing an even width by at least half. Use `flags=neighbor+full_chroma_inp`
-to sample the RGB channels at the same coordinates.
+For packed RGB, `neighbor`, `bilinear` and `bicublin` use FFmpeg's paired chroma
+sampling when reducing an even width by at least half. Add `+full_chroma_inp`
+to sample the RGB channels at full resolution.
+RGB conversion after spatial filters can differ from FFmpeg for YUV input
+with odd output dimensions or high bit depth.
 
 Crop coordinates accept frame number `n` and timestamp `t` in seconds.
 Scale accepts these variables in its dimensions with `eval=frame`.
