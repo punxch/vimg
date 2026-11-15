@@ -94,9 +94,10 @@ lossless streams that use transform bypass and 4:4:4 RGB streams signaled
 with an identity color matrix. The decoder handles both jointly and
 independently coded 4:4:4 color planes. It also combines separately coded
 top and bottom fields into full frames, including fields stored in separate
-MP4 samples or MPEG transport PES packets. Macroblock-adaptive frame and
-field coding (MBAFF) and prediction between frame and field pictures remain
-pending. `extract` and `vcs` decode
+MP4 samples or MPEG transport PES packets. Picture-adaptive frame/field
+coding (PAFF) can use reference pictures coded in either form.
+Macroblock-adaptive frame and field coding (MBAFF) remains pending.
+`extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
 same GOP, and schedule captures using the source frame durations and the
 Rust CLI's constant-frame-rate selection rules. `sample/input.mkv`

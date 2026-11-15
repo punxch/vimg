@@ -4,31 +4,53 @@ import 'picture.dart';
 import 'slice_header.dart';
 
 final class ReferencePicture {
-  const ReferencePicture(
-    this.picture,
-    this.identity,
+  ReferencePicture(
+    this._decodedPicture,
+    this.frameIdentity,
     this.frameNum,
     this.poc, {
     this.longIndex,
-    int? frameIdentity,
     this.bottomField,
-  }) : frameIdentity = frameIdentity ?? identity;
+    this.fields,
+  });
 
-  final H264Picture? picture;
-  final int identity, frameNum, poc, frameIdentity;
+  final H264Picture? _decodedPicture;
+  final int frameIdentity, frameNum, poc;
   final bool? bottomField;
   final int? longIndex;
+  // Present for a frame reference made of two separately coded fields.
+  final ({ReferencePicture top, ReferencePicture bottom})? fields;
+
+  int get identity => _pictureIdentity(frameIdentity, bottomField);
+
+  late final H264Picture? picture = _decodedPicture ?? _assembleFields();
+
+  H264Picture? _assembleFields() {
+    final pair = fields;
+    final top = pair?.top._decodedPicture,
+        bottom = pair?.bottom._decodedPicture;
+    return top != null && bottom != null
+        ? top.referenceFrameWith(bottom)
+        : null;
+  }
 
   ReferencePicture asLongTerm(int index) => ReferencePicture(
-    picture,
-    identity,
+    _decodedPicture,
+    frameIdentity,
     frameNum,
     poc,
     longIndex: index,
-    frameIdentity: frameIdentity,
     bottomField: bottomField,
   );
 }
+
+// Give the frame and each of its two reference fields distinct identities,
+// even when they share sample storage or their long-term marking changes.
+int _pictureIdentity(int frame, bool? bottomField) =>
+    frame * 3 + (bottomField == null ? 0 : (bottomField ? 2 : 1));
+
+int referenceIdentityWithParity(int identity, bool? bottomField) =>
+    _pictureIdentity(identity ~/ 3, bottomField);
 
 typedef _History = ({int frame, int wrap, int msb, int lsb});
 typedef _Order = ({int top, int bottom, _History next});
@@ -51,10 +73,9 @@ ReferencePicture getReference(List<ReferencePicture?> references, int index) {
 /// A staged picture shares the decoded reference store across its slices.
 /// Each slice independently builds its active reference lists.
 final class PendingPicture {
-  const PendingPicture(
+  PendingPicture(
     this.header,
     this._store,
-    this.identity,
     this._order,
     this.frameIdentity,
     this.idrStart,
@@ -62,14 +83,19 @@ final class PendingPicture {
 
   final SliceHeader header;
   final List<ReferencePicture> _store;
-  final int identity, frameIdentity;
+  final int frameIdentity;
   final bool idrStart;
   final _Order _order;
 
   int get poc => math.min(_order.top, _order.bottom);
 
+  late final List<ReferencePicture> _available =
+      header.field || header.pps.sps.frameOnly
+      ? _store
+      : _frameReferences(_store);
+
   List<ReferencePicture?> pList(SliceHeader slice) {
-    final short = _store.where((ref) => ref.longIndex == null).toList();
+    final short = _available.where((ref) => ref.longIndex == null).toList();
     final max = 1 << slice.pps.sps.frameNumBits;
     short.sort(
       (a, b) => _shortNumber(
@@ -91,7 +117,7 @@ final class PendingPicture {
     final future = <ReferencePicture>[];
     final frameOrders = <int, int>{};
     if (slice.field) {
-      for (final ref in _store) {
+      for (final ref in _available) {
         frameOrders.update(
           ref.frameIdentity,
           (old) => math.min(old, ref.poc),
@@ -101,7 +127,7 @@ final class PendingPicture {
     }
     int order(ReferencePicture ref) =>
         frameOrders[ref.frameIdentity] ?? ref.poc;
-    for (final ref in _store.where((ref) => ref.longIndex == null)) {
+    for (final ref in _available.where((ref) => ref.longIndex == null)) {
       (order(ref) < poc ? past : future).add(ref);
     }
     past.sort((a, b) => order(b).compareTo(order(a)));
@@ -130,7 +156,7 @@ final class PendingPicture {
   }
 
   List<ReferencePicture> _longReferences() =>
-      _store.where((ref) => ref.longIndex != null).toList()
+      _available.where((ref) => ref.longIndex != null).toList()
         ..sort((a, b) => a.longIndex!.compareTo(b.longIndex!));
 
   List<ReferencePicture?> _modified(
@@ -149,7 +175,7 @@ final class PendingPicture {
       final operation = modifications[i];
       final ReferencePicture? selected;
       if (operation.op == 2) {
-        selected = _store
+        selected = _available
             .where((ref) => _longPicNum(ref, slice) == operation.value)
             .firstOrNull;
       } else {
@@ -160,7 +186,7 @@ final class PendingPicture {
         final target = predicted > slice.currPicNum
             ? predicted - maximum
             : predicted;
-        selected = _store
+        selected = _available
             .where(
               (ref) =>
                   ref.longIndex == null && _shortPicNum(ref, slice) == target,
@@ -196,11 +222,6 @@ final class ReferenceState {
     final paired = last != null && header.complements(last.header);
     final idrStart = header.idr && !paired;
     final store = idrStart ? <ReferencePicture>[] : [..._references];
-    if (store.isNotEmpty && (store.first.bottomField != null) != header.field) {
-      throw UnsupportedError(
-        'H.264 mixed frame and field references are unavailable',
-      );
-    }
     var history = idrStart ? _initialHistory : _history;
     final previous = _previousReference;
     if (!header.idr && previous == null) {
@@ -218,25 +239,16 @@ final class ReferenceState {
         history = order.next;
         if (sps.maxReferences > 0) {
           _evictOldest(store, sps.maxReferences, gap, maximum);
-          final poc = math.min(order.top, order.bottom);
-          if (header.field) {
-            for (final bottom in [false, true]) {
-              store.add(
-                ReferencePicture(
-                  null,
-                  -1,
-                  gap,
-                  poc,
-                  frameIdentity: -2 - gap,
-                  bottomField: bottom,
-                ),
-              );
-            }
-          } else {
-            store.add(
-              ReferencePicture(null, -1, gap, poc, frameIdentity: -2 - gap),
-            );
-          }
+          _storePicture(
+            store,
+            null,
+            sps.frameOnly,
+            null,
+            -2 - gap,
+            gap,
+            order,
+            null,
+          );
         }
         gap = (gap + 1) % maximum;
       }
@@ -244,7 +256,6 @@ final class ReferenceState {
     return PendingPicture(
       header,
       store,
-      _identity,
       _order(header, history),
       paired ? last.frameIdentity : _identity,
       idrStart,
@@ -265,7 +276,11 @@ final class ReferenceState {
       final marking = header.marking;
       if (marking == null) {
         if (sps.maxReferences > 0 &&
-            !next.any((ref) => ref.frameIdentity == pending.frameIdentity)) {
+            !next.any(
+              (ref) =>
+                  ref.frameIdentity == pending.frameIdentity &&
+                  ref.longIndex == null,
+            )) {
           _evictOldest(next, sps.maxReferences, header.frameNum, maximum);
         }
       } else {
@@ -273,27 +288,33 @@ final class ReferenceState {
           switch (operation.op) {
             case 1 || 3:
               final target = header.currPicNum - operation.first - 1;
-              final entry = next.indexWhere(
-                (ref) =>
-                    ref.longIndex == null &&
-                    _shortPicNum(ref, header) == target,
-              );
-              if (entry < 0)
+              final matches = next
+                  .where(
+                    (ref) =>
+                        ref.longIndex == null &&
+                        _shortPicNum(ref, header) == target,
+                  )
+                  .toList();
+              if (matches.isEmpty) {
                 throw const FormatException(
                   'H.264 marking references a missing short-term picture',
                 );
-              final ref = next.removeAt(entry);
-              if (operation.op == 3) {
-                if (operation.second > longMaximum)
-                  throw const FormatException(
-                    'Invalid H.264 long-term reference index',
+              }
+              for (final ref in matches) {
+                next.remove(ref);
+                if (operation.op == 3) {
+                  if (operation.second > longMaximum) {
+                    throw const FormatException(
+                      'Invalid H.264 long-term reference index',
+                    );
+                  }
+                  next.removeWhere(
+                    (other) =>
+                        other.longIndex == operation.second &&
+                        other.frameIdentity != ref.frameIdentity,
                   );
-                next.removeWhere(
-                  (other) =>
-                      other.longIndex == operation.second &&
-                      other.frameIdentity != ref.frameIdentity,
-                );
-                next.add(ref.asLongTerm(operation.second));
+                  next.add(ref.asLongTerm(operation.second));
+                }
               }
             case 2:
               next.removeWhere(
@@ -324,21 +345,26 @@ final class ReferenceState {
       }
     }
     if (header.reference && sps.maxReferences > 0) {
-      if (_frameCount(next) >= sps.maxReferences &&
-          !next.any((ref) => ref.frameIdentity == pending.frameIdentity)) {
+      final order = pending._order;
+      _storePicture(
+        next,
+        picture,
+        sps.frameOnly,
+        header.bottomField,
+        pending.frameIdentity,
+        clearNumber ? 0 : header.frameNum,
+        clearNumber
+            ? (
+                top: order.top - pending.poc,
+                bottom: order.bottom - pending.poc,
+                next: order.next,
+              )
+            : order,
+        longIndex,
+      );
+      if (_referenceCount(next) > sps.maxReferences) {
         throw const FormatException('H.264 decoded picture buffer is full');
       }
-      next.add(
-        ReferencePicture(
-          picture,
-          pending.identity,
-          clearNumber ? 0 : header.frameNum,
-          clearNumber ? 0 : pending.poc,
-          longIndex: longIndex,
-          frameIdentity: pending.frameIdentity,
-          bottomField: header.bottomField,
-        ),
-      );
     }
     _references = next;
     _longMaximum = longMaximum;
@@ -352,6 +378,68 @@ final class ReferenceState {
     if (header.reference)
       _previousReference = clearNumber ? 0 : header.frameNum;
   }
+}
+
+// Interlaced sequences mark fields separately, even for a decoded frame.
+// A frame reference is available only when both its fields have the same
+// short-term or long-term marking.
+void _storePicture(
+  List<ReferencePicture> store,
+  H264Picture? picture,
+  bool frameOnly,
+  bool? bottomField,
+  int frameIdentity,
+  int frameNum,
+  _Order order,
+  int? longIndex,
+) {
+  void add(bool? bottom, int poc) => store.add(
+    ReferencePicture(
+      picture,
+      frameIdentity,
+      frameNum,
+      poc,
+      longIndex: longIndex,
+      bottomField: bottom,
+    ),
+  );
+  if (bottomField != null) {
+    add(bottomField, bottomField ? order.bottom : order.top);
+  } else if (frameOnly) {
+    add(null, math.min(order.top, order.bottom));
+  } else {
+    add(false, order.top);
+    add(true, order.bottom);
+  }
+}
+
+List<ReferencePicture> _frameReferences(List<ReferencePicture> store) {
+  final bottoms = {
+    for (final ref in store)
+      if (ref.bottomField == true) ref.frameIdentity: ref,
+  };
+  final frames = <ReferencePicture>[];
+  for (final top in store) {
+    if (top.bottomField != false) continue;
+    final bottom = bottoms[top.frameIdentity];
+    if (bottom == null ||
+        bottom.longIndex != top.longIndex ||
+        bottom.frameNum != top.frameNum) {
+      continue;
+    }
+    final samePicture = top._decodedPicture == bottom._decodedPicture;
+    frames.add(
+      ReferencePicture(
+        samePicture ? top._decodedPicture : null,
+        top.frameIdentity,
+        top.frameNum,
+        math.min(top.poc, bottom.poc),
+        longIndex: top.longIndex,
+        fields: samePicture ? null : (top: top, bottom: bottom),
+      ),
+    );
+  }
+  return frames;
 }
 
 // Each parity advances independently through the ordered frame list (§8.2.4.2.5).
@@ -389,10 +477,12 @@ int? _longPicNum(ReferencePicture ref, SliceHeader slice) {
   return 2 * number + (ref.bottomField == slice.bottomField ? 1 : 0);
 }
 
-int _frameCount(List<ReferencePicture> store) =>
+int _referenceCount(List<ReferencePicture> store) =>
     store.isEmpty || store.first.bottomField == null
     ? store.length
-    : {for (final ref in store) ref.frameIdentity}.length;
+    : {
+        for (final ref in store) (ref.frameIdentity, ref.longIndex != null),
+      }.length;
 
 int _shortNumber(ReferencePicture ref, int current, int maximum) =>
     ref.frameNum > current ? ref.frameNum - maximum : ref.frameNum;
@@ -403,7 +493,7 @@ void _evictOldest(
   int current,
   int maximum,
 ) {
-  if (_frameCount(store) < capacity) return;
+  if (_referenceCount(store) < capacity) return;
   ReferencePicture? oldest;
   var minimum = maximum;
   for (final ref in store) {

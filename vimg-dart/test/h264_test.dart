@@ -395,6 +395,39 @@ const _field444Planes = [
   [0xaee9e2af, 0x16e2ac20, 0xc9e0b558],
 ];
 
+// JM PAFF fixtures with a fixed picture structure schedule and FFmpeg
+// reference samples. CABAC exercises temporal direct prediction and 4:2:2
+// exercises spatial direct prediction. CAVLC uses just one reference frame.
+const _paffCabacPlanes = [
+  [0x2caa9d2f, 0x55b11d1d, 0x6b798236],
+  [0x065cbf74, 0x69002d29, 0x331e08e8],
+  [0xb0490b35, 0x8df404e9, 0x6633f98f],
+  [0x6c8af1ff, 0x6239abf1, 0x59c4cecf],
+  [0x214007aa, 0x895c8a42, 0x692caca5],
+  [0x7e27da5e, 0x5e5e8c43, 0x10a4e19c],
+  [0x7033ddb2, 0x534a97d6, 0x07d5b672],
+];
+
+const _paffCavlcPlanes = [
+  [0x20fa9cec, 0x5abfe3ba, 0xd9e3ed47],
+  [0x2a36825b, 0x22574577, 0x98b200bd],
+  [0xb3f68230, 0x7478fee3, 0x969e9baa],
+  [0x2525ccdf, 0xf3c07fb1, 0xd4514686],
+  [0x960e625f, 0xd86313e8, 0x482c4644],
+  [0xcd88fa78, 0xd7749fcf, 0x7bf54a46],
+  [0x2ea61f21, 0x304b6245, 0x354b052e],
+];
+
+const _paff422Planes = [
+  [0x3e55fd5f, 0x92079b69, 0x4b4b6525],
+  [0xd0c2cc3a, 0xe13b239d, 0xfb528de2],
+  [0xc2de58a0, 0x27ef9087, 0x7565624c],
+  [0x064dd9b5, 0x7e68b798, 0xb74a59d0],
+  [0x91aa0dc8, 0x0cd5be22, 0x9360d9db],
+  [0xea221eef, 0xfebdc8de, 0xca5e3dea],
+  [0x036dbf18, 0x79e44753, 0x67b830da],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -540,6 +573,10 @@ Future<void> main(List<String> arguments) async {
   const field444 = 'test/fixtures/avc-field-cabac444.mkv';
   const fieldTs = 'test/fixtures/avc-field-cabac.ts';
   const fieldMp4 = 'test/fixtures/avc-field-cavlc.mp4';
+  const paffCabac = 'test/fixtures/avc-paff-cabac.mkv';
+  const paffCavlc = 'test/fixtures/avc-paff-cavlc.mkv';
+  const paff422 = 'test/fixtures/avc-paff-cabac422.mkv';
+  const paffTs = 'test/fixtures/avc-paff-cabac.ts';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -789,6 +826,35 @@ Future<void> main(List<String> arguments) async {
   );
   await _checkFieldRemux(fieldCavlc, fieldMp4);
   await _checkFieldRemux(fieldCabac, fieldTs);
+  _checkPlanes(
+    paffCabac,
+    _paffCabacPlanes,
+    inter: true,
+    profile: 244,
+    field: true,
+    dimensions: (64, 64),
+  );
+  _checkPlanes(
+    paffCavlc,
+    _paffCavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    field: true,
+    dimensions: (64, 64),
+  );
+  _checkPlanes(
+    paff422,
+    _paff422Planes,
+    inter: true,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 2,
+    field: true,
+    dimensions: (64, 64),
+  );
+  await _checkFieldRemux(paffCabac, paffTs);
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -870,6 +936,7 @@ Future<void> main(List<String> arguments) async {
       ('12-bit', cabac12, 64, 48),
       ('separate-planes', separateCabac, 64, 48),
       ('field', fieldTs, 64, 64),
+      ('paff', paffTs, 64, 64),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';
@@ -906,8 +973,8 @@ Future<void> main(List<String> arguments) async {
   }
 }
 
-// The MP4 stores each field in its own sample. The TS puts each field in a
-// separate PES and sends an access unit delimiter before it.
+// MP4 and TS may store each field in a separate sample or PES, even when
+// the stream switches between frame and field coding.
 Future<void> _checkFieldRemux(String bundled, String split) async {
   final original = Video(bundled);
   final remux = Video(split);

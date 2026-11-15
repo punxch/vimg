@@ -39,6 +39,7 @@ final class H264Picture {
   final int stride;
   final List<int> y, cb, cr;
   final bool? bottomField;
+  H264Picture? _referenceFrame;
   int get mbHeight => _mbHeight(sps, bottomField);
   int get _fieldShift => bottomField == null ? 0 : 1;
   int get _chromaDepth =>
@@ -46,6 +47,26 @@ final class H264Picture {
   int get chromaStride => sps.mbWidth * sps.chromaWidth;
   MotionField? motionL0;
   MotionField? motionL1;
+
+  H264Picture referenceFrameWith(H264Picture bottom) =>
+      _referenceFrame ??= H264Picture.fromFields(this, bottom);
+
+  // References to a field of a decoded frame advance by two rows.
+  // The bottom field begins one row later in the same sample storage.
+  late final _bottomRows = [
+    _skipRow(y, stride),
+    _skipRow(cb, chromaStride),
+    _skipRow(cr, chromaStride),
+  ];
+
+  List<int> referenceSamples(int plane, {required bool skipTopRow}) =>
+      skipTopRow
+      ? _bottomRows[plane]
+      : switch (plane) {
+          0 => y,
+          1 => cb,
+          _ => cr,
+        };
 
   image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
     y: y,
@@ -95,3 +116,9 @@ List<int> _weave(List<int> top, List<int> bottom, int stride, int depth) {
 
 List<int> _samples(int count, int depth) =>
     depth == 8 ? Uint8List(count) : Uint16List(count);
+
+List<int> _skipRow(List<int> data, int stride) => switch (data) {
+  Uint8List() => Uint8List.sublistView(data, stride),
+  Uint16List() => Uint16List.sublistView(data, stride),
+  _ => const [],
+};

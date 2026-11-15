@@ -116,6 +116,7 @@ typedef _Source = ({
   ReferencePicture ref,
   List<int> data,
   int stride,
+  int width,
   int height,
   int x,
   int y,
@@ -130,22 +131,23 @@ _Source _source(
   bool? bottomField,
 ) {
   final picture = ref.picture!;
-  final data = switch (plane) {
-    0 => picture.y,
-    1 => picture.cb,
-    _ => picture.cr,
-  };
-  final stride = plane == 0 ? picture.stride : picture.chromaStride;
+  final fieldOfFrame = ref.bottomField != null && picture.bottomField == null;
+  final skipTopRow = fieldOfFrame && ref.bottomField!;
+  final data = picture.referenceSamples(plane, skipTopRow: skipTopRow);
+  final row = plane == 0 ? picture.stride : picture.chromaStride;
+  final stride = fieldOfFrame ? 2 * row : row;
+  final height = (data.length + (skipTopRow ? row : 0)) ~/ stride;
   final vector = field.vectorAt(x, y);
   final chroma420 = plane != 0 && picture.sps.chromaFormat == 1;
-  final correction = chroma420 && bottomField != picture.bottomField
+  final correction = chroma420 && bottomField != ref.bottomField
       ? (bottomField == true ? 2 : -2)
       : 0;
   return (
     ref: ref,
     data: data,
     stride: stride,
-    height: data.length ~/ stride,
+    width: row,
+    height: height,
     x: 16 * x + vector.x,
     y:
         (16 * y + vector.y + correction) <<
@@ -155,21 +157,8 @@ _Source _source(
 
 int _interSample(_Source source, bool fullSize, int dx, int dy, int maximum) =>
     fullSize
-    ? _luma(
-        source.data,
-        source.stride,
-        source.height,
-        source.x + dx,
-        source.y + dy,
-        maximum,
-      )
-    : _chroma(
-        source.data,
-        source.stride,
-        source.height,
-        source.x + dx,
-        source.y + dy,
-      );
+    ? _luma(source, source.x + dx, source.y + dy, maximum)
+    : _chroma(source, source.x + dx, source.y + dy);
 
 int _weighted(
   int sample,
@@ -184,55 +173,46 @@ int _weighted(
       .clamp(0, maximum);
 }
 
-int _sample(List<int> data, int stride, int height, int x, int y) =>
-    data[y.clamp(0, height - 1) * stride + x.clamp(0, stride - 1)];
+int _sample(_Source source, int x, int y) =>
+    source.data[y.clamp(0, source.height - 1) * source.stride +
+        x.clamp(0, source.width - 1)];
 
-int _chroma(List<int> data, int stride, int height, int x8, int y8) {
+int _chroma(_Source source, int x8, int y8) {
   final x = x8 >> 3, y = y8 >> 3;
   final dx = x8 & 7, dy = y8 & 7;
-  final a = _sample(data, stride, height, x, y);
+  final a = _sample(source, x, y);
   if (dx == 0 && dy == 0) return a;
-  final b = _sample(data, stride, height, x + 1, y);
-  final c = _sample(data, stride, height, x, y + 1);
-  final d = _sample(data, stride, height, x + 1, y + 1);
+  final b = _sample(source, x + 1, y);
+  final c = _sample(source, x, y + 1);
+  final d = _sample(source, x + 1, y + 1);
   return ((8 - dx) * ((8 - dy) * a + dy * c) +
           dx * ((8 - dy) * b + dy * d) +
           32) >>
       6;
 }
 
-int _luma(List<int> data, int stride, int height, int x4, int y4, int maximum) {
+int _luma(_Source source, int x4, int y4, int maximum) {
   final x = x4 >> 2, y = y4 >> 2;
   final dx = x4 & 3, dy = y4 & 3;
-  if (dx == 0 && dy == 0) return _sample(data, stride, height, x, y);
+  if (dx == 0 && dy == 0) return _sample(source, x, y);
   if (dy == 0) {
-    final half = _halfX(data, stride, height, x, y, maximum);
-    return dx == 2
-        ? half
-        : _average(half, _sample(data, stride, height, x + (dx >> 1), y));
+    final half = _halfX(source, x, y, maximum);
+    return dx == 2 ? half : _average(half, _sample(source, x + (dx >> 1), y));
   }
   if (dx == 0) {
-    final half = _halfY(data, stride, height, x, y, maximum);
-    return dy == 2
-        ? half
-        : _average(half, _sample(data, stride, height, x, y + (dy >> 1)));
+    final half = _halfY(source, x, y, maximum);
+    return dy == 2 ? half : _average(half, _sample(source, x, y + (dy >> 1)));
   }
   if (dx == 2 || dy == 2) {
-    final half = _diagonal(data, stride, height, x, y, maximum);
+    final half = _diagonal(source, x, y, maximum);
     if (dx == 2 && dy == 2) return half;
     return dx == 2
-        ? _average(
-            half,
-            _halfX(data, stride, height, x, y + (dy >> 1), maximum),
-          )
-        : _average(
-            half,
-            _halfY(data, stride, height, x + (dx >> 1), y, maximum),
-          );
+        ? _average(half, _halfX(source, x, y + (dy >> 1), maximum))
+        : _average(half, _halfY(source, x + (dx >> 1), y, maximum));
   }
   return _average(
-    _halfX(data, stride, height, x, y + (dy >> 1), maximum),
-    _halfY(data, stride, height, x + (dx >> 1), y, maximum),
+    _halfX(source, x, y + (dy >> 1), maximum),
+    _halfY(source, x + (dx >> 1), y, maximum),
   );
 }
 
@@ -241,9 +221,10 @@ int _average(int a, int b) => (a + b + 1) >> 1;
 int _six(int a, int b, int c, int d, int e, int f) =>
     a - 5 * (b + e) + 20 * (c + d) + f;
 
-int _horizontal(List<int> data, int stride, int height, int x, int y) {
-  final row = y.clamp(0, height - 1) * stride;
-  if (x >= 2 && x + 3 < stride) {
+int _horizontal(_Source source, int x, int y) {
+  final data = source.data, width = source.width;
+  final row = y.clamp(0, source.height - 1) * source.stride;
+  if (x >= 2 && x + 3 < width) {
     final p = row + x;
     return _six(
       data[p - 2],
@@ -254,15 +235,16 @@ int _horizontal(List<int> data, int stride, int height, int x, int y) {
       data[p + 3],
     );
   }
-  int at(int offset) => data[row + (x + offset).clamp(0, stride - 1)];
+  int at(int offset) => data[row + (x + offset).clamp(0, width - 1)];
   return _six(at(-2), at(-1), at(0), at(1), at(2), at(3));
 }
 
-int _halfX(List<int> data, int stride, int height, int x, int y, int maximum) =>
-    ((_horizontal(data, stride, height, x, y) + 16) >> 5).clamp(0, maximum);
+int _halfX(_Source source, int x, int y, int maximum) =>
+    ((_horizontal(source, x, y) + 16) >> 5).clamp(0, maximum);
 
-int _halfY(List<int> data, int stride, int height, int x, int y, int maximum) {
-  final column = x.clamp(0, stride - 1);
+int _halfY(_Source source, int x, int y, int maximum) {
+  final stride = source.stride, data = source.data, height = source.height;
+  final column = x.clamp(0, source.width - 1);
   if (y >= 2 && y + 3 < height) {
     final p = y * stride + column;
     return ((_six(
@@ -285,15 +267,8 @@ int _halfY(List<int> data, int stride, int height, int x, int y, int maximum) {
   );
 }
 
-int _diagonal(
-  List<int> data,
-  int stride,
-  int height,
-  int x,
-  int y,
-  int maximum,
-) {
-  int at(int offset) => _horizontal(data, stride, height, x, y + offset);
+int _diagonal(_Source source, int x, int y, int maximum) {
+  int at(int offset) => _horizontal(source, x, y + offset);
   return ((_six(at(-2), at(-1), at(0), at(1), at(2), at(3)) + 512) >> 10).clamp(
     0,
     maximum,

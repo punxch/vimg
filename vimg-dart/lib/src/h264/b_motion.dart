@@ -14,6 +14,14 @@ final class BDirect {
 
   void derive(MotionPartition whole, List<MotionPartition> parts, int owner) {
     final col = getReference(refs.l1, 0);
+    final pair = col.fields;
+    final colocatedPicture = pair == null
+        ? col
+        : (pair.top.poc - poc).abs() < (pair.bottom.poc - poc).abs()
+        ? pair.top
+        : pair.bottom;
+    final colocatedField = colocatedPicture.picture!.bottomField != null;
+    final changesStructure = colocatedField != header.field;
     final spatial = header.directSpatial;
     var r0 = spatial ? l0.spatialReference(whole, owner) : 0;
     var r1 = spatial ? l1.spatialReference(whole, owner) : 0;
@@ -33,7 +41,11 @@ final class BDirect {
           final cell = (x: x, y: y, width: step, height: step);
           final colX = step == 2 ? whole.x + ((x - whole.x) ~/ 2) * 3 : x;
           final colY = step == 2 ? whole.y + ((y - whole.y) ~/ 2) * 3 : y;
-          final colocated = _motionAt(col, colX, colY);
+          // Map 4×4 rows in the co-located picture's frame or field coordinates.
+          final sourceY = !changesStructure
+              ? colY
+              : (header.field ? colY * 2 : colY ~/ 2);
+          final colocated = _motionAt(colocatedPicture, colX, sourceY);
           if (spatial) {
             final zero =
                 col.longIndex == null &&
@@ -60,11 +72,23 @@ final class BDirect {
             _write(l0, refs.l0, cell, owner, 0, zeroMotion);
             _write(l1, refs.l1, cell, owner, 0, zeroMotion);
           } else {
+            final identity = changesStructure
+                ? referenceIdentityWithParity(
+                    colocated.identity,
+                    header.bottomField,
+                  )
+                : colocated.identity;
             final index = refs.l0.indexWhere(
-              (ref) => ref?.identity == colocated.identity,
+              (ref) => ref?.identity == identity,
             );
             final ref = getReference(refs.l0, index);
-            final mv = colocated.vector;
+            final raw = colocated.vector;
+            final mv = (
+              x: raw.x,
+              y: !changesStructure
+                  ? raw.y
+                  : (header.field ? raw.y ~/ 2 : raw.y * 2),
+            );
             final factor = ref.longIndex != null
                 ? 256
                 : distanceScale(ref.poc, col.poc, poc);
