@@ -5,23 +5,57 @@ import 'slice_header.dart';
 /// Direct B prediction derives motion from adjacent partitions and the
 /// co-located list-1 picture. It consumes no reference or MVD bins.
 final class BDirect {
-  const BDirect(this.header, this.poc, this.refs, this.l0, this.l1);
+  const BDirect(
+    this.header,
+    this.poc,
+    this.refs,
+    this.l0,
+    this.l1, {
+    this.mbaffBottomField,
+  });
 
   final SliceHeader header;
   final int poc;
   final ReferenceLists refs;
   final MotionField l0, l1;
+  final bool? mbaffBottomField;
 
   void derive(MotionPartition whole, List<MotionPartition> parts, int owner) {
     final col = getReference(refs.l1, 0);
+    final parity = mbaffBottomField ?? header.bottomField;
     final pair = col.fields;
+    final chooseBottom =
+        parity ??
+        (pair == null ||
+            (pair.top.poc - poc).abs() >= (pair.bottom.poc - poc).abs());
     final colocatedPicture = pair == null
         ? col
-        : (pair.top.poc - poc).abs() < (pair.bottom.poc - poc).abs()
-        ? pair.top
-        : pair.bottom;
-    final colocatedField = colocatedPicture.picture!.bottomField != null;
-    final changesStructure = colocatedField != header.field;
+        : (chooseBottom ? pair.bottom : pair.top);
+    final reference = colocatedPicture.picture!;
+    final mbRow = whole.y ~/ 4;
+    final pairRow = header.field ? mbRow : mbRow ~/ 2;
+    final pairs = reference.mbaffFieldPairs;
+    final colocatedField =
+        reference.bottomField != null ||
+        pairs?[pairRow * reference.sps.mbWidth + whole.x ~/ 4] == 1;
+    final changesStructure = colocatedField != (parity != null);
+
+    // Table 8-8 locates co-located motion in the reference's frame or
+    // field macroblock geometry, using 4×4 block rows here.
+    int colocatedRow(int y) {
+      final local = y % 4;
+      if (!colocatedField) return parity == null ? y : 8 * pairRow + 2 * local;
+      if (pairs == null) {
+        if (header.field) return y;
+        return 4 * pairRow +
+            (parity != null ? local : 2 * (mbRow & 1) + local ~/ 2);
+      }
+      final fieldRow =
+          2 * pairRow + (colocatedPicture.bottomField == true ? 1 : 0);
+      return 4 * fieldRow +
+          (parity != null ? local : 2 * (mbRow & 1) + local ~/ 2);
+    }
+
     final spatial = header.directSpatial;
     var r0 = spatial ? l0.spatialReference(whole, owner) : 0;
     var r1 = spatial ? l1.spatialReference(whole, owner) : 0;
@@ -41,11 +75,11 @@ final class BDirect {
           final cell = (x: x, y: y, width: step, height: step);
           final colX = step == 2 ? whole.x + ((x - whole.x) ~/ 2) * 3 : x;
           final colY = step == 2 ? whole.y + ((y - whole.y) ~/ 2) * 3 : y;
-          // Map 4×4 rows in the co-located picture's frame or field coordinates.
-          final sourceY = !changesStructure
-              ? colY
-              : (header.field ? colY * 2 : colY ~/ 2);
-          final colocated = _motionAt(colocatedPicture, colX, sourceY);
+          final colocated = _motionAt(
+            colocatedPicture,
+            colX,
+            colocatedRow(colY),
+          );
           if (spatial) {
             final zero =
                 col.longIndex == null &&
@@ -73,10 +107,7 @@ final class BDirect {
             _write(l1, refs.l1, cell, owner, 0, zeroMotion);
           } else {
             final identity = changesStructure
-                ? referenceIdentityWithParity(
-                    colocated.identity,
-                    header.bottomField,
-                  )
+                ? referenceIdentityWithParity(colocated.identity, parity)
                 : colocated.identity;
             final index = refs.l0.indexWhere(
               (ref) => ref?.identity == identity,
@@ -87,7 +118,7 @@ final class BDirect {
               x: raw.x,
               y: !changesStructure
                   ? raw.y
-                  : (header.field ? raw.y ~/ 2 : raw.y * 2),
+                  : (parity != null ? raw.y ~/ 2 : raw.y * 2),
             );
             final factor = ref.longIndex != null
                 ? 256

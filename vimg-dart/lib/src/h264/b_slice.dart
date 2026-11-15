@@ -22,13 +22,14 @@ extension BidirectionalSlice on SliceData {
     Macroblock? top,
     BDirect motion,
     int mbX,
-    int mbY,
-  ) {
+    int mbY, {
+    bool? skipped,
+  }) {
     final owner = header.firstMb + 1;
     final x = mbX * 4, y = mbY * 4;
     final whole = (x: x, y: y, width: 4, height: 4);
-    final block = Macroblock(header, -1);
-    if (readSkip(left, top)) {
+    final block = Macroblock(header, -1)..mbaffField = mbaffField;
+    if (skipped ?? readSkip(left, top)) {
       motion.derive(whole, [whole], owner);
       _previousQpDelta = false;
       return block
@@ -100,7 +101,7 @@ extension BidirectionalSlice on SliceData {
           continue;
         }
         bool positiveRef(int x, int y) =>
-            field.referenceAt(x, y, owner) > 0 &&
+            field.neighborReferenceAt(x, y, owner) > 0 &&
             !motion.l0.directAt(x, y, owner);
         final context = _pair(
           positiveRef(part.x - 1, part.y),

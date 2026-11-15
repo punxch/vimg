@@ -96,8 +96,8 @@ independently coded 4:4:4 color planes. It also combines separately coded
 top and bottom fields into full frames, including fields stored in separate
 MP4 samples or MPEG transport PES packets. Picture-adaptive frame/field
 coding (PAFF) can use reference pictures coded in either form.
-Macroblock-adaptive frame and field coding (MBAFF) is supported for I and P
-slices. MBAFF B slices remain pending.
+Macroblock-adaptive frame and field coding (MBAFF) supports I, P and B slices,
+including spatial and temporal direct prediction and B reference pictures.
 `extract` and `vcs` decode
 forward from the preceding IDR, reuse reference pictures for captures in the
 same GOP, and schedule captures using the source frame durations and the

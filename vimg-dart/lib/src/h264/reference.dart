@@ -18,7 +18,7 @@ final class ReferencePicture {
   final int frameIdentity, frameNum, poc;
   final bool? bottomField;
   final int? longIndex;
-  // Present for a frame reference made of two separately coded fields.
+  // The two reference fields of a frame in an interlaced sequence.
   final ({ReferencePicture top, ReferencePicture bottom})? fields;
 
   int get identity => _pictureIdentity(frameIdentity, bottomField);
@@ -88,6 +88,11 @@ final class PendingPicture {
   final _Order _order;
 
   int get poc => math.min(_order.top, _order.bottom);
+  int pocFor(bool? bottomField) => switch (bottomField) {
+    false => _order.top,
+    true => _order.bottom,
+    null => poc,
+  };
 
   late final List<ReferencePicture> _available =
       header.field || header.pps.sps.frameOnly
@@ -449,7 +454,7 @@ List<ReferencePicture> _frameReferences(List<ReferencePicture> store) {
         top.frameNum,
         math.min(top.poc, bottom.poc),
         longIndex: top.longIndex,
-        fields: samePicture ? null : (top: top, bottom: bottom),
+        fields: (top: top, bottom: bottom),
       ),
     );
   }

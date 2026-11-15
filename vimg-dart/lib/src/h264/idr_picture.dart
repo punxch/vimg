@@ -194,9 +194,6 @@ final class _Reconstruction {
   var decoded = 0;
 
   void decode(SliceHeader slice, PendingPicture? pending) {
-    if (slice.mbaff && slice.kind == SliceKind.b) {
-      throw UnsupportedError('H.264 MBAFF B slices are unavailable');
-    }
     final SliceData reader = slice.pps.cabac
         ? CabacSlice(slice)
         : CavlcSlice(slice);
@@ -218,6 +215,22 @@ final class _Reconstruction {
         : null;
     late final topFields = pending!.mbaffLists(references, false);
     late final bottomFields = pending!.mbaffLists(references, true);
+    late final topDirect = BDirect(
+      slice,
+      pending!.pocFor(false),
+      topFields,
+      motion!,
+      motion1!,
+      mbaffBottomField: false,
+    );
+    late final bottomDirect = BDirect(
+      slice,
+      pending!.pocFor(true),
+      bottomFields,
+      motion!,
+      motion1!,
+      mbaffBottomField: true,
+    );
     bool? bottomSkipped;
     var address = slice.firstMbAddress;
     while (true) {
@@ -269,8 +282,7 @@ final class _Reconstruction {
 
         reader.mbaffNeighbor = neighbor;
         if (motion != null) {
-          motion.mbaffField = reader.mbaffField;
-          motion.mbaffNeighbor = (column, localRow, above) {
+          MotionNeighbor? motionNeighbor(int column, int localRow, bool above) {
             final dx = column - 4 * x, dy = localRow - 4 * row;
             if (dx >= 0 && dx < 4 && dy >= 0 && dy < 4) {
               return (x: column, y: localRow, field: reader.mbaffField);
@@ -291,7 +303,12 @@ final class _Reconstruction {
               y: 4 * _mbaff.row(at.address) + at.y ~/ 4,
               field: other!.mbaffField,
             );
-          };
+          }
+
+          motion.mbaffField = reader.mbaffField;
+          motion.mbaffNeighbor = motionNeighbor;
+          motion1?.mbaffField = reader.mbaffField;
+          motion1?.mbaffNeighbor = motionNeighbor;
         }
         left = neighbor(-1, 0, 16, 16).block;
         top = neighbor(0, -1, 16, 16).block;
@@ -321,7 +338,14 @@ final class _Reconstruction {
           blockReferences.l0,
           skipped: skipped,
         ),
-        SliceKind.b => reader.readB(left, top, b!, x, row),
+        SliceKind.b => reader.readB(
+          left,
+          top,
+          reader.mbaffField ? (row.isOdd ? bottomDirect : topDirect) : b!,
+          x,
+          row,
+          skipped: skipped,
+        ),
       };
       _transform = block.field ? _fieldTransform : _frameTransform;
       if (block.intra) {
@@ -357,13 +381,17 @@ final class _Reconstruction {
           motion!,
           b?.l1,
           blockReferences,
-          pending!.poc,
+          pending!.pocFor(reader.mbaffField ? row.isOdd : slice.bottomField),
         );
+      }
+      if (slice.mbaff && address.isEven) {
+        picture.mbaffFieldPairs![address >> 1] = block.mbaffField ? 1 : 0;
       }
       blocks[address++] = block;
       decoded++;
       if ((!slice.mbaff || address.isEven) && reader.endOfSlice()) {
         motion?.mbaffNeighbor = null;
+        motion1?.mbaffNeighbor = null;
         return;
       }
     }

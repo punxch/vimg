@@ -62,8 +62,8 @@ final class MotionField {
   int storedReferenceAt(int x, int y) => _reference[y * width + x];
 
   bool directAt(int x, int y, int owner) {
-    final index = _index(x, y);
-    return index >= 0 && _owners[index] == owner && _direct?[index] == 1;
+    final (index, _) = _neighborIndex(x, y, owner);
+    return index >= 0 && _direct?[index] == 1;
   }
 
   void markDirect(MotionPartition part) {

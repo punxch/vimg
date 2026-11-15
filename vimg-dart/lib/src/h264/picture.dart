@@ -17,11 +17,21 @@ final class H264Picture {
         _chromaSamples(sps, bottomField),
         _chromaSamples(sps, bottomField),
         bottomField,
+        mbaffFieldPairs: sps.mbAdaptive && bottomField == null
+            ? Uint8List(sps.mbWidth * (sps.mbHeight ~/ 2))
+            : null,
       );
 
   /// Assemble the independently decoded planes without copying samples.
   H264Picture.fromPlanes(H264Picture y, H264Picture cb, H264Picture cr)
-    : this._(y.sps, y.y, cb.y, cr.y, y.bottomField);
+    : this._(
+        y.sps,
+        y.y,
+        cb.y,
+        cr.y,
+        y.bottomField,
+        mbaffFieldPairs: y.mbaffFieldPairs,
+      );
 
   H264Picture.fromFields(H264Picture top, H264Picture bottom)
     : this._(
@@ -32,13 +42,20 @@ final class H264Picture {
         null,
       );
 
-  H264Picture._(this.sps, this.y, this.cb, this.cr, this.bottomField)
-    : stride = sps.mbWidth * 16;
+  H264Picture._(
+    this.sps,
+    this.y,
+    this.cb,
+    this.cr,
+    this.bottomField, {
+    this.mbaffFieldPairs,
+  }) : stride = sps.mbWidth * 16;
 
   final H264Sps sps;
   final int stride;
   final List<int> y, cb, cr;
   final bool? bottomField;
+  final Uint8List? mbaffFieldPairs;
   H264Picture? _referenceFrame;
   int get mbHeight => _mbHeight(sps, bottomField);
   int get _fieldShift => bottomField == null ? 0 : 1;

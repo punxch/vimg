@@ -478,6 +478,60 @@ const _mbaffPSeparatePlanes = [
   [0xa311be11, 0xbd801d3a, 0x20486538],
 ];
 
+// x264 CABAC with hierarchical B references, implicit weights and adaptive
+// direct prediction, including co-located blocks in the opposite frame/field mode.
+const _mbaffBCabacPlanes = [
+  [0xf0aaa316, 0x4c7e8463, 0xdb8e674a],
+  [0x6273b60e, 0x469b287b, 0x8c47d02e],
+  [0x87a6f513, 0x5a9e36bd, 0x439eea51],
+  [0x26227acb, 0xe97e9a5b, 0x777abe90],
+  [0x94bd5344, 0x17feca0d, 0xc67087f6],
+  [0x27ef79f5, 0x01dd31c7, 0x310c2be3],
+  [0x6e3d0445, 0xf1b66029, 0x2087d3f4],
+  [0xbca4730f, 0x3bb5e12b, 0xc1dd2b42],
+  [0x2f7014cf, 0x9e95d289, 0x3548b103],
+  [0xf331127a, 0x87875f63, 0xa5ea2013],
+  [0x3e56501c, 0x097cb880, 0xc1eca35c],
+  [0x8ef15c15, 0x010fa08b, 0x6f30f917],
+  [0xcba682b0, 0x4134bff0, 0x62f3d60d],
+  [0x4424fbee, 0xc0c64d3b, 0xe576b3bf],
+  [0x1d2c7699, 0x02608f85, 0xc2ce0833],
+  [0x085fe057, 0xebaa4e79, 0x9317b2e0],
+  [0x1eaa7bdf, 0xa73f9be2, 0x9ad782e2],
+  [0x62a311bd, 0xe825cac1, 0x99a72314],
+  [0xcd40677b, 0xaf2e29eb, 0xc2db3c21],
+  [0xd1a58a1e, 0xd9ac3dd1, 0x623c0bc6],
+  [0x93a1e742, 0x88cc49f1, 0x64107a75],
+  [0x77652810, 0x0853033f, 0x3739d9f5],
+  [0xe71b69fd, 0x95e5f7bc, 0x5263a4f1],
+  [0x8c23cccc, 0xbae3c6f6, 0xcc78f115],
+  [0x5a67b68b, 0xd56dd829, 0x6ad62423],
+];
+
+// JM 10-bit CAVLC with spatial direct prediction across mixed pairs.
+const _mbaffBCavlcPlanes = [
+  [0xbbcad96a, 0x50fcef8e, 0xfdde1b49],
+  [0x0c98660d, 0x210b3042, 0xc9d03d83],
+  [0x95c369bb, 0xa1e79c4e, 0xc7f96e06],
+  [0x1e929e59, 0x3365c12c, 0x9eac1cef],
+  [0xc265128d, 0x46dcded4, 0x1b9ea239],
+  [0xaf793294, 0x55c1632f, 0x9672a733],
+  [0xb96eb080, 0x4d859da2, 0x0898aed7],
+  [0x56bab78e, 0x6f22dcf2, 0x5cbf696c],
+];
+
+// JM spatial direct prediction from separately coded fields in an MBAFF B frame.
+const _mixedAffBPlanes = [
+  [0x2b06b692, 0xa08f0d66, 0xa5c2cb71],
+  [0x4adb766a, 0x2ecea911, 0xf8a6f0ad],
+  [0x98838d43, 0xacc0a454, 0x4c0b174c],
+  [0x0b4313a3, 0xcdd5a7ba, 0xe2e282d6],
+  [0xbd36164f, 0x10660137, 0x59a65cf5],
+  [0x2ea48882, 0x1a56f431, 0xf95608a3],
+  [0x02119d2c, 0xc09cce4d, 0x31688df4],
+  [0x5b06fddb, 0x2057d930, 0xbc694bd3],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -634,6 +688,9 @@ Future<void> main(List<String> arguments) async {
   const mbaffPCabac = 'test/fixtures/avc-mbaff-p-cabac.mkv';
   const mbaffPWeighted = 'test/fixtures/avc-mbaff-p-weighted-cavlc.mkv';
   const mbaffPSeparate = 'test/fixtures/avc-mbaff-p-separate.mkv';
+  const mbaffBCabac = 'test/fixtures/avc-mbaff-b-cabac.mkv';
+  const mbaffBCavlc = 'test/fixtures/avc-mbaff-b-cavlc.mkv';
+  const mixedAffB = 'test/fixtures/avc-mixed-aff-b.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -958,6 +1015,31 @@ Future<void> main(List<String> arguments) async {
     mbaff: true,
     dimensions: (96, 64),
   );
+  _checkPlanes(
+    mbaffBCabac,
+    _mbaffBCabacPlanes,
+    inter: true,
+    mbaff: true,
+    dimensions: (192, 128),
+  );
+  _checkPlanes(
+    mbaffBCavlc,
+    _mbaffBCavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    mbaff: true,
+    dimensions: (96, 64),
+  );
+  _checkPlanes(
+    mixedAffB,
+    _mixedAffBPlanes,
+    inter: true,
+    profile: 244,
+    mbaff: true,
+    dimensions: (96, 64),
+  );
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -1019,6 +1101,7 @@ Future<void> main(List<String> arguments) async {
       (fieldMp4, 64, 64),
       (mbaff422, 96, 64),
       (mbaffPWeighted, 96, 64),
+      (mbaffBCabac, 192, 128),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -1045,6 +1128,7 @@ Future<void> main(List<String> arguments) async {
       ('paff', paffTs, 64, 64),
       ('mbaff', mbaff422, 96, 64),
       ('mbaff-p', mbaffPWeighted, 96, 64),
+      ('mbaff-b', mbaffBCavlc, 96, 64),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';
