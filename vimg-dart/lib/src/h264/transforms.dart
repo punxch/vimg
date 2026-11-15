@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'parameters.dart';
+import 'slice_data.dart' show blockX, blockY;
 
 const scan4 = [0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15];
 const scan8 = [
@@ -289,8 +290,59 @@ const _defaultInter8 = [
 /// Inverse scanning, scaling and transforms (§8.5). The residual buffer is
 /// reused for each block to keep the frame's working set proportional to pixels.
 final class IntraTransform {
-  final residual = Int32List(64);
+  final residual = Int32List(256);
   final _lumaDc = Int32List(16);
+
+  void bypassBlock(Int32List levels, int offset, int size, {int mode = 2}) {
+    _unscan(levels, offset, size == 8 ? scan8 : scan4, 0, size, size);
+    _undoResidualPrediction(size, mode);
+  }
+
+  void bypassMacroblock(
+    Int32List levels,
+    int offset,
+    List<int> dc,
+    int size,
+    int mode, {
+    int dcStart = 0,
+  }) {
+    final blocksAcross = size ~/ 4;
+    for (var i = 0; i < blocksAcross * blocksAcross; i++) {
+      final x = blockX(i), y = blockY(i);
+      final start = 4 * (y * size + x);
+      _unscan(levels, offset + i * 16, scan4, start, 4, size);
+      residual[start] = dc[dcStart + y * blocksAcross + x];
+    }
+    _undoResidualPrediction(size, mode);
+  }
+
+  void _unscan(
+    Int32List levels,
+    int offset,
+    List<int> scan,
+    int start,
+    int size,
+    int stride,
+  ) {
+    for (var i = 0; i < scan.length; i++) {
+      final position = scan[i];
+      residual[start + position ~/ size * stride + position % size] =
+          levels[offset + i];
+    }
+  }
+
+  // Intra horizontal and vertical modes predict from the preceding sample
+  // in the bypass residual, including across 4×4 boundaries in a macroblock.
+  void _undoResidualPrediction(int size, int mode) {
+    if (mode > 1) return;
+    final step = mode == 0 ? size : 1;
+    for (var y = mode == 0 ? 1 : 0; y < size; y++) {
+      for (var x = mode == 1 ? 1 : 0; x < size; x++) {
+        final index = y * size + x;
+        residual[index] += residual[index - step];
+      }
+    }
+  }
 
   void block4(
     Int32List levels,
@@ -339,10 +391,16 @@ final class IntraTransform {
     _round(64);
   }
 
-  Int32List lumaDc(Int32List levels, int qp, int weight) {
+  Int32List lumaDc(
+    Int32List levels,
+    int qp,
+    int weight, {
+    bool bypass = false,
+  }) {
     for (var i = 0; i < 16; i++) {
       _lumaDc[scan4[i]] = levels[i];
     }
+    if (bypass) return _lumaDc;
     for (var i = 0; i < 4; i++) {
       _hadamard4(_lumaDc, i * 4, 1);
     }

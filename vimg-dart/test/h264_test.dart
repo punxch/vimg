@@ -175,6 +175,28 @@ const _high10Pcm9Planes = [
   [0x10b95145, 0x21b90145, 0x2ec7f3c5],
 ];
 
+// Checksums of the original raw input to x264 --qp 0. Both streams use
+// 4×4, 8×8 and 16×16 intra prediction and 4×4 and 8×8 inter residuals.
+const _losslessCabacPlanes = [
+  [0xf5f6873b, 0xf07bfb90, 0xc6bc45bc],
+  [0x1aeed8cb, 0xc0f291ba, 0xe5b25de4],
+  [0x99626e4b, 0xb5bc6f38, 0x1a385298],
+  [0xab95326f, 0x32c9ce02, 0xe6a21398],
+  [0x9cf2e71b, 0x8cae6a00, 0x74087f7c],
+  [0x0008e3d7, 0xf16df162, 0x19f2e51c],
+  [0x00e5516b, 0x0d366060, 0xbab05eb0],
+];
+
+const _losslessCavlcPlanes = [
+  [0x33544995, 0xf5a3bdb0, 0xe921d259],
+  [0x1cb2e1dd, 0x2dcb4c1b, 0x5a1a93d0],
+  [0xd28fda1d, 0x2337e4e2, 0xf16e6c33],
+  [0xd82b624d, 0xe7490309, 0x31024d5a],
+  [0x622ad135, 0x50108408, 0xe76d4f39],
+  [0x447c691d, 0xd1d6d28b, 0x3fee51e8],
+  [0x1c614efd, 0xf29e0aaa, 0x96f3f7f3],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -183,6 +205,7 @@ void _checkPlanes(
   int profile = 100,
   int depth = 8,
   bool monochrome = false,
+  bool lossless = false,
   (int, int) dimensions = (78, 50),
 }) {
   final handle = File(input).openSync();
@@ -218,6 +241,7 @@ void _checkPlanes(
             sps.lumaDepth == depth &&
             sps.chromaDepth == depth &&
             sps.chromaFormat == (monochrome ? 0 : 1) &&
+            sps.transformBypass == lossless &&
             (sps.width, sps.height) == dimensions,
         'H.264 dimensions, bit depth and profile',
       );
@@ -236,7 +260,7 @@ void _checkPlanes(
         );
         check(
           hash == expected[frame][index],
-          'H.264 $input frame $frame plane $index differs from FFmpeg: ${hash.toRadixString(16)}',
+          'H.264 $input frame $frame plane $index differs from reference: ${hash.toRadixString(16)}',
         );
       }
     }
@@ -268,6 +292,8 @@ Future<void> main(List<String> arguments) async {
   const high10Cabac = 'test/fixtures/high10-cabac.mkv';
   const high10Cavlc = 'test/fixtures/high10-cavlc.mp4';
   const high10Monochrome = 'test/fixtures/high10-mono.mkv';
+  const losslessCabac = 'test/fixtures/lossless-avc-cabac.mkv';
+  const losslessCavlc = 'test/fixtures/lossless-avc-cavlc.mp4';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -326,6 +352,25 @@ Future<void> main(List<String> arguments) async {
     dimensions: (32, 16),
   );
 
+  _checkPlanes(
+    losslessCabac,
+    _losslessCabacPlanes,
+    inter: true,
+    lossless: true,
+    profile: 244,
+    dimensions: (94, 62),
+  );
+  _checkPlanes(
+    losslessCavlc,
+    _losslessCavlcPlanes,
+    inter: true,
+    cabac: false,
+    lossless: true,
+    profile: 244,
+    depth: 10,
+    dimensions: (94, 62),
+  );
+
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
     final result = await Process.run(
@@ -343,6 +388,7 @@ Future<void> main(List<String> arguments) async {
       (mp4, 39, 25),
       (high10Cabac, 47, 31),
       (high10Monochrome, 47, 31),
+      (losslessCabac, 47, 31),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -371,9 +417,11 @@ Future<void> main(List<String> arguments) async {
     for (final (input, width, height) in [
       (interMkv, 78, 50),
       (high10Cavlc, 94, 62),
+      (losslessCavlc, 94, 62),
       (cavlcBaseline, 166, 110),
     ]) {
-      final output = '${directory.path}/frames-$width';
+      final name = input.split('/').last;
+      final output = '${directory.path}/frames-$name';
       await run(['extract', '-n1', '-t500ms', '--output-dir', output, input]);
       final bmp = Directory(output).listSync().single as File;
       final frame = image.decodeBmp(bmp.readAsBytesSync())!;
@@ -387,6 +435,7 @@ Future<void> main(List<String> arguments) async {
       ('cabac', temporal, 166, 110),
       ('cavlc', cavlcHigh, 166, 110),
       ('high10', high10Cabac, 94, 62),
+      ('lossless', losslessCavlc, 94, 62),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';
