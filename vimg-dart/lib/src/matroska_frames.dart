@@ -39,11 +39,6 @@ Iterable<FramePacket> matroskaFrames(
       case 0x1654ae6b:
         final track = media.videoTracks(element).firstOrNull;
         if (track == null) break;
-        if (track.containsKey(0x6d80)) {
-          throw const FormatException(
-            'Encoded Matroska track contents are unsupported',
-          );
-        }
         trackNumber = media.number(track[0xd7]);
         frameDuration = media.number(track[0x23e383]);
       case matroskaCluster:
@@ -177,7 +172,7 @@ Iterable<FramePacket> _block(
             : sizes.last + field.value - ((1 << (7 * field.width - 1)) - 1);
       }
       remaining -= size + offset - previousOffset;
-      if (size <= 0 || remaining < 0) {
+      if (size < 0 || remaining < 0 || (size == 0 && !media.hasEncodedFrames)) {
         throw const FormatException('Invalid Matroska lace size');
       }
       sizes.add(size);

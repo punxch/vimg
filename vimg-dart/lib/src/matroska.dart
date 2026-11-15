@@ -1,11 +1,16 @@
 import 'dart:convert';
+import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
 
 import 'binary_file.dart';
+import 'frame_packet.dart';
 import 'metadata.dart';
 import 'raw_video.dart';
+
+part 'matroska_compression.dart';
 
 const _ebml = 0x1a45dfa3;
 const _segment = 0x18538067;
@@ -36,6 +41,78 @@ final class Matroska {
   Matroska(this.file);
 
   final BinaryFile file;
+
+  late final firstVideoTrack = segmentElements()
+      .where((element) => element.id == 0x1654ae6b)
+      .expand(videoTracks)
+      .firstOrNull;
+  final _encodings = <int, List<_ContentCompression>>{};
+  final _privateData = <int, Uint8List>{};
+  late final _frameEncodings = firstVideoTrack == null
+      ? const <_ContentCompression>[]
+      : _contentEncodings(
+          firstVideoTrack!,
+        ).where((entry) => entry.scope & 1 != 0).toList();
+
+  bool get hasEncodedFrames => _frameEncodings.isNotEmpty;
+
+  Uint8List readFrame(FramePacket packet) {
+    if (packet.size < 0 || packet.size > _maxFramePayload) {
+      throw const FormatException('Invalid video frame size');
+    }
+    final bytes = _restoreContent(
+      file.read(packet.offset, packet.size),
+      _frameEncodings,
+      _maxFramePayload,
+    );
+    if (bytes.isEmpty) {
+      throw const FormatException('Invalid video frame size');
+    }
+    return bytes;
+  }
+
+  Uint8List readFramePrefix(FramePacket packet, int count) {
+    if (!hasEncodedFrames) {
+      return file.read(packet.offset, math.min(packet.size, count));
+    }
+    if (_frameEncodings.length == 1 && _frameEncodings.single.algorithm == 3) {
+      final prefix = _frameEncodings.single.settings;
+      if (prefix.length >= count)
+        return Uint8List.sublistView(prefix, 0, count);
+      final body = file.read(
+        packet.offset,
+        math.min(packet.size, count - prefix.length),
+      );
+      return _prepend(prefix, body, count);
+    }
+    final bytes = readFrame(packet);
+    return Uint8List.sublistView(bytes, 0, math.min(bytes.length, count));
+  }
+
+  Uint8List? codecPrivate(Map<int, EbmlElement> track) {
+    final field = track[0x63a2];
+    if (field == null) return null;
+    return _privateData.putIfAbsent(field.data, () {
+      const limit = 1024 * 1024;
+      final count = field.end - field.data;
+      if (count > limit) {
+        throw const FormatException('Oversized Matroska codec private data');
+      }
+      final encodings = _contentEncodings(
+        track,
+      ).where((entry) => entry.scope & 2 != 0);
+      return _restoreContent(file.read(field.data, count), encodings, limit);
+    });
+  }
+
+  List<_ContentCompression> _contentEncodings(Map<int, EbmlElement> track) {
+    final parent = track[0x6d80];
+    if (parent == null) return const [];
+    return _encodings.putIfAbsent(
+      parent.data,
+      () => _readContentEncodings(this, parent),
+    );
+  }
 
   ({int value, int width}) vint(int offset, int end, {bool id = false}) {
     if (offset >= end) throw const FormatException('Missing EBML integer');
@@ -220,10 +297,7 @@ final class Matroska {
 
   ({VideoCrop? crop, VideoOrientation? orientation, double? sampleAspect})
   videoPresentation() {
-    final tracks = segmentElements()
-        .where((e) => e.id == 0x1654ae6b)
-        .firstOrNull;
-    final track = tracks == null ? null : videoTracks(tracks).firstOrNull;
+    final track = firstVideoTrack;
     if (track == null)
       return (crop: null, orientation: null, sampleAspect: null);
     final video = fields(track[0xe0]!);
@@ -292,18 +366,16 @@ final class Matroska {
 
   String trackCodec(Map<int, EbmlElement> track) {
     final codec = text(track[0x86]);
-    final config = track[0x63a2];
-    if (codec == 'V_PRORES' &&
-        config != null &&
-        config.end - config.data == 4) {
-      final tag = file.unsigned(config.data, 4);
+    final config = codec == 'V_PRORES' || codec == 'V_MS/VFW/FOURCC'
+        ? codecPrivate(track)
+        : null;
+    if (codec == 'V_PRORES' && config != null && config.length == 4) {
+      final tag = ByteData.sublistView(config).getUint32(0);
       if (tag == 0x6170726e || tag == 0x61707268) return 'prores_raw';
     }
-    if (codec == 'V_MS/VFW/FOURCC' &&
-        config != null &&
-        config.end - config.data >= 20) {
+    if (codec == 'V_MS/VFW/FOURCC' && config != null && config.length >= 20) {
       final tag = ascii.decode(
-        file.read(config.data + 16, 4),
+        Uint8List.sublistView(config, 16, 20),
         allowInvalid: true,
       );
       return switch (tag.toUpperCase()) {

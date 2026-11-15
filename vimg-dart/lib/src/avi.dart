@@ -199,7 +199,11 @@ final class Avi {
                 video1?.indexed == true ||
                 (bitmap != null && bits <= 8) ||
                 (codec == 'cinepak' && bits == 8)
-            ? readDibPalette(file, format.data, format.end, bits)
+            ? readDibPalette(
+                format.end - format.data,
+                (offset, size) => file.read(format.data + offset, size),
+                bits,
+              )
             : null,
       ));
     }
@@ -234,9 +238,12 @@ final class Avi {
 
   HuffYuvDecoder? huffYuvDecoder() {
     final format = _header.tracks.firstOrNull?.huffFormat;
-    return format == null
-        ? null
-        : readHuffYuvFormat(file, format.data, format.end);
+    if (format == null) return null;
+    final length = format.end - format.data;
+    if (length > 1024 * 1024) {
+      throw const FormatException('Invalid HuffYUV bitmap header');
+    }
+    return readHuffYuvFormat(file.read(format.data, length));
   }
 
   bool isUncompressedRle(FramePacket packet) =>

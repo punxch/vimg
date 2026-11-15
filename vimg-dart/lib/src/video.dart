@@ -327,12 +327,7 @@ final class Video {
               onSample: (packet, sync) {
                 final position = decodeOrder.length;
                 final vp8 = name == 'vp8'
-                    ? vp8FrameTag(
-                        file.read(
-                          packet.offset,
-                          packet.size < 3 ? packet.size : 3,
-                        ),
-                      )
+                    ? vp8FrameTag(_readPrefix(packet, 3))
                     : null;
                 if (vp8?.shown == false) hidden.add(packet);
                 final anchor =
@@ -343,12 +338,7 @@ final class Video {
                     (anchor != null
                         ? anchor == position
                         : name == 'ffv1'
-                        ? isFfv1Keyframe(
-                            file.read(
-                              packet.offset,
-                              packet.size < 2 ? packet.size : 2,
-                            ),
-                          )
+                        ? isFfv1Keyframe(_readPrefix(packet, 2))
                         : name == 'rpza'
                         ? isRpzaKeyframe(_read(packet), rpzaBlocks)
                         : rle != null
@@ -728,11 +718,7 @@ final class Video {
     }
 
     if (_matroska != null) configure();
-    void parameterSet(int start, int length) {
-      final nal = file.read(start, length);
-      final key = hevc == null ? avc!.store(nal) : hevc!.store(HevcNal(nal));
-      parameters.update(key!, nal);
-    }
+    final encodedFrames = _matroska?.hasEncodedFrames ?? false;
 
     int? type;
     var keyframe = false;
@@ -745,17 +731,35 @@ final class Video {
       onDescription: configure,
       onSample: (packet, sync) {
         final before = parameters.snapshot();
+        final restored = encodedFrames ? _read(packet) : null;
+        final offset = restored == null ? packet.offset : 0;
+        final size = restored?.length ?? packet.size;
+        final read = restored == null
+            ? file.read
+            : (int start, int length) =>
+                  Uint8List.sublistView(restored, start, start + length);
+        final unsigned = restored == null
+            ? file.unsigned
+            : (int start, int length) => readBigEndian(read(start, length));
+        void parameterSet(int start, int length) {
+          final nal = read(start, length);
+          final key = hevc == null
+              ? avc!.store(nal)
+              : hevc!.store(HevcNal(nal));
+          parameters.update(key!, nal);
+        }
+
         final header = hevc?.pictureHeader(
-          packet.offset,
-          packet.size,
-          file.unsigned,
+          offset,
+          size,
+          unsigned,
           onParameterSet: parameterSet,
         );
         final avcSample = avc?.sampleHeader(
-          packet.offset,
-          packet.size,
-          file.unsigned,
-          readBytes: file.read,
+          offset,
+          size,
+          unsigned,
+          readBytes: read,
           onParameterSet: parameterSet,
         );
         type = systems?.nalType(packet) ?? header?.type ?? avcSample?.type;
@@ -1440,7 +1444,12 @@ final class Video {
     return null;
   }
 
+  Uint8List _readPrefix(FramePacket packet, int count) =>
+      _matroska?.readFramePrefix(packet, count) ??
+      file.read(packet.offset, packet.size < count ? packet.size : count);
+
   Uint8List _read(FramePacket packet) {
+    if (_matroska case final media?) return media.readFrame(packet);
     if (packet.size <= 0 || packet.size > 64 * 1024 * 1024) {
       throw const FormatException('Invalid video frame size');
     }

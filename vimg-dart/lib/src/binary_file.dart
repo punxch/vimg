@@ -43,10 +43,14 @@ final class BinaryFile {
     if (count < 1 || count > 8) {
       throw const FormatException('Invalid integer width');
     }
-    var value = 0;
-    for (final byte in read(offset, count)) {
-      value = (value << 8) | byte;
-    }
-    return value;
+    return readBigEndian(read(offset, count));
   }
+}
+
+int readBigEndian(Uint8List bytes) {
+  var value = 0;
+  for (final byte in bytes) {
+    value = (value << 8) | byte;
+  }
+  return value;
 }

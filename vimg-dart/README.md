@@ -170,6 +170,9 @@ navigation remain pending.
 
 Matroska and WebM capture apply the selected track's pixel crop and rectangular
 projection roll or mirror before user filters and tile sizing.
+Matroska restores zlib, bzip2, LZO1X and header-stripped video frames and
+codec private data before decoding, including tracks with multiple compression
+layers.
 
 `preview`, `extract` and `vcs` decode AV1 from Matroska, MP4 and IVF. IVF
 uses packet timestamps to derive playback duration and retains coded order

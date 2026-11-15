@@ -14,16 +14,19 @@ RawVideoFormat? matroskaRawVideoConfiguration(Matroska media) {
   final width = media.number(video[0xb0]) ?? 0;
   final height = media.number(video[0xba]) ?? 0;
   final vfw = media.text(track[0x86]) == 'V_MS/VFW/FOURCC';
-  final box = vfw ? track[0x63a2] : video[0x2eb524];
-  final offset = vfw ? 16 : 0;
-  if (box == null ||
-      box.end - box.data < offset + 4 ||
-      (!vfw && box.end - box.data != 4)) {
+  final box = video[0x2eb524];
+  final config = vfw ? media.codecPrivate(track) : null;
+  final Uint8List fourcc;
+  if (vfw && config != null && config.length >= 20) {
+    fourcc = Uint8List.sublistView(config, 16, 20);
+  } else if (!vfw && box != null && box.end - box.data == 4) {
+    fourcc = media.file.read(box.data, 4);
+  } else {
     throw const FormatException('Missing or invalid Matroska raw video FourCC');
   }
   final color = _matroskaColor(media, video);
   return RawVideoFormat(
-    String.fromCharCodes(media.file.read(box.data + offset, 4)),
+    String.fromCharCodes(fourcc),
     width,
     height,
     matrix: color.matrix,
@@ -60,13 +63,14 @@ RawVideoFormat? matroskaRawVideoConfiguration(Matroska media) {
 ({MsVideo1Format format, List<int>? palette}) matroskaVideo1Configuration(
   Matroska media,
 ) {
-  final config = _firstVideoTrack(media, 'msvideo1')?[0x63a2];
-  if (config == null || config.end - config.data < 40) {
+  final track = _firstVideoTrack(media, 'msvideo1');
+  final config = track == null ? null : media.codecPrivate(track);
+  if (config == null || config.length < 40) {
     throw const FormatException('Missing Microsoft Video 1 bitmap header');
   }
-  final data = ByteData.sublistView(media.file.read(config.data, 40));
+  final data = ByteData.sublistView(config);
   final headerSize = data.getUint32(0, Endian.little);
-  if (headerSize < 40 || headerSize > config.end - config.data) {
+  if (headerSize < 40 || headerSize > config.length) {
     throw const FormatException('Invalid Microsoft Video 1 bitmap header');
   }
   final bits = data.getUint16(14, Endian.little);
@@ -78,39 +82,34 @@ RawVideoFormat? matroskaRawVideoConfiguration(Matroska media) {
   return (
     format: format,
     palette: format.indexed
-        ? readDibPalette(media.file, config.data, config.end, bits)
+        ? readDibPalette(
+            config.length,
+            (start, length) =>
+                Uint8List.sublistView(config, start, start + length),
+            bits,
+          )
         : null,
   );
 }
 
 Uint8List? matroskaVideoConfiguration(Matroska media, String codec) {
   final track = _firstVideoTrack(media, codec);
-  final config = track?[0x63a2];
+  final config = track == null ? null : media.codecPrivate(track);
   if (config == null) return null;
-  final start = media.text(track![0x86]) == 'V_MS/VFW/FOURCC'
-      ? config.data + 40
-      : config.data;
-  final length = config.end - start;
-  if (length < _minimumSize(codec) || length > 1024 * 1024) return null;
-  return media.file.read(start, length);
+  final start = media.text(track![0x86]) == 'V_MS/VFW/FOURCC' ? 40 : 0;
+  if (config.length - start < _minimumSize(codec)) return null;
+  return Uint8List.sublistView(config, start);
 }
 
 HuffYuvDecoder? matroskaHuffYuvConfiguration(Matroska media, String codec) {
-  final config = _firstVideoTrack(media, codec)?[0x63a2];
-  return config == null
-      ? null
-      : readHuffYuvFormat(media.file, config.data, config.end);
+  final track = _firstVideoTrack(media, codec);
+  final config = track == null ? null : media.codecPrivate(track);
+  return config == null ? null : readHuffYuvFormat(config);
 }
 
 Map<int, EbmlElement>? _firstVideoTrack(Matroska media, String codec) {
-  final tracks = media
-      .segmentElements()
-      .where((box) => box.id == 0x1654ae6b)
-      .firstOrNull;
-  if (tracks == null) return null;
-  final track = media.videoTracks(tracks).firstOrNull;
-  if (track == null || media.trackCodec(track) != codec) return null;
-  return track;
+  final track = media.firstVideoTrack;
+  return track != null && media.trackCodec(track) == codec ? track : null;
 }
 
 Uint8List? isoVideoConfiguration(

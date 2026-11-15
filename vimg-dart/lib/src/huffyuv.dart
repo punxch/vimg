@@ -3,7 +3,6 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 
-import 'binary_file.dart';
 import 'yuv_image.dart';
 
 enum _Prediction { left, plane, median }
@@ -11,22 +10,21 @@ enum _Prediction { left, plane, median }
 bool isHuffYuvCodec(String codec) =>
     codec == 'huffyuv' || codec == 'ffvhuff' || codec == 'hymt';
 
-HuffYuvDecoder readHuffYuvFormat(BinaryFile file, int start, int end) {
-  if (end - start < 40 || end - start > 1024 * 1024) {
+HuffYuvDecoder readHuffYuvFormat(Uint8List bytes) {
+  if (bytes.length < 40 || bytes.length > 1024 * 1024) {
     throw const FormatException('Invalid HuffYUV bitmap header');
   }
-  final header = ByteData.sublistView(file.read(start, 40));
+  final header = ByteData.sublistView(bytes);
   final size = header.getUint32(0, Endian.little);
-  if (size < 40 || size > end - start) {
+  if (size < 40 || size > bytes.length) {
     throw const FormatException('Invalid HuffYUV bitmap header size');
   }
   return HuffYuvDecoder(
     header.getInt32(4, Endian.little),
     header.getInt32(8, Endian.little).abs(),
     header.getUint16(14, Endian.little),
-    file.read(start + 40, end - start - 40),
-    multithreaded:
-        String.fromCharCodes(file.read(start + 16, 4)).toUpperCase() == 'HYMT',
+    Uint8List.sublistView(bytes, 40),
+    multithreaded: String.fromCharCodes(bytes, 16, 20).toUpperCase() == 'HYMT',
   );
 }
 
