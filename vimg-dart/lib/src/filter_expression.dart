@@ -2,14 +2,18 @@ import 'dart:math' as math;
 
 typedef FilterExpression = double Function(Map<String, double> variables);
 
-FilterExpression parseFilterExpression(String source, Set<String> variables) =>
-    _Parser(source, variables).parse();
+FilterExpression parseFilterExpression(
+  String source,
+  Set<String> variables, {
+  void Function(String)? onVariable,
+}) => _Parser(source, variables, onVariable).parse();
 
 final class _Parser {
-  _Parser(this.source, this.variables);
+  _Parser(this.source, this.variables, this.onVariable);
 
   final String source;
   final Set<String> variables;
+  final void Function(String)? onVariable;
   var _offset = 0;
   static final _number = RegExp(r'(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?');
   static final _name = RegExp(r'[a-zA-Z_][a-zA-Z_0-9]*');
@@ -85,7 +89,10 @@ final class _Parser {
     final name = _match(_name);
     if (name == null) _fail();
     if (!_take('(')) {
-      if (variables.contains(name)) return (v) => v[name] ?? double.nan;
+      if (variables.contains(name)) {
+        onVariable?.call(name);
+        return (v) => v[name] ?? double.nan;
+      }
       return switch (name) {
         'PI' => (_) => math.pi,
         'E' => (_) => math.e,

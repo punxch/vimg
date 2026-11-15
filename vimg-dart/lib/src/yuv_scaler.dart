@@ -59,6 +59,20 @@ final class YuvImageScaler {
   _PlaneScaler? _chroma;
   ({int matrix, bool fullRange})? _tableColor;
   late _RgbTable _table;
+  List<FilterFramePosition> _positions = const [];
+
+  image.Image renderCapture(
+    List<FilterFramePosition> positions,
+    image.Image Function() render,
+  ) {
+    final previous = _positions;
+    _positions = positions;
+    try {
+      return render();
+    } finally {
+      _positions = previous;
+    }
+  }
 
   image.Image filterRgb(image.Image frame, {double sampleAspect = 1}) {
     if (filters == null) return frame;
@@ -106,10 +120,17 @@ final class YuvImageScaler {
 
   image.Image _renderFiltered(_VideoPlanes source) {
     final scale = width == null && height == null ? filters!._finalScale : null;
-    final frame = filters!._apply(source, deferScale: scale != null);
+    final frame = filters!._apply(
+      source,
+      _positions,
+      deferScale: scale != null,
+    );
     if (scale != null) {
       // The terminal scale can upsample chroma while converting to RGB.
-      final (w, h) = scale.dimensions(frame);
+      final (w, h) = scale.dimensions(
+        frame,
+        scale.usesFramePosition ? _positions.lastOrNull : null,
+      );
       if (_outputScale?.width != w || _outputScale?.height != h) {
         _outputScale = YuvImageScaler._fixed(w, h, scale.nearest);
       }

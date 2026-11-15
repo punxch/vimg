@@ -4,6 +4,24 @@ abstract interface class _TimingFilter {
   CaptureTimeline apply(CaptureTimeline input);
 }
 
+final class _RecordFramePosition implements _TimingFilter {
+  const _RecordFramePosition();
+
+  @override
+  CaptureTimeline apply(CaptureTimeline input) =>
+      CaptureTimeline(_events(input), input.timeBase, input.frameRate);
+
+  Iterable<CaptureTimelineEvent> _events(CaptureTimeline input) sync* {
+    final unit = input.timeBase.value;
+    var index = 0;
+    for (final event in input.events) {
+      yield event is CaptureTimedFrame
+          ? event.atFilter((index: index++, seconds: event.pts * unit))
+          : event;
+    }
+  }
+}
+
 final class _Trim implements _TimingFilter {
   factory _Trim(String? args) {
     final options = _filterOptions(args, [

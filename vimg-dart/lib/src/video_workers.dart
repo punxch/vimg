@@ -28,7 +28,23 @@ final class VideoCaptureDecoder {
     return threads == 0 || threads > available ? available : threads;
   }
 
-  Stream<_SelectedFrame> decode(Iterable<FramePacket> selected) async* {
+  Stream<_SelectedFrame> decode(Iterable<FramePacket> selected) =>
+      _decode(selected, null);
+
+  Stream<_SelectedFrame> decodeCaptures(Iterable<CaptureFrame> selected) {
+    final captures = <FramePacket, Set<CaptureFrame>>{};
+    var dynamicFilters = false;
+    for (final frame in selected) {
+      captures.putIfAbsent(frame.packet, () => {}).add(frame);
+      if (frame.positions.isNotEmpty) dynamicFilters = true;
+    }
+    return _decode(captures.keys, dynamicFilters ? captures : null);
+  }
+
+  Stream<_SelectedFrame> _decode(
+    Iterable<FramePacket> selected,
+    Map<FramePacket, Set<CaptureFrame>>? captures,
+  ) async* {
     if (_closed || _busy) throw StateError('Capture decoder is unavailable');
     _busy = true;
     var finished = false;
@@ -41,6 +57,7 @@ final class VideoCaptureDecoder {
             run,
             _scaler,
             _includeOriginal,
+            captures: captures,
           )) {
             yield frame;
           }
@@ -49,9 +66,21 @@ final class VideoCaptureDecoder {
         await _startWorkers(active);
         // Start longer GOPs early and let workers take the next available run.
         runs.sort((a, b) => b.packets.length.compareTo(a.packets.length));
+        void send(int worker, _DecodeRun run) {
+          _workers[worker].send((
+            run: run,
+            captures: captures == null
+                ? null
+                : {
+                    for (final index in run.targets)
+                      run.packets[index]: captures[run.packets[index]]!,
+                  },
+          ));
+        }
+
         var next = 0;
         for (; next < active; next++) {
-          _workers[next].send(runs[next]);
+          send(next, runs[next]);
         }
         var working = active;
         while (working > 0) {
@@ -60,7 +89,8 @@ final class VideoCaptureDecoder {
               final frame = _unpackImage(result.frame);
               final original = result.original;
               yield (
-                packet: result.packet,
+                packet: result.capture.packet,
+                capture: result.capture,
                 frame: frame,
                 original: original != null
                     ? _unpackImage(original)
@@ -70,7 +100,7 @@ final class VideoCaptureDecoder {
               _workers[result.worker].send(true);
             case final int worker:
               if (next < runs.length) {
-                _workers[worker].send(runs[next++]);
+                send(worker, runs[next++]);
               } else {
                 working--;
               }
@@ -180,9 +210,13 @@ typedef _PackedImage = ({
 });
 typedef _DecodedFrame = ({
   int worker,
-  FramePacket packet,
+  CaptureFrame capture,
   _PackedImage frame,
   _PackedImage? original,
+});
+typedef _DecodeJob = ({
+  _DecodeRun run,
+  Map<FramePacket, Set<CaptureFrame>>? captures,
 });
 typedef _DecodeFailure = ({Object error, String stack});
 
@@ -204,15 +238,22 @@ Future<void> _decodeWorker(_WorkerInput input) async {
     Iterator<_SelectedFrame>? cursor;
     await for (final command in commands) {
       if (command == null) break;
-      if (command is _DecodeRun) {
-        cursor = video._decodeRun(command, scaler, input.original).iterator;
+      if (command is _DecodeJob) {
+        cursor = video
+            ._decodeRun(
+              command.run,
+              scaler,
+              input.original,
+              captures: command.captures,
+            )
+            .iterator;
       }
       if (cursor!.moveNext()) {
         final result = cursor.current;
         final original = result.original;
         input.events.send((
           worker: input.index,
-          packet: result.packet,
+          capture: result.capture,
           frame: _packImage(result.frame),
           original: original == null || identical(original, result.frame)
               ? null

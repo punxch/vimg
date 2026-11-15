@@ -1,6 +1,6 @@
 part of 'capture.dart';
 
-List<List<FramePacket>> _selectFilteredCaptures(
+List<List<CaptureFrame>> _selectFilteredCaptures(
   CapturePlan plan,
   Iterable<FramePacket> packets,
   CaptureTimeline Function(CaptureTimeline) filter,
@@ -14,7 +14,7 @@ List<List<FramePacket>> _selectFilteredCaptures(
     frameRate,
     plan._rate.period,
   );
-  final selected = <List<FramePacket>>[];
+  final selected = <List<CaptureFrame>>[];
   for (final (index, start) in plan.starts.indexed) {
     final schedule = _CaptureSchedule(
       index,
@@ -195,7 +195,7 @@ final class _CaptureWindowReader {
         duration =
             _durationTicks(pending) ?? (elapsed > 0 ? elapsed : duration);
         yield CaptureTimedFrame(timestamp, duration, (
-          packet: pending,
+          frame: CaptureFrame(pending),
           index: index++,
         ));
       }
@@ -204,7 +204,7 @@ final class _CaptureWindowReader {
     }
     if (pending != null) {
       yield CaptureTimedFrame(timestamp, _durationTicks(pending) ?? duration, (
-        packet: pending,
+        frame: CaptureFrame(pending),
         index: index,
       ));
     }

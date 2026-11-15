@@ -187,6 +187,11 @@ accept static dimension expressions with arithmetic and functions such as
 `flags=neighbor`. Crop aligns to chroma samples by default and accepts
 `exact=1` for odd coordinates and dimensions.
 
+Crop coordinates accept frame number `n` and timestamp `t` in seconds.
+Scale accepts these variables in its dimensions with `eval=frame`.
+As in FFmpeg 8, the first frame has `n=0` in crop and `n=1` in scale.
+`--vfilter 'crop=iw/2:ih:min(n*2,iw/2):0'` pans across the frame.
+
 For example, `--vfilter 'pad=iw+32:ih+32:-1:-1:black,drawbox=8:8:64:40:yellow@0.5:3'`
 adds a centered border and draws a translucent box. Colors accept named
 values, RGB/RGBA hex and explicit opacity. `negate=components=y+u`
@@ -202,8 +207,11 @@ each seek window before conversion to the requested capture rate. For example,
 quarter-second of each window and restarts its filtered timestamps at zero.
 `trim` accepts time, PTS and frame-count limits. `setpts` accepts deterministic
 expressions over timestamps, frame counts and rates. `settb` changes the
-time base, and `fps` supports start padding, rounding and EOF modes. Wall-clock
-expressions, frame-dependent spatial expressions and branched graphs are pending.
+time base, and `fps` supports start padding, rounding and EOF modes. Spatial
+expressions use the timeline at their position in the chain. A crop after
+`fps` sees the duplicated frames, and a crop before `fps` sees the
+original frames. Wall-clock expressions, expressions that depend on earlier
+spatial evaluations, and branched graphs are pending.
 
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered

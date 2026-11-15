@@ -10,6 +10,7 @@ import 'av1/access_units.dart';
 import 'av1/frame_header.dart';
 import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
+import 'capture_timeline.dart';
 import 'cinepak.dart';
 import 'frame_packet.dart';
 import 'grid.dart' show resizeToFit;
@@ -41,6 +42,7 @@ part 'video_workers.dart';
 
 typedef _SelectedFrame = ({
   FramePacket packet,
+  CaptureFrame capture,
   image.Image frame,
   image.Image? original,
 });
@@ -996,14 +998,43 @@ final class Video {
   Iterable<_SelectedFrame> _decodeRun(
     _DecodeRun run,
     YuvImageScaler? requestedScaler,
-    bool includeOriginal,
-  ) sync* {
+    bool includeOriginal, {
+    Map<FramePacket, Set<CaptureFrame>>? captures,
+  }) sync* {
     YuvImageScaler? scalerFor(FramePacket packet) => requestedScaler == null
         ? _previewScaler
         : _presentationScaler(
             requestedScaler,
             aspect: run.sampleAspects?[packet] ?? run.sampleAspect,
           );
+    Iterable<_SelectedFrame> renderCaptures(
+      FramePacket packet,
+      _RenderPicture render,
+      YuvImageScaler? scaler,
+    ) sync* {
+      final unscaled = scaler?.unscaled;
+      for (final capture in captures?[packet] ?? [CaptureFrame(packet)]) {
+        image.Image renderAt(YuvImageScaler? target) =>
+            target == null || capture.positions.isEmpty
+            ? render(scaler: target)
+            : target.renderCapture(
+                capture.positions,
+                () => render(scaler: target),
+              );
+        final frame = renderAt(scaler);
+        yield (
+          packet: packet,
+          capture: capture,
+          frame: frame,
+          original: !includeOriginal
+              ? null
+              : identical(unscaled, scaler)
+              ? frame
+              : renderAt(unscaled),
+        );
+      }
+    }
+
     final name = run.codec;
     if (!_usesReferences(name)) {
       final packet = run.packets.single;
@@ -1064,17 +1095,7 @@ final class Video {
         );
         render = ({scaler}) => _renderRgb(source, scaler);
       }
-      final frame = render(scaler: scaler);
-      final unscaled = scaler?.unscaled;
-      yield (
-        packet: packet,
-        frame: frame,
-        original: !includeOriginal
-            ? null
-            : identical(unscaled, scaler)
-            ? frame
-            : render(scaler: unscaled),
-      );
+      yield* renderCaptures(packet, render, scaler);
       return;
     }
     final readPicture = _pictureReader(run);
@@ -1090,13 +1111,7 @@ final class Video {
               : 'Invalid $name video frame',
         );
       }
-      final scaler = scalerFor(packet);
-      final frame = render(scaler: scaler);
-      final unscaled = scaler?.unscaled;
-      final original = includeOriginal
-          ? (identical(unscaled, scaler) ? frame : render(scaler: unscaled))
-          : null;
-      yield (packet: packet, frame: frame, original: original);
+      yield* renderCaptures(packet, render, scalerFor(packet));
       target++;
     }
   }

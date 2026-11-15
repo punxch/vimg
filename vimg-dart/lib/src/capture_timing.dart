@@ -50,7 +50,7 @@ final class _CaptureSchedule {
   final double start;
   final CaptureRational rate;
   final CaptureSelection? onSelect;
-  final frames = <FramePacket>[];
+  final frames = <CaptureFrame>[];
   CaptureSource? _previous, _lastEmitted;
   late final _extraBits = (30 - rate.numerator.bitLength).clamp(0, 16);
 
@@ -96,7 +96,11 @@ final class _CaptureSchedule {
   }
 
   void push(FramePacket packet, int inputIndex, double duration) {
-    _push((packet: packet, index: inputIndex), _adjustedPts(packet), duration);
+    _push(
+      (frame: CaptureFrame(packet), index: inputIndex),
+      _adjustedPts(packet),
+      duration,
+    );
   }
 
   int _push(CaptureSource source, double pts, double duration) {
@@ -137,18 +141,21 @@ final class _CaptureSchedule {
         'Video filters produced no frames for capture ${index + 1}',
       );
     }
-    finish(last.packet, last.index);
+    _fill(last);
   }
 
-  void finish(FramePacket last, int lastIndex) {
+  void finish(FramePacket last, int lastIndex) =>
+      _fill((frame: CaptureFrame(last), index: lastIndex));
+
+  void _fill(CaptureSource last) {
     while (!complete) {
-      _add((packet: last, index: lastIndex));
+      _add(last);
     }
   }
 
   void _add(CaptureSource source) {
-    onSelect?.call(frames.length, index, source.packet, source.index);
-    frames.add(source.packet);
+    onSelect?.call(frames.length, index, source.frame.packet, source.index);
+    frames.add(source.frame);
     _lastEmitted = source;
   }
 

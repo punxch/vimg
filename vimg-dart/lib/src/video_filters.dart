@@ -1,6 +1,6 @@
 part of 'yuv_image.dart';
 
-/// A linear chain of static spatial operations and frame-timing filters.
+/// A linear chain of spatial operations and frame-timing filters.
 final class VideoFilterChain {
   VideoFilterChain._(this.source, this._filters, this._timing);
 
@@ -10,6 +10,13 @@ final class VideoFilterChain {
     }
     final filters = <_SpatialFilter>[];
     final timing = <_TimingFilter>[];
+    void addSpatial(_SpatialFilter filter) {
+      filters.add(filter);
+      if (filter is _FrameSpatialFilter && filter.usesFramePosition) {
+        timing.add(const _RecordFramePosition());
+      }
+    }
+
     for (final entry in _splitFilters(source, ',')) {
       final equal = entry.indexOf('=');
       final name = (equal < 0 ? entry : entry.substring(0, equal)).trim();
@@ -20,11 +27,11 @@ final class VideoFilterChain {
           if (name == 'hflip') filters.add(_Flip.horizontal);
           if (name == 'vflip') filters.add(_Flip.vertical);
         case 'crop':
-          filters.add(_Crop(args));
+          addSpatial(_Crop(args));
         case 'transpose':
           filters.add(_Transpose(args));
         case 'scale':
-          filters.add(_Scale(args));
+          addSpatial(_Scale(args));
         case 'pad':
           filters.add(_Pad(args));
         case 'drawbox':
@@ -72,7 +79,7 @@ final class VideoFilterChain {
   }
 
   bool get hasSpatialFilters => _filters.isNotEmpty;
-  bool get hasTimingFilters => _timing.isNotEmpty;
+  bool get usesTimeline => _timing.isNotEmpty;
 
   CaptureTimeline filterTiming(CaptureTimeline timeline) {
     for (final filter in _timing) {
@@ -86,10 +93,21 @@ final class VideoFilterChain {
     _ => null,
   };
 
-  _VideoPlanes _apply(_VideoPlanes frame, {required bool deferScale}) {
+  _VideoPlanes _apply(
+    _VideoPlanes frame,
+    List<FilterFramePosition> positions, {
+    required bool deferScale,
+  }) {
     final count = _filters.length - (deferScale ? 1 : 0);
+    var next = 0;
     for (var i = 0; i < count; i++) {
-      frame = _filters[i].apply(frame);
+      final filter = _filters[i];
+      frame =
+          filter is _FrameSpatialFilter &&
+              filter.usesFramePosition &&
+              next < positions.length
+          ? filter.applyAt(frame, positions[next++])
+          : filter.apply(frame);
     }
     return frame;
   }
@@ -214,6 +232,17 @@ abstract interface class _SpatialFilter {
   _VideoPlanes apply(_VideoPlanes frame);
 }
 
+abstract class _FrameSpatialFilter implements _SpatialFilter {
+  bool get usesFramePosition;
+  _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position);
+
+  @override
+  _VideoPlanes apply(_VideoPlanes frame) =>
+      applyAt(frame, (index: 0, seconds: 0));
+}
+
+const _frameVariables = {'n', 't'};
+
 final class _PresentationCrop implements _SpatialFilter {
   const _PresentationCrop(this.crop);
   final VideoCrop crop;
@@ -250,7 +279,7 @@ enum _Flip implements _SpatialFilter {
   );
 }
 
-final class _Crop implements _SpatialFilter {
+final class _Crop extends _FrameSpatialFilter {
   factory _Crop(String? source) {
     final options = _filterOptions(
       source,
@@ -263,25 +292,58 @@ final class _Crop implements _SpatialFilter {
       _ => throw const FormatException('crop exact must be 0 or 1'),
     };
     final keepAspect = _filterFlag(options['keep_aspect'], 'crop keep_aspect');
-    const positionVariables = {..._dimensionVariables, 'x', 'y'};
+    const positionVariables = {
+      ..._dimensionVariables,
+      ..._frameVariables,
+      'x',
+      'y',
+    };
+    var dynamicPosition = false;
+    void reference(String name) {
+      if (_frameVariables.contains(name)) dynamicPosition = true;
+    }
+
+    final x = parseFilterExpression(
+      options['x'] ?? '(iw-ow)/2',
+      positionVariables,
+      onVariable: reference,
+    );
+    final y = parseFilterExpression(
+      options['y'] ?? '(ih-oh)/2',
+      positionVariables,
+      onVariable: reference,
+    );
     return _Crop._(
       parseFilterExpression(options['w'] ?? 'iw', _dimensionVariables),
       parseFilterExpression(options['h'] ?? 'ih', _dimensionVariables),
-      parseFilterExpression(options['x'] ?? '(iw-ow)/2', positionVariables),
-      parseFilterExpression(options['y'] ?? '(ih-oh)/2', positionVariables),
+      x,
+      y,
       exact,
       keepAspect,
+      dynamicPosition,
     );
   }
 
-  _Crop._(this.width, this.height, this.x, this.y, this.exact, this.keepAspect);
+  _Crop._(
+    this.width,
+    this.height,
+    this.x,
+    this.y,
+    this.exact,
+    this.keepAspect,
+    this.usesFramePosition,
+  );
 
   final FilterExpression width, height, x, y;
   final bool exact, keepAspect;
+  @override
+  final bool usesFramePosition;
 
   @override
-  _VideoPlanes apply(_VideoPlanes frame) {
-    final vars = frame.variables;
+  _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) {
+    final vars = frame.variables
+      ..['n'] = position.index.toDouble()
+      ..['t'] = position.seconds;
     vars['out_w'] = vars['ow'] = width(vars);
     vars['out_h'] = vars['oh'] = height(vars);
     vars['out_w'] = vars['ow'] = width(vars);
@@ -417,11 +479,11 @@ final class _Rotate implements _SpatialFilter {
   }
 }
 
-final class _Scale implements _SpatialFilter {
+final class _Scale extends _FrameSpatialFilter {
   factory _Scale(String? source) {
     final options = _filterOptions(
       source,
-      ['w', 'h', 'flags'],
+      ['w', 'h', 'flags', 'eval'],
       {'width': 'w', 'height': 'h'},
     );
     final nearest = switch (options['flags']) {
@@ -431,29 +493,53 @@ final class _Scale implements _SpatialFilter {
         'Supported scale flags are bicubic and neighbor',
       ),
     };
-    return _Scale._(
-      parseFilterExpression(options['w'] ?? 'iw', _dimensionVariables),
-      parseFilterExpression(options['h'] ?? 'ih', _dimensionVariables),
-      nearest,
+    final perFrame = switch (options['eval']) {
+      null || 'init' || '0' => false,
+      'frame' || '1' => true,
+      _ => throw const FormatException('scale eval must be init or frame'),
+    };
+    final variables = perFrame
+        ? const {..._dimensionVariables, ..._frameVariables}
+        : _dimensionVariables;
+    var dynamicSize = false;
+    void reference(String name) {
+      if (_frameVariables.contains(name)) dynamicSize = true;
+    }
+
+    final width = parseFilterExpression(
+      options['w'] ?? 'iw',
+      variables,
+      onVariable: reference,
     );
+    final height = parseFilterExpression(
+      options['h'] ?? 'ih',
+      variables,
+      onVariable: reference,
+    );
+    return _Scale._(width, height, nearest, dynamicSize);
   }
 
-  _Scale._(this.width, this.height, this.nearest);
+  _Scale._(this.width, this.height, this.nearest, this.usesFramePosition);
   final FilterExpression width, height;
   final bool nearest;
+  @override
+  final bool usesFramePosition;
   final _scalers = <(int, int, int, int), _PlaneScaler>{};
 
   @override
-  _VideoPlanes apply(_VideoPlanes frame) {
-    final (w, h) = dimensions(frame);
+  _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) {
+    final (w, h) = dimensions(frame, position);
     return frame.map(
       (plane, sx, sy) => _resize(plane, _subSize(w, sx), _subSize(h, sy)),
       sampleAspect: frame.sampleAspect * frame.width * h / (frame.height * w),
     );
   }
 
-  (int, int) dimensions(_VideoPlanes frame) {
-    final vars = frame.variables;
+  (int, int) dimensions(_VideoPlanes frame, FilterFramePosition? position) {
+    final vars = frame.variables
+      // FFmpeg 8's scale evaluates after its input frame has been consumed.
+      ..['n'] = ((position?.index ?? 0) + 1).toDouble()
+      ..['t'] = position?.seconds ?? 0;
     final firstWidth = width(vars);
     vars['out_w'] = vars['ow'] = firstWidth == 0
         ? frame.width.toDouble()

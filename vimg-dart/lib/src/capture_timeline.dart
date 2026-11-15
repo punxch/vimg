@@ -13,7 +13,33 @@ extension CaptureRationalValue on CaptureRational {
 
 const captureMicroseconds = (numerator: 1, denominator: 1000000);
 
-typedef CaptureSource = ({FramePacket packet, int index});
+typedef FilterFramePosition = ({int index, double seconds});
+
+/// A single decoded picture can appear more than once after a timing filter.
+/// The values seen by spatial filters distinguish those renderings.
+final class CaptureFrame {
+  const CaptureFrame(this.packet, [this.positions = const []]);
+
+  final FramePacket packet;
+  final List<FilterFramePosition> positions;
+
+  @override
+  bool operator ==(Object other) {
+    if (other is! CaptureFrame ||
+        other.packet != packet ||
+        other.positions.length != positions.length)
+      return false;
+    for (var i = 0; i < positions.length; i++) {
+      if (positions[i] != other.positions[i]) return false;
+    }
+    return true;
+  }
+
+  @override
+  int get hashCode => Object.hash(packet, Object.hashAll(positions));
+}
+
+typedef CaptureSource = ({CaptureFrame frame, int index});
 
 sealed class CaptureTimelineEvent {
   const CaptureTimelineEvent(this.pts);
@@ -28,6 +54,15 @@ final class CaptureTimedFrame extends CaptureTimelineEvent {
 
   CaptureTimedFrame retime(int pts, {int? duration}) =>
       CaptureTimedFrame(pts, duration ?? this.duration, source);
+
+  CaptureTimedFrame atFilter(FilterFramePosition position) =>
+      CaptureTimedFrame(pts, duration, (
+        frame: CaptureFrame(
+          source.frame.packet,
+          List.unmodifiable([...source.frame.positions, position]),
+        ),
+        index: source.index,
+      ));
 }
 
 final class CaptureTimelineEnd extends CaptureTimelineEvent {

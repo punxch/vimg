@@ -115,6 +115,7 @@ void _checkErrors() {
     '[in]crop=4:2[out]',
     "scale=w='min(4,2):h=2",
     'scale=4:2:flags=lanczos',
+    'scale=w=iw-n:h=ih',
     'crop=5:2:w=4',
     'crop=iw-n:ih',
     'transpose=clock:passthrough=unknown',
@@ -223,6 +224,115 @@ Future<void> _checkCli(String? executable) async {
     final kept = Directory(rawCaptures).listSync().cast<File>().single;
     final rawFrame = image.decodeBmp(kept.readAsBytesSync())!;
     check(rawFrame.width == 2 && rawFrame.height == 3, 'Kept RGB tile');
+
+    // Four 32×24 BGR gradients at 4 fps, with RGB values (7x, 9y, 20i+2x+2y).
+    const motion = 'test/fixtures/filter-motion.avi';
+    const dynamicChain =
+        "fps=8,crop=16:12:n*2:8*t,scale=w='16+2*if(isnan(n),0,n)'"
+        ':h=12:flags=neighbor:eval=frame';
+    const reference = [
+      0xe0506b94,
+      0xf5149408,
+      0xa707d4dc,
+      0x33c40a1f,
+      0x1dc55a9b,
+      0x59629a07,
+      0x1485fd8b,
+      0x76e84a9e,
+    ];
+    List<File> ordered(String path) =>
+        Directory(path).listSync().cast<File>()
+          ..sort((a, b) => a.path.compareTo(b.path));
+    final dynamicPath = '${temp.path}/dynamic-extract';
+    await run([
+      'extract',
+      '-n1',
+      '-f8',
+      '-t1s',
+      '-T4',
+      '--output-dir',
+      dynamicPath,
+      '--vfilter',
+      dynamicChain,
+      motion,
+    ]);
+    final dynamicFrames = ordered(dynamicPath);
+    check(dynamicFrames.length == 8, 'Dynamic extract count');
+    for (final (i, file) in dynamicFrames.indexed) {
+      final frame = image.decodeBmp(file.readAsBytesSync())!;
+      check(
+        frame.width == 18 + 2 * i && frame.height == 12,
+        'Dynamic scale size',
+      );
+      // FFmpeg 8 showinfo reports Adler-32 over BGR24, initialized at zero.
+      var low = 0, high = 0;
+      for (final pixel in frame) {
+        for (final value in [pixel.b, pixel.g, pixel.r]) {
+          low = (low + value.toInt()) % 65521;
+          high = (high + low) % 65521;
+        }
+      }
+      check((high << 16 | low) == reference[i], 'Dynamic frame $i pixels');
+    }
+    final dynamicKeep = '${temp.path}/dynamic-keep';
+    await run([
+      'vcs',
+      '-c1',
+      '-n1',
+      '-f8',
+      '-t1s',
+      '-T1',
+      '-H12',
+      '--keep',
+      '--output-dir',
+      dynamicKeep,
+      '--vfilter',
+      dynamicChain,
+      '-o',
+      '${temp.path}/dynamic.avif',
+      motion,
+    ]);
+    final keptDynamic = ordered(dynamicKeep);
+    check(keptDynamic.length == 8, 'Dynamic keep count');
+    for (final (i, file) in keptDynamic.indexed) {
+      _sameBytes(
+        file.readAsBytesSync(),
+        dynamicFrames[i].readAsBytesSync(),
+        'Kept dynamic frame $i',
+      );
+    }
+
+    for (final (name, filter) in [
+      ('before-fps', 'crop=16:12:n*2:8*t,fps=8'),
+      ('retimed', 'fps=8,setpts=PTS+1,crop=16:12:n*2:8*t,setpts=PTS-1'),
+    ]) {
+      final folder = '${temp.path}/$name';
+      await run([
+        'extract',
+        '-n1',
+        '-f8',
+        '-t1s',
+        '--output-dir',
+        folder,
+        '--vfilter',
+        filter,
+        motion,
+      ]);
+      final outputs = ordered(folder);
+      check(outputs.length == 8, '$name capture count');
+      for (final (i, file) in outputs.indexed) {
+        final frame = image.decodeBmp(file.readAsBytesSync())!;
+        final x = name == 'before-fps' ? (i ~/ 2) * 2 : i * 2;
+        final y = name == 'before-fps' ? (i ~/ 2) * 2 : i + 1;
+        final first = frame.getPixel(0, 0);
+        check(
+          first.r == 7 * x &&
+              first.g == 9 * y &&
+              first.b == 20 * (i ~/ 2) + 2 * (x + y),
+          '$name evaluates on its input timeline at frame $i',
+        );
+      }
+    }
 
     final rejected = '${temp.path}/rejected';
     final result = await run([

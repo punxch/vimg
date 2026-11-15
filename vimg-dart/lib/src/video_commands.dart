@@ -6,6 +6,7 @@ import 'package:path/path.dart' as paths;
 
 import 'avif_encoder.dart';
 import 'capture.dart';
+import 'capture_timeline.dart';
 import 'frame_packet.dart';
 import 'grid.dart';
 import 'output.dart';
@@ -98,15 +99,15 @@ image.Image _previewFrame(Video video, int seconds) {
 
 const defaultCaptureThreads = 4;
 
-List<List<FramePacket>> _selectCaptures(
+List<List<CaptureFrame>> _selectCaptures(
   Video video,
   CapturePlan plan,
   VideoFilterChain? filters, {
   CaptureSelection? onSelect,
 }) {
   final packets = video.packets();
-  if (filters == null || !filters.hasTimingFilters) {
-    return plan.select(packets, onSelect: onSelect);
+  if (filters == null || !filters.usesTimeline) {
+    return plan.selectFrames(packets, onSelect: onSelect);
   }
   final stream = video.metadata.streams.firstWhere(
     (stream) => !stream.attached,
@@ -115,7 +116,7 @@ List<List<FramePacket>> _selectCaptures(
       .split('/')
       .map(int.parse)
       .toList();
-  return plan.selectFiltered(
+  return plan.selectFilteredFrames(
     packets,
     filters.filterTiming,
     timeBase: (numerator: numerator, denominator: denominator),
@@ -145,8 +146,8 @@ Future<void> extractFrames(
           ? YuvImageScaler(filters: filters)
           : null,
     );
-    await for (final decoded in decoder.decode(paths.keys)) {
-      _publishCaptures(paths[decoded.packet]!, decoded.frame);
+    await for (final decoded in decoder.decodeCaptures(paths.keys)) {
+      _publishCaptures(paths[decoded.capture]!, decoded.frame);
     }
   } finally {
     try {
@@ -157,13 +158,13 @@ Future<void> extractFrames(
   }
 }
 
-Map<FramePacket, List<String>> _capturePaths(
+Map<CaptureFrame, List<String>> _capturePaths(
   String input,
   String directory,
   CapturePlan plan,
-  List<List<FramePacket>> selected,
+  List<List<CaptureFrame>> selected,
 ) {
-  final paths = <FramePacket, List<String>>{};
+  final paths = <CaptureFrame, List<String>>{};
   final stem = videoStem(input);
   final secondsWidth = plan.usableDuration.floor().toString().length;
   final frameWidth = plan.frames.toString().length;
@@ -260,7 +261,7 @@ Future<void> writeContactSheet(
     final inter = video.usesReferencePictures;
     final spatial = filters?.hasSpatialFilters == true ? filters : null;
     final scaleInDecoder = spatial != null || video.scalesBeforeRgb;
-    Map<FramePacket, List<String>>? paths;
+    Map<CaptureFrame, List<String>>? paths;
     if (captureDirectory != null) {
       Directory(captureDirectory).createSync(recursive: true);
       paths = _capturePaths(input, captureDirectory, plan, selected);
@@ -274,10 +275,10 @@ Future<void> writeContactSheet(
           : null,
       includeOriginal: paths != null && scaleInDecoder,
     );
-    final cached = <FramePacket, image.Image>{};
+    final cached = <CaptureFrame, image.Image>{};
     if (inter) {
       var decodedBytes = 0;
-      await for (final result in decoder.decode(
+      await for (final result in decoder.decodeCaptures(
         selected.expand((tile) => tile),
       )) {
         final frame = result.frame;
@@ -287,9 +288,9 @@ Future<void> writeContactSheet(
             'Contact sheet exceeds 256 MiB of decoded tiles',
           );
         }
-        cached[result.packet] = frame;
+        cached[result.capture] = frame;
         if (paths != null) {
-          _publishCaptures(paths[result.packet]!, result.original!);
+          _publishCaptures(paths[result.capture]!, result.original!);
         }
       }
     }
@@ -297,12 +298,12 @@ Future<void> writeContactSheet(
         .map((start) => timestampLabel(start.floor()))
         .toList();
     final tiles = List<image.Image?>.filled(selected.length, null);
-    final last = List<FramePacket?>.filled(selected.length, null);
+    final last = List<CaptureFrame?>.filled(selected.length, null);
     image.Image? animation, previousGrid;
     AvifEncoder? avif;
     GridComposer? composer;
     for (var frame = 0; frame < options.frames; frame++) {
-      final missing = <FramePacket, List<int>>{};
+      final missing = <CaptureFrame, List<int>>{};
       var changed = false;
       for (var tile = 0; tile < tiles.length; tile++) {
         final packet = selected[tile][frame];
@@ -316,15 +317,15 @@ Future<void> writeContactSheet(
         changed = true;
       }
       if (missing.isNotEmpty) {
-        await for (final result in decoder.decode(missing.keys)) {
-          final captures = paths?.remove(result.packet);
+        await for (final result in decoder.decodeCaptures(missing.keys)) {
+          final captures = paths?.remove(result.capture);
           if (captures != null) {
             _publishCaptures(captures, result.original ?? result.frame);
           }
           final tile = scaleInDecoder
               ? result.frame
               : resizeToFit(result.frame, width: width, height: height);
-          for (final index in missing[result.packet]!) {
+          for (final index in missing[result.capture]!) {
             tiles[index] = tile;
           }
         }

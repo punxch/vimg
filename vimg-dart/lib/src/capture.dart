@@ -143,6 +143,11 @@ final class CapturePlan {
   List<List<FramePacket>> select(
     Iterable<FramePacket> packets, {
     CaptureSelection? onSelect,
+  }) => _packets(selectFrames(packets, onSelect: onSelect));
+
+  List<List<CaptureFrame>> selectFrames(
+    Iterable<FramePacket> packets, {
+    CaptureSelection? onSelect,
   }) {
     final schedules = [
       for (final (index, start) in starts.indexed)
@@ -200,6 +205,22 @@ final class CapturePlan {
     CaptureRational? timeBase,
     double? frameRate,
     CaptureSelection? onSelect,
+  }) => _packets(
+    selectFilteredFrames(
+      packets,
+      filter,
+      timeBase: timeBase,
+      frameRate: frameRate,
+      onSelect: onSelect,
+    ),
+  );
+
+  List<List<CaptureFrame>> selectFilteredFrames(
+    Iterable<FramePacket> packets,
+    CaptureTimeline Function(CaptureTimeline) filter, {
+    CaptureRational? timeBase,
+    double? frameRate,
+    CaptureSelection? onSelect,
   }) => _selectFilteredCaptures(
     this,
     packets,
@@ -208,6 +229,10 @@ final class CapturePlan {
     frameRate,
     onSelect,
   );
+
+  List<List<FramePacket>> _packets(List<List<CaptureFrame>> frames) => [
+    for (final tile in frames) [for (final frame in tile) frame.packet],
+  ];
 }
 
 String timestampLabel(int seconds) {
