@@ -61,8 +61,9 @@ void _pixel(image.Image frame, int x, int y, int r, int g, int b, int a) {
 }
 
 void _checkOracle() {
-  // FFmpeg 8.1 filtered planar frames converted using the same limited-range
-  // RGB matrix and nearest chroma placement as the unscaled Dart renderer.
+  // FFmpeg 8.1 filtered planar frames. The 8-bit cases use the unscaled
+  // Dart renderer's RGB matrix and nearest chroma placement. The 10-bit
+  // cases use FFmpeg's RGB24 output after filtering.
   for (final (file, filters, index, width, height, expected) in [
     (_avc, 'pad=iw+16:ih+12:-1:-1:navy', 8, 182, 122, 0xb79aded9),
     (_avc, 'drawbox=-3:5:37:29:red@0.5:3', 8, 166, 110, 0x9bb72417),
@@ -76,8 +77,8 @@ void _checkOracle() {
     ),
     (_avc, _chain, 8, 128, 128, 0xa414a54d),
     (_anamorphic, 'pad=aspect=2:x=-1:y=-1:color=red', 5, 96, 64, 0x3207fe3d),
-    (_hevc, 'negate=components=y+u', 6, 166, 110, 0xdb216262),
-    (_hevc, 'pad=iw+16:ih+12:-1:-1:#1af085', 6, 182, 122, 0x844e755b),
+    (_hevc, 'negate=components=y+u', 6, 166, 110, 0xefc4cafc),
+    (_hevc, 'pad=iw+16:ih+12:-1:-1:#1af085', 6, 182, 122, 0x006d3acd),
   ]) {
     final video = Video(file);
     try {

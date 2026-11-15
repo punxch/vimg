@@ -8,7 +8,15 @@ typedef _YuvGeometry = ({
   int chromaWidth,
   int chromaHeight,
   int outputChromaWidth,
+  _ScaleKernel chromaKernel,
 });
+
+bool _needsChromaResampling(
+  int width,
+  int horizontal,
+  int vertical,
+  int depth,
+) => (horizontal != 0 || vertical != 0) && (width.isOdd || depth > 8);
 
 /// Resize video samples before RGB conversion. Reuse filter taps across frames.
 final class YuvImageScaler {
@@ -133,15 +141,28 @@ final class YuvImageScaler {
       if (frame.packedRgb && scale.algorithm != _ScaleAlgorithm.bicubic) {
         frame = scale.resize(frame, w, h);
       } else {
-        if (_outputScale?.width != w || _outputScale?.height != h) {
-          _outputScale = YuvImageScaler._fixed(w, h, scale.algorithm);
-        }
-        outputScale = _outputScale;
+        outputScale = _fixedOutput(w, h, scale.algorithm);
       }
     } else if (width != null || height != null) {
       outputScale = _outputScale ??= YuvImageScaler(
         width: width,
         height: height,
+      );
+    }
+    if (outputScale == null &&
+        frame.planes.length == 3 &&
+        !frame.rgb &&
+        _needsChromaResampling(
+          frame.width,
+          frame.subX,
+          frame.subY,
+          math.max(frame.planes.first.depth, frame.planes[1].depth),
+        )) {
+      // RGB conversion can resample chroma even when the luma size is fixed.
+      outputScale = _fixedOutput(
+        frame.width,
+        frame.height,
+        _ScaleAlgorithm.bicubic,
       );
     }
     var y = frame.planes.first.atOrigin;
@@ -180,6 +201,21 @@ final class YuvImageScaler {
     );
   }
 
+  YuvImageScaler _fixedOutput(
+    int width,
+    int height,
+    _ScaleAlgorithm algorithm,
+  ) {
+    final previous = _outputScale;
+    if (previous != null &&
+        previous.width == width &&
+        previous.height == height &&
+        previous._algorithm == algorithm) {
+      return previous;
+    }
+    return _outputScale = YuvImageScaler._fixed(width, height, algorithm);
+  }
+
   (int, int) _dimensions(int sourceWidth, int sourceHeight) => _exact
       ? (width!, height!)
       : fitDimensions(sourceWidth, sourceHeight, width: width, height: height);
@@ -214,9 +250,13 @@ final class YuvImageScaler {
       );
     }
     final gbr = matrix == 0 && cb.isNotEmpty;
-    // RGB24 contact sheets use one chroma sample per horizontal pixel pair
-    // at even widths. Odd widths and GBR use a sample at every pixel.
-    final halfChroma = !gbr && width.isEven && cb.isNotEmpty;
+    // FFmpeg reuses chroma across pixel pairs for even-width RGB output when
+    // the input already has chroma subsampling.
+    final halfChroma =
+        !gbr &&
+        width.isEven &&
+        cb.isNotEmpty &&
+        (subsamplingX != 0 || subsamplingY != 0);
     final geometry = (
       sourceWidth: sourceWidth,
       sourceHeight: sourceHeight,
@@ -225,6 +265,7 @@ final class YuvImageScaler {
       chromaWidth: (sourceWidth + (1 << subsamplingX) - 1) >> subsamplingX,
       chromaHeight: (sourceHeight + (1 << subsamplingY) - 1) >> subsamplingY,
       outputChromaWidth: cb.isEmpty ? 0 : (halfChroma ? width >> 1 : width),
+      chromaKernel: _algorithm.kernel(chroma: !gbr),
     );
     if (geometry != _geometry) {
       _luma = _PlaneScaler(
@@ -241,11 +282,14 @@ final class YuvImageScaler {
               geometry.chromaHeight,
               geometry.outputChromaWidth,
               height,
-              kernel: _algorithm.kernel(chroma: !gbr),
+              kernel: geometry.chromaKernel,
             );
       _geometry = geometry;
     }
-    final useTable = halfChroma && lumaDepth == 8 && chromaDepth == 8;
+    // The paired-chroma filter output quantizes its YUV samples before the
+    // RGB lookup, including when the decoded planes use more than eight bits.
+    final useTable =
+        halfChroma && (_exact || lumaDepth == 8 && chromaDepth == 8);
     final fractionalBits = useTable ? 0 : 9;
     final luma = _luma.resize(
       y,

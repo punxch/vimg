@@ -86,7 +86,17 @@ image.Image yuvImage({
   }
   if (scaler != null) {
     final (scaledWidth, scaledHeight) = scaler._dimensions(width, height);
-    if (scaledWidth != width || scaledHeight != height) {
+    if (scaledWidth != width ||
+        scaledHeight != height ||
+        (scaler._exact &&
+            matrix != 0 &&
+            cb.isNotEmpty &&
+            _needsChromaResampling(
+              width,
+              subsamplingX,
+              subsamplingY,
+              math.max(lumaDepth, chromaDepth),
+            ))) {
       return scaler._resize(
         y: y,
         cb: cb,

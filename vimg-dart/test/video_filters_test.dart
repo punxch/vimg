@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -210,32 +211,74 @@ void _checkLinearScale() {
   final y = plane(32, 24, 13, 7, 220);
   final u = plane(16, 12, 5, 19, 225);
   final v = plane(16, 12, 27, 13, 225);
-  for (final (flag, expected) in [
-    ('bilinear', 0x77af208e),
-    ('bicublin', 0x22e81fdf),
+  List<int> samples(List<int> source, int depth) => depth == 8
+      ? source
+      : [for (final (i, value) in source.indexed) 4 * value + (i & 3)];
+  image.Image filterYuv(String filter, int depth, {bool fullChroma = false}) =>
+      yuvImage(
+        y: samples(y, depth),
+        cb: samples(fullChroma ? plane(32, 24, 5, 19, 225) : u, depth),
+        cr: samples(fullChroma ? plane(32, 24, 27, 13, 225) : v, depth),
+        stride: 32,
+        chromaStride: fullChroma ? 32 : 16,
+        width: 32,
+        height: 24,
+        cropLeft: 0,
+        cropTop: 0,
+        matrix: 6,
+        fullRange: false,
+        lumaDepth: depth,
+        chromaDepth: depth,
+        subsamplingX: fullChroma ? 0 : 1,
+        subsamplingY: fullChroma ? 0 : 1,
+        scaler: YuvImageScaler(filters: VideoFilterChain.parse(filter)),
+      );
+  for (final (flag, depth, expected) in [
+    ('bilinear', 8, 0x77af208e),
+    ('bicublin', 8, 0x22e81fdf),
+    ('bilinear', 10, 0x5862215f),
+    ('bilinear,hflip', 10, 0xfab41fd0),
+    ('bicublin,hflip', 10, 0xa5da1ef7),
   ]) {
-    final output = yuvImage(
-      y: y,
-      cb: u,
-      cr: v,
-      stride: 32,
-      chromaStride: 16,
-      width: 32,
-      height: 24,
-      cropLeft: 0,
-      cropTop: 0,
-      matrix: 6,
-      fullRange: false,
-      scaler: YuvImageScaler(
-        filters: VideoFilterChain.parse('scale=16:12:flags=$flag'),
-      ),
-    );
+    final output = filterYuv('scale=16:12:flags=$flag', depth);
     check((output.width, output.height) == (16, 12), '$flag YUV dimensions');
     check(
       checksum(output, image.ChannelOrder.rgb) == expected,
-      '$flag YUV pixels',
+      '$flag $depth-bit YUV pixels',
     );
   }
+
+  // FFmpeg rgb24 after scale=15:11:flags=bilinear,format=yuv420p,hflip.
+  final expected = base64Decode(
+    '/6qU/Jlvr5NFVpAXCogAAG0AAFYA4cY5/7tB96kWoagAU58AAZoAAJQAAIMA/7G5/6CVy5lr'
+    'dZc+J40SAHsAAFcAhIQH/8hh/7Y9v60RcqUAHaAAAJoAAIoA/5XX/6LT85eooZJ8U4pRBIQl'
+    'AG4AGEoA+bRz/7566qlOnaEjRp4AAJcAAIcAtjqb/6r//5rn04y7foaPJoZkAHg5AEgOeXVQ'
+    '/8iy/6eNyp5icZw3IpUMAIUAHw13snPm/6D//4j1p4XKUIOeB3lzAFxJA0U326Oy/6vH752d'
+    'mppxSpNGEoMiAC2yOCzI/5H//4X/0IH/fX3iMHe1AGqIAEdbSTlr/6bv/6HZx5WtdY+COoBe'
+    'AFTAAByrzVz//5H/9YP/q3n/W3TrBXHAAFuWAh9xxXbg/6n/8ZHpn4y+Y36aAIFeAEhRTiqB'
+    '/6L//5D/2Hv/g3T/KXD/AGHYADG0OS3B/6f//5L/x4z6jX3VAKMDAHUAADkAs4ST/6z9/43/'
+    'rIL/V3zwD27UAFHAACGqwGn//5X/7or/t3n/J64ABpAAAG8ANVMA/7Zy/7OB1alxg51nOI5m'
+    'AHhmAEV0ZRO//4T//4r/43f/R7kAGKUAAJMAB1AAtlwA/9I68ccepLkbVacnCZY1AGFYSgCd'
+    '/zj//5D//3z/',
+  );
+  final odd = filterYuv('scale=15:11:flags=bilinear,hflip', 8);
+  check((odd.width, odd.height) == (15, 11), 'Odd-width filtered YUV');
+  final actual = odd.getBytes(order: image.ChannelOrder.rgb);
+  for (final (i, value) in actual.indexed) {
+    check(
+      (value - expected[i]).abs() <= 1,
+      'Filtered odd-width RGB channel $i',
+    );
+  }
+  final fullChroma = filterYuv(
+    'scale=14:10:flags=bilinear',
+    8,
+    fullChroma: true,
+  );
+  check(
+    checksum(fullChroma, image.ChannelOrder.rgb) == 0xfbd8d384,
+    'Scaled 4:4:4 RGB pixels',
+  );
 }
 
 void _checkScaleAspect() {

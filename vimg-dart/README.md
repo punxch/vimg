@@ -197,8 +197,8 @@ proportional scaling and set square pixels for downstream filters.
 For packed RGB, `neighbor`, `bilinear` and `bicublin` use FFmpeg's paired chroma
 sampling when reducing an even width by at least half. Add `+full_chroma_inp`
 to sample the RGB channels at full resolution.
-RGB conversion after spatial filters can differ from FFmpeg for YUV input
-with odd output dimensions or high bit depth.
+RGB conversion after spatial filters interpolates subsampled chroma at odd
+widths and keeps full-resolution chroma for 4:4:4 input.
 
 Crop coordinates accept frame number `n` and timestamp `t` in seconds.
 Scale accepts these variables in its dimensions with `eval=frame`.
