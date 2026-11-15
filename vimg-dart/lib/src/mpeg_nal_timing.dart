@@ -15,9 +15,10 @@ List<int> _nalDisplayOrder(
     throw const FormatException('Missing MPEG video random-access picture');
   }
   final initial = configurations[frames[first].offset]!;
-  final avc = codec == 'h264' ? AvcConfiguration.inBand(initial) : null;
+  final avc = codec == 'h264'
+      ? AvcPictureOrder(AvcConfiguration.inBand(initial))
+      : null;
   final hevc = codec == 'hevc' ? HevcConfiguration.inBand(initial) : null;
-  final avcReferences = ReferenceState();
   final hevcOrder = HevcPictureOrder();
   final pictures = <({int index, int epoch, int poc})>[];
   var epoch = 0;
@@ -35,7 +36,9 @@ List<int> _nalDisplayOrder(
       if (order.reset) epoch++;
       if (order.output) pictures.add((index: i, epoch: epoch, poc: order.poc));
     } else {
-      final order = _avcDisplayOrder(avc!, avcReferences, bytes);
+      final order = avc!.observe(bytes);
+      if (order == null)
+        throw const FormatException('Missing H.264 picture order');
       if (order.reset) epoch++;
       pictures.add((index: i, epoch: epoch, poc: order.poc));
     }
@@ -50,36 +53,6 @@ List<int> _nalDisplayOrder(
     return poc == 0 ? a.index.compareTo(b.index) : poc;
   });
   return [for (final picture in pictures) picture.index];
-}
-
-({int poc, bool reset}) _avcDisplayOrder(
-  AvcConfiguration configuration,
-  ReferenceState references,
-  Uint8List sample,
-) {
-  SliceHeader? previous;
-  int? poc;
-  var reset = false;
-  for (final nal in configuration.nals(sample)) {
-    final type = nal[0] & 31;
-    if (type == 7 || type == 8) {
-      configuration.store(nal);
-    } else if (type == 1 || type == 5) {
-      final slice = SliceHeader(nal, configuration.pictures);
-      if (slice.colorPlane != 0 || previous?.samePicture(slice) == true) {
-        continue;
-      }
-      final pending = references.begin(slice);
-      references.commit(pending, null);
-      final clearsNumber = slice.marking?.any((entry) => entry.op == 5) == true;
-      reset |= pending.idrStart || clearsNumber;
-      final fieldOrder = pending.pocFor(slice.bottomField);
-      poc = clearsNumber ? 0 : math.min(poc ?? fieldOrder, fieldOrder);
-      previous = slice;
-    }
-  }
-  if (poc == null) throw const FormatException('Missing H.264 picture order');
-  return (poc: poc, reset: reset);
 }
 
 int? _displayPeriod(Map<int, int>? stamps) {

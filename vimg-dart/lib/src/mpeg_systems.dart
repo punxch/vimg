@@ -6,8 +6,7 @@ import 'binary_file.dart';
 import 'frame_packet.dart';
 import 'h264/access_unit.dart';
 import 'h264/parameters.dart';
-import 'h264/reference.dart';
-import 'h264/slice_header.dart';
+import 'h264/picture_order.dart';
 import 'hevc/access_unit.dart';
 import 'hevc/nal.dart';
 import 'hevc/parameters.dart';
@@ -67,7 +66,7 @@ final class MpegSystemsVideo {
 
   Uint8List read(FramePacket frame) {
     final data = _input.read(frame, _program.videoId);
-    return isMpegVideo(programCodec) ? data : _lengthPrefix(data);
+    return isMpegVideo(programCodec) ? data : annexBToLengthPrefixed(data);
   }
 
   _SystemsIndex _scan() {
@@ -773,28 +772,4 @@ final class _AccessUnits {
     _nal();
     _frame(_avcPrefix?.$1 ?? _length);
   }
-}
-
-Uint8List _lengthPrefix(Uint8List bytes) {
-  final nals = <Uint8List>[];
-  var start = -1, zeros = 0;
-  for (var i = 0; i < bytes.length; i++) {
-    final byte = bytes[i];
-    if (byte == 0) {
-      zeros++;
-      continue;
-    }
-    if (byte == 1 && zeros >= 2) {
-      if (start >= 0 && i - zeros > start) {
-        nals.add(Uint8List.sublistView(bytes, start, i - zeros));
-      }
-      start = i + 1;
-    }
-    zeros = 0;
-  }
-  if (start >= 0 && bytes.length - zeros > start) {
-    nals.add(Uint8List.sublistView(bytes, start, bytes.length - zeros));
-  }
-  if (nals.isEmpty) throw const FormatException('Missing Annex B NAL units');
-  return lengthPrefixNals(nals);
 }

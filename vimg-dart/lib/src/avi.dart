@@ -32,6 +32,7 @@ typedef _Track = ({
   MsRleFormat? rle,
   MsVideo1Format? video1,
   _Chunk? huffFormat,
+  _Chunk? nalFormat,
   List<int>? palette,
 });
 
@@ -124,8 +125,8 @@ final class Avi {
       final codec = switch (compression) {
         'MJPG' || 'JPEG' => 'mjpeg',
         'PNG ' || 'MPNG' => 'png',
-        'H264' || 'X264' || 'AVC1' => 'h264',
-        'HEVC' || 'H265' => 'hevc',
+        'H264' || 'X264' || 'AVC1' || 'AVC3' => 'h264',
+        'HEVC' || 'H265' || 'HVC1' || 'HEV1' => 'hevc',
         'XVID' || 'DIVX' || 'DX50' || 'FMP4' => 'mpeg4',
         'FFV1' => 'ffv1',
         'HFYU' => 'huffyuv',
@@ -189,6 +190,7 @@ final class Avi {
         rle: rle,
         video1: video1,
         huffFormat: isHuffYuvCodec(codec) ? format : null,
+        nalFormat: codec == 'h264' || codec == 'hevc' ? format : null,
         palette:
             rle != null ||
                 video1?.indexed == true ||
@@ -212,6 +214,20 @@ final class Avi {
       _header.tracks.firstOrNull?.cinepakDescription;
   MsRleFormat? get rleFormat => _header.tracks.firstOrNull?.rle;
   MsVideo1Format? get video1Format => _header.tracks.firstOrNull?.video1;
+
+  Uint8List? nalPrivateData() {
+    final format = _header.tracks.firstOrNull?.nalFormat;
+    if (format == null) return null;
+    var length = format.end - format.data;
+    if (length <= 40) return null;
+    final headerSize = _u32(format.data);
+    // Some muxers report the alignment byte in the chunk length only.
+    if (headerSize.isOdd && headerSize == length - 1) length = headerSize;
+    if (length - 40 > 1024 * 1024) {
+      throw const FormatException('Oversized AVI codec configuration');
+    }
+    return file.read(format.data + 40, length - 40);
+  }
 
   HuffYuvDecoder? huffYuvDecoder() {
     final format = _header.tracks.firstOrNull?.huffFormat;

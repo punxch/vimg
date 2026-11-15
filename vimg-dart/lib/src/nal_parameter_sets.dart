@@ -38,3 +38,27 @@ Uint8List lengthPrefixNals(Iterable<Uint8List> nals, {int lengthBytes = 4}) {
   }
   return buffer;
 }
+
+Uint8List annexBToLengthPrefixed(Uint8List bytes) {
+  final nals = <Uint8List>[];
+  var start = -1, zeros = 0;
+  for (var i = 0; i < bytes.length; i++) {
+    final byte = bytes[i];
+    if (byte == 0) {
+      zeros++;
+      continue;
+    }
+    if (byte == 1 && zeros >= 2) {
+      if (start >= 0 && i - zeros > start) {
+        nals.add(Uint8List.sublistView(bytes, start, i - zeros));
+      }
+      start = i + 1;
+    }
+    zeros = 0;
+  }
+  if (start >= 0 && bytes.length - zeros > start) {
+    nals.add(Uint8List.sublistView(bytes, start, bytes.length - zeros));
+  }
+  if (nals.isEmpty) throw const FormatException('Missing Annex B NAL units');
+  return lengthPrefixNals(nals);
+}

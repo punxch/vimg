@@ -93,12 +93,16 @@ final class HevcConfiguration {
     return null;
   }
 
-  List<HevcSliceHeader> slices(Uint8List sample) {
+  List<HevcSliceHeader> slices(
+    Uint8List sample, {
+    void Function((int, int), Uint8List)? onParameterSet,
+  }) {
     final result = <HevcSliceHeader>[];
     for (final nal in nals(sample)) {
       if (nal.header.layer != 0) continue;
       if (!nal.header.codedSlice) {
-        store(nal);
+        final key = store(nal);
+        if (key != null) onParameterSet?.call(key, nal.bytes);
         continue;
       }
       final previous = result.lastOrNull;

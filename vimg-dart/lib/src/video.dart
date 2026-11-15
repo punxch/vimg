@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:image/image.dart' as image;
 
 import 'avi.dart';
+import 'avi_nal.dart';
 import 'av1/access_units.dart';
 import 'av1/frame_header.dart';
 import 'av1/picture_decoder.dart';
@@ -147,6 +148,9 @@ final class Video {
   }
 
   late final _nalTimeline = _indexNalVideo();
+  late final _aviNal = _avi != null && (codec == 'h264' || codec == 'hevc')
+      ? AviNal(_avi!, codec)
+      : null;
   final _previewNalConfigurations = <FramePacket, _NalConfiguration>{};
   final _avcFieldPairKeys = <FramePacket>{};
   final _previewAv1Configurations = <FramePacket, Uint8List>{};
@@ -414,7 +418,9 @@ final class Video {
   }
 
   Iterable<FramePacket> _orderedIfNeeded(Iterable<FramePacket> packets) =>
-      _iso?.hasOverlappingVideoFragments == true || _ivf?.outOfOrder == true
+      _iso?.hasOverlappingVideoFragments == true ||
+          _ivf?.outOfOrder == true ||
+          _aviNal != null
       ? _presentationOrder(packets)
       : packets;
 
@@ -618,6 +624,26 @@ final class Video {
     void Function(FramePacket, int?, bool, _NalConfiguration?, bool)? onSample,
     _IsoSection? section,
   }) sync* {
+    if (_aviNal case final avi?) {
+      for (final frame in avi.frames) {
+        final packet = frame.packet;
+        final _NalConfiguration? configuration = frame.randomAccess
+            ? (record: avi.record, parameterSets: frame.parameters)
+            : null;
+        onSample?.call(
+          packet,
+          frame.type,
+          frame.randomAccess,
+          configuration,
+          false,
+        );
+        if (!frame.shown || preview && !frame.keyframe) continue;
+        if (preview && configuration != null)
+          _previewNalConfigurations[packet] = configuration;
+        yield packet;
+      }
+      return;
+    }
     final systems = _systems;
     final name = section?.codec ?? codec;
     final isHevc = name == 'hevc';
@@ -1298,7 +1324,9 @@ final class Video {
     if (packet.size <= 0 || packet.size > 64 * 1024 * 1024) {
       throw const FormatException('Invalid video frame size');
     }
-    return _systems?.read(packet) ?? file.read(packet.offset, packet.size);
+    return _systems?.read(packet) ??
+        _aviNal?.read(packet) ??
+        file.read(packet.offset, packet.size);
   }
 
   image.Image decode(FramePacket packet, {bool preview = false}) {

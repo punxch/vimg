@@ -131,6 +131,10 @@ Standalone H.264 and HEVC Annex B streams support probe, preview, extraction
 and contact sheets. Their timeline starts at zero and uses picture order and
 the signalled frame rate. Streams without a signalled rate use 25 fps.
 
+AVI also supports H.264 and HEVC chunks with Annex B start codes or a
+length-prefixed codec configuration. Presentation uses the AVI sample clock
+and the bitstream's picture order. Empty chunks leave gaps in the clock.
+
 Matroska, MP4/MOV, MPEG-TS, MPEG-PS and elementary `.m1v`/`.m2v` streams
 support MPEG-1 and MPEG-2 I/P/B pictures. MP4/MOV can supply the sequence
 headers in the video samples, an `esds` descriptor or a QuickTime `glbl`
