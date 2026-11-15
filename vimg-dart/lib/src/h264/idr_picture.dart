@@ -194,8 +194,8 @@ final class _Reconstruction {
   var decoded = 0;
 
   void decode(SliceHeader slice, PendingPicture? pending) {
-    if (slice.mbaff && slice.kind != SliceKind.intra) {
-      throw UnsupportedError('H.264 MBAFF inter prediction is unavailable');
+    if (slice.mbaff && slice.kind == SliceKind.b) {
+      throw UnsupportedError('H.264 MBAFF B slices are unavailable');
     }
     final SliceData reader = slice.pps.cabac
         ? CabacSlice(slice)
@@ -216,6 +216,9 @@ final class _Reconstruction {
     final b = slice.kind == SliceKind.b
         ? BDirect(slice, pending!.poc, references, motion!, motion1!)
         : null;
+    late final topFields = pending!.mbaffLists(references, false);
+    late final bottomFields = pending!.mbaffLists(references, true);
+    bool? bottomSkipped;
     var address = slice.firstMbAddress;
     while (true) {
       if (address >= blocks.length || blocks[address] != null) {
@@ -224,19 +227,72 @@ final class _Reconstruction {
       final x = slice.mbaff ? _mbaff.column(address) : address % width;
       final row = slice.mbaff ? _mbaff.row(address) : address ~/ width;
       final Macroblock? left, top, corner, topRight;
+      bool? skipped;
       if (slice.mbaff) {
+        MbaffNeighbor lookup(int at, int dx, int dy, int w, int h) =>
+            _mbaff.neighbor(at, reader.mbaffField, dx, dy, w, h);
+        Macroblock? skipNeighbor(int at, int dx, int dy) {
+          final other = lookup(at, dx, dy, 16, 16).block;
+          return other?.slice == slice ? other : null;
+        }
+
+        bool readSkip(int at) =>
+            reader.readSkip(skipNeighbor(at, -1, 0), skipNeighbor(at, 0, -1));
+
         if (address.isEven) {
-          reader.mbaffField = reader.readMbaffField(
-            x == 0 ? null : _neighbor(address - 2, slice),
-            row == 0 ? null : _neighbor(address - 2 * width, slice),
-          );
+          final leftPair = x == 0 ? null : _neighbor(address - 2, slice);
+          final topPair = row == 0
+              ? null
+              : _neighbor(address - 2 * width, slice);
+          if (slice.kind == SliceKind.intra) {
+            reader.mbaffField = reader.readMbaffField(leftPair, topPair);
+          } else {
+            reader.mbaffField =
+                leftPair?.mbaffField ?? topPair?.mbaffField ?? false;
+            skipped = readSkip(address);
+            // A skipped top macroblock takes its mode from the bottom
+            // macroblock's field flag when the bottom is coded.
+            bottomSkipped = skipped ? readSkip(address + 1) : null;
+            if (!skipped || bottomSkipped == false) {
+              reader.mbaffField = reader.readMbaffField(leftPair, topPair);
+            }
+          }
+        } else if (slice.kind != SliceKind.intra) {
+          skipped = bottomSkipped ?? readSkip(address);
         }
         SampleNeighbor neighbor(int dx, int dy, int w, int h) {
-          final at = _mbaff.neighbor(address, reader.mbaffField, dx, dy, w, h);
-          return at.block?.slice == slice ? at : (block: null, x: 0, y: 0);
+          final at = lookup(address, dx, dy, w, h);
+          return at.block?.slice == slice
+              ? (block: at.block, x: at.x, y: at.y)
+              : (block: null, x: 0, y: 0);
         }
 
         reader.mbaffNeighbor = neighbor;
+        if (motion != null) {
+          motion.mbaffField = reader.mbaffField;
+          motion.mbaffNeighbor = (column, localRow, above) {
+            final dx = column - 4 * x, dy = localRow - 4 * row;
+            if (dx >= 0 && dx < 4 && dy >= 0 && dy < 4) {
+              return (x: column, y: localRow, field: reader.mbaffField);
+            }
+            final at = lookup(
+              address,
+              dx < 0 ? -1 : 4 * dx,
+              // A corner above a partition uses the last sample row of
+              // the neighboring 4×4 block, which can change field parity.
+              dy < 0 ? -1 : 4 * dy + (above ? 3 : 0),
+              16,
+              16,
+            );
+            final other = at.block;
+            if (other?.slice != slice) return null;
+            return (
+              x: 4 * _mbaff.column(at.address) + at.x ~/ 4,
+              y: 4 * _mbaff.row(at.address) + at.y ~/ 4,
+              field: other!.mbaffField,
+            );
+          };
+        }
         left = neighbor(-1, 0, 16, 16).block;
         top = neighbor(0, -1, 16, 16).block;
         corner = neighbor(-1, -1, 16, 16).block;
@@ -251,9 +307,20 @@ final class _Reconstruction {
             ? null
             : _neighbor(address - width + 1, slice);
       }
+      final blockReferences = reader.mbaffField && slice.kind != SliceKind.intra
+          ? (row.isOdd ? bottomFields : topFields)
+          : references;
       final block = switch (slice.kind) {
         SliceKind.intra => reader.readIntra(left, top),
-        SliceKind.p => reader.readP(left, top, motion!, x, row, references.l0),
+        SliceKind.p => reader.readP(
+          left,
+          top,
+          motion!,
+          x,
+          row,
+          blockReferences.l0,
+          skipped: skipped,
+        ),
         SliceKind.b => reader.readB(left, top, b!, x, row),
       };
       _transform = block.field ? _fieldTransform : _frameTransform;
@@ -271,7 +338,16 @@ final class _Reconstruction {
           corner: usable(corner),
           topRight: usable(topRight),
         );
-        _reconstruct(block, reader.coefficients, x, row, available);
+        _reconstruct(
+          block,
+          reader.coefficients,
+          x,
+          row,
+          available,
+          constrainedNeighbor: slice.pps.constrainedIntra
+              ? reader.mbaffNeighbor
+              : null,
+        );
       } else {
         _reconstructInter(
           block,
@@ -280,13 +356,16 @@ final class _Reconstruction {
           row,
           motion!,
           b?.l1,
-          references,
+          blockReferences,
           pending!.poc,
         );
       }
       blocks[address++] = block;
       decoded++;
-      if ((!slice.mbaff || address.isEven) && reader.endOfSlice()) return;
+      if ((!slice.mbaff || address.isEven) && reader.endOfSlice()) {
+        motion?.mbaffNeighbor = null;
+        return;
+      }
     }
   }
 
@@ -300,8 +379,9 @@ final class _Reconstruction {
     MacroblockCoefficients levels,
     int mbX,
     int mbY,
-    Neighbors available,
-  ) {
+    Neighbors available, {
+    SampleNeighbor Function(int, int, int, int)? constrainedNeighbor,
+  }) {
     final sps = picture.sps;
     final lumaQp = block.qp + sps.lumaQpOffset;
     final bypass = sps.transformBypass && lumaQp == 0;
@@ -312,6 +392,26 @@ final class _Reconstruction {
         mbY,
         mbaffField: block.mbaffField,
       );
+      final full = component == 0 || sps.fullChroma;
+      final width = full ? 16 : sps.chromaWidth;
+      final height = full ? 16 : sps.chromaHeight;
+      bool intraAt(int x, int y) =>
+          constrainedNeighbor!(x, y, width, height).block?.intra == true;
+      bool leftRange(int first, int count) {
+        for (var line = first; line < first + count; line++) {
+          if (!intraAt(-1, line)) return false;
+        }
+        return true;
+      }
+
+      final predictionNeighbors = constrainedNeighbor == null
+          ? available
+          : (
+              left: leftRange(0, height),
+              top: available.top,
+              corner: available.corner,
+              topRight: available.topRight,
+            );
       if (block.pcm) {
         final samples = sps.chromaWidth * sps.chromaHeight;
         _copyBlock(
@@ -323,7 +423,7 @@ final class _Reconstruction {
           component == 0 ? 16 : sps.chromaWidth,
           height: component == 0 ? 16 : sps.chromaHeight,
         );
-      } else if (component == 0 || sps.fullChroma) {
+      } else if (full) {
         _reconstructFullIntra(
           block,
           levels.levels[component],
@@ -334,7 +434,11 @@ final class _Reconstruction {
           offset,
           component == 0 ? lumaQp : _chromaTransformQp(block, component - 1),
           bypass,
-          available,
+          predictionNeighbors,
+          leftRange: constrainedNeighbor == null ? null : leftRange,
+          leftCornerAt: constrainedNeighbor == null
+              ? null
+              : (y) => intraAt(-1, y),
         );
       } else {
         _chromaPrediction.chroma(
@@ -342,8 +446,9 @@ final class _Reconstruction {
           stride,
           offset,
           block.chromaMode,
-          available,
+          predictionNeighbors,
           sps.chromaHeight,
+          leftRange: constrainedNeighbor == null ? null : leftRange,
         );
         _reconstructChroma(
           plane,
@@ -393,8 +498,10 @@ final class _Reconstruction {
     int yOffset,
     int qp,
     bool bypass,
-    Neighbors available,
-  ) {
+    Neighbors available, {
+    bool Function(int first, int count)? leftRange,
+    bool Function(int row)? leftCornerAt,
+  }) {
     final prediction = _predictionFor(component);
     final four = _scaling.four[component + _colorPlane];
     if (block.intra16) {
@@ -428,7 +535,15 @@ final class _Reconstruction {
         final x = blockX(z);
         final row = blockY(z);
         final offset = yOffset + 4 * (row * stride + x);
-        final neighbors = _withinMb(x * 4, row * 4, size, available, i);
+        var neighbors = _withinMb(x * 4, row * 4, size, available, i);
+        if (x == 0 && leftRange != null) {
+          neighbors = (
+            left: leftRange(4 * row, size),
+            top: neighbors.top,
+            corner: leftCornerAt!(4 * row - 1),
+            topRight: neighbors.topRight,
+          );
+        }
         final mode = block.predictionMode(x, row);
         prediction.luma(plane, stride, offset, size, mode, neighbors);
         if (bypass) {
@@ -464,7 +579,12 @@ final class _Reconstruction {
     final lumaQp = block.qp + sps.lumaQpOffset;
     final bypass = sps.transformBypass && lumaQp == 0;
     for (var component = 0; component < levels.levels.length; component++) {
-      final (plane, stride, offset) = _target(component, mbX, mbY);
+      final (plane, stride, offset) = _target(
+        component,
+        mbX,
+        mbY,
+        mbaffField: block.mbaffField,
+      );
       final prediction = _predictionFor(component);
       predictInter(
         prediction.pixels,
@@ -477,6 +597,7 @@ final class _Reconstruction {
         references,
         slice,
         poc,
+        mbaffField: block.mbaffField,
       );
       if (component == 0 || sps.fullChroma) {
         _copyBlock(prediction.pixels, 0, plane, offset, stride, 16);

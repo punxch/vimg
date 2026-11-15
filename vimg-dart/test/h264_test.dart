@@ -444,6 +444,40 @@ const _mbaff422Planes = [
   [0xb0c13729, 0xabc9fbc8, 0xce483441],
 ];
 
+// x264 I/P with multiple references, constrained intra prediction and
+// skipped macroblocks, including pairs with just one skipped macroblock.
+const _mbaffPCabacPlanes = [
+  [0xd9624e48, 0x04a729b5, 0x7983d3a3],
+  [0x7a9d365f, 0xee9480fe, 0x4a31cb8b],
+  [0xbb51f94c, 0x5e5e6430, 0x9779c538],
+  [0x7d9d870a, 0xce2546c2, 0xe2278313],
+  [0x6d881a95, 0xdc7ffb84, 0x1f8596a6],
+  [0x39144804, 0x99c00548, 0x01735a01],
+  [0x82239cc9, 0x3c41a900, 0x29415c33],
+  [0xbb1cf746, 0xe5da46e8, 0xf9d69380],
+];
+
+// JM I/P with explicit luma and chroma weights added to the P slice headers.
+const _mbaffPWeightedPlanes = [
+  [0xa8cbeef5, 0x50fcef8e, 0xfdde1b49],
+  [0xdfe0a34c, 0x4866d2ee, 0xad15ae02],
+  [0xd8de1230, 0x7719ef59, 0xc03f86cb],
+  [0x055133e1, 0x421ebda3, 0xe88fbcc0],
+];
+
+// JM independently coded 4:4:4 planes. Each plane was also decoded
+// as a monochrome stream by FFmpeg to obtain the reference checksums.
+const _mbaffPSeparatePlanes = [
+  [0x43f016cb, 0x4aed37d6, 0x4aed37d6],
+  [0x441569c5, 0x7d40995e, 0x8e4e8b1d],
+  [0x66a5e6dc, 0xe69fccbb, 0x4b149cf1],
+  [0x26eb11df, 0xb555a3f2, 0xd2930908],
+  [0xf7038cd0, 0x7a639aab, 0xca7bf2a5],
+  [0x83ff8389, 0x8ea5c443, 0x244dba4e],
+  [0x3b74418e, 0xd04d8b43, 0x68abc001],
+  [0xa311be11, 0xbd801d3a, 0x20486538],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -597,6 +631,9 @@ Future<void> main(List<String> arguments) async {
   const paffTs = 'test/fixtures/avc-paff-cabac.ts';
   const mbaffCavlc = 'test/fixtures/avc-mbaff-cavlc.mkv';
   const mbaff422 = 'test/fixtures/avc-mbaff-cabac422.mkv';
+  const mbaffPCabac = 'test/fixtures/avc-mbaff-p-cabac.mkv';
+  const mbaffPWeighted = 'test/fixtures/avc-mbaff-p-weighted-cavlc.mkv';
+  const mbaffPSeparate = 'test/fixtures/avc-mbaff-p-separate.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -894,6 +931,33 @@ Future<void> main(List<String> arguments) async {
     mbaff: true,
     dimensions: (96, 64),
   );
+  _checkPlanes(
+    mbaffPCabac,
+    _mbaffPCabacPlanes,
+    inter: true,
+    mbaff: true,
+    dimensions: (192, 128),
+  );
+  _checkPlanes(
+    mbaffPWeighted,
+    _mbaffPWeightedPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    mbaff: true,
+    dimensions: (96, 64),
+  );
+  _checkPlanes(
+    mbaffPSeparate,
+    _mbaffPSeparatePlanes,
+    inter: true,
+    profile: 244,
+    chromaFormat: 3,
+    separate: true,
+    mbaff: true,
+    dimensions: (96, 64),
+  );
 
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
@@ -954,6 +1018,7 @@ Future<void> main(List<String> arguments) async {
       (separateCavlc, 64, 48),
       (fieldMp4, 64, 64),
       (mbaff422, 96, 64),
+      (mbaffPWeighted, 96, 64),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -979,6 +1044,7 @@ Future<void> main(List<String> arguments) async {
       ('field', fieldTs, 64, 64),
       ('paff', paffTs, 64, 64),
       ('mbaff', mbaff422, 96, 64),
+      ('mbaff-p', mbaffPWeighted, 96, 64),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';

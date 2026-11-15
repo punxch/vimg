@@ -107,12 +107,35 @@ void deblockPicture(List<Macroblock?> blocks, H264Picture picture) {
 void _deblockMbaff(MbaffLayout layout, H264Picture picture) {
   final sps = picture.sps;
   final planes = [picture.y, picture.cb, picture.cr];
+  final motion = picture.motionL0, motion1 = picture.motionL1;
   for (var address = 0; address < layout.blocks.length; address++) {
     final block = layout.blocks[address]!;
     final slice = block.slice;
     if (slice.deblocking == 1) continue;
     final field = block.mbaffField;
     final column = layout.column(address), row = layout.row(address);
+    int strength(
+      Macroblock other,
+      int otherAddress,
+      int x,
+      int y,
+      int px,
+      int py,
+      int intraStrength,
+    ) {
+      if (block.intra || other.intra) return intraStrength;
+      return _interStrength(
+        block,
+        other,
+        motion!,
+        motion1,
+        column * 4 + x,
+        row * 4 + y,
+        layout.column(otherAddress) * 4 + px,
+        layout.row(otherAddress) * 4 + py,
+      );
+    }
+
     for (var component = 0; component < planes.length; component++) {
       final plane = planes[component];
       if (plane.isEmpty) continue;
@@ -145,7 +168,7 @@ void _deblockMbaff(MbaffLayout layout, H264Picture picture) {
         int across,
         int along,
         int count,
-        int strength,
+        int Function(int) strengthAt,
       ) {
         final shift = depth - 8;
         final average = (currentQp + qp(other) + 1) >> 1;
@@ -154,10 +177,12 @@ void _deblockMbaff(MbaffLayout layout, H264Picture picture) {
         final beta =
             deblockBeta[(average + slice.betaOffset).clamp(0, 51)] << shift;
         if (alpha == 0 || beta == 0) return;
-        final limit = strength == 4
-            ? 0
-            : deblockLimit[strength - 1][index] << shift;
         for (var i = 0; i < count; i++) {
+          final strength = strengthAt(i);
+          if (strength == 0) continue;
+          final limit = strength == 4
+              ? 0
+              : deblockLimit[strength - 1][index] << shift;
           _filter(
             plane,
             offset + i * along,
@@ -186,26 +211,69 @@ void _deblockMbaff(MbaffLayout layout, H264Picture picture) {
           null,
           slice.alphaOffset,
           slice.betaOffset,
-          (_, _) => 3,
+          (edge, segment) {
+            final x = vertical ? edge : segment;
+            final y = vertical ? segment : edge;
+            return strength(
+              block,
+              address,
+              x,
+              y,
+              x - (vertical ? 1 : 0),
+              y - (vertical ? 0 : 1),
+              3,
+            );
+          },
         );
       }
 
       for (var y = 0; y < height; y++) {
         final left = neighbor(-1, y);
-        if (left != null) boundary(left, start + y * step, 1, step, 1, 4);
+        if (left == null) continue;
+        // Chroma 4:2:0 uses the corresponding luma strength of the same field.
+        final line = height == 16
+            ? y
+            : (field && !left.mbaffField)
+            ? 2 * y
+            : (y & ~1) * 2 + (y & 1);
+        final at = layout.neighbor(address, field, -1, line, 16, 16);
+        boundary(left, start + y * step, 1, step, 1, (_) {
+          return strength(at.block!, at.address, 0, line ~/ 4, 3, at.y ~/ 4, 4);
+        });
       }
       interior(true);
+
+      void horizontal(
+        Macroblock other,
+        int sampleRow,
+        int offset,
+        int across,
+        int intraStrength,
+      ) {
+        final at = layout.neighbor(address, field, 0, sampleRow, 16, 16);
+        boundary(other, offset, across, 1, width, (i) {
+          final x = i * 4 ~/ width;
+          return strength(
+            at.block!,
+            at.address,
+            x,
+            0,
+            x,
+            at.y ~/ 4,
+            intraStrength,
+          );
+        });
+      }
 
       final top = neighbor(0, -1);
       if (top != null) {
         if (!field && top.mbaffField) {
           // A frame below two fields has a separate boundary for each parity.
           final evenTop = neighbor(0, -2);
-          if (evenTop != null)
-            boundary(evenTop, start, 2 * stride, 1, width, 3);
-          boundary(top, start + stride, 2 * stride, 1, width, 3);
+          if (evenTop != null) horizontal(evenTop, -2, start, 2 * stride, 3);
+          horizontal(top, -1, start + stride, 2 * stride, 3);
         } else {
-          boundary(top, start, step, 1, width, field ? 3 : 4);
+          horizontal(top, -1, start, step, field ? 3 : 4);
         }
       }
       interior(false);
@@ -233,18 +301,32 @@ int _strength(
   final y = mbY * 4 + (vertical ? segment : edge);
   final px = x - (vertical ? 1 : 0);
   final py = y - (vertical ? 0 : 1);
+  return _interStrength(block, other, motion!, motion1, x, y, px, py);
+}
+
+int _interStrength(
+  Macroblock block,
+  Macroblock other,
+  MotionField motion,
+  MotionField? motion1,
+  int x,
+  int y,
+  int px,
+  int py,
+) {
   if (block.codedLuma & (1 << blockIndex(x & 3, y & 3)) != 0 ||
       other.codedLuma & (1 << blockIndex(px & 3, py & 3)) != 0) {
     return 2;
   }
+  if (block.mbaffField != other.mbaffField) return 1;
   bool same(MotionField first, MotionField second) {
     if (first.identityAt(px, py) != second.identityAt(x, y)) return false;
     final a = first.vectorAt(px, py);
     final b = second.vectorAt(x, y);
-    return (a.x - b.x).abs() < 4 && (a.y - b.y).abs() < (field ? 2 : 4);
+    return (a.x - b.x).abs() < 4 && (a.y - b.y).abs() < (block.field ? 2 : 4);
   }
 
-  final primary = same(motion!, motion);
+  final primary = same(motion, motion);
   if (motion1 == null) return primary ? 0 : 1;
   return (primary && same(motion1, motion1)) ||
           (same(motion, motion1) && same(motion1, motion))

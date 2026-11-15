@@ -28,7 +28,7 @@ extension BidirectionalSlice on SliceData {
     final x = mbX * 4, y = mbY * 4;
     final whole = (x: x, y: y, width: 4, height: 4);
     final block = Macroblock(header, -1);
-    if (_skip(left, top)) {
+    if (readSkip(left, top)) {
       motion.derive(whole, [whole], owner);
       _previousQpDelta = false;
       return block

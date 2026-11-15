@@ -127,7 +127,7 @@ abstract class SliceData {
   }
 
   bool endOfSlice();
-  bool _skip(Macroblock? left, Macroblock? top);
+  bool readSkip(Macroblock? left, Macroblock? top);
   int _pType();
   int _pSubType();
   int _bType(int context);

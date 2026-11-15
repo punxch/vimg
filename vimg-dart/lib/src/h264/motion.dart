@@ -4,6 +4,7 @@ import 'dart:typed_data';
 typedef MotionVector = ({int x, int y});
 typedef MotionPartition = ({int x, int y, int width, int height});
 typedef _Candidate = ({int reference, MotionVector vector});
+typedef MotionNeighbor = ({int x, int y, bool field});
 
 const zeroMotion = (x: 0, y: 0);
 
@@ -26,6 +27,8 @@ final class MotionField {
   late final Uint8List _decoded;
   late final Int16List _vectors, _differences;
   Uint8List? _direct;
+  MotionNeighbor? Function(int x, int y, bool above)? mbaffNeighbor;
+  bool mbaffField = false;
 
   int _index(int x, int y) =>
       x < 0 || x >= width || y < 0 || y >= height ? -1 : y * width + x;
@@ -35,11 +38,18 @@ final class MotionField {
     return index < 0 || _owners[index] != owner ? -1 : _reference[index];
   }
 
+  int neighborReferenceAt(int x, int y, int owner) {
+    final (index, scale) = _neighborIndex(x, y, owner);
+    return index < 0 ? -1 : _scaleReference(_reference[index], scale);
+  }
+
   MotionVector differenceAt(int x, int y, int owner) {
-    final index = _index(x, y);
-    if (index < 0 || _owners[index] != owner || _decoded[index] == 0)
-      return zeroMotion;
-    return (x: _differences[index * 2], y: _differences[index * 2 + 1]);
+    final (index, scale) = _neighborIndex(x, y, owner);
+    if (index < 0 || _decoded[index] == 0) return zeroMotion;
+    return (
+      x: _differences[index * 2],
+      y: _scaleVertical(_differences[index * 2 + 1], scale),
+    );
   }
 
   MotionVector vectorAt(int x, int y) {
@@ -96,16 +106,35 @@ final class MotionField {
     setVector(part, zeroMotion, zeroMotion);
   }
 
-  _Candidate? _candidate(int x, int y, int owner) {
+  _Candidate? _candidate(int x, int y, int owner, {bool above = false}) {
+    final (index, scale) = _neighborIndex(x, y, owner, above: above);
+    if (index < 0 || _decoded[index] == 0) return null;
+    return (
+      reference: _scaleReference(_reference[index], scale),
+      vector: (
+        x: _vectors[index * 2],
+        y: _scaleVertical(_vectors[index * 2 + 1], scale),
+      ),
+    );
+  }
+
+  (int, int) _neighborIndex(int x, int y, int owner, {bool above = false}) {
+    var scale = 0;
+    final lookup = mbaffNeighbor;
+    if (lookup != null) {
+      final target = lookup(x, y, above);
+      if (target == null) return (-1, 0);
+      if (target.field != mbaffField) scale = target.field ? 1 : -1;
+      x = target.x;
+      y = target.y;
+    }
     final index = _index(x, y);
-    if (index < 0 || _owners[index] != owner || _decoded[index] == 0)
-      return null;
-    return (reference: _reference[index], vector: vectorAt(x, y));
+    return (index < 0 || _owners[index] != owner ? -1 : index, scale);
   }
 
   MotionVector predictSkip(MotionPartition part, int owner) {
     final left = _candidate(part.x - 1, part.y, owner);
-    final top = _candidate(part.x, part.y - 1, owner);
+    final top = _candidate(part.x, part.y - 1, owner, above: true);
     if (left == null ||
         top == null ||
         (left.reference == 0 && left.vector == zeroMotion) ||
@@ -164,11 +193,29 @@ final class MotionField {
         cy ~/ 4 == y ~/ 4 &&
         _scanIndex(cx, cy) >= _scanIndex(x, y);
     final corner =
-        (later ? null : _candidate(cx, cy, owner)) ??
-        _candidate(x - 1, cy, owner);
-    return (_candidate(x - 1, y, owner), _candidate(x, cy, owner), corner);
+        (later ? null : _candidate(cx, cy, owner, above: true)) ??
+        _candidate(x - 1, cy, owner, above: true);
+    return (
+      _candidate(x - 1, y, owner),
+      _candidate(x, cy, owner, above: true),
+      corner,
+    );
   }
 }
+
+int _scaleVertical(int value, int scale) => switch (scale) {
+  1 => value * 2,
+  -1 => value ~/ 2,
+  _ => value,
+};
+
+int _scaleReference(int index, int scale) => index < 0
+    ? index
+    : switch (scale) {
+        1 => index >> 1,
+        -1 => index * 2,
+        _ => index,
+      };
 
 int _scanIndex(int x, int y) =>
     ((y & 2) << 2) | ((x & 2) << 1) | ((y & 1) << 1) | (x & 1);

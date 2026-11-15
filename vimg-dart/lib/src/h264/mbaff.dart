@@ -1,5 +1,7 @@
 import 'slice_data.dart';
 
+typedef MbaffNeighbor = ({Macroblock? block, int address, int x, int y});
+
 /// Maps between macroblock-pair scan order and sample rows in a frame (§6.4).
 final class MbaffLayout {
   MbaffLayout(this.blocks, this.mbWidth);
@@ -13,7 +15,7 @@ final class MbaffLayout {
   static int firstRow(int row, int height, bool field) =>
       field ? (row & ~1) * height + (row & 1) : row * height;
 
-  SampleNeighbor neighbor(
+  MbaffNeighbor neighbor(
     int address,
     bool field,
     int x,
@@ -21,7 +23,7 @@ final class MbaffLayout {
     int width,
     int height,
   ) {
-    const unavailable = (block: null, x: 0, y: 0);
+    const unavailable = (block: null, address: -1, x: 0, y: 0);
     if (y >= height || (x >= width && y >= 0)) return unavailable;
     final sampleX = column(address) * width + x;
     final sampleY = firstRow(row(address), height, field) + y * (field ? 2 : 1);
@@ -38,6 +40,7 @@ final class MbaffLayout {
     final member = targetField ? line & 1 : line ~/ height;
     return (
       block: blocks[top + member],
+      address: top + member,
       x: sampleX % width,
       y: targetField ? line >> 1 : line % height,
     );

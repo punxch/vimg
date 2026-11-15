@@ -94,6 +94,20 @@ final class PendingPicture {
       ? _store
       : _frameReferences(_store);
 
+  late final _byIdentity = {for (final ref in _store) ref.identity: ref};
+
+  ReferenceLists mbaffLists(ReferenceLists frames, bool bottom) {
+    List<ReferencePicture?> fields(List<ReferencePicture?> list) => [
+      for (final ref in list)
+        for (final parity in [bottom, !bottom])
+          if (ref == null)
+            null
+          else
+            _byIdentity[referenceIdentityWithParity(ref.identity, parity)],
+    ];
+    return (l0: fields(frames.l0), l1: fields(frames.l1));
+  }
+
   List<ReferencePicture?> pList(SliceHeader slice) {
     final short = _available.where((ref) => ref.longIndex == null).toList();
     final max = 1 << slice.pps.sps.frameNumBits;

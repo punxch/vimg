@@ -20,11 +20,11 @@ final class CavlcSlice extends SliceData {
   }
 
   @override
-  bool _skip(Macroblock? left, Macroblock? top) {
+  bool readSkip(Macroblock? left, Macroblock? top) {
     final sps = header.pps.sps;
     final run =
         _skipRun ??
-        header.bits.ue(sps.mbWidth * header.mbHeight - header.firstMb);
+        header.bits.ue(sps.mbWidth * header.mbHeight - header.firstMbAddress);
     _skipRun = run == 0 ? null : run - 1;
     return run > 0;
   }

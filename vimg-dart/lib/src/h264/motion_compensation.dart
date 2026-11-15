@@ -3,7 +3,7 @@ import 'motion.dart';
 import 'reference.dart';
 import 'slice_header.dart';
 
-/// Inter prediction for progressive pictures (§8.4.2.2–8.4.2.3).
+/// Inter prediction for frame and field macroblocks (§8.4.2.2–8.4.2.3).
 void predictInter(
   List<int> output,
   int plane,
@@ -14,8 +14,9 @@ void predictInter(
   MotionField? motion1,
   ReferenceLists references,
   SliceHeader header,
-  int poc,
-) {
+  int poc, {
+  required bool mbaffField,
+}) {
   final luma = plane == 0;
   final sps = header.pps.sps;
   final depth = luma ? sps.lumaDepth : sps.chromaDepth;
@@ -27,10 +28,13 @@ void predictInter(
   final size = blockWidth * 4;
   final unit = fullSize ? 4 : 8;
   final weights = header.weights;
+  final bottomField = mbaffField ? mbY.isOdd : header.bottomField;
+  final sourceMbY = mbaffField ? mbY ~/ 2 : mbY;
   final denominator = luma ? weights?.lumaShift : weights?.chromaShift;
   for (var py = 0; py < 4; py++) {
     for (var px = 0; px < 4; px++) {
       final x = mbX * 4 + px, y = mbY * 4 + py;
+      final sourceY = sourceMbY * 4 + py;
       final index0 = motion0.referenceAt(x, y, owner);
       final index1 = motion1?.referenceAt(x, y, owner) ?? -1;
       final first = index0 < 0
@@ -39,9 +43,9 @@ void predictInter(
               getReference(references.l0, index0),
               plane,
               x,
-              y,
-              motion0,
-              header.bottomField,
+              sourceY,
+              motion0.vectorAt(x, y),
+              bottomField,
             );
       final second = index1 < 0
           ? null
@@ -49,15 +53,19 @@ void predictInter(
               getReference(references.l1, index1),
               plane,
               x,
-              y,
-              motion1!,
-              header.bottomField,
+              sourceY,
+              motion1!.vectorAt(x, y),
+              bottomField,
             );
       if (first == null && second == null) {
         throw const FormatException('H.264 inter block has no reference');
       }
-      final weight0 = index0 < 0 ? null : weights?.l0[index0][plane];
-      final weight1 = index1 < 0 ? null : weights?.l1[index1][plane];
+      final weight0 = index0 < 0
+          ? null
+          : weights?.l0[mbaffField ? index0 >> 1 : index0][plane];
+      final weight1 = index1 < 0
+          ? null
+          : weights?.l1[mbaffField ? index1 >> 1 : index1][plane];
       final targetX = px * blockWidth, targetY = py * blockHeight;
       var implicit = 32;
       if (first != null &&
@@ -127,7 +135,7 @@ _Source _source(
   int plane,
   int x,
   int y,
-  MotionField field,
+  MotionVector vector,
   bool? bottomField,
 ) {
   final picture = ref.picture!;
@@ -137,7 +145,6 @@ _Source _source(
   final row = plane == 0 ? picture.stride : picture.chromaStride;
   final stride = fieldOfFrame ? 2 * row : row;
   final height = (data.length + (skipTopRow ? row : 0)) ~/ stride;
-  final vector = field.vectorAt(x, y);
   final chroma420 = plane != 0 && picture.sps.chromaFormat == 1;
   final correction = chroma420 && bottomField != ref.bottomField
       ? (bottomField == true ? 2 : -2)

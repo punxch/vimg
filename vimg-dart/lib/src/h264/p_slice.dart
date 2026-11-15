@@ -7,14 +7,16 @@ extension PredictiveSlice on SliceData {
     MotionField motion,
     int mbX,
     int mbY,
-    List<ReferencePicture?> references,
-  ) {
+    List<ReferencePicture?> references, {
+    bool? skipped,
+  }) {
     final owner = header.firstMb + 1;
     final x = mbX * 4, y = mbY * 4;
     final whole = (x: x, y: y, width: 4, height: 4);
-    if (_skip(left, top)) {
+    if (skipped ?? readSkip(left, top)) {
       final block = Macroblock(header, -1)
         ..skipped = true
+        ..mbaffField = mbaffField
         ..qp = _qp;
       _previousQpDelta = false;
       final vector = motion.predictSkip(whole, owner);
@@ -54,10 +56,10 @@ extension PredictiveSlice on SliceData {
         : const <int>[];
     for (final partition in partitions) {
       final context = _pair(
-        motion.referenceAt(partition.x - 1, partition.y, owner) > 0,
-        motion.referenceAt(partition.x, partition.y - 1, owner) > 0,
+        motion.neighborReferenceAt(partition.x - 1, partition.y, owner) > 0,
+        motion.neighborReferenceAt(partition.x, partition.y - 1, owner) > 0,
       );
-      final index = type == 4 ? 0 : _referenceIndex(context, header.activeL0);
+      final index = type == 4 ? 0 : _referenceIndex(context, references.length);
       motion.setReference(
         partition,
         owner,
@@ -83,7 +85,7 @@ extension PredictiveSlice on SliceData {
         }
       }
     }
-    final block = Macroblock(header, -1);
+    final block = Macroblock(header, -1)..mbaffField = mbaffField;
     _interResiduals(block, left, top, subTypes.every((type) => type == 0));
     return block;
   }

@@ -69,8 +69,9 @@ final class IntraPrediction {
     int start,
     int mode,
     Neighbors available,
-    int height,
-  ) {
+    int height, {
+    bool Function(int first, int count)? leftRange,
+  }) {
     const size = 8;
     _references(plane, stride, start, size, available, height: height);
     if (mode != 0) {
@@ -79,10 +80,15 @@ final class IntraPrediction {
     }
     // A chroma macroblock has one DC predictor per 4×4 block.
     for (var by = 0; by < height; by += 4) {
+      final left = leftRange?.call(by, 4) ?? available.left;
+      if (left && !available.left) {
+        for (var i = by; i < by + 4; i++) {
+          _left[i] = plane[start - 1 + i * stride];
+        }
+      }
       for (var bx = 0; bx < 8; bx += 4) {
-        final useTop = available.top && (bx != 0 || by == 0 || !available.left);
-        final useLeft =
-            available.left && (by != 0 || bx == 0 || !available.top);
+        final useTop = available.top && (bx != 0 || by == 0 || !left);
+        final useLeft = left && (by != 0 || bx == 0 || !available.top);
         var count = 0, sum = 0;
         for (var i = 0; i < 4; i++) {
           if (useTop) {

@@ -61,7 +61,7 @@ final class CabacSlice extends SliceData {
   void _restartAfterPcm() => _cabac.restart();
 
   @override
-  bool _skip(Macroblock? left, Macroblock? top) {
+  bool readSkip(Macroblock? left, Macroblock? top) {
     final base = header.kind == SliceKind.b ? 24 : 11;
     return _cabac.decision(
           base +
