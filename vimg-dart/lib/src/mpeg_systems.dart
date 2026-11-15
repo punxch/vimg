@@ -416,6 +416,9 @@ final class _AccessUnits {
   final configurations = <int, Uint8List>{};
   final mpegPictures = <int, MpegPictureInfo>{};
   final _parameters = NalParameterSets();
+  final _avcSeparateSequences = <int>{};
+  final _avcPpsSequences = <int, int>{};
+  var _avcPlanes = 0;
   String? bitstreamCodec;
   (int, int)? dimensions;
   (int, int)? timing;
@@ -478,7 +481,9 @@ final class _AccessUnits {
     }
     final limit = _mpeg != null
         ? (_parameter ? 512 : 5)
-        : (_parameter ? 65535 : 4);
+        : _parameter
+        ? 65535
+        : (_avcSeparateSequences.isEmpty ? 4 : 16);
     final count = math.min(end - start, limit - _prefix.length);
     if (count > 0)
       _prefix.add(Uint8List.sublistView(bytes, start, start + count));
@@ -496,11 +501,18 @@ final class _AccessUnits {
     if (header != null && header.layer != 0) return;
     final type = header?.type ?? (bytes[0] & 31);
     final slice = header?.codedSlice ?? (type == 1 || type == 5);
-    final startsPicture =
+    final firstSlice =
         slice &&
         (_hevc
             ? bytes.length >= 3 && bytes[2] & 0x80 != 0
             : bytes.length >= 2 && bytes[1] & 0x80 != 0);
+    final plane = firstSlice && !_hevc && _avcSeparateSequences.isNotEmpty
+        ? _firstAvcColorPlane(bytes)
+        : null;
+    // Each independent plane starts at macroblock zero. A repeated plane
+    // starts the next picture when there is no access unit delimiter.
+    final startsPicture =
+        firstSlice && (plane == null || _avcPlanes & (1 << plane) != 0);
     final prefix = _hevc
         ? type >= 32 && type <= 35 ||
               type == 39 ||
@@ -510,12 +522,26 @@ final class _AccessUnits {
     if (_frameType != null && (prefix || startsPicture)) _frame(_nalStart);
     _beginUnit();
     if (_parameter) _parameterSet(bytes);
+    if (plane != null) _avcPlanes |= 1 << plane;
     if (slice && _frameType == null) {
       _beginPicture(type);
       if ((_hevc && type >= 16 && type <= 21) || (!_hevc && type == 5)) {
         configurations[_framePosition] = _parameters.snapshot() ?? Uint8List(0);
       }
     }
+  }
+
+  int? _firstAvcColorPlane(Uint8List bytes) {
+    final bits = Rbsp.fromNal(bytes);
+    bits.bit(); // first_mb_in_slice = 0
+    bits.ue(9); // slice_type
+    final sequence = _avcPpsSequences[bits.ue(255)];
+    if (!_avcSeparateSequences.contains(sequence)) return null;
+    final plane = bits.read(2);
+    if (plane == 3) {
+      throw const FormatException('Invalid H.264 slice color plane');
+    }
+    return plane;
   }
 
   void _mpegUnit(MpegHeaders headers, Uint8List bytes) {
@@ -651,11 +677,18 @@ final class _AccessUnits {
       type = nal[0] & 31;
       if (type == 7) {
         final sps = H264Sps.parse(nal);
+        if (sps.separateColorPlane) {
+          _avcSeparateSequences.add(sps.id);
+        } else {
+          _avcSeparateSequences.remove(sps.id);
+        }
         dimensions ??= (sps.width, sps.height);
         timing ??= sps.timing;
         id = sps.id;
       } else {
-        id = Rbsp.fromNal(nal).ue(255);
+        final bits = Rbsp.fromNal(nal);
+        id = bits.ue(255);
+        _avcPpsSequences[id] = bits.ue(31);
       }
     }
     _parameters.update((type, id), nal);
@@ -689,6 +722,7 @@ final class _AccessUnits {
 
   void _clearPicture() {
     _frameType = null;
+    _avcPlanes = 0;
     _frameTime = null;
     _fields = 2;
     _mpegStructure = 3;

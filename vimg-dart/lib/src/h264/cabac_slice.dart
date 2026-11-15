@@ -32,7 +32,7 @@ final class CabacSlice extends SliceData {
     : _cabac = Cabac(
         header.bits,
         header.qp,
-        fullChroma: header.pps.sps.fullChroma,
+        fullChroma: header.pps.sps.chromaArrayType == 3,
         interInit: header.kind == SliceKind.intra ? null : header.cabacInit,
       ),
       super(header);
@@ -254,7 +254,7 @@ final class CabacSlice extends SliceData {
 
   void _residuals(Macroblock block, Macroblock? left, Macroblock? top) {
     coefficients.clearResiduals();
-    final fullChroma = header.pps.sps.fullChroma;
+    final fullChroma = header.pps.sps.chromaArrayType == 3;
     for (var plane = 0; plane < (fullChroma ? 3 : 1); plane++) {
       _fullResiduals(block, left, top, plane, fullChroma);
     }
@@ -362,7 +362,7 @@ final class CabacSlice extends SliceData {
     int length,
   ) {
     final large = length == 64;
-    if ((!large || header.pps.sps.fullChroma) &&
+    if ((!large || header.pps.sps.chromaArrayType == 3) &&
         _cabac.decision(category.coded + context) == 0) {
       return false;
     }

@@ -30,7 +30,7 @@ final class H264IdrDecoder {
           slices.add(SliceHeader(nal, configuration.pictures));
       }
     }
-    return slices.isEmpty ? null : _decodePicture(slices);
+    return slices.isEmpty ? null : _decodeAccessUnit(slices);
   }
 }
 
@@ -40,7 +40,7 @@ final class H264StreamDecoder {
   H264StreamDecoder(this.configuration);
 
   final AvcConfiguration configuration;
-  final _references = ReferenceState();
+  var _references = [ReferenceState()];
 
   H264Picture? decode(Uint8List sample) {
     final slices = <SliceHeader>[];
@@ -53,11 +53,53 @@ final class H264StreamDecoder {
       }
     }
     if (slices.isEmpty) return null;
-    final pending = _references.begin(slices.first);
+    final planeCount = slices.first.pps.sps.separateColorPlane ? 3 : 1;
+    if (_references.length != planeCount) {
+      _references = List.generate(planeCount, (_) => ReferenceState());
+    }
+    return _decodeAccessUnit(slices, _references);
+  }
+}
+
+H264Picture _decodeAccessUnit(
+  List<SliceHeader> slices, [
+  List<ReferenceState>? references,
+]) {
+  final first = slices.first;
+  if (slices.any((slice) => !first.samePicture(slice))) {
+    throw const FormatException('H.264 sample contains more than one picture');
+  }
+  if (!first.pps.sps.separateColorPlane) {
+    final state = references?.first;
+    final pending = state?.begin(first);
     final picture = _decodePicture(slices, pending: pending);
-    _references.commit(pending, picture);
+    if (pending != null) state!.commit(pending, picture);
     return picture;
   }
+
+  final planes = [<SliceHeader>[], <SliceHeader>[], <SliceHeader>[]];
+  for (final slice in slices) {
+    planes[slice.colorPlane].add(slice);
+  }
+  if (planes.any((plane) => plane.isEmpty)) {
+    throw const FormatException('Incomplete H.264 picture color planes');
+  }
+  final pending = references == null
+      ? null
+      : [
+          for (var i = 0; i < planes.length; i++)
+            references[i].begin(planes[i].first),
+        ];
+  final pictures = [
+    for (var i = 0; i < planes.length; i++)
+      _decodePicture(planes[i], pending: pending?[i]),
+  ];
+  if (pending != null) {
+    for (var i = 0; i < planes.length; i++) {
+      references![i].commit(pending[i], pictures[i]);
+    }
+  }
+  return H264Picture.fromPlanes(pictures[0], pictures[1], pictures[2]);
 }
 
 H264Picture _decodePicture(
@@ -78,13 +120,8 @@ H264Picture _decodePicture(
   if (slices.any((slice) => slice.kind == SliceKind.b)) {
     picture.motionL1 = MotionField(sps.mbWidth * 4, sps.mbHeight * 4);
   }
-  final decoder = _Reconstruction(picture, first.pps);
+  final decoder = _Reconstruction(picture, first.pps, first.colorPlane);
   for (final slice in slices) {
-    if (!first.samePicture(slice)) {
-      throw const FormatException(
-        'H.264 sample contains more than one picture',
-      );
-    }
     decoder.decode(slice, pending);
   }
   if (decoder.decoded != decoder.blocks.length) {
@@ -95,7 +132,7 @@ H264Picture _decodePicture(
 }
 
 final class _Reconstruction {
-  _Reconstruction(this.picture, H264Pps pps)
+  _Reconstruction(this.picture, H264Pps pps, this._colorPlane)
     : _scaling = ScalingMatrices(pps),
       width = picture.sps.mbWidth,
       blocks = List<Macroblock?>.filled(
@@ -107,6 +144,7 @@ final class _Reconstruction {
   final int width;
   final List<Macroblock?> blocks;
   final ScalingMatrices _scaling;
+  final int _colorPlane;
   late final _lumaPrediction = IntraPrediction(picture.sps.lumaDepth);
   late final _chromaPrediction =
       picture.sps.chromaDepth == picture.sps.lumaDepth
@@ -281,15 +319,11 @@ final class _Reconstruction {
     Neighbors available,
   ) {
     final prediction = _predictionFor(component);
+    final four = _scaling.four[component + _colorPlane];
     if (block.intra16) {
       final mode = (block.type - 1) & 3;
       prediction.luma(plane, stride, yOffset, 16, mode, available);
-      final dc = _transform.lumaDc(
-        dcLevels,
-        qp,
-        _scaling.four[component][0],
-        bypass: bypass,
-      );
+      final dc = _transform.lumaDc(dcLevels, qp, four[0], bypass: bypass);
       if (bypass) {
         _transform.bypassMacroblock(levels, 0, dc, 16, 16, mode);
         _add(prediction, plane, stride, yOffset, 16, 16, 0);
@@ -297,13 +331,7 @@ final class _Reconstruction {
         for (var i = 0; i < 16; i++) {
           final x = blockX(i);
           final row = blockY(i);
-          _transform.block4(
-            levels,
-            i * 16,
-            qp,
-            _scaling.four[component],
-            dc: dc[row * 4 + x],
-          );
+          _transform.block4(levels, i * 16, qp, four, dc: dc[row * 4 + x]);
           _add(
             prediction,
             plane,
@@ -329,9 +357,14 @@ final class _Reconstruction {
         if (bypass) {
           _transform.bypassBlock(levels, z * 16, size, mode: mode);
         } else if (block.transform8x8) {
-          _transform.block8(levels, i * 64, qp, _scaling.eight[component]);
+          _transform.block8(
+            levels,
+            i * 64,
+            qp,
+            _scaling.eight[component + _colorPlane],
+          );
         } else {
-          _transform.block4(levels, i * 16, qp, _scaling.four[component]);
+          _transform.block4(levels, i * 16, qp, four);
         }
         _add(prediction, plane, stride, offset, size, size, 0);
       }
@@ -409,15 +442,16 @@ final class _Reconstruction {
     bool bypass,
   ) {
     final prediction = _predictionFor(component);
+    final matrix = component + _colorPlane;
     final size = block.transform8x8 ? 8 : 4;
     for (var z = 0; z < 16; z += block.transform8x8 ? 4 : 1) {
       if ((coded & (1 << z)) == 0) continue;
       if (bypass) {
         _transform.bypassBlock(levels, z * 16, size);
       } else if (block.transform8x8) {
-        _transform.block8(levels, z * 16, qp, _scaling.interEight[component]);
+        _transform.block8(levels, z * 16, qp, _scaling.interEight[matrix]);
       } else {
-        _transform.block4(levels, z * 16, qp, _scaling.interFour[component]);
+        _transform.block4(levels, z * 16, qp, _scaling.interFour[matrix]);
       }
       _add(
         prediction,

@@ -19,7 +19,7 @@ final class PredictionWeights {
     int activeL1,
   ) {
     final lumaShift = bits.ue(7);
-    final hasChroma = sps.chromaFormat != 0;
+    final hasChroma = sps.chromaArrayType != 0;
     final chromaShift = hasChroma ? bits.ue(7) : 0;
     final lumaDefault = (weight: 1 << lumaShift, offset: 0);
     final chromaDefault = (weight: 1 << chromaShift, offset: 0);
@@ -80,10 +80,14 @@ final class SliceHeader {
       throw const FormatException('H.264 slice references a missing PPS');
     pps = picture;
     final sps = pps.sps;
-    if (!sps.frameOnly || pps.sliceGroups != 1 || sps.separateColorPlane) {
+    if (!sps.frameOnly || pps.sliceGroups != 1) {
       throw UnsupportedError(
         'Interlaced and slice-group H.264 pictures are unavailable',
       );
+    }
+    colorPlane = sps.separateColorPlane ? bits.read(2) : 0;
+    if (colorPlane == 3) {
+      throw const FormatException('Invalid H.264 slice color plane');
     }
     frameNum = bits.read(sps.frameNumBits);
     if (idr) idrId = bits.ue(65535);
@@ -134,7 +138,7 @@ final class SliceHeader {
   }
 
   final Rbsp bits;
-  late final int firstMb, frameNum, qp;
+  late final int firstMb, frameNum, qp, colorPlane;
   late final H264Pps pps;
   late final SliceKind kind;
   late final bool idr, reference;

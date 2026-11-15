@@ -7,17 +7,19 @@ import 'motion.dart';
 import 'parameters.dart';
 
 final class H264Picture {
-  H264Picture(this.sps)
-    : stride = sps.mbWidth * 16,
-      y = _samples(sps.mbWidth * sps.mbHeight * 256, sps.lumaDepth),
-      cb = _samples(
-        sps.mbWidth * sps.mbHeight * sps.chromaWidth * sps.chromaHeight,
-        sps.chromaDepth,
-      ),
-      cr = _samples(
-        sps.mbWidth * sps.mbHeight * sps.chromaWidth * sps.chromaHeight,
-        sps.chromaDepth,
+  H264Picture(H264Sps sps)
+    : this._(
+        sps,
+        _samples(sps.mbWidth * sps.mbHeight * 256, sps.lumaDepth),
+        _chromaSamples(sps),
+        _chromaSamples(sps),
       );
+
+  /// Assemble the independently decoded planes without copying samples.
+  H264Picture.fromPlanes(H264Picture y, H264Picture cb, H264Picture cr)
+    : this._(y.sps, y.y, cb.y, cr.y);
+
+  H264Picture._(this.sps, this.y, this.cb, this.cr) : stride = sps.mbWidth * 16;
 
   final H264Sps sps;
   final int stride;
@@ -41,11 +43,18 @@ final class H264Picture {
     matrix: sps.color.matrix,
     fullRange: sps.color.fullRange,
     lumaDepth: sps.lumaDepth,
-    chromaDepth: sps.chromaDepth,
+    chromaDepth: sps.separateColorPlane ? sps.lumaDepth : sps.chromaDepth,
     sampleAspect: sps.sampleAspect,
     scaler: scaler,
   );
 }
+
+List<int> _chromaSamples(H264Sps sps) => sps.chromaArrayType == 0
+    ? const []
+    : _samples(
+        sps.mbWidth * sps.mbHeight * sps.chromaWidth * sps.chromaHeight,
+        sps.chromaDepth,
+      );
 
 List<int> _samples(int count, int depth) =>
     depth == 8 ? Uint8List(count) : Uint16List(count);

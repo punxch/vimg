@@ -319,6 +319,38 @@ const _mixedDepthGbrPlanes = [
   [0x065f4596, 0x14b407b3, 0xbb5b5f5e],
 ];
 
+// Independent color planes encoded with JM 19.0, three slices per plane.
+// The CABAC sample interleaves slices and uses distinct scaling lists.
+const _separateCabacPlanes = [
+  [0xf66e8a3d, 0x4a1ce7f8, 0x0159661b],
+  [0x0e3e219b, 0x36da164f, 0x249e1e13],
+  [0x80d2bc3c, 0xb6fdf9e6, 0xe985f30e],
+  [0xb179477b, 0xcf9bc2e3, 0x762419b6],
+  [0xe71ab2c5, 0x62b03238, 0x1f76dc44],
+  [0x04019efd, 0x3137043e, 0x911ddd75],
+  [0x2de8a775, 0xb957296c, 0xba1de31f],
+];
+
+const _separateCavlcPlanes = [
+  [0xcb50aa57, 0xf0bffb7c, 0x07ecd914],
+  [0xd77d811e, 0x7bfdb9e9, 0xc1b863b5],
+  [0x6485cf49, 0x0124f273, 0x37415590],
+  [0xf3a3ae87, 0x2fb9c561, 0x5191e779],
+  [0x42d62b31, 0xdf90b961, 0xccbc6d2f],
+  [0x02f3b3f2, 0x990dfe7c, 0x1c822015],
+  [0x4d243da3, 0xfed8f83e, 0x75a0e61d],
+];
+
+const _separateLosslessPlanes = [
+  [0x64e69285, 0x5b4933b5, 0x4fb88c92],
+  [0xd098f1c5, 0xbe564a65, 0xd7602cff],
+  [0xbe182c05, 0xa3c888f5, 0x51e73fe5],
+  [0x345c3685, 0x527ed935, 0x14811cd5],
+  [0x649c8705, 0x32eaad65, 0x5f79a9e6],
+  [0xc04dfe45, 0xf05e8f45, 0xe35dfb1b],
+  [0x23353905, 0x1a39a085, 0x4d29cc64],
+];
+
 void _checkPlanes(
   String input,
   List<List<int>> expected, {
@@ -329,6 +361,7 @@ void _checkPlanes(
   int? chromaDepth,
   int chromaFormat = 1,
   bool lossless = false,
+  bool separate = false,
   bool rgb = false,
   (int, int) dimensions = (78, 50),
 }) {
@@ -387,6 +420,7 @@ void _checkPlanes(
             sps.lumaDepth == depth &&
             sps.chromaDepth == (chromaDepth ?? depth) &&
             sps.chromaFormat == chromaFormat &&
+            sps.separateColorPlane == separate &&
             sps.transformBypass == lossless &&
             (sps.width, sps.height) == dimensions,
         'H.264 dimensions, bit depth and profile',
@@ -451,6 +485,9 @@ Future<void> main(List<String> arguments) async {
   const cavlc12 = 'test/fixtures/avc-12-cavlc.mp4';
   const lossless14 = 'test/fixtures/avc-14-lossless.mkv';
   const mixedGbr = 'test/fixtures/avc-mixed-gbr.mkv';
+  const separateCabac = 'test/fixtures/avc-separate-cabac.mkv';
+  const separateCavlc = 'test/fixtures/avc-separate-cavlc.mkv';
+  const separateLossless = 'test/fixtures/avc-separate-lossless.mkv';
   _checkPlanes(mkv, _idrPlanes);
   _checkPlanes(mp4, _idrPlanes);
   _checkPlanes(interMkv, _pPlanes, inter: true);
@@ -626,6 +663,40 @@ Future<void> main(List<String> arguments) async {
     dimensions: (64, 48),
   );
 
+  _checkPlanes(
+    separateCabac,
+    _separateCabacPlanes,
+    inter: true,
+    profile: 244,
+    chromaFormat: 3,
+    separate: true,
+    dimensions: (64, 48),
+  );
+  _checkPlanes(
+    separateCavlc,
+    _separateCavlcPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 3,
+    separate: true,
+    dimensions: (64, 48),
+  );
+  _checkPlanes(
+    separateLossless,
+    _separateLosslessPlanes,
+    inter: true,
+    cabac: false,
+    profile: 244,
+    depth: 10,
+    chromaFormat: 3,
+    separate: true,
+    lossless: true,
+    rgb: true,
+    dimensions: (64, 48),
+  );
+
   final directory = Directory.systemTemp.createTempSync('vimg-h264-test-');
   Future<String> run(List<String> args) async {
     final result = await Process.run(
@@ -647,6 +718,7 @@ Future<void> main(List<String> arguments) async {
       (cabac422, 47, 31),
       (cabac444, 47, 31),
       (mixedGbr, 32, 24),
+      (separateLossless, 32, 24),
       (cavlcBaseline, 83, 55),
     ]) {
       final response =
@@ -679,6 +751,7 @@ Future<void> main(List<String> arguments) async {
       (cavlc422, 94, 61),
       (cavlc444, 93, 61),
       (cavlc12, 64, 48),
+      (separateCavlc, 64, 48),
       (cavlcBaseline, 166, 110),
     ]) {
       final name = input.split('/').last;
@@ -700,6 +773,7 @@ Future<void> main(List<String> arguments) async {
       ('422', cavlc422, 94, 61),
       ('444-rgb', losslessRgb, 93, 61),
       ('12-bit', cabac12, 64, 48),
+      ('separate-planes', separateCabac, 64, 48),
     ]) {
       final avif = File('${directory.path}/grid-$mode.avif');
       final kept = '${directory.path}/kept-$mode';

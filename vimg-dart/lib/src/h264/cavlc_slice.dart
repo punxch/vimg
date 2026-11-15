@@ -90,7 +90,7 @@ final class CavlcSlice extends SliceData {
     }
     block.qp = _qp;
     coefficients.clearResiduals();
-    final planes = header.pps.sps.fullChroma ? 3 : 1;
+    final planes = header.pps.sps.chromaArrayType == 3 ? 3 : 1;
     for (var plane = 0; plane < planes; plane++) {
       _fullResiduals(block, left, top, plane);
     }

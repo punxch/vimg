@@ -26,12 +26,52 @@ Future<void> main() async {
     preview: [148500, 238500, 328500],
   );
   await _checkNtsc();
+  _checkSeparatePlanes();
   final temp = Directory.systemTemp.createTempSync('vimg-ts-');
   try {
     _checkWrapped204(temp);
     _checkContinuity(temp);
   } finally {
     temp.deleteSync(recursive: true);
+  }
+}
+
+// The transport remux omits AUD NAL units. Each macroblock row starts a slice
+// in every color plane, with the three planes interleaved in the stream.
+void _checkSeparatePlanes() {
+  final video = Video('test/fixtures/avc-separate-cabac.ts');
+  final original = Video('test/fixtures/avc-separate-cabac.mkv');
+  try {
+    final packets = video.packets().toList();
+    check(packets.length == 7, 'Group separate H.264 planes into one frame');
+    for (final (i, packet) in packets.indexed) {
+      check(
+        packet.timestamp ==
+            frameTimestamp(90000 + i * 15000, 1, 90000, duration: 15000),
+        'Separate-plane picture timestamp $i',
+      );
+    }
+    final expected = original
+        .decodeSelected(original.packets().toList())
+        .toList();
+    final frames = video.decodeSelected(packets).toList();
+    check(frames.length == expected.length, 'Decode every color picture');
+    for (final (i, frame) in frames.indexed) {
+      _same(
+        frame.frame.getBytes(),
+        expected[i].frame.getBytes(),
+        'Separate-plane MPEG-TS picture $i',
+      );
+    }
+    final key = video.packets(preview: true).single;
+    _same(
+      video.decode(key, preview: true).getBytes(),
+      expected.first.frame.getBytes(),
+      'Separate-plane MPEG-TS preview',
+    );
+  } finally {
+    video.close();
+    original.close();
   }
 }
 

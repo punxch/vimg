@@ -164,6 +164,7 @@ final class H264Sps {
 
   bool get fullChroma => chromaFormat == 3;
   bool get subsampledChroma => chromaFormat == 1 || chromaFormat == 2;
+  int get chromaArrayType => separateColorPlane ? 0 : chromaFormat;
   int get chromaWidth => fullChroma ? 16 : (subsampledChroma ? 8 : 0);
 
   int get chromaHeight => switch (chromaFormat) {
@@ -172,7 +173,8 @@ final class H264Sps {
     _ => 16,
   };
 
-  int get chromaBlockCount => chromaWidth * chromaHeight ~/ 16;
+  int get chromaBlockCount =>
+      separateColorPlane ? 0 : chromaWidth * chromaHeight ~/ 16;
 
   int get lumaQpOffset => 6 * (lumaDepth - 8);
   int get chromaQpOffset => 6 * (chromaDepth - 8);
