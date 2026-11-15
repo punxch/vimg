@@ -282,7 +282,7 @@ Future<void> writeContactSheet(
         selected.expand((tile) => tile),
       )) {
         final frame = result.frame;
-        decodedBytes += frame.width * frame.height * 3;
+        decodedBytes += frame.width * frame.height * frame.numChannels;
         if (decodedBytes > _decodedFrameLimit) {
           throw const FormatException(
             'Contact sheet exceeds 256 MiB of decoded tiles',

@@ -175,8 +175,10 @@ projection roll or mirror before user filters and tile sizing.
 uses packet timestamps to derive playback duration and retains coded order
 for reference pictures. VP8 supports keyframe previews and extraction
 from interframes in IVF, WebM/Matroska and AVI, as well as MOV/MP4 tracks
-with a `vp08` sample entry. Capture decodes the
-hidden reference frames in coded order. IVF can also probe VP9 metadata.
+with a `vp08` sample entry. Capture decodes hidden reference frames in coded
+order. WebM/Matroska VP8 alpha is decoded from block additions, including
+opacity streams with independent keyframes. BMP extraction preserves
+transparency. IVF can also probe VP9 metadata.
 The AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and

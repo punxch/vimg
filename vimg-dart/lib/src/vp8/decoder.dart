@@ -29,7 +29,8 @@ final class Vp8Picture {
   final bool fullRange;
   final Vp8Plane y, u, v;
 
-  image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
+  image.Image rgb({YuvImageScaler? scaler, Uint8List? alpha}) => yuvImage(
+    alpha: alpha,
     y: y.samples,
     cb: u.samples,
     cr: v.samples,

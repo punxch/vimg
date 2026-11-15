@@ -43,6 +43,7 @@ import 'vp8/decoder.dart';
 import 'yuv_image.dart';
 
 part 'video_workers.dart';
+part 'video_vp8_alpha.dart';
 
 typedef _SelectedFrame = ({
   FramePacket packet,
@@ -242,7 +243,12 @@ final class Video {
     return _indexNalVideo(section: section);
   }
 
+  _Vp8AlphaIndex? _vp8Alpha;
+
   _IndexedVideo _indexStatefulPictures(String name, {_IsoSection? section}) {
+    final alpha = _matroska != null && name == 'vp8'
+        ? _Vp8AlphaIndex(file)
+        : null;
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
     final hidden = <FramePacket>{};
@@ -287,6 +293,7 @@ final class Video {
         _containerPackets(
               false,
               section: section,
+              onAlpha: alpha?.add,
               onDescription: (entry) {
                 _iso!.requireBytes(entry, 78);
                 if (name == 'ffv1') {
@@ -371,6 +378,7 @@ final class Video {
             final byTime = a.seconds.compareTo(b.seconds);
             return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
           });
+    if (alpha != null) _vp8Alpha = alpha;
     return (
       timeline: (
         decodeOrder: decodeOrder,
@@ -533,6 +541,7 @@ final class Video {
   Iterable<FramePacket> _containerPackets(
     bool keyframes, {
     FrameVisitor? onSample,
+    MatroskaAlphaVisitor? onAlpha,
     void Function(MediaBox)? onDescription,
     _IsoSection? section,
   }) {
@@ -546,7 +555,12 @@ final class Video {
     if (_ivf case final ivf?) return ivf.packets(keyframes, onSample: onSample);
     final matroska = _matroska;
     if (matroska != null) {
-      return matroskaFrames(matroska, keyframes: keyframes, onSample: onSample);
+      return matroskaFrames(
+        matroska,
+        keyframes: keyframes,
+        onSample: onSample,
+        onAlpha: onAlpha,
+      );
     }
     final iso = _iso!;
     final changingAspect = _isoDescriptions.length > 1;
@@ -1027,6 +1041,7 @@ final class Video {
           targets: const [0],
           configuration: null,
           rawFormat: _quickTimeFormat(packet, name),
+          vp8Alpha: null,
           sampleAspect: _commonIsoAspect,
           sampleAspects: _captureAspects([packet]),
           aviPalettes: _avi?.hasPalette == true
@@ -1045,23 +1060,28 @@ final class Video {
     }.toList()..sort();
     var start = -1, end = -1;
     var wanted = <int>[];
-    _DecodeRun run() => (
-      codec: name,
-      packets: timeline.decodeOrder.sublist(start, end + 1),
-      targets: wanted,
-      configuration: configurations[start]!,
-      rawFormat: null,
-      sampleAspect: _commonIsoAspect,
-      sampleAspects: _captureAspects(
-        wanted.map((i) => timeline.decodeOrder[start + i]),
-      ),
-      aviPalettes: _avi?.hasPalette == true
-          ? {
-              for (final i in wanted)
-                i: _avi!.paletteFor(timeline.decodeOrder[start + i])!,
-            }
-          : null,
-    );
+    _DecodeRun run() {
+      final packets = timeline.decodeOrder.sublist(start, end + 1);
+      return (
+        codec: name,
+        packets: packets,
+        targets: wanted,
+        configuration: configurations[start]!,
+        rawFormat: null,
+        vp8Alpha: name == 'vp8' ? _vp8Alpha?.forRun(packets) : null,
+        sampleAspect: _commonIsoAspect,
+        sampleAspects: _captureAspects(
+          wanted.map((i) => timeline.decodeOrder[start + i]),
+        ),
+        aviPalettes: _avi?.hasPalette == true
+            ? {
+                for (final i in wanted)
+                  i: _avi!.paletteFor(timeline.decodeOrder[start + i])!,
+              }
+            : null,
+      );
+    }
+
     for (final target in targets) {
       final anchor = timeline.gopStart[target];
       if (anchor < 0) {
@@ -1227,7 +1247,9 @@ final class Video {
     switch (run.codec) {
       case 'vp8':
         final decoder = Vp8Decoder();
-        final independent = run.packets.length == 1;
+        final alpha = run.vp8Alpha;
+        final opacity = alpha == null ? null : _Vp8AlphaDecoder(file, alpha);
+        final independent = opacity == null && run.packets.length == 1;
         return (packet, selected, _) {
           final bytes = _read(packet);
           if (independent && selected) {
@@ -1242,7 +1264,16 @@ final class Video {
             };
           }
           final picture = decoder.decode(bytes);
-          return selected ? picture.rgb : null;
+          final mask = opacity?.decode(packet);
+          if (!selected) return null;
+          if (mask != null &&
+              (mask.width != picture.width || mask.height != picture.height)) {
+            throw const FormatException(
+              'VP8 color and alpha dimensions differ',
+            );
+          }
+          return ({scaler}) =>
+              picture.rgb(scaler: scaler, alpha: mask?.y.samples);
         };
       case 'ffv1':
         final stream = metadata.streams.firstWhere(
@@ -1552,6 +1583,7 @@ typedef _DecodeRun = ({
   List<int> targets,
   _RunConfiguration? configuration,
   QuickTimeRawFormat? rawFormat,
+  _Vp8AlphaRun? vp8Alpha,
   double? sampleAspect,
   Map<FramePacket, double>? sampleAspects,
   Map<int, List<int>>? aviPalettes,

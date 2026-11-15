@@ -18,10 +18,13 @@ Iterable<FramePacket> matroskaCovers(Matroska media) sync* {
   }
 }
 
+typedef MatroskaAlphaVisitor = void Function(FramePacket, EbmlElement);
+
 Iterable<FramePacket> matroskaFrames(
   Matroska media, {
   bool keyframes = false,
   FrameVisitor? onSample,
+  MatroskaAlphaVisitor? onAlpha,
 }) sync* {
   int? trackNumber;
   int? frameDuration;
@@ -81,7 +84,9 @@ Iterable<FramePacket> matroskaFrames(
               frameDuration,
               blockDuration: duration,
               groupKeyframe: sync,
+              additions: group[0x75a1],
               onSample: onSample,
+              onAlpha: onAlpha,
             );
           }
         }
@@ -99,7 +104,9 @@ Iterable<FramePacket> _block(
   int? blockDuration,
   bool keyframes = false,
   bool? groupKeyframe,
+  EbmlElement? additions,
   FrameVisitor? onSample,
+  MatroskaAlphaVisitor? onAlpha,
 }) sync* {
   final trackField = media.vint(block.data, block.end);
   if (trackField.value != track) return;
@@ -114,6 +121,12 @@ Iterable<FramePacket> _block(
   final seconds = pts * (timestampScale / 1e9);
   offset += 3;
   final lacing = (flags >> 1) & 3;
+  final alpha = onAlpha != null && additions != null
+      ? _blockAlpha(media, additions)
+      : null;
+  if (alpha != null && lacing != 0) {
+    throw const FormatException('Laced Matroska block has one alpha picture');
+  }
   if (lacing == 0) {
     final packet = (
       seconds: seconds,
@@ -126,6 +139,7 @@ Iterable<FramePacket> _block(
         duration: blockDuration ?? (frameDuration ?? 0) ~/ timestampScale,
       ),
     );
+    if (alpha != null) onAlpha!(packet, alpha);
     onSample?.call(packet, sync);
     yield packet;
     return;
@@ -207,4 +221,21 @@ Iterable<FramePacket> _block(
     yield packet;
     offset += sizes[index];
   }
+}
+
+// The VP8 codec mapping defines BlockAddID 1 as a separately coded alpha
+// picture. BlockAddID defaults to 1 when omitted.
+EbmlElement? _blockAlpha(Matroska media, EbmlElement additions) {
+  EbmlElement? alpha;
+  for (final more in media.elements(additions.data, additions.end)) {
+    if (more.id != 0xa6) continue;
+    final fields = media.fields(more);
+    if ((media.number(fields[0xee]) ?? 1) != 1) continue;
+    final data = fields[0xa5];
+    if (alpha != null || data == null || data.end - data.data < 3) {
+      throw const FormatException('Invalid Matroska alpha block addition');
+    }
+    alpha = data;
+  }
+  return alpha;
 }
