@@ -218,7 +218,7 @@ Iterable<FramePacket> _block(
   }
 }
 
-// The VP8 codec mapping defines BlockAddID 1 as a separately coded alpha
+// The VP8 and VP9 codec mappings use BlockAddID 1 for a separately coded alpha
 // picture. BlockAddID defaults to 1 when omitted.
 EbmlElement? _blockAlpha(Matroska media, EbmlElement additions) {
   EbmlElement? alpha;
@@ -227,7 +227,7 @@ EbmlElement? _blockAlpha(Matroska media, EbmlElement additions) {
     final fields = media.fields(more);
     if ((media.number(fields[0xee]) ?? 1) != 1) continue;
     final data = fields[0xa5];
-    if (alpha != null || data == null || data.end - data.data < 3) {
+    if (alpha != null || data == null || data.end == data.data) {
       throw const FormatException('Invalid Matroska alpha block addition');
     }
     alpha = data;

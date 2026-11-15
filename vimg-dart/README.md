@@ -182,11 +182,13 @@ with a `vp08` sample entry. Capture decodes hidden reference frames in coded
 order. WebM/Matroska VP8 alpha is decoded from block additions, including
 opacity streams with independent keyframes. BMP extraction preserves
 transparency.
-VP9 keyframes in WebM/Matroska, MP4/MOV, AVI and IVF support static previews
-and capture from all-intra streams. The VP9 decoder handles lossless and
-lossy 8-, 10- and 12-bit intra pictures, segmentation, tiles, and display of
-previously reconstructed intra references. Inter-picture reconstruction and
-multiple displayed pictures in a single superframe remain pending.
+VP9 capture supports lossless and lossy 8-, 10- and 12-bit intra and inter
+pictures in WebM/Matroska, MP4/MOV, AVI and IVF. It handles single and
+compound prediction, scaled references, segmentation, tiles, hidden
+reference updates in superframes, and display of previously decoded frames.
+WebM/Matroska VP9 opacity uses the separately coded alpha stream, including
+when its keyframes differ from the color stream. BMP extraction keeps the
+alpha channel. Multiple displayed pictures in a single superframe remain pending.
 The AVIF animation reader handles intra and inter pictures, including hidden
 references, reused pictures, compound prediction, warped motion, deblocking,
 CDEF, horizontal super-resolution, Wiener and SGRPROJ loop restoration, and

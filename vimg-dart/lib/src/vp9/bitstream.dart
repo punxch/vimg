@@ -196,7 +196,8 @@ final class Vp9FrameHeader {
       refreshMask = bits.read(8);
       for (var i = 0; i < 3; i++) {
         references.add(bits.read(3));
-        biases.add(bits.flag());
+        final bias = bits.flag();
+        biases.add(!errorResilient && bias);
       }
       Vp9FrameHeader getReference(int index) =>
           reference?.call(index) ??

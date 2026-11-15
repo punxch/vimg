@@ -9,8 +9,10 @@ import 'entropy.dart';
 import 'tables.dart';
 import 'transform.dart';
 
+part 'inter_prediction.dart';
 part 'intra_prediction.dart';
 part 'loop_filter.dart';
+part 'motion.dart';
 
 final class Vp9Plane {
   Vp9Plane(this.paddedWidth, this.paddedHeight)
@@ -38,7 +40,12 @@ final class Vp9Picture {
   final Vp9FrameHeader header;
   final Vp9Plane y, u, v;
 
-  image.Image rgb({YuvImageScaler? scaler}) {
+  image.Image rgb({YuvImageScaler? scaler, Vp9Picture? alpha}) {
+    if (alpha != null &&
+        (alpha.header.width != header.width ||
+            alpha.header.height != header.height)) {
+      throw const FormatException('VP9 color and alpha dimensions differ');
+    }
     final color = header.color;
     final matrix = switch (color.space) {
       2 => 1,
@@ -67,6 +74,8 @@ final class Vp9Picture {
       subsamplingX: color.subX,
       subsamplingY: color.subY,
       sampleAspect: aspect,
+      alpha: alpha?.y.samples,
+      alphaDepth: alpha?.header.color.depth ?? 8,
       scaler: scaler,
     );
   }
@@ -74,6 +83,13 @@ final class Vp9Picture {
 
 final class Vp9Decoder {
   final _references = List<Vp9Picture?>.filled(8, null);
+  final _contexts = List.filled(4, Vp9EntropyContext.defaults);
+  final _refDeltas = [1, 0, -1, -1];
+  final _modeDeltas = [0, 0];
+  _SegmentationFeatures? _features;
+  Uint8List? _segments;
+  Vp9FrameHeader? _previous;
+  _BlockMap? _previousMotion;
 
   static Vp9Picture preview(Uint8List bytes) {
     final tag = vp9PacketTag(
@@ -89,7 +105,7 @@ final class Vp9Decoder {
       frame.offset,
       frame.offset + frame.length,
     );
-    return _decodeIntra(coded, Vp9FrameHeader.read(coded)!);
+    return Vp9Decoder()._decodeFrame(coded, Vp9FrameHeader.read(coded)!);
   }
 
   Vp9Picture? decodePacket(Uint8List bytes) {
@@ -115,10 +131,7 @@ final class Vp9Decoder {
             _references[tag.existing!] ??
             (throw const FormatException('Missing VP9 display reference'));
       } else {
-        if (!header.intra) {
-          throw UnsupportedError('VP9 inter-frame reconstruction');
-        }
-        picture = _decodeIntra(frame, header);
+        picture = _decodeFrame(frame, header);
         for (var slot = 0; slot < 8; slot++) {
           if (header.refreshMask & (1 << slot) != 0) {
             _references[slot] = picture;
@@ -134,16 +147,82 @@ final class Vp9Decoder {
     }
     return shown;
   }
+
+  Vp9Picture _decodeFrame(Uint8List bytes, Vp9FrameHeader header) {
+    if (header.width * header.height > 64 * 1024 * 1024) {
+      throw const FormatException('Invalid VP9 picture dimensions');
+    }
+    final previous = _previous;
+    final sameSize =
+        header.width == previous?.width && header.height == previous?.height;
+    final independent = header.intra || header.errorResilient;
+    if (!sameSize || independent) _segments = null;
+    if (independent) {
+      if (header.tag.key || header.errorResilient || header.resetContext == 3) {
+        _contexts.fillRange(0, 4, Vp9EntropyContext.defaults);
+      } else if (header.resetContext == 2) {
+        _contexts[header.frameContext] = Vp9EntropyContext.defaults;
+      }
+      _features = null;
+      _refDeltas.setAll(0, const [1, 0, -1, -1]);
+      _modeDeltas.fillRange(0, 2, 0);
+    }
+    final segmentation = header.segmentation;
+    if (segmentation.features case final data?) {
+      _features = (absolute: segmentation.absolute, data: data);
+    }
+    for (final (i, delta) in header.filter.referenceDeltas.indexed) {
+      if (delta != null) _refDeltas[i] = delta;
+    }
+    for (final (i, delta) in header.filter.modeDeltas.indexed) {
+      if (delta != null) _modeDeltas[i] = delta;
+    }
+    final slot = independent ? 0 : header.frameContext;
+    final entropy = Vp9FrameEntropy(bytes, header, _contexts[slot]);
+    final picture = Vp9Picture._(header);
+    final previousMotion =
+        !independent &&
+            sameSize &&
+            previous?.tag.shown == true &&
+            previous?.intra == false
+        ? _previousMotion
+        : null;
+    final decoder = _FrameDecoder(
+      picture,
+      entropy,
+      references: [
+        for (final slot in header.references)
+          _references[slot] ??
+              (throw const FormatException('Missing VP9 picture reference')),
+      ],
+      features: segmentation.enabled ? _features : null,
+      previousSegments: _segments,
+      previousMotion: previousMotion,
+    );
+    decoder.decode(bytes);
+    if (header.filter.level != 0) {
+      _LoopFilter(
+        picture,
+        decoder.blocks,
+        decoder.features,
+        _refDeltas,
+        _modeDeltas,
+      ).apply();
+    }
+    if (header.refreshContext) {
+      _contexts[slot] = entropy.save(
+        intra: header.intra,
+        previousKey: previous?.tag.key == true,
+      );
+    }
+    if (segmentation.enabled) _segments = decoder.segments;
+    _previous = header;
+    _previousMotion = header.intra ? null : decoder.blocks;
+    return picture;
+  }
 }
 
-Vp9Picture _decodeIntra(Uint8List bytes, Vp9FrameHeader header) {
-  if (header.width * header.height > 64 * 1024 * 1024) {
-    throw const FormatException('Invalid VP9 picture dimensions');
-  }
-  final picture = Vp9Picture._(header);
-  _IntraDecoder(picture, Vp9IntraEntropy(bytes, header)).decode(bytes);
-  return picture;
-}
+typedef _SegmentationFeatures = ({bool absolute, List<List<int?>> data});
 
 const _partitionTree = [0, 2, -1, 4, -2, -3];
 const _intraModeTree = [
@@ -212,19 +291,34 @@ const _scans = [
   [defaultScan32],
 ];
 
-final class _IntraDecoder {
-  _IntraDecoder(this.picture, this.entropy)
-    : _abovePartition = Uint8List((picture.header.miColumns + 7) & ~7),
-      _aboveModes = Uint8List(picture.header.miColumns * 2),
-      _aboveSkip = Uint8List(picture.header.miColumns),
-      _aboveTx = Uint8List(picture.header.miColumns),
-      _aboveCoefficients = List.generate(
-        3,
-        (_) => Uint8List(((picture.header.miColumns + 7) & ~7) * 2),
-      );
+final class _FrameDecoder {
+  _FrameDecoder(
+    this.picture,
+    this.entropy, {
+    required this.references,
+    required this.features,
+    required this.previousSegments,
+    required this.previousMotion,
+  }) : blocks = _BlockMap(picture.header.miColumns, picture.header.miRows),
+       segments = picture.header.segmentation.tree == null
+           ? previousSegments
+           : Uint8List(picture.header.miColumns * picture.header.miRows),
+       _abovePartition = Uint8List((picture.header.miColumns + 7) & ~7),
+       _aboveModes = Uint8List(picture.header.miColumns * 2),
+       _aboveSkip = Uint8List(picture.header.miColumns),
+       _aboveTx = Uint8List(picture.header.miColumns),
+       _aboveCoefficients = List.generate(
+         3,
+         (_) => Uint8List(((picture.header.miColumns + 7) & ~7) * 2),
+       );
 
   final Vp9Picture picture;
-  final Vp9IntraEntropy entropy;
+  final Vp9FrameEntropy entropy;
+  final List<Vp9Picture> references;
+  final _SegmentationFeatures? features;
+  final Uint8List? segments, previousSegments;
+  final _BlockMap blocks;
+  final _BlockMap? previousMotion;
   Vp9FrameHeader get _header => picture.header;
   final Uint8List _abovePartition, _aboveModes, _aboveSkip, _aboveTx;
   final _leftPartition = Uint8List(8);
@@ -233,14 +327,14 @@ final class _IntraDecoder {
   final _leftTx = Uint8List(8);
   final List<Uint8List> _aboveCoefficients;
   final _leftCoefficients = List.generate(3, (_) => Uint8List(16));
-  late final _loopFilter = _IntraLoopFilter(picture);
+  late final _interPredictor = _InterPrediction();
   final _predictor = _IntraPrediction();
   final _transform = Vp9InverseTransform();
   final _modes = Uint8List(4);
   final _energy = Uint8List(1024);
   final _residual = Int32List(1024);
 
-  int _tileLeft = 0;
+  int _tileLeft = 0, _tileRight = 0;
   late Vp9BoolReader _bits;
 
   void decode(Uint8List bytes) {
@@ -255,12 +349,12 @@ final class _IntraDecoder {
         _header.miColumns,
         _header.tileColumnLog,
       );
-      final right = tileEdge(
+      _tileRight = tileEdge(
         tile.column + 1,
         _header.miColumns,
         _header.tileColumnLog,
       );
-      if (rowStart == rowEnd || _tileLeft == right) {
+      if (rowStart == rowEnd || _tileLeft == _tileRight) {
         throw const FormatException('Empty VP9 tile');
       }
       for (var y = rowStart; y < rowEnd; y += 8) {
@@ -268,12 +362,11 @@ final class _IntraDecoder {
         for (final left in _leftCoefficients) {
           left.fillRange(0, left.length, 0);
         }
-        for (var x = _tileLeft; x < right; x += 8) {
+        for (var x = _tileLeft; x < _tileRight; x += 8) {
           _partition(x, y, 3);
         }
       }
     }
-    if (_header.filter.level != 0) _loopFilter.apply();
   }
 
   void _partition(int x, int y, int level) {
@@ -284,13 +377,42 @@ final class _IntraDecoder {
     final aboveSplit = (_abovePartition[x] >> (3 - level)) & 1;
     final leftSplit = (_leftPartition[y & 7] >> (3 - level)) & 1;
     final context = (4 * level + 2 * leftSplit + aboveSplit) * 3;
-    final partition = hasRight && hasBottom
-        ? _bits.tree(_partitionTree, keyPartitionProbabilities, context)
-        : hasRight
-        ? (_bits.bit(keyPartitionProbabilities[context + 1]) == 0 ? 1 : 3)
-        : hasBottom
-        ? (_bits.bit(keyPartitionProbabilities[context + 2]) == 0 ? 2 : 3)
-        : 3;
+    int probability(int node) => _header.intra
+        ? keyPartitionProbabilities[context + node]
+        : entropy.probability(Vp9Probability.partition, context + node);
+    final int partition;
+    if (hasRight && hasBottom) {
+      partition = _header.intra
+          ? _bits.tree(_partitionTree, keyPartitionProbabilities, context)
+          : entropy.tree(
+              _bits,
+              _partitionTree,
+              Vp9Probability.partition,
+              context,
+            );
+    } else {
+      partition = hasRight
+          ? (_bits.bit(probability(1)) == 0 ? 1 : 3)
+          : hasBottom
+          ? (_bits.bit(probability(2)) == 0 ? 2 : 3)
+          : 3;
+      if (!_header.intra) {
+        // Boundary decisions still contribute to the full partition tree.
+        entropy.count(Vp9Probability.partition, context, 1);
+        entropy.count(
+          Vp9Probability.partition,
+          context + 1,
+          _flag(partition != 1),
+        );
+        if (partition != 1) {
+          entropy.count(
+            Vp9Probability.partition,
+            context + 2,
+            _flag(partition == 3),
+          );
+        }
+      }
+    }
     final splitX = partition >= 2;
     final splitY = partition.isOdd;
     if (level == 0 || partition != 3) {
@@ -319,63 +441,58 @@ final class _IntraDecoder {
     final haveAbove = y != 0, haveLeft = x > _tileLeft;
     final skipContext =
         (haveAbove ? _aboveSkip[x] : 0) + (haveLeft ? _leftSkip[y & 7] : 0);
-    final tree = _header.segmentation.tree;
-    final segment = tree == null ? 0 : _bits.tree(_segmentTree, tree, 0);
-    final features = _header.segmentation.features?[segment];
+    final blockWidth = math.max(width, 8), blockHeight = math.max(height, 8);
+    final right = math.min(x + (blockWidth >> 3), _header.miColumns);
+    final bottom = math.min(y + (blockHeight >> 3), _header.miRows);
+    final neighbors = _ReferenceNeighbors(
+      haveAbove ? blocks.at(x, y - 1) : null,
+      haveLeft ? blocks.at(x - 1, y) : null,
+    );
+    final (segment, predictedSegment) = _segment(
+      x,
+      y,
+      right,
+      bottom,
+      neighbors,
+    );
+    final segmentFeatures = features?.data[segment];
+    final skipSegment = segmentFeatures?[3] != null;
     final skip =
-        features?[3] != null || _bits.bit(entropy.skip[skipContext]) != 0;
+        skipSegment ||
+        entropy.bit(_bits, Vp9Probability.skip, skipContext) != 0;
+    final forcedReference = segmentFeatures?[2];
+    final inter =
+        !_header.intra &&
+        (forcedReference != null
+            ? forcedReference != 0
+            : entropy.bit(_bits, Vp9Probability.isInter, neighbors.isInter) !=
+                  0);
     final maxTx = math.min(3, math.min(width, height).bitLength - 3);
     var tx = math.min(maxTx, entropy.largestTransform);
-    if (maxTx > 0 && entropy.selectTransform) {
+    if (maxTx > 0 && entropy.selectTransform && (!skip || !inter)) {
       var above = haveAbove && _aboveSkip[x] == 0 ? _aboveTx[x] : maxTx;
       var left = haveLeft && _leftSkip[y & 7] == 0 ? _leftTx[y & 7] : maxTx;
       if (!haveLeft) left = above;
       if (!haveAbove) above = left;
       final offset = maxTx * 6 + (above + left > maxTx ? 3 : 0);
       tx = 0;
-      while (tx < maxTx && _bits.bit(entropy.transform[offset + tx]) != 0) {
+      while (tx < maxTx &&
+          entropy.bit(_bits, Vp9Probability.transform, offset + tx) != 0) {
         tx++;
       }
     }
 
     final subBlock = width < 8 || height < 8;
-    final modeWidth = width == 4 ? 1 : 2, modeHeight = height == 4 ? 1 : 2;
-    for (var j = 0; j < 2; j += modeHeight) {
-      for (var i = 0; i < 2; i += modeWidth) {
-        final above = j > 0
-            ? _modes[i]
-            : haveAbove
-            ? _aboveModes[x * 2 + i]
-            : 0;
-        final left = i > 0
-            ? _modes[j * 2]
-            : haveLeft
-            ? _leftModes[(y & 7) * 2 + j]
-            : 0;
-        final mode = _bits.tree(
-          _intraModeTree,
-          keyYModeProbabilities,
-          (10 * above + left) * 9,
-        );
-        for (var v = j; v < j + modeHeight; v++) {
-          _modes.fillRange(v * 2 + i, v * 2 + i + modeWidth, mode);
-        }
-      }
-    }
+    final motion = inter
+        ? _motion(x, y, width, height, neighbors, forcedReference, skipSegment)
+        : null;
+    final uvMode = motion == null ? _readIntraModes(x, y, width, height) : 0;
     final yMode = _modes[3];
-    final uvMode = _bits.tree(
-      _intraModeTree,
-      keyUvModeProbabilities,
-      yMode * 9,
-    );
     var quant = _header.quantization.base;
-    if (features?[0] case final delta?) {
-      quant = (_header.segmentation.absolute ? delta : quant + delta).clamp(
-        0,
-        255,
-      );
+    if (segmentFeatures?[0] case final delta?) {
+      quant = (features!.absolute ? delta : quant + delta).clamp(0, 255);
     }
-    final blockWidth = math.max(width, 8), blockHeight = math.max(height, 8);
+    var anyResidual = false;
     final planes = [picture.y, picture.u, picture.v];
     for (var i = 0; i < 3; i++) {
       final chroma = i != 0;
@@ -388,6 +505,20 @@ final class _IntraDecoder {
       );
       final plane = planes[i];
       final size = 4 << planeTx;
+      if (motion != null) {
+        _interPredictor.predict(
+          plane: plane,
+          target: picture,
+          references: references,
+          motion: motion,
+          index: i,
+          x: x * 8,
+          y: y * 8,
+          blockWidth: blockWidth,
+          blockHeight: blockHeight,
+          subblock: subBlock,
+        );
+      }
       for (var j = 0; j < planeHeight; j += size) {
         for (var k = 0; k < planeWidth; k += size) {
           final px = ((x * 8) >> sx) + k, py = ((y * 8) >> sy) + j;
@@ -398,20 +529,31 @@ final class _IntraDecoder {
               : yMode;
           var nonzero = 0;
           if (px < plane.paddedWidth && py < plane.paddedHeight) {
-            _predictor.predict(
-              plane,
-              px,
-              py,
-              size,
-              mode,
-              haveAbove: haveAbove || j > 0,
-              haveLeft: haveLeft || k > 0,
-              haveAboveRight: k + size < planeWidth,
-              midpoint: 1 << (_header.color.depth - 1),
-            );
+            if (motion == null)
+              _predictor.predict(
+                plane,
+                px,
+                py,
+                size,
+                mode,
+                haveAbove: haveAbove || j > 0,
+                haveLeft: haveLeft || k > 0,
+                haveAboveRight: k + size < planeWidth,
+                midpoint: 1 << (_header.color.depth - 1),
+              );
             if (!skip)
-              nonzero = _coefficients(plane, i, px, py, planeTx, mode, quant);
+              nonzero = _coefficients(
+                plane,
+                i,
+                px,
+                py,
+                planeTx,
+                mode,
+                quant,
+                inter,
+              );
           }
+          anyResidual |= nonzero != 0;
           final c = _aboveCoefficients[i], r = _leftCoefficients[i];
           final startY = (py >> 2) & (15 >> sy);
           c.fillRange(px >> 2, (px + size) >> 2, nonzero);
@@ -419,23 +561,114 @@ final class _IntraDecoder {
         }
       }
     }
-    if (_header.filter.level != 0) {
-      _loopFilter.remember(x, y, width, height, tx, segment);
-    }
-    final right = math.min(x + (blockWidth >> 3), _header.miColumns);
-    final bottom = math.min(y + (blockHeight >> 3), _header.miRows);
+    final finalSkip = skip || (inter && !subBlock && !anyResidual);
+    blocks.fill(x, y, right, bottom, (
+      width: width,
+      height: height,
+      transform: tx,
+      segment: segment,
+      skip: finalSkip,
+      motion: motion,
+      predictedSegment: predictedSegment,
+    ));
     for (var i = x; i < right; i++) {
-      _aboveSkip[i] = skip ? 1 : 0;
+      _aboveSkip[i] = finalSkip ? 1 : 0;
       _aboveTx[i] = tx;
       _aboveModes[i * 2] = _modes[2];
       _aboveModes[i * 2 + 1] = _modes[3];
     }
     for (var i = y; i < bottom; i++) {
-      _leftSkip[i & 7] = skip ? 1 : 0;
+      _leftSkip[i & 7] = finalSkip ? 1 : 0;
       _leftTx[i & 7] = tx;
       _leftModes[(i & 7) * 2] = _modes[1];
       _leftModes[(i & 7) * 2 + 1] = _modes[3];
     }
+  }
+
+  (int, bool) _segment(
+    int x,
+    int y,
+    int right,
+    int bottom,
+    _ReferenceNeighbors neighbors,
+  ) {
+    final segmentation = _header.segmentation;
+    if (!segmentation.enabled) return (0, false);
+    final previous = previousSegments;
+    var predicted = 0;
+    if (!_header.intra && previous != null) {
+      predicted = 7;
+      final cols = _header.miColumns;
+      for (var row = y; row < bottom; row++) {
+        for (var col = x; col < right; col++) {
+          predicted = math.min(predicted, previous[row * cols + col]);
+        }
+      }
+    }
+    final tree = segmentation.tree;
+    if (tree == null) return (predicted, false);
+    final predProbs = segmentation.prediction;
+    final context =
+        _flag(neighbors.above?.predictedSegment == true) +
+        _flag(neighbors.left?.predictedSegment == true);
+    final usePredicted =
+        !_header.intra &&
+        predProbs != null &&
+        _bits.bit(predProbs[context]) != 0;
+    final segment = usePredicted
+        ? predicted
+        : _bits.tree(_segmentTree, tree, 0);
+    final cols = _header.miColumns;
+    for (var row = y; row < bottom; row++) {
+      segments!.fillRange(row * cols + x, row * cols + right, segment);
+    }
+    return (segment, usePredicted);
+  }
+
+  int _readIntraModes(int x, int y, int width, int height) {
+    final modeWidth = width == 4 ? 1 : 2, modeHeight = height == 4 ? 1 : 2;
+    final haveAbove = y != 0, haveLeft = x > _tileLeft;
+    final group = math.min(3, math.min(width, height).bitLength - 3);
+    for (var j = 0; j < 2; j += modeHeight) {
+      for (var i = 0; i < 2; i += modeWidth) {
+        final int mode;
+        if (_header.intra) {
+          final above = j > 0
+              ? _modes[i]
+              : haveAbove
+              ? _aboveModes[x * 2 + i]
+              : 0;
+          final left = i > 0
+              ? _modes[j * 2]
+              : haveLeft
+              ? _leftModes[(y & 7) * 2 + j]
+              : 0;
+          mode = _bits.tree(
+            _intraModeTree,
+            keyYModeProbabilities,
+            (10 * above + left) * 9,
+          );
+        } else {
+          mode = entropy.tree(
+            _bits,
+            _intraModeTree,
+            Vp9Probability.yMode,
+            group * 9,
+          );
+        }
+        for (var row = j; row < j + modeHeight; row++) {
+          _modes.fillRange(row * 2 + i, row * 2 + i + modeWidth, mode);
+        }
+      }
+    }
+    return _header.intra
+        ? _bits.tree(_intraModeTree, keyUvModeProbabilities, _modes[3] * 9)
+        : entropy.tree(
+            _bits,
+            _intraModeTree,
+            Vp9Probability.uvMode,
+            _modes[3] * 9,
+          );
   }
 
   int _coefficients(
@@ -446,6 +679,7 @@ final class _IntraDecoder {
     int tx,
     int mode,
     int quant,
+    bool inter,
   ) {
     final chroma = index != 0, lossless = _header.lossless;
     final sy = chroma ? _header.color.subY : 0;
@@ -456,7 +690,7 @@ final class _IntraDecoder {
       if (x + i * 4 < plane.paddedWidth) a |= _aboveCoefficients[index][x4 + i];
       if (y + i * 4 < plane.paddedHeight) l |= _leftCoefficients[index][y4 + i];
     }
-    final type = chroma || tx == 3 || lossless
+    final type = inter || chroma || tx == 3 || lossless
         ? Vp9TransformType.dct
         : vp9IntraTransforms[mode];
     final scan = _scans[tx][type.index];
@@ -489,22 +723,24 @@ final class _IntraDecoder {
             : left;
         context = (1 + _energy[first] + _energy[second]) >> 1;
       }
-      final offset = Vp9IntraEntropy.coefficientOffset(
+      final offset = Vp9FrameEntropy.coefficientOffset(
         tx,
         chroma ? 1 : 0,
-        0,
+        _flag(inter),
         band,
         context,
       );
-      final probabilities = entropy.coefficients;
-      if (checkEnd && _bits.bit(probabilities[offset]) == 0) break;
+      const coefficient = Vp9Probability.coefficient;
+      if (checkEnd && entropy.bit(_bits, coefficient, offset) == 0) break;
       var node = 0;
       do {
         final p = node >> 1;
-        final probability = p < 2
-            ? probabilities[offset + p + 1]
-            : _pareto(probabilities[offset + 2], p - 2);
-        node = _coefficientTree[node + _bits.bit(probability)];
+        final bit = p < 2
+            ? entropy.bit(_bits, coefficient, offset + p + 1)
+            : _bits.bit(
+                _pareto(entropy.probability(coefficient, offset + 2), p - 2),
+              );
+        node = _coefficientTree[node + bit];
       } while (node > 0);
       final token = -node;
       _energy[position] = _coefficientEnergy[token];

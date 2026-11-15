@@ -41,11 +41,11 @@ import 'quicktime_smc.dart';
 import 'video_configuration.dart';
 import 'vp8/decoder.dart';
 import 'vp9/bitstream.dart';
-import 'vp9/intra.dart';
+import 'vp9/decoder.dart';
 import 'yuv_image.dart';
 
 part 'video_workers.dart';
-part 'video_vp8_alpha.dart';
+part 'video_matroska_alpha.dart';
 
 typedef _SelectedFrame = ({
   FramePacket packet,
@@ -246,11 +246,11 @@ final class Video {
     return _indexNalVideo(section: section);
   }
 
-  _Vp8AlphaIndex? _vp8Alpha;
+  _MatroskaAlphaIndex? _matroskaAlpha;
 
   _IndexedVideo _indexStatefulPictures(String name, {_IsoSection? section}) {
-    final alpha = _matroska != null && name == 'vp8'
-        ? _Vp8AlphaIndex(file)
+    final alpha = _matroska != null && (name == 'vp8' || name == 'vp9')
+        ? _MatroskaAlphaIndex(file, name)
         : null;
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
@@ -376,7 +376,7 @@ final class Video {
             final byTime = a.seconds.compareTo(b.seconds);
             return byTime == 0 ? index[a]!.compareTo(index[b]!) : byTime;
           });
-    if (alpha != null) _vp8Alpha = alpha;
+    if (alpha != null) _matroskaAlpha = alpha;
     return (
       timeline: (
         decodeOrder: decodeOrder,
@@ -454,14 +454,13 @@ final class Video {
     }
     if (_hasStatefulFrames(codec)) {
       final indexed = _statefulTimeline;
+      if (preview && codec == 'vp9') {
+        return _vp9Previews(indexed.timeline.presentation);
+      }
       return indexed.timeline.presentation.where(
         (packet) =>
             !preview ||
-            (codec == 'vp9'
-                ? _vp9PreviewPackets.contains(packet)
-                : indexed.configurations.containsKey(
-                    indexed.timeline.index[packet],
-                  )),
+            indexed.configurations.containsKey(indexed.timeline.index[packet]),
       );
     }
     final avi = _avi;
@@ -499,10 +498,13 @@ final class Video {
       final name = section.codec;
       if (_usesReferences(name)) {
         final indexed = section.indexed ??= _indexIsoSection(section);
+        if (preview && name == 'vp9') {
+          packets.addAll(_vp9Previews(indexed.timeline.presentation));
+          continue;
+        }
         packets.addAll(
           indexed.timeline.presentation.where((packet) {
             if (!preview) return true;
-            if (name == 'vp9') return _vp9PreviewPackets.contains(packet);
             return _avcFieldPairKeys.contains(packet) ||
                 indexed.configurations.containsKey(
                   indexed.timeline.index[packet],
@@ -517,6 +519,11 @@ final class Video {
     // A fragment or chunk can begin in decode order before the preceding
     // section's last composition timestamp.
     yield* _presentationOrder(packets);
+  }
+
+  Iterable<FramePacket> _vp9Previews(List<FramePacket> displayed) {
+    final keys = displayed.where(_vp9PreviewPackets.contains);
+    return keys.isEmpty ? displayed : keys;
   }
 
   Iterable<FramePacket> _presentationOrder(Iterable<FramePacket> packets) {
@@ -1058,7 +1065,7 @@ final class Video {
           targets: const [0],
           configuration: null,
           rawFormat: _quickTimeFormat(packet, name),
-          vp8Alpha: null,
+          matroskaAlpha: null,
           sampleAspect: _commonIsoAspect,
           sampleAspects: _captureAspects([packet]),
           aviPalettes: _avi?.hasPalette == true
@@ -1085,7 +1092,7 @@ final class Video {
         targets: wanted,
         configuration: configurations[start]!,
         rawFormat: null,
-        vp8Alpha: name == 'vp8' ? _vp8Alpha?.forRun(packets) : null,
+        matroskaAlpha: _matroskaAlpha?.forRun(packets),
         sampleAspect: _commonIsoAspect,
         sampleAspects: _captureAspects(
           wanted.map((i) => timeline.decodeOrder[start + i]),
@@ -1264,15 +1271,26 @@ final class Video {
     switch (run.codec) {
       case 'vp9':
         final decoder = Vp9Decoder();
+        final alpha = run.matroskaAlpha;
+        final opacity = alpha == null
+            ? null
+            : _MatroskaAlphaDecoder(file, alpha, Vp9Decoder().decodePacket);
         return (packet, selected, _) {
           final picture = decoder.decodePacket(_read(packet));
+          final mask = opacity?.decode(packet);
           if (!selected || picture == null) return null;
-          return picture.rgb;
+          return ({scaler}) => picture.rgb(scaler: scaler, alpha: mask);
         };
       case 'vp8':
         final decoder = Vp8Decoder();
-        final alpha = run.vp8Alpha;
-        final opacity = alpha == null ? null : _Vp8AlphaDecoder(file, alpha);
+        final alpha = run.matroskaAlpha;
+        final Vp8Decoder? maskDecoder = alpha == null ? null : Vp8Decoder();
+        final opacity = alpha == null
+            ? null
+            : _MatroskaAlphaDecoder(file, alpha, (bytes) {
+                final picture = maskDecoder!.decode(bytes);
+                return vp8FrameTag(bytes).shown ? picture : null;
+              });
         final independent = opacity == null && run.packets.length == 1;
         return (packet, selected, _) {
           final bytes = _read(packet);
@@ -1497,7 +1515,9 @@ final class Video {
     if (_mixedIsoCodecs) {
       final section = _isoSectionByPacket[packet];
       if (section == null) throw const FormatException('Unknown video packet');
-      if (preview && section.codec == 'vp9') {
+      if (preview &&
+          section.codec == 'vp9' &&
+          _vp9PreviewPackets.contains(packet)) {
         return Vp9Decoder.preview(_read(packet)).rgb(scaler: _previewScaler);
       }
       if (!_usesReferences(section.codec) && !_hasPresentationTransform) {
@@ -1506,7 +1526,7 @@ final class Video {
       final frame = decodeSelected([packet]).single.frame;
       return preview && frame.hasAlpha ? _rgb(frame) : frame;
     }
-    if (preview && codec == 'vp9') {
+    if (preview && codec == 'vp9' && _vp9PreviewPackets.contains(packet)) {
       return Vp9Decoder.preview(_read(packet)).rgb(scaler: _previewScaler);
     }
     if (_hasStatefulFrames(codec)) {
@@ -1633,7 +1653,7 @@ typedef _DecodeRun = ({
   List<int> targets,
   _RunConfiguration? configuration,
   QuickTimeRawFormat? rawFormat,
-  _Vp8AlphaRun? vp8Alpha,
+  _MatroskaAlphaRun? matroskaAlpha,
   double? sampleAspect,
   Map<FramePacket, double>? sampleAspects,
   Map<int, List<int>>? aviPalettes,

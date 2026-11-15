@@ -5,7 +5,7 @@ import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/video.dart';
 import 'package:vimg_dart/src/vp9/bitstream.dart';
-import 'package:vimg_dart/src/vp9/intra.dart';
+import 'package:vimg_dart/src/vp9/decoder.dart';
 
 import 'fixtures.dart';
 
@@ -220,6 +220,7 @@ void _checkSuperframes(Directory directory) {
   );
 
   final path = '${directory.path}/superframe.ivf';
+  final referenceOnly = '${directory.path}/reference-only.ivf';
   final output = BytesBuilder(copy: false)..add(ivfHeader);
   for (final (index, data) in [hidden, existing, superframe].indexed) {
     final header = ByteData(12)
@@ -228,6 +229,11 @@ void _checkSuperframes(Directory directory) {
     output
       ..add(header.buffer.asUint8List())
       ..add(data);
+    if (index == 1) {
+      final snapshot = output.toBytes();
+      ByteData.sublistView(snapshot).setUint32(24, 2, Endian.little);
+      File(referenceOnly).writeAsBytesSync(snapshot);
+    }
   }
   File(path).writeAsBytesSync(output.takeBytes());
   final video = Video(path);
@@ -257,6 +263,16 @@ void _checkSuperframes(Directory directory) {
     }
   } finally {
     video.close();
+  }
+  final reused = Video(referenceOnly);
+  try {
+    final packet = reused.packets(preview: true).single;
+    check(
+      _same(reused.decode(packet, preview: true).getBytes(), pixels),
+      'VP9 preview from a hidden keyframe in an earlier sample',
+    );
+  } finally {
+    reused.close();
   }
 }
 

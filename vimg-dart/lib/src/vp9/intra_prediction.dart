@@ -1,4 +1,4 @@
-part of 'intra.dart';
+part of 'decoder.dart';
 
 /// Intra prediction uses reconstructed neighbors before loop filtering.
 final class _IntraPrediction {

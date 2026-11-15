@@ -1,39 +1,21 @@
-part of 'intra.dart';
+part of 'decoder.dart';
 
-typedef _FilterBlock = ({int width, int height, int transform, int segment});
-
-/// Deblocks an all-intra picture after prediction and residual reconstruction.
-final class _IntraLoopFilter {
-  _IntraLoopFilter(this.picture)
-    : _blocks = List<_FilterBlock?>.filled(
-        picture.header.miRows * picture.header.miColumns,
-        null,
-      ),
-      _depthShift = picture.header.color.depth - 8;
+/// Deblocks the reconstructed picture before it can be used as a reference.
+final class _LoopFilter {
+  _LoopFilter(
+    this.picture,
+    this.blocks,
+    this.features,
+    this.referenceDeltas,
+    this.modeDeltas,
+  ) : _depthShift = picture.header.color.depth - 8;
 
   final Vp9Picture picture;
-  final List<_FilterBlock?> _blocks;
+  final _BlockMap blocks;
+  final _SegmentationFeatures? features;
+  final List<int> referenceDeltas, modeDeltas;
   final int _depthShift;
   final _wideResult = Int32List(16);
-
-  void remember(int x, int y, int width, int height, int tx, int segment) {
-    final header = picture.header;
-    final block = (
-      width: width,
-      height: height,
-      transform: tx,
-      segment: segment,
-    );
-    final right = math.min<int>(x + math.max(1, width >> 3), header.miColumns);
-    final bottom = math.min<int>(y + math.max(1, height >> 3), header.miRows);
-    for (var r = y; r < bottom; r++) {
-      _blocks.fillRange(
-        r * header.miColumns + x,
-        r * header.miColumns + right,
-        block,
-      );
-    }
-  }
 
   void apply() {
     final header = picture.header;
@@ -44,19 +26,18 @@ final class _IntraLoopFilter {
         : sharpness > 0
         ? 1
         : 0;
-    final defaultDelta = header.filter.referenceDeltas[0] ?? 1;
-    final refDelta = header.filter.deltaEnabled
-        ? defaultDelta << (baseLevel >> 5)
-        : 0;
-    final levels = List.generate(8, (segment) {
+    final deltaScale = 1 << (baseLevel >> 5);
+    final levels = List.generate(8 * 8, (i) {
+      final segment = i >> 3, ref = (i >> 1) & 3, mode = i & 1;
       var level = baseLevel;
-      if (header.segmentation.features?[segment][1] case final delta?) {
-        level = (header.segmentation.absolute ? delta : level + delta).clamp(
-          0,
-          63,
-        );
+      if (features?.data[segment][1] case final delta?) {
+        level = (features!.absolute ? delta : level + delta).clamp(0, 63);
       }
-      level = (level + refDelta).clamp(0, 63);
+      if (header.filter.deltaEnabled) {
+        final refDelta = referenceDeltas[ref];
+        final modeDelta = ref == 0 ? 0 : modeDeltas[mode];
+        level = (level + (refDelta + modeDelta) * deltaScale).clamp(0, 63);
+      }
       final limit = sharpness == 0
           ? math.max(1, level)
           : (level >> thresholdShift).clamp(1, 9 - sharpness);
@@ -90,7 +71,7 @@ final class _IntraLoopFilter {
                   continue;
                 }
                 final mx = ((x >> 3) >> sx) << sx, my = ((y >> 3) >> sy) << sy;
-                final block = _blocks[my * miColumns + mx]!;
+                final block = blocks.at(mx, my)!;
                 final tx = index == 0 || block.width < 8 || block.height < 8
                     ? block.transform
                     : math.min(
@@ -113,8 +94,15 @@ final class _IntraLoopFilter {
                     edge.isOdd &&
                     x + 8 >= miColumns * 8;
                 final isTxEdge = !crossesChromaRight && edge % (1 << tx) == 0;
-                if (!isBlockEdge && !isTxEdge) continue;
-                final strength = levels[block.segment];
+                if (!isBlockEdge &&
+                    (!isTxEdge || (block.motion != null && block.skip)))
+                  continue;
+                final motion = block.motion;
+                final ref = motion?.first ?? 0;
+                final type = motion == null || motion.mode == _zeroMotion
+                    ? 0
+                    : 1;
+                final strength = levels[block.segment * 8 + ref * 2 + type];
                 if (strength.level == 0) continue;
                 var filterSize = tx == 0 && edge % 8 == 0 ? 1 : math.min(2, tx);
                 if (sub == 1 &&
