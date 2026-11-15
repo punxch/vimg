@@ -9,6 +9,7 @@ import 'fixtures.dart';
 Future<void> main(List<String> arguments) async {
   _checkRgb();
   _checkYuv();
+  _checkScaleAspect();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
 }
@@ -163,6 +164,75 @@ void _checkYuv() {
   }
 }
 
+void _checkScaleAspect() {
+  final source = image.Image(width: 96, height: 64);
+  final y = Uint8List(96 * 64);
+  final chroma = Uint8List(48 * 32)..fillRange(0, 48 * 32, 128);
+  final cases = [
+    ('160:120:force_original_aspect_ratio=decrease', 160, 107),
+    ('160:120:force_original_aspect_ratio=increase', 180, 120),
+    ('157:117:force_original_aspect_ratio=1:force_divisible_by=8', 152, 104),
+    ('157:117:force_original_aspect_ratio=2:force_divisible_by=8', 176, 120),
+    (
+      '157:117:force_original_aspect_ratio=decrease:force_divisible_by=8'
+          ':reset_sar=1',
+      152,
+      80,
+    ),
+    (
+      '157:117:force_original_aspect_ratio=increase:force_divisible_by=8'
+          ':reset_sar=1',
+      232,
+      120,
+    ),
+    ('157:117:force_divisible_by=8:reset_sar=1', 157, 117),
+    ('-4:117:reset_sar=1', 236, 117),
+    ('157:-4:reset_sar=1', 157, 80),
+    ('-4:-6:reset_sar=1', 128, 64),
+    ('32:24:flags=neighbor:reset_sar=1,pad=aspect=1/1', 32, 32),
+    ('32:24:flags=neighbor,pad=aspect=1/1', 32, 48),
+    ('32:24:flags=neighbor:reset_sar=1,crop=trunc(16*sar):16', 16, 16),
+    ('32:24:flags=neighbor,crop=trunc(16*sar):16', 24, 16),
+  ];
+  // Geometry measured with FFmpeg 8.1.2 for 96×64 input at SAR 4:3.
+  for (final (options, width, height) in cases) {
+    final scaler = YuvImageScaler(
+      filters: VideoFilterChain.parse('scale=$options'),
+    );
+    final rgb = scaler.filterRgb(source, sampleAspect: 4 / 3);
+    final yuv = yuvImage(
+      y: y,
+      cb: chroma,
+      cr: chroma,
+      stride: 96,
+      chromaStride: 48,
+      width: 96,
+      height: 64,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: 6,
+      fullRange: true,
+      sampleAspect: 4 / 3,
+      scaler: scaler,
+    );
+    check((rgb.width, rgb.height) == (width, height), 'RGB scale=$options');
+    check((yuv.width, yuv.height) == (width, height), 'YUV scale=$options');
+  }
+
+  final perFrame = YuvImageScaler(
+    filters: VideoFilterChain.parse(
+      'scale=w=160+n*8:h=120:eval=frame:reset_sar=1'
+      ':force_original_aspect_ratio=decrease:force_divisible_by=8',
+    ),
+  );
+  for (final (index, width) in [168, 176].indexed) {
+    final frame = perFrame.renderCapture([
+      (index: index, seconds: index / 2),
+    ], () => perFrame.filterRgb(source, sampleAspect: 4 / 3));
+    check((frame.width, frame.height) == (width, 88), 'Aspect with eval=frame');
+  }
+}
+
 void _checkErrors() {
   for (final chain in [
     '',
@@ -171,6 +241,10 @@ void _checkErrors() {
     '[in]crop=4:2[out]',
     "scale=w='min(4,2):h=2",
     'scale=4:2:flags=lanczos',
+    'scale=4:2:force_original_aspect_ratio=fit',
+    'scale=4:2:force_divisible_by=0',
+    'scale=4:2:force_divisible_by=257',
+    'scale=4:2:reset_sar=2',
     'scale=w=iw-n:h=ih',
     'crop=5:2:w=4',
     'crop=iw-n:ih',
@@ -299,6 +373,38 @@ Future<void> _checkCli(String? executable) async {
     List<File> ordered(String path) =>
         Directory(path).listSync().cast<File>()
           ..sort((a, b) => a.path.compareTo(b.path));
+
+    final fitted = '${temp.path}/fitted';
+    await run([
+      'extract',
+      '-n1',
+      '-f4',
+      '-t1s',
+      '--output-dir',
+      fitted,
+      '--vfilter',
+      'setsar=4/3,scale=50:39:force_original_aspect_ratio=decrease'
+          ':force_divisible_by=2:reset_sar=1:flags=neighbor,pad=aspect=1/1',
+      motion,
+    ]);
+    final fittedFrames = ordered(fitted);
+    const fittedReference = [0xa66cb24b, 0xf2b81fba, 0x3f138d1a, 0x8b5ffa7a];
+    check(
+      fittedFrames.length == fittedReference.length,
+      'Fitted capture count',
+    );
+    for (final (i, file) in fittedFrames.indexed) {
+      final frame = image.decodeBmp(file.readAsBytesSync())!;
+      check(
+        (frame.width, frame.height) == (50, 50),
+        'Square output dimensions',
+      );
+      check(
+        _bgrChecksum(frame) == fittedReference[i],
+        'Fitted frame $i pixels',
+      );
+    }
+
     final dynamicPath = '${temp.path}/dynamic-extract';
     await run([
       'extract',

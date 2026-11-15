@@ -2,7 +2,12 @@ part of 'yuv_image.dart';
 
 /// FFmpeg's packed RGB point scaler uses BT.601 with one chroma sample
 /// per pair of source pixels when the width shrinks by at least half.
-_VideoPlanes _pointScalePackedRgb(_VideoPlanes frame, int width, int height) {
+_VideoPlanes _pointScalePackedRgb(
+  _VideoPlanes frame,
+  int width,
+  int height,
+  double sampleAspect,
+) {
   final sw = frame.width, sh = frame.height;
   final dx = _scaleStep(sw, width), dy = _scaleStep(sh, height);
   final chromaWidth = sw ~/ 2;
@@ -55,7 +60,7 @@ _VideoPlanes _pointScalePackedRgb(_VideoPlanes frame, int width, int height) {
     matrix: 0,
     fullRange: true,
     packedRgb: true,
-    sampleAspect: frame.sampleAspect * sw * height / (sh * width),
+    sampleAspect: sampleAspect,
     alpha: outA == null ? null : plane(outA),
   );
 }

@@ -188,6 +188,11 @@ accept static dimension expressions with arithmetic and functions such as
 `flags=neighbor`. Crop aligns to chroma samples by default and accepts
 `exact=1` for odd coordinates and dimensions.
 
+Use `scale=400:300:force_original_aspect_ratio=decrease:force_divisible_by=2`
+to fit inside a bounding box with even dimensions. `increase` scales to cover
+the box. Add `reset_sar=1` to use the input display aspect ratio for
+proportional scaling and set square pixels for downstream filters.
+
 For packed RGB, `flags=neighbor` follows FFmpeg's chroma sampling when
 reducing an even width by at least half. Use `flags=neighbor+full_chroma_inp`
 to sample the RGB channels at the same coordinates.

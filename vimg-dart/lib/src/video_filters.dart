@@ -480,11 +480,21 @@ final class _Rotate implements _SpatialFilter {
   }
 }
 
+enum _ScaleAspect { disable, decrease, increase }
+
 final class _Scale extends _FrameSpatialFilter {
   factory _Scale(String? source) {
     final options = _filterOptions(
       source,
-      ['w', 'h', 'flags', 'eval'],
+      [
+        'w',
+        'h',
+        'flags',
+        'eval',
+        'force_original_aspect_ratio',
+        'force_divisible_by',
+        'reset_sar',
+      ],
       {'width': 'w', 'height': 'h'},
     );
     final (nearest, fullChromaInput) = switch (options['flags']) {
@@ -500,6 +510,18 @@ final class _Scale extends _FrameSpatialFilter {
       'frame' || '1' => true,
       _ => throw const FormatException('scale eval must be init or frame'),
     };
+    final aspect = switch (options['force_original_aspect_ratio']) {
+      null || '0' || 'disable' => _ScaleAspect.disable,
+      '1' || 'decrease' => _ScaleAspect.decrease,
+      '2' || 'increase' => _ScaleAspect.increase,
+      _ => throw const FormatException('Invalid scale aspect ratio mode'),
+    };
+    final divisibleBy =
+        _filterInteger(options, 'force_divisible_by', minimum: 1) ?? 1;
+    if (divisibleBy > 256) {
+      throw const FormatException('scale force_divisible_by exceeds 256');
+    }
+    final resetSar = _filterFlag(options['reset_sar'], 'scale reset_sar');
     final variables = perFrame
         ? const {..._dimensionVariables, ..._frameVariables}
         : _dimensionVariables;
@@ -518,7 +540,16 @@ final class _Scale extends _FrameSpatialFilter {
       variables,
       onVariable: reference,
     );
-    return _Scale._(width, height, nearest, fullChromaInput, dynamicSize);
+    return _Scale._(
+      width,
+      height,
+      nearest,
+      fullChromaInput,
+      dynamicSize,
+      aspect,
+      divisibleBy,
+      resetSar,
+    );
   }
 
   _Scale._(
@@ -527,9 +558,14 @@ final class _Scale extends _FrameSpatialFilter {
     this.nearest,
     this.fullChromaInput,
     this.usesFramePosition,
+    this.aspect,
+    this.divisibleBy,
+    this.resetSar,
   );
   final FilterExpression width, height;
-  final bool nearest, fullChromaInput;
+  final bool nearest, fullChromaInput, resetSar;
+  final _ScaleAspect aspect;
+  final int divisibleBy;
   @override
   final bool usesFramePosition;
   final _scalers = <(int, int, int, int), _PlaneScaler>{};
@@ -548,8 +584,11 @@ final class _Scale extends _FrameSpatialFilter {
       width <= frame.width ~/ 2;
 
   _VideoPlanes resize(_VideoPlanes frame, int width, int height) {
+    final sampleAspect = resetSar
+        ? 1.0
+        : frame.sampleAspect * frame.width * height / (frame.height * width);
     if (_subsamplesRgb(frame, width)) {
-      return _pointScalePackedRgb(frame, width, height);
+      return _pointScalePackedRgb(frame, width, height, sampleAspect);
     }
     return frame.mapComponents(
       (plane, sx, sy, component) => _resize(
@@ -558,8 +597,7 @@ final class _Scale extends _FrameSpatialFilter {
         _subSize(height, sy),
         packedAlpha: frame.packedRgb && component == 3,
       ),
-      sampleAspect:
-          frame.sampleAspect * frame.width * height / (frame.height * width),
+      sampleAspect: sampleAspect,
     );
   }
 
@@ -579,13 +617,46 @@ final class _Scale extends _FrameSpatialFilter {
     vars['out_h'] = vars['oh'] = h.toDouble();
     var w = _dimension(width(vars));
     if (w == 0) w = frame.width;
+    final displayWidth = frame.width * (resetSar ? frame.sampleAspect : 1.0);
+    // FFmpeg rounds to the nearest requested multiple, with ties upward.
+    // Its integer rescaling truncates the SAR-adjusted operand first.
+    int widthFor(int height, int multiple) => _scaleMultiple(
+      height,
+      displayWidth.truncate(),
+      frame.height * multiple,
+      multiple,
+    );
+    int heightFor(int width, int multiple) => _scaleMultiple(
+      width,
+      frame.height,
+      (displayWidth * multiple).truncate(),
+      multiple,
+    );
+
     if (w < 0 && h < 0) {
-      w = frame.width;
+      w = displayWidth.truncate();
       h = frame.height;
     } else if (w < 0) {
-      w = (h * frame.width / (frame.height * -w)).round() * -w;
+      w = widthFor(h, -w);
     } else if (h < 0) {
-      h = (w * frame.height / (frame.width * -h)).round() * -h;
+      h = heightFor(w, -h);
+    }
+    if (aspect != _ScaleAspect.disable) {
+      final proportionalWidth = widthFor(h, divisibleBy);
+      final proportionalHeight = heightFor(w, divisibleBy);
+      if (aspect == _ScaleAspect.decrease) {
+        w = math.min(w, proportionalWidth) ~/ divisibleBy * divisibleBy;
+        h = math.min(h, proportionalHeight) ~/ divisibleBy * divisibleBy;
+      } else {
+        w =
+            (math.max(w, proportionalWidth) + divisibleBy - 1) ~/
+            divisibleBy *
+            divisibleBy;
+        h =
+            (math.max(h, proportionalHeight) + divisibleBy - 1) ~/
+            divisibleBy *
+            divisibleBy;
+      }
     }
     _checkFilterSize(w, h);
     return (w, h);
@@ -640,6 +711,20 @@ final class _Scale extends _FrameSpatialFilter {
     }
     return _FilterPlane(samples, width, height, plane.depth, rowStep: width);
   }
+}
+
+int _scaleMultiple(int size, int numerator, int denominator, int multiple) {
+  if (denominator <= 0) {
+    throw const FormatException('Invalid scale input aspect ratio');
+  }
+  final divisor = BigInt.from(denominator);
+  final product = BigInt.from(size) * BigInt.from(numerator);
+  final scaled =
+      ((product + (divisor >> 1)) ~/ divisor) * BigInt.from(multiple);
+  if (!scaled.isValidInt) {
+    throw const FormatException('Invalid scaled video dimension');
+  }
+  return scaled.toInt();
 }
 
 int _subSize(int size, int shift) => (size + (1 << shift) - 1) >> shift;
