@@ -1007,6 +1007,11 @@ final class _VideoPlanes {
       planes.first.depth > 8 &&
       planes.every((plane) => plane.depth == planes.first.depth);
 
+  bool get usesDeepYuvPacking =>
+      planes.length == 3 &&
+      _hasDeepYuvDepth(matrix, planes.first.depth, planes[1].depth) &&
+      planes.first.depth == planes[2].depth;
+
   bool get usesUnscaledRgbTable =>
       width.isEven &&
       height.isEven &&

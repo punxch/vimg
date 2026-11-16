@@ -12,6 +12,7 @@ import 'fixtures.dart';
 Future<void> main(List<String> arguments) async {
   _checkRgb();
   _checkYuv();
+  _checkDeepYuvPacking();
   _checkLinearScale();
   _checkScaleAspect();
   _checkGraph();
@@ -450,6 +451,84 @@ void _checkGraph() {
   }
 }
 
+void _checkDeepYuvPacking() {
+  for (final (depth, width, height, sx, sy, alpha, matrix, full, outputs) in [
+    (16, 8, 6, 1, 0, true, 1, true, [(8, 6, 'bicubic', 0x76cbf79c)]),
+    (
+      16,
+      8,
+      6,
+      1,
+      1,
+      true,
+      1,
+      true,
+      [(14, 8, 'bilinear', 0xb33c1231), (11, 8, 'bilinear', 0x38ade1c2)],
+    ),
+    (
+      12,
+      13,
+      9,
+      0,
+      0,
+      false,
+      9,
+      false,
+      [(13, 9, 'bicubic', 0xff66b7f2), (23, 15, 'bicublin', 0x6c15024f)],
+    ),
+    (10, 8, 6, 1, 0, true, 6, false, [(8, 6, 'bicubic', 0xa6e4a2a4)]),
+  ]) {
+    final cw = (width + (1 << sx) - 1) >> sx;
+    final ch = (height + (1 << sy) - 1) >> sy;
+    final max = (1 << depth) - 1;
+    List<int> samples(int plane, int count) => [
+      for (var i = 0; i < count; i++)
+        (i * 6079 + (i ~/ 7) * 2111 + plane * 19151 + 993) & max,
+    ];
+    final y = samples(0, width * height);
+    final cb = samples(1, cw * ch), cr = samples(2, cw * ch);
+    final opacity = alpha ? samples(3, width * height) : null;
+    for (final (w, h, algorithm, checksum) in outputs) {
+      final scale = 'scale=$w:$h:flags=$algorithm';
+      final format = alpha ? 'rgba' : 'rgb24';
+      for (final graph in [
+        scale,
+        '$scale,format=$format',
+        if (w == width && h == height) null,
+      ]) {
+        final pixels = yuvImage(
+          y: y,
+          cb: cb,
+          cr: cr,
+          alpha: opacity,
+          stride: width,
+          chromaStride: cw,
+          width: width,
+          height: height,
+          cropLeft: 0,
+          cropTop: 0,
+          matrix: matrix,
+          fullRange: full,
+          lumaDepth: depth,
+          chromaDepth: depth,
+          alphaDepth: depth,
+          subsamplingX: sx,
+          subsamplingY: sy,
+          scaler: graph == null
+              ? null
+              : YuvImageScaler(filters: VideoFilterChain.parse(graph)),
+        );
+        check(
+          pixels.width == w &&
+              pixels.height == h &&
+              getCrc32(pixels.getBytes()) == checksum,
+          '$depth-bit YUV packing matches FFmpeg for ${graph ?? 'native'}',
+        );
+      }
+    }
+  }
+}
+
 void _checkColorFormats() {
   image.Image render(int depth, String filter) {
     List<int> samples(int w, int h, int base, int dx, int dy, int wrap) => [
@@ -575,7 +654,7 @@ void _checkColorFormats() {
             'format=yuv444p10le',
           ).getBytes(),
         ) ==
-        0x7d2b2cda,
+        0x5dd6b070,
     'Scale negotiates 10-bit 4:4:4 output and converts matrix while resizing',
   );
   final auto = render(
@@ -586,7 +665,8 @@ void _checkColorFormats() {
     auto.numChannels == 4 && getCrc32(auto.getBytes()) == 0xfffd05a0,
     'Automatic overlay keeps 10-bit 4:2:0 and adds opaque alpha',
   );
-  for (final (depth, checksum) in [(8, 0xb1c3b03e), (10, 0x031721d3)]) {
+  for (final (depth, checksum) in [(8, 0xb1c3b03e), (10, 0x06ec2c1d)]) {
+    final layout = depth == 10 ? ',format=yuva444p10le' : '';
     final gray = yuvImage(
       y: [
         for (var y = 0; y < 6; y++)
@@ -605,7 +685,8 @@ void _checkColorFormats() {
       lumaDepth: depth,
       scaler: YuvImageScaler(
         filters: VideoFilterChain.parse(
-          'split[a][b];[b]crop=4:4:2:2,hflip[r];[a][r]overlay=2:2:format=auto',
+          'split[a][b];[b]crop=4:4:2:2,hflip[r];'
+          '[a][r]overlay=2:2:format=auto$layout',
         ),
       ),
     );
@@ -767,12 +848,12 @@ void _checkCompositing() {
   for (final (graph, channels, checksum) in [
     ('format=yuv420p', 3, 0x307b6ca8),
     ('format=yuva420p10le', 4, 0x72a13b87),
-    ('crop=7:5:0:0,format=yuva420p10le', 4, 0xc6b327bf),
+    ('crop=7:5:0:0,format=yuva420p10le', 4, 0xcbbe8aa7),
     (
       'scale=16:12:flags=bilinear:out_color_matrix=bt709:out_range=tv,'
           'format=yuva420p10le',
       4,
-      0xaae6c9d6,
+      0x8344b334,
     ),
     (
       'split[a][b];[a]format=rgb24[m];[b]crop=4:4:2:0,format=yuva444p[c];'
@@ -827,8 +908,8 @@ void _checkCompositing() {
     ('yuva420p', '2:0', 0x9af53551),
     ('yuva422p', '-1:1', 0x8ecae76b),
     ('yuva444p', '-1:1', 0xedf5b33a),
-    ('yuva420p10le', '2:0', 0xf3840e13),
-    ('yuva444p10le', '-1:1', 0xb3783697),
+    ('yuva420p10le', '2:0', 0x0cdb4218),
+    ('yuva444p10le', '-1:1', 0xb79031c5),
     ('gbrap', '-1:1', 0xf3fc397c),
   ]) {
     final actual = render(
@@ -865,7 +946,7 @@ void _checkCompositing() {
   }
   for (final (format, offset, checksum) in [
     ('yuva420p', '2:0', 0x77e8dc69),
-    ('yuva420p10le', '2:1', 0x9f08ad74),
+    ('yuva420p10le', '2:1', 0x6057e17f),
     ('gbrap', '-1:1', 0x3aa669ab),
   ]) {
     final filter =
@@ -959,11 +1040,10 @@ void _checkStandaloneAlpha() {
       0x31b489aa,
     ),
     ('format=gbrap10le,scale=23:17:flags=bicublin', 0xd7a26c32),
-    // FFmpeg's native YUVA planes rendered by the Dart RGB converter.
-    ('format=yuva444p10le,unpremultiply=inplace=1', 0x78324ce2),
+    ('format=yuva444p10le,unpremultiply=inplace=1', 0x4ce06cb0),
     (
       'format=yuva444p10le,premultiply=inplace=1,unpremultiply=inplace=1',
-      0xa1f06cdd,
+      0x878ef200,
     ),
     ('premultiply_dynamic,format=alpha_modes=premultiplied', 0xd7eb4aee),
     ('format=alpha_modes=premultiplied,premultiply=inplace=1', 0x1dab83f7),
@@ -1474,6 +1554,18 @@ Future<void> _checkCli(String? executable) async {
       0x0d3e430c,
       0x0d3e430c,
     ];
+    const scaledYuv =
+        'format=yuva420p10le,scale=14:8:flags=bilinear,format=rgba,fps=8';
+    const scaledYuvReference = [
+      0x36e177c8,
+      0x36e177c8,
+      0x47b27e01,
+      0x47b27e01,
+      0xabbb84ab,
+      0xabbb84ab,
+      0x03c08b25,
+      0x03c08b25,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1495,6 +1587,7 @@ Future<void> _checkCli(String? executable) async {
       ('implicit-alpha', implicitAlpha, 8, 6, implicitAlphaReference),
       ('packed-alpha', packedAlpha, 8, 6, packedAlphaReference),
       ('scaled-alpha', scaledAlpha, 11, 8, scaledAlphaReference),
+      ('scaled-yuv', scaledYuv, 14, 8, scaledYuvReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1521,7 +1614,8 @@ Future<void> _checkCli(String? executable) async {
                   name == 'float-alpha' ||
                   name == 'implicit-alpha' ||
                   name == 'packed-alpha' ||
-                  name == 'scaled-alpha'
+                  name == 'scaled-alpha' ||
+                  name == 'scaled-yuv'
               ? transparentMotion
               : motion,
         ]);

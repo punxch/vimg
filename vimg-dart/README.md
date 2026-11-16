@@ -412,6 +412,9 @@ when converting between 8-bit RGB and higher component depths.
 Resizing high-depth GBR into packed RGB uses scalar fixed-point taps and
 filters the studio-range components before packing. Bicublin uses distinct
 luma and chroma taps. Alpha retains its own full-range rounding.
+High-depth YUV with centered chroma uses the scalar matrix for full
+horizontal chroma and a paired lookup for subsampled chroma at even output
+widths. Each path rounds alpha using its own filter precision.
 
 Use `premultiply=inplace=1` or `unpremultiply=inplace=1` to process the
 frame's own alpha. `premultiply_dynamic` follows the downstream alpha

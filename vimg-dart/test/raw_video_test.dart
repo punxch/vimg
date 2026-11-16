@@ -132,7 +132,7 @@ void _checkLayouts() {
   check(
     high.getPixel(0, 0).r == 0 &&
         high.getPixel(0, 0).a == 0 &&
-        high.getPixel(1, 0).r == 255 &&
+        high.getPixel(1, 0).r == 253 &&
         high.getPixel(1, 0).a == 255,
     'Big-endian 10-bit limited-range YUV and alpha',
   );
@@ -146,7 +146,7 @@ void _checkLayouts() {
       )
       .rgb();
   check(
-    packed.getPixel(0, 0).r == 0 && packed.getPixel(1, 0).r == 255,
+    packed.getPixel(0, 0).r == 0 && packed.getPixel(1, 0).r == 253,
     'Y210 stores ten significant bits at the top of each word',
   );
   try {

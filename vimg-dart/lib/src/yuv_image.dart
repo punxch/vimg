@@ -21,6 +21,7 @@ part 'video_timing_filters.dart';
 part 'rgb_scale.dart';
 part 'yuv_scaler.dart';
 part 'scalar_scale_taps.dart';
+part 'packed_yuv.dart';
 
 /// Convert cropped YUV, GBR or monochrome samples to an 8-bit RGB image.
 image.Image yuvImage({
@@ -93,11 +94,18 @@ image.Image yuvImage({
     );
     return scaler._renderFiltered(planes);
   }
-  if (scaler != null) {
-    final (scaledWidth, scaledHeight) = scaler._dimensions(width, height);
+  final deepYuv =
+      cb.isNotEmpty && _hasDeepYuvDepth(matrix, lumaDepth, chromaDepth);
+  final outputScale =
+      scaler ??
+      (deepYuv && (subsamplingX != 0 || subsamplingY != 0)
+          ? YuvImageScaler._fixed(width, height, _ScaleAlgorithm.bicubic)
+          : null);
+  if (outputScale != null) {
+    final (scaledWidth, scaledHeight) = outputScale._dimensions(width, height);
     if (scaledWidth != width ||
         scaledHeight != height ||
-        (scaler._exact &&
+        ((outputScale._exact || deepYuv) &&
             matrix != 0 &&
             cb.isNotEmpty &&
             _needsChromaResampling(
@@ -106,7 +114,7 @@ image.Image yuvImage({
               subsamplingY,
               math.max(lumaDepth, chromaDepth),
             ))) {
-      return scaler._resize(
+      return outputScale._resize(
         y: y,
         cb: cb,
         cr: cr,
@@ -149,8 +157,22 @@ image.Image yuvImage({
       final luma = row * stride + x, chroma = row * chromaStride + x;
       final (r, g, b) = packing.rgb(cr[chroma], y[luma], cb[chroma]);
       pixel.setRgb(r, g, b);
-      if (alpha != null)
-        pixel.a = _RgbStudioConverter.alpha8(alpha[luma], alphaDepth);
+      if (alpha != null) pixel.a = _packedAlphaSample8(alpha[luma], alphaDepth);
+    }
+    return pixels;
+  }
+  if (deepYuv) {
+    final packed = _PackedYuvMatrix(matrix, fullRange);
+    for (final pixel in pixels) {
+      final x = cropLeft + pixel.x, row = cropTop + pixel.y;
+      final luma = row * stride + x, chroma = row * chromaStride + x;
+      final (r, g, b) = packed.rgb(
+        _unscaledSampleQ9(y[luma], lumaDepth),
+        _unscaledSampleQ9(cb[chroma], chromaDepth),
+        _unscaledSampleQ9(cr[chroma], chromaDepth),
+      );
+      pixel.setRgb(r, g, b);
+      if (alpha != null) pixel.a = _packedAlphaSample8(alpha[luma], alphaDepth);
     }
     return pixels;
   }

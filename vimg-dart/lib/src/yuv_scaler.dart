@@ -449,6 +449,8 @@ final class YuvImageScaler {
       );
     }
     final gbr = matrix == 0 && cb.isNotEmpty;
+    final deepYuv =
+        cb.isNotEmpty && _hasDeepYuvDepth(matrix, lumaDepth, chromaDepth);
     final studio =
         gbr &&
             !packedRgb &&
@@ -475,7 +477,7 @@ final class YuvImageScaler {
       chromaHeight: (sourceHeight + (1 << subsamplingY) - 1) >> subsamplingY,
       outputChromaWidth: cb.isEmpty ? 0 : (halfChroma ? width >> 1 : width),
       chromaKernel: _algorithm.kernel(chroma: !gbr || studio != null),
-      scalarTaps: studio != null,
+      scalarTaps: studio != null || deepYuv,
     );
     if (geometry != _geometry) {
       final lumaKernel = _algorithm.kernel(chroma: false);
@@ -489,7 +491,10 @@ final class YuvImageScaler {
       );
       _chroma = cb.isEmpty
           ? null
-          : studio != null && geometry.chromaKernel == lumaKernel
+          : geometry.scalarTaps &&
+                subsamplingX == 0 &&
+                subsamplingY == 0 &&
+                geometry.chromaKernel == lumaKernel
           ? _luma
           : _PlaneScaler(
               geometry.chromaWidth,
@@ -504,7 +509,7 @@ final class YuvImageScaler {
     // The paired-chroma filter output quantizes its YUV samples before the
     // RGB lookup, including when the decoded planes use more than eight bits.
     final useTable =
-        halfChroma && (_exact || lumaDepth == 8 && chromaDepth == 8);
+        halfChroma && (deepYuv || _exact || lumaDepth == 8 && chromaDepth == 8);
     final fractionalBits = useTable ? 0 : 9;
     final lumaOffset = cropTop * stride + cropLeft;
     final chromaOffset =
@@ -532,7 +537,7 @@ final class YuvImageScaler {
     }
     bool truncateMatrix(int row) =>
         _luma.hasPackedPair(row) && _chroma!.hasPackedPair(row);
-    final truncateRows = studio == null ? null : truncateMatrix;
+    final truncateRows = geometry.scalarTaps ? truncateMatrix : null;
     final luma = _luma.resize(
       studioPlanes?.$1 ?? y,
       studio == null ? stride : sourceWidth,
@@ -575,6 +580,14 @@ final class YuvImageScaler {
       }
     } else if (useTable) {
       _rgbTable(matrix, fullRange).write(pixels, luma, blueChroma!, redChroma!);
+    } else if (deepYuv) {
+      final packed = _PackedYuvMatrix(matrix, fullRange);
+      var i = 0;
+      for (final pixel in pixels) {
+        final (r, g, b) = packed.rgb(luma[i], blueChroma![i], redChroma![i]);
+        pixel.setRgb(r, g, b);
+        i++;
+      }
     } else {
       _writeRgb(
         pixels,
@@ -590,21 +603,38 @@ final class YuvImageScaler {
       );
     }
     if (alpha != null) {
-      const fractionalBits = 9;
+      final pairedAlpha = deepYuv && halfChroma;
       final scaled = _luma.resize(
         alpha,
         stride,
         lumaOffset,
         alphaDepth,
-        studio == null ? fractionalBits : 0,
+        geometry.scalarTaps ? 0 : 9,
+        truncateRows: pairedAlpha ? truncateRows : null,
       );
+      // A paired identity row rescales its Q7 alpha by 255. The packed
+      // two-tap path truncates alpha together with the YUV samples.
+      if (pairedAlpha && _luma.vertical.first.weights.length == 1) {
+        for (var row = 0; row < height; row++) {
+          final chroma = _chroma!.vertical[row].weights;
+          if (chroma.length != 1 &&
+              !(_chroma!.hasPackedPair(row) && chroma[1] == 0)) {
+            continue;
+          }
+          final start = _luma.vertical[row].start * width;
+          for (var x = 0; x < width; x++) {
+            scaled[row * width + x] =
+                (_luma.intermediate[start + x] * 255 + 16384) >> 15;
+          }
+        }
+      }
       final maximum = ((1 << alphaDepth) - 1) << (17 - alphaDepth);
       var index = 0;
       for (final pixel in pixels) {
         final sample = scaled[index++];
-        pixel.a = studio == null
-            ? (sample.clamp(0, maximum) * 255 + (maximum >> 1)) ~/ maximum
-            : sample.clamp(0, 255);
+        pixel.a = geometry.scalarTaps
+            ? sample.clamp(0, 255)
+            : (sample.clamp(0, maximum) * 255 + (maximum >> 1)) ~/ maximum;
       }
     }
     return pixels;

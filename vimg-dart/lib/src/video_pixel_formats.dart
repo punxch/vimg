@@ -453,18 +453,12 @@ final class _RgbStudioConverter {
   _RgbStudioConverter(int depth, {int outputDepth = 8})
     : studioDepth = depth == 16 ? 16 : 14,
       _inputShift = depth == 16 ? 15 : depth + 1,
-      _outputShift = 30 - outputDepth,
-      _rounding = 1 << (29 - outputDepth),
-      _maximum = (1 << outputDepth) - 1,
+      _matrix = _PackedYuvMatrix(6, false, outputDepth: outputDepth),
       _lumaBias = (16 << (depth + 7)) + (1 << (depth == 16 ? 14 : depth)),
       _chromaBias = (128 << (depth + 7)) + (1 << (depth == 16 ? 14 : depth));
 
   final int studioDepth, _inputShift, _lumaBias, _chromaBias;
-  final int _outputShift, _rounding, _maximum;
-  static final _inverse = (() {
-    final (rv, bu, gu, gv) = _rgbCoefficients(6);
-    return ((rv + 4) >> 3, (bu + 4) >> 3, (gu + 4) >> 3, (gv + 4) >> 3);
-  })();
+  final _PackedYuvMatrix _matrix;
 
   (int, int, int) toStudio(int r, int g, int b) => (
     (_rgbProduct(_bt601RgbToYuv[0], r, g, b) + _lumaBias) >> _inputShift,
@@ -474,27 +468,11 @@ final class _RgbStudioConverter {
 
   (int, int, int) rgb(int r, int g, int b) {
     final (y, u, v) = toStudio(r, g, b);
-    // The horizontal identity filter expands Q6 and truncates Q8 to Q7.
-    int q9(int sample) => (studioDepth == 16 ? sample >> 1 : sample << 1) << 2;
+    int q9(int sample) => _unscaledSampleQ9(sample, studioDepth);
     return fromStudio(q9(y), q9(u), q9(v));
   }
 
-  (int, int, int) fromStudio(int y, int cb, int cr) {
-    final lum = (y - (16 << 9)) * 9539;
-    final u = cb - (128 << 9), v = cr - (128 << 9);
-    final (vr, ub, ug, vg) = _inverse;
-    return (
-      _sample(lum + vr * v),
-      _sample(lum + ug * u + vg * v),
-      _sample(lum + ub * u),
-    );
-  }
-
-  int _sample(int value) =>
-      ((value + _rounding) >> _outputShift).clamp(0, _maximum);
-
-  static int alpha8(int sample, int depth) =>
-      math.min(255, ((sample << (16 - depth)) + 128) >> 8);
+  (int, int, int) fromStudio(int y, int cb, int cr) => _matrix.rgb(y, cb, cr);
 }
 
 _VideoPlanes _convertRgbViaStudio(
@@ -522,7 +500,7 @@ _VideoPlanes _convertRgbViaStudio(
       if (opacity != null) {
         opacity[i] = inputAlpha == null
             ? 255
-            : _RgbStudioConverter.alpha8(inputAlpha.at(x, y), inputAlpha.depth);
+            : _packedAlphaSample8(inputAlpha.at(x, y), inputAlpha.depth);
       }
       i++;
     }
@@ -627,8 +605,12 @@ final class _PixelFormatConverter {
       );
     }
     if (source.floating) source = _quantizeFloatFrame(source);
-    final packsDeepRgb =
-        source.usesDeepRgbPacking && target.packedRgb && target.depth == 8;
+    final packsDeepYuv =
+        source.usesDeepYuvPacking && target.packedRgb && target.depth == 8;
+    final packsDeep =
+        target.packedRgb &&
+        target.depth == 8 &&
+        (packsDeepYuv || source.usesDeepRgbPacking);
     final expandsRgb8 =
         source.rgb &&
         source.subX == 0 &&
@@ -638,12 +620,13 @@ final class _PixelFormatConverter {
         target.color == _PixelColor.rgb &&
         target.depth > 8 &&
         target.depth < 16;
-    if ((packsDeepRgb || expandsRgb8) &&
-        source.fullRange &&
+    if ((packsDeep || expandsRgb8) &&
+        (source.fullRange || packsDeepYuv) &&
         full &&
         opacityDepth == target.depth &&
-        (packsDeepRgb || scale == null)) {
-      if (scale != null && (width != source.width || height != source.height)) {
+        (packsDeep || scale == null)) {
+      if (packsDeepYuv ||
+          scale != null && (width != source.width || height != source.height)) {
         return _toRgb(
           source,
           width,
@@ -653,7 +636,7 @@ final class _PixelFormatConverter {
           includeAlpha: requestedAlpha,
         ).mapComponents(
           (plane, _, _, _) => plane,
-          sampleAspect: scale.sampleAspect,
+          sampleAspect: scale?.sampleAspect,
           premultiplied:
               requestedAlpha && (premultiplied ?? source.premultiplied),
         );
@@ -1044,7 +1027,8 @@ final class _PixelFormatConverter {
       geometry,
       () => YuvImageScaler._fixed(width, height, algorithm),
     );
-    if (width == frame.width &&
+    if (!includeAlpha &&
+        width == frame.width &&
         height == frame.height &&
         frame.usesUnscaledRgbTable) {
       final pixels = scaler
@@ -1061,9 +1045,7 @@ final class _PixelFormatConverter {
         : frame.planes.first.atOrigin;
     final cb = frame.planes.length == 3 ? frame.planes[1].packed : null;
     final cr = frame.planes.length == 3 ? frame.planes[2].packed : null;
-    final alpha = includeAlpha
-        ? frame.alpha?.packed ?? _constantPlane(y.width, y.height, 8, 255)
-        : null;
+    final alpha = includeAlpha ? frame.alpha?.packed : null;
     final result = scaler._resize(
       y: y.samples,
       cb: cb?.samples ?? const [],
@@ -1086,10 +1068,22 @@ final class _PixelFormatConverter {
       alpha: alpha?.samples,
       alphaDepth: alpha?.depth ?? 8,
     );
-    return YuvImageScaler._imagePlanes(
+    final packed = YuvImageScaler._imagePlanes(
       result,
       frame.sampleAspect,
       bgr24: bgr24,
+    );
+    if (!includeAlpha || alpha != null) return packed;
+    return _VideoPlanes(
+      packed.planes,
+      0,
+      0,
+      matrix: 0,
+      fullRange: true,
+      packedRgb: true,
+      bgr24: bgr24,
+      sampleAspect: frame.sampleAspect,
+      alpha: _constantPlane(width, height, 8, 255),
     );
   }
 
