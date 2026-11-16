@@ -130,6 +130,31 @@ Future<void> main(List<String> arguments) async {
     keys: 2,
     timeBase: '1/1000',
   );
+  // Annex E streams authored with arithmetic and equivalent VLC payloads.
+  // The baseline stream has GOB resets and start-code prevention bits.
+  // The AVI uses inherited H.263+ options, slices, AIC, loop filtering and
+  // four-vector macroblocks with quantizer changes. The goldens come from
+  // FFmpeg's simple-IDCT decode of the equivalent VLC payloads.
+  await _verify(
+    '$_fixtures/h263-sac.h263',
+    'h263',
+    128,
+    96,
+    [4061969915, 4188358317, 4188358317, 2476630119, 564209759],
+    rate: 15,
+    keys: 2,
+    timeBase: '1/1200000',
+  );
+  await _verify(
+    '$_fixtures/h263-plus-sac.avi',
+    'h263',
+    64,
+    48,
+    [211708720, 1287488537, 1287488537, 4151371288, 3530864030],
+    rate: 25,
+    keys: 2,
+    timeBase: '1/600',
+  );
   await _verify(
     _spark,
     'flv1',

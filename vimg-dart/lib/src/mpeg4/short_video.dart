@@ -79,6 +79,7 @@ final class _H263Macroblocks {
       List<_H263IntraBlock?>.filled(picture.columns * picture.rows, null),
   ];
   late final _filterQuant = Uint8List(picture.columns * picture.rows);
+  late final _sac = header.format.arithmetic ? _H263Sac(_bits) : null;
   late final _overlap = header.format.overlapping && reference != null
       ? _H263Overlap(picture, reference!, _motion, _prediction, header)
       : null;
@@ -93,24 +94,7 @@ final class _H263Macroblocks {
     for (var index = 0; index < count; index++) {
       if (index != 0) _readGroupHeader(index, count);
       final x = index % columns, y = index ~/ columns;
-      final int mode;
-      if (header.intra) {
-        var code = _intraMacroblock.read(_bits);
-        while (code == 8) {
-          code = _intraMacroblock.read(_bits);
-        }
-        mode = code;
-      } else {
-        var code = 20;
-        while (code == 20) {
-          if (_bits.flag()) {
-            code = -1;
-          } else {
-            code = _interMacroblock.read(_bits);
-          }
-        }
-        mode = code;
-      }
+      final mode = _readMacroblock();
       if (mode == -1) {
         if (overlap != null) {
           overlap.markInter(index, _sliceStart);
@@ -125,8 +109,10 @@ final class _H263Macroblocks {
       }
       final intra = header.intra || mode & 4 != 0;
       final aic = intra && header.format.advancedIntra;
-      final fromLeft = aic && _bits.flag() ? _bits.flag() : null;
-      final cbpy = _lumaPattern.read(_bits);
+      final fromLeft = aic ? _readIntraDirection() : null;
+      final cbpy =
+          _sac?.read(intra ? _sacIntraPattern : _sacInterPattern) ??
+          _lumaPattern.read(_bits);
       final normalPattern =
           intra || header.format.alternateVlc && mode & 3 == 3;
       final pattern = ((normalPattern ? cbpy : cbpy ^ 15) << 2) | (mode & 3);
@@ -176,6 +162,44 @@ final class _H263Macroblocks {
     }
   }
 
+  int _readMacroblock() {
+    final sac = _sac;
+    if (header.intra) {
+      while (true) {
+        final code =
+            sac?.read(_sacIntraMacroblock) ?? _intraMacroblock.read(_bits);
+        if (code != 8) return code;
+      }
+    }
+    final format = header.format;
+    final table = header.extended && (format.overlapping || format.loopFilter)
+        ? _sacInterMacroblock4mvq
+        : _sacInterMacroblock;
+    while (true) {
+      if (sac == null ? _bits.flag() : sac.read(_sacCod) != 0) return -1;
+      if (sac == null) {
+        final code = _interMacroblock.read(_bits);
+        if (code != 20) return code;
+      } else {
+        final index = sac.read(table);
+        if (index < 20) {
+          // Table 8 lists INTER, INTER+Q, INTER4V, INTRA and INTRA+Q.
+          const mode = [0, 8, 16, 4, 12];
+          return mode[index >> 2] | (index & 3);
+        }
+        if (index > 20) return index + 3;
+      }
+    }
+  }
+
+  bool? _readIntraDirection() {
+    if (_sac case final sac?) {
+      final direction = sac.read(_sacIntraMode);
+      return direction == 0 ? null : direction == 2;
+    }
+    return _bits.flag() ? _bits.flag() : null;
+  }
+
   // Delay the previous inter macroblock until its right neighbor's mode
   // and motion vectors are available. Only its six residuals are buffered.
   void _finishOverlap(int index) {
@@ -194,7 +218,7 @@ final class _H263Macroblocks {
 
   void _readQuantChange() {
     final quant = !header.format.modifiedQuant
-        ? _quant + _quantChange[_bits.read(2)]
+        ? _quant + _quantChange[_sac?.read(_sacQuant) ?? _bits.read(2)]
         : _bits.flag()
         ? _h263QuantChange[_bits.bit()][_quant]
         : _bits.read(5);
@@ -212,6 +236,17 @@ final class _H263Macroblocks {
     while (!_bits.flag()) {
       if (++padding > 15)
         throw const FormatException('Invalid H.263 GOB start');
+    }
+    if (header.format.arithmetic &&
+        _bits.remaining >= 5 &&
+        _bits.remaining <= 12) {
+      final afterStart = _bits.position;
+      if (_bits.read(5) == 31 && _bits.read(_bits.remaining) == 0) {
+        // Let the last buffered symbols finish before a terminal EOS.
+        _bits.position = start;
+        return;
+      }
+      _bits.position = afterStart;
     }
     final int address, quant;
     if (header.format.structured) {
@@ -232,11 +267,18 @@ final class _H263Macroblocks {
       _bits.skip(2);
       quant = _bits.read(5);
     }
+    // A SAC interval can reach a future start code while the last
+    // buffered macroblocks of the current segment are still being decoded.
+    if (header.format.arithmetic && address > index && address < macroblocks) {
+      _bits.position = start;
+      return;
+    }
     if (address != index || quant == 0) {
       throw const FormatException('Invalid H.263 group address or quantizer');
     }
     _quant = quant;
     _sliceStart = index;
+    _sac?.reset();
   }
 
   List<_Vector> _readMotion(int x, int y, bool split) {
@@ -252,7 +294,9 @@ final class _H263Macroblocks {
         h263: true,
       );
       final _Vector vector;
-      if (header.format.unrestricted) {
+      if (_sac case final sac?) {
+        vector = sac.motion(prediction, header.longVectors);
+      } else if (header.format.unrestricted) {
         final dx = _readUmv(), dy = _readUmv();
         if (dx == 1 && dy == 1) h263Marker(_bits);
         vector = (x: prediction.x + dx, y: prediction.y + dy);
@@ -293,8 +337,12 @@ final class _H263Macroblocks {
     final values = _coefficients..fillRange(0, 64, 0);
     final separateDc = intra && !advanced;
     if (separateDc) {
-      final dc = _bits.read(8);
-      values[0] = (dc == 255 ? 128 : dc) * 8;
+      if (_sac case final sac?) {
+        values[0] = (sac.read(_sacDc) + 1) * 8;
+      } else {
+        final dc = _bits.read(8);
+        values[0] = (dc == 255 ? 128 : dc) * 8;
+      }
     }
     final luma = block < 4;
     final plane = luma ? 0 : block - 3;
@@ -310,11 +358,23 @@ final class _H263Macroblocks {
       final start = _bits.position;
       final position = separateDc ? 0 : -1;
       final table = advanced ? _aicEvents : _interEvents;
-      if (!_readCoefficients(table, scan, position)) {
+      if (!_readCoefficients(
+        table,
+        scan,
+        position,
+        intra: intra,
+        advanced: advanced,
+      )) {
         if (!intra && header.format.alternateVlc) {
           _bits.position = start;
           values.fillRange(0, 64, 0);
-          if (!_readCoefficients(_aicEvents, scan, position)) {
+          if (!_readCoefficients(
+            _aicEvents,
+            scan,
+            position,
+            intra: false,
+            advanced: false,
+          )) {
             throw const FormatException(
               'H.263 alternative VLC run exceeds the block',
             );
@@ -367,13 +427,23 @@ final class _H263Macroblocks {
     );
   }
 
-  bool _readCoefficients(_Events table, List<int> scan, int position) {
+  bool _readCoefficients(
+    _Events table,
+    List<int> scan,
+    int position, {
+    required bool intra,
+    required bool advanced,
+  }) {
+    var number = 0;
     while (true) {
-      final event = _readShortEvent(_bits, table, header.sparkEscape);
+      final event =
+          _sac?.event(number, intra: intra, advanced: advanced) ??
+          _readShortEvent(_bits, table, header.sparkEscape);
       position += event.run + 1;
       if (position >= 64) return false;
       _coefficients[scan[position]] = event.value;
       if (event.last) return true;
+      if (number < 3) number++;
     }
   }
 }

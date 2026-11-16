@@ -20,6 +20,7 @@ typedef H263Format = ({
   bool customClock,
   bool unrestricted,
   bool overlapping,
+  bool arithmetic,
   bool advancedIntra,
   bool loopFilter,
   bool structured,
@@ -36,6 +37,7 @@ typedef H263Header = ({
   bool noRound,
   bool longVectors,
   bool sparkEscape,
+  bool extended,
   Rbsp bits,
 });
 
@@ -61,13 +63,19 @@ final class H263Headers {
     if (source < 6) {
       intra = !bits.flag();
       longVectors = bits.flag();
-      if (bits.flag()) throw UnsupportedError('H.263 arithmetic coding');
+      final arithmetic = bits.flag();
       final overlapping = bits.flag();
       if (bits.flag()) throw UnsupportedError('H.263 PB pictures');
       quant = bits.read(5);
       _checkMultipoint(bits);
       final (width, height) = _standardSize[source];
-      format = _basicFormat(width, height, 12 / 11, overlapping: overlapping);
+      format = _basicFormat(
+        width,
+        height,
+        12 / 11,
+        overlapping: overlapping,
+        arithmetic: arithmetic,
+      );
       noRound = false;
     } else {
       final update = bits.read(3);
@@ -111,6 +119,7 @@ final class H263Headers {
       noRound: noRound,
       longVectors: longVectors,
       sparkEscape: false,
+      extended: source >= 6,
       bits: bits,
     );
   }
@@ -148,6 +157,7 @@ final class H263Headers {
       noRound: false,
       longVectors: false,
       sparkEscape: version == 1,
+      extended: false,
       bits: bits,
     );
   }
@@ -158,6 +168,7 @@ H263Format _basicFormat(
   int height,
   double aspect, {
   bool overlapping = false,
+  bool arithmetic = false,
 }) => (
   width: width,
   height: height,
@@ -167,6 +178,7 @@ H263Format _basicFormat(
   customClock: false,
   unrestricted: false,
   overlapping: overlapping,
+  arithmetic: arithmetic,
   advancedIntra: false,
   loopFilter: false,
   structured: false,
@@ -179,6 +191,7 @@ typedef _Options = ({
   bool customClock,
   bool unrestricted,
   bool overlapping,
+  bool arithmetic,
   bool advancedIntra,
   bool loopFilter,
   bool structured,
@@ -189,7 +202,7 @@ typedef _Options = ({
 _Options _readOptions(Rbsp bits) {
   final source = bits.read(3);
   final customClock = bits.flag(), unrestricted = bits.flag();
-  if (bits.flag()) throw UnsupportedError('H.263+ arithmetic coding');
+  final arithmetic = bits.flag();
   final overlapping = bits.flag(), aic = bits.flag(), loop = bits.flag();
   final structured = bits.flag();
   if (bits.read(2) != 0)
@@ -197,12 +210,16 @@ _Options _readOptions(Rbsp bits) {
       'H.263+ reference selection or independent segments',
     );
   final alternate = bits.flag(), modified = bits.flag();
+  if (arithmetic && (unrestricted || alternate || modified)) {
+    throw const FormatException('Incompatible H.263+ arithmetic coding modes');
+  }
   if (bits.read(4) != 8) throw const FormatException('Invalid H.263+ OPPTYPE');
   return (
     source: source,
     customClock: customClock,
     unrestricted: unrestricted,
     overlapping: overlapping,
+    arithmetic: arithmetic,
     advancedIntra: aic,
     loopFilter: loop,
     structured: structured,
@@ -252,6 +269,7 @@ H263Format _readFormat(Rbsp bits, _Options options) {
     customClock: options.customClock,
     unrestricted: options.unrestricted,
     overlapping: options.overlapping,
+    arithmetic: options.arithmetic,
     advancedIntra: options.advancedIntra,
     loopFilter: options.loopFilter,
     structured: options.structured,

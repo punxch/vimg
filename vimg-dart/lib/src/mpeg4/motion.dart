@@ -116,16 +116,21 @@ _Vector _motionVector(
     if (magnitude == 0) return base;
     final negative = bits.flag();
     final delta = ((magnitude - 1) << extra) + bits.read(extra) + 1;
-    final value = base + (negative ? -delta : delta);
-    if (long) {
-      if (base < -31 && value < -63) return value + 64;
-      if (base > 32 && value > 63) return value - 64;
-      return value;
-    }
-    return ((value + limit) & (2 * limit - 1)) - limit;
+    return _addMotionDifference(base, negative ? -delta : delta, limit, long);
   }
 
   return (x: component(prediction.x), y: component(prediction.y));
+}
+
+int _addMotionDifference(int base, int difference, int limit, bool long) {
+  if (difference == 0) return base;
+  final value = base + difference;
+  if (long) {
+    if (base < -31 && value < -63) return value + 64;
+    if (base > 32 && value > 63) return value - 64;
+    return value;
+  }
+  return ((value + limit) & (2 * limit - 1)) - limit;
 }
 
 final class _Mpeg4MotionCompensation {

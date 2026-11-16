@@ -16,6 +16,8 @@ part 'motion.dart';
 part 'partitions.dart';
 part 'short_annex.dart';
 part 'short_overlap.dart';
+part 'short_sac.dart';
+part 'short_sac_models.dart';
 part 'short_video.dart';
 
 class _DctPicture {
