@@ -133,6 +133,14 @@ int _addMotionDifference(int base, int difference, int limit, bool long) {
   return ((value + limit) & (2 * limit - 1)) - limit;
 }
 
+_Vector _chromaMotion(_Vector sum, {required bool split}) {
+  const chromaRound = [0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1];
+  int reduce(int value) => split
+      ? (value >> 3) + chromaRound[value & 15]
+      : (value >> 1) | (value & 1);
+  return (x: reduce(sum.x), y: reduce(sum.y));
+}
+
 final class _Mpeg4MotionCompensation {
   final _sourceRow = Uint8List(17);
   final _horizontal = Uint8List(17 * 16);
@@ -243,11 +251,7 @@ final class _Mpeg4MotionCompensation {
     required bool noRound,
     bool average = false,
   }) {
-    const chromaRound = [0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1];
-    int reduce(int value) => split
-        ? (value >> 3) + chromaRound[value & 15]
-        : (value >> 1) | (value & 1);
-    final chromaX = reduce(sum.x), chromaY = reduce(sum.y);
+    final chroma = _chromaMotion(sum, split: split);
     for (var plane = 1; plane < 3; plane++) {
       _half(
         output.planes[plane],
@@ -257,8 +261,8 @@ final class _Mpeg4MotionCompensation {
         x * 8,
         y * 8,
         8,
-        chromaX,
-        chromaY,
+        chroma.x,
+        chroma.y,
         noRound,
         average,
       );

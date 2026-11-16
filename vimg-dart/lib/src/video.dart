@@ -179,8 +179,9 @@ final class Video {
   late final _mpegTimeline = _indexMpeg();
   late final _statefulTimeline = _indexStatefulPictures(codec);
   final _vp9PreviewPictures = <FramePacket, FramePacket>{};
-  var _vp9ClockDivisor = 1;
-  var _vp9MultipleDisplayPictures = false;
+  var _displayClockDivisor = 1;
+  var _displayRateVaries = false;
+  var _displayNanosecondClock = false;
   late final _containerCaptureClock = _readCaptureClock();
 
   CaptureRational _readCaptureClock() {
@@ -195,22 +196,52 @@ final class Video {
   ({CaptureRational timeBase, double? frameRate}) get filterTiming {
     if (_mixedIsoCodecs) {
       for (final section in _isoSections) {
-        if (section.codec == 'vp9' && section.visible.isNotEmpty) {
-          section.indexed ??= _indexVp9(section: section);
+        if ((section.codec == 'vp9' || section.codec == 'h263') &&
+            section.visible.isNotEmpty) {
+          section.indexed ??= _indexStatefulPictures(
+            section.codec,
+            section: section,
+          );
         }
       }
-    } else if (codec == 'vp9') {
+    } else if (codec == 'vp9' || codec == 'h263') {
       final _ = _statefulTimeline;
     }
     final base = _containerCaptureClock;
     final stream = metadata.streams.firstWhere((stream) => !stream.attached);
     return (
-      timeBase: (
-        numerator: base.numerator,
-        denominator: base.denominator * _vp9ClockDivisor,
-      ),
-      frameRate: _vp9MultipleDisplayPictures ? null : stream.nominalFrameRate,
+      timeBase: _displayNanosecondClock
+          ? (numerator: 1, denominator: 1000000000)
+          : (
+              numerator: base.numerator,
+              denominator: base.denominator * _displayClockDivisor,
+            ),
+      frameRate: _displayRateVaries ? null : stream.nominalFrameRate,
     );
+  }
+
+  void _refinePresentationClock(
+    FrameTimestamp timestamp,
+    CaptureRational native,
+    String codec,
+  ) {
+    if (_displayNanosecondClock) return;
+    final sample =
+        BigInt.from(timestamp.denominator) * BigInt.from(native.numerator);
+    final container =
+        BigInt.from(timestamp.numerator) * BigInt.from(native.denominator);
+    final factor = sample ~/ sample.gcd(container);
+    final current = BigInt.from(_displayClockDivisor);
+    final finer = (current ~/ current.gcd(factor)) * factor;
+    final bits = (finer * BigInt.from(native.denominator)).bitLength;
+    if (codec == 'H.263' && bits > 30) {
+      // Many distinct TRB/TRD ratios can require mutually prime denominators.
+      _displayNanosecondClock = true;
+    } else if (bits > 62) {
+      throw FormatException('$codec presentation time base is out of range');
+    } else {
+      _displayClockDivisor = finer.toInt();
+    }
   }
 
   late final _huffYuv =
@@ -1328,9 +1359,24 @@ final class Video {
           spark: run.codec == 'flv1',
           previous: configuration.shortVideo,
         );
+        H263Picture? pairedReference;
         return (packet, selected, _) {
-          final picture = decoder.decode(_read(packet));
-          return selected ? picture.rgb : null;
+          switch (packet.subframe?.displayIndex) {
+            case 0:
+              final pair = decoder.decodePair(
+                _read(packet),
+                includeBidirectional: selected,
+              );
+              pairedReference = pair.picture;
+              return pair.bidirectional?.rgb;
+            case 1:
+              final picture = pairedReference;
+              pairedReference = null;
+              return selected ? picture?.rgb : null;
+            default:
+              final picture = decoder.decode(_read(packet));
+              return selected ? picture.rgb : null;
+          }
         };
       case 'mpeg4':
         final reader = _SamplePayloadReader(this);

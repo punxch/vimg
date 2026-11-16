@@ -1,6 +1,10 @@
 part of 'decoder.dart';
 
 // Cumulative frequencies from ITU-T H.263, Annex E.8.
+const _sacPbMode = [16383, 6062, 2130, 0];
+const _sacImprovedPbMode = [16383, 6717, 4568, 2784, 1370, 655, 0];
+const _sacPbLuma = [16383, 6062, 0];
+const _sacPbChroma = [16383, 491, 0];
 const _sacCod = [16383, 6849, 0];
 const _sacIntraMacroblock = [16383, 7410, 6549, 5188, 442, 182, 181, 141, 1, 0];
 const _sacInterMacroblock = [

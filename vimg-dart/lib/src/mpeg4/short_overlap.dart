@@ -15,13 +15,13 @@ final class _H263Overlap {
   final _PictureMotion motion;
   final _Mpeg4MotionCompensation sampler;
   final bool _structured, _noRound;
-  // Zero denotes an intra macroblock. Skipped inter macroblocks have zero
-  // motion but can still contribute to and receive overlapped prediction.
+  // Zero denotes an intra macroblock with no transmitted motion vector.
+  // Skipped inter blocks contribute a zero vector to their neighbors.
   final Uint16List _segments;
   final residuals = List.generate(6, (_) => Int16List(64));
   final _samples = List.generate(5, (_) => Uint8List(64));
 
-  void markInter(int index, int start) {
+  void markMotion(int index, int start) {
     _segments[index] = _structured ? start + 1 : 1;
   }
 

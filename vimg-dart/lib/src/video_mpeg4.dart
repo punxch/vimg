@@ -7,32 +7,78 @@ extension _Mpeg4Timeline on Video {
     final positions = <FramePacket, int>{};
     final configurations = <int, _RunConfiguration>{};
     final sections = <int, int>{};
+    final paired = <FramePacket, List<FramePacket>>{};
     var anchor = -1;
+    FramePacket? previousPacket;
+    int? previousTime;
+    void record(FramePacket packet) {
+      positions[packet] = decodeOrder.length;
+      decodeOrder.add(packet);
+      anchors.add(anchor);
+    }
+
     final display =
         _containerPackets(
-          false,
-          section: section,
-          onSample: (packet, _) {
-            final header = headers.read(_readPrefix(packet, 1024));
-            final position = decodeOrder.length;
-            if (header.intra) {
-              anchor = position;
-              configurations[anchor] = _RunConfiguration(
-                shortVideo: header.format,
-              );
-              sections[anchor] = 0;
-            }
-            positions[packet] = position;
-            decodeOrder.add(packet);
-            anchors.add(anchor);
-          },
-        ).where((packet) => anchors[positions[packet]!] >= 0).toList()..sort((
-          a,
-          b,
-        ) {
-          final byTime = a.seconds.compareTo(b.seconds);
-          return byTime == 0 ? positions[a]!.compareTo(positions[b]!) : byTime;
-        });
+              false,
+              section: section,
+              onSample: (packet, _) {
+                final header = headers.read(_readPrefix(packet, 1024));
+                final position = decodeOrder.length;
+                if (header.intra) {
+                  anchor = position;
+                  configurations[anchor] = _RunConfiguration(
+                    shortVideo: header.format,
+                  );
+                  sections[anchor] = 0;
+                }
+                if (header.pb != null && previousPacket != null) {
+                  final distance = h263PbDistance(previousTime!, header);
+                  final frames = _h263PairedPackets(
+                    previousPacket!,
+                    packet,
+                    header,
+                    distance,
+                  );
+                  for (final frame in frames) {
+                    if (section != null) _isoSectionByPacket[frame] = section;
+                    if (_isoAspects[packet] case final aspect?)
+                      _isoAspects[frame] = aspect;
+                    record(frame);
+                  }
+                  paired[packet] = frames;
+                } else {
+                  record(packet);
+                }
+                if (!header.disposable) {
+                  previousPacket = packet;
+                  previousTime = header.temporalReference;
+                }
+              },
+            )
+            .expand((packet) => paired[packet] ?? [packet])
+            .where((packet) => anchors[positions[packet]!] >= 0)
+            .toList()
+          ..sort((a, b) {
+            final byTime = a.seconds.compareTo(b.seconds);
+            return byTime == 0
+                ? positions[a]!.compareTo(positions[b]!)
+                : byTime;
+          });
+    if (paired.isNotEmpty && _shortElementary == null) {
+      for (var i = 0; i + 1 < display.length; i++) {
+        final next = display[i + 1];
+        if (next.subframe?.displayIndex != 0) continue;
+        final previous = display[i];
+        final shortened = _h263BeforeBidirectional(previous, next);
+        if (shortened == previous) continue;
+        final position = positions.remove(previous)!;
+        positions[shortened] = position;
+        decodeOrder[position] = display[i] = shortened;
+        if (section != null) _isoSectionByPacket[shortened] = section;
+        if (_isoAspects[previous] case final aspect?)
+          _isoAspects[shortened] = aspect;
+      }
+    }
     return (
       timeline: (
         presentation: display,
@@ -43,6 +89,89 @@ extension _Mpeg4Timeline on Video {
       sections: sections,
       configurations: configurations,
     );
+  }
+
+  FramePacket _h263BeforeBidirectional(FramePacket previous, FramePacket next) {
+    final before = previous.timestamp, after = next.timestamp;
+    final duration = before?.duration;
+    if (before == null || after == null || duration == null) return previous;
+    final divisor = before.denominator.gcd(after.denominator);
+    final startScale = after.denominator ~/ divisor * before.numerator;
+    final endScale = before.denominator ~/ divisor * after.numerator;
+    final start = before.pts * startScale;
+    final interval = after.pts * endScale - start;
+    if (interval <= 0 || interval >= duration * startScale) return previous;
+    return (
+      offset: previous.offset,
+      size: previous.size,
+      seconds: previous.seconds,
+      subframe: previous.subframe,
+      timestamp: frameTimestamp(
+        start,
+        1,
+        before.denominator ~/ divisor * after.denominator,
+        duration: interval,
+      ),
+    );
+  }
+
+  List<FramePacket> _h263PairedPackets(
+    FramePacket previous,
+    FramePacket packet,
+    H263Header header,
+    int distance,
+  ) {
+    final offset = header.pb!.offset;
+    final before = previous.timestamp, after = packet.timestamp;
+    final gap = packet.seconds - previous.seconds;
+    var bTime = gap > 0
+        ? previous.seconds + gap * offset / distance
+        : packet.seconds -
+              (distance - offset) *
+                  header.format.tickNumerator /
+                  header.format.tickDenominator;
+    var stamp = _shortElementary?.bidirectionalTimestamp(packet);
+    if (stamp != null) {
+      bTime = stamp.pts * stamp.numerator / stamp.denominator;
+    } else if (before != null &&
+        after != null &&
+        before.numerator == after.numerator &&
+        before.denominator == after.denominator &&
+        after.pts > before.pts) {
+      final delta = after.pts - before.pts;
+      final divisor = (delta * offset).gcd(distance);
+      final scale = distance ~/ divisor;
+      final time = before.pts * scale + delta * offset ~/ divisor;
+      stamp = frameTimestamp(
+        time,
+        after.numerator,
+        after.denominator * scale,
+        duration: after.pts * scale - time,
+      );
+    }
+    if (_shortElementary == null) {
+      _displayRateVaries = true;
+      if (stamp != null) {
+        _refinePresentationClock(stamp, _containerCaptureClock, 'H.263');
+      }
+    }
+    FramePacket subframe(
+      int index,
+      double seconds,
+      FrameTimestamp? timestamp,
+    ) => (
+      offset: packet.offset,
+      size: packet.size,
+      seconds: seconds,
+      timestamp: timestamp,
+      subframe: (
+        offset: 0,
+        length: packet.size,
+        displayIndex: index,
+        sampleTimestamp: packet.timestamp,
+      ),
+    );
+    return [subframe(0, bTime, stamp), subframe(1, packet.seconds, after)];
   }
 
   _IndexedVideo _indexMpeg4({_IsoSection? section}) {

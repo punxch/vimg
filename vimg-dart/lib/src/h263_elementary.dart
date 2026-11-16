@@ -25,6 +25,13 @@ final class H263Elementary {
 
   VideoMetadata metadata() => _index.metadata;
 
+  FrameTimestamp? bidirectionalTimestamp(FramePacket packet) {
+    final pts = _index.pairedTimes[packet.offset];
+    return pts == null
+        ? null
+        : frameTimestamp(pts, 1, _clock, duration: packet.timestamp!.pts - pts);
+  }
+
   Iterable<FramePacket> packets(bool preview, {FrameVisitor? onSample}) sync* {
     for (final (packet, key) in _index.frames) {
       onSample?.call(packet, key);
@@ -32,7 +39,12 @@ final class H263Elementary {
     }
   }
 
-  ({VideoMetadata metadata, List<(FramePacket, bool)> frames}) _scan() {
+  ({
+    VideoMetadata metadata,
+    List<(FramePacket, bool)> frames,
+    Map<int, int> pairedTimes,
+  })
+  _scan() {
     final offsets = <int>[];
     const chunkSize = 256 * 1024;
     var zeroes = 0;
@@ -51,6 +63,8 @@ final class H263Elementary {
     final headers = H263Headers();
     final pictures = <(int, int, bool)>[];
     final ticks = <int>[];
+    final displayTicks = <int>[], durations = <int>[];
+    final pairedTimes = <int, int>{};
     H263Format? format;
     int? previous;
     // Accumulate at the common clock before rounding to output timestamps.
@@ -65,22 +79,32 @@ final class H263Elementary {
       format ??= current;
       final temporal = header.temporalReference;
       if (previous != null) {
-        final wrap = current.customClock ? 1024 : 256;
-        final delta = (temporal - previous) % wrap;
-        elapsed +=
-            delta *
-            current.tickNumerator *
-            (commonClock ~/ current.tickDenominator);
+        final unit =
+            current.tickNumerator * (commonClock ~/ current.tickDenominator);
+        if (header.pb case final pb?) {
+          final delta = h263PbDistance(previous, header);
+          final time = (elapsed + unit * pb.offset + 1) ~/ 3;
+          pairedTimes[offset] = time;
+          displayTicks.add(time);
+          elapsed += delta * unit;
+        } else {
+          elapsed += h263TemporalDistance(previous, header) * unit;
+        }
       }
       previous = temporal;
       ticks.add((elapsed + 1) ~/ 3);
+      displayTicks.add(ticks.last);
+      if (ticks.length > 1) {
+        final next = displayTicks.length - (header.pb == null ? 1 : 2);
+        durations.add(displayTicks[next] - ticks[ticks.length - 2]);
+      }
       pictures.add((offset, size, header.intra));
     }
     if (format == null)
       throw const FormatException('H.263 stream has no intra picture');
     final cadence = <int, int>{};
-    for (var i = 1; i < ticks.length; i++) {
-      final delta = ticks[i] - ticks[i - 1];
+    for (var i = 1; i < displayTicks.length; i++) {
+      final delta = displayTicks[i] - displayTicks[i - 1];
       if (delta > 0)
         cadence.update(delta, (count) => count + 1, ifAbsent: () => 1);
     }
@@ -94,8 +118,10 @@ final class H263Elementary {
             ?.key ??
         (_clock * format.tickNumerator / format.tickDenominator).round();
     ticks.add(ticks.last + period);
+    durations.add(period);
     final fixed = cadence.keys.every((delta) => (delta - period).abs() <= 1);
     return (
+      pairedTimes: pairedTimes,
       metadata: VideoMetadata(ticks.last / _clock, [
         VideoStream(
           codec: 'h263',
@@ -116,7 +142,7 @@ final class H263Elementary {
                 ticks[i],
                 1,
                 _clock,
-                duration: ticks[i + 1] - ticks[i],
+                duration: durations[i],
               ),
               subframe: null,
             ),

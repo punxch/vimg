@@ -65,9 +65,9 @@ extension _Vp9Timeline on Video {
             )
           : null;
       if (visible && clocks != null) {
-        _vp9MultipleDisplayPictures = true;
+        _displayRateVaries = true;
         if (clocks.timestamp case final timestamp?) {
-          _refineVp9Clock(timestamp, _containerCaptureClock);
+          _refinePresentationClock(timestamp, _containerCaptureClock, 'VP9');
         }
       }
       var display = 0;
@@ -149,20 +149,6 @@ extension _Vp9Timeline on Video {
       }
     }
     return intervals;
-  }
-
-  void _refineVp9Clock(FrameTimestamp timestamp, CaptureRational native) {
-    final sample =
-        BigInt.from(timestamp.denominator) * BigInt.from(native.numerator);
-    final container =
-        BigInt.from(timestamp.numerator) * BigInt.from(native.denominator);
-    final factor = sample ~/ sample.gcd(container);
-    final current = BigInt.from(_vp9ClockDivisor);
-    final finer = (current ~/ current.gcd(factor)) * factor;
-    if ((finer * BigInt.from(native.denominator)).bitLength > 62) {
-      throw const FormatException('VP9 presentation time base is out of range');
-    }
-    _vp9ClockDivisor = finer.toInt();
   }
 
   Iterable<FramePacket> _vp9Previews(List<FramePacket> displayed) {

@@ -38,6 +38,7 @@ typedef H263Header = ({
   bool longVectors,
   bool sparkEscape,
   bool extended,
+  ({int offset, int quantFactor})? pb,
   Rbsp bits,
 });
 
@@ -57,7 +58,7 @@ final class H263Headers {
     if (bits.read(2) != 2) throw const FormatException('Invalid H.263 PTYPE');
     bits.skip(3); // split-screen, document camera, freeze release
     final source = bits.read(3);
-    final bool intra, longVectors, noRound;
+    final bool intra, longVectors, noRound, paired;
     final H263Format format;
     final int quant;
     if (source < 6) {
@@ -65,7 +66,7 @@ final class H263Headers {
       longVectors = bits.flag();
       final arithmetic = bits.flag();
       final overlapping = bits.flag();
-      if (bits.flag()) throw UnsupportedError('H.263 PB pictures');
+      paired = bits.flag();
       quant = bits.read(5);
       _checkMultipoint(bits);
       final (width, height) = _standardSize[source];
@@ -82,8 +83,9 @@ final class H263Headers {
       if (update > 1) throw const FormatException('Invalid H.263+ UFEP');
       final options = update == 1 ? _readOptions(bits) : null;
       final type = bits.read(3);
-      if (type > 1) throw UnsupportedError('H.263+ picture type $type');
+      if (type > 2) throw UnsupportedError('H.263+ picture type $type');
       intra = type == 0;
+      paired = type == 2;
       if (bits.read(2) != 0)
         throw UnsupportedError('H.263+ resampled reference or scaled update');
       noRound = bits.flag();
@@ -102,6 +104,16 @@ final class H263Headers {
       quant = bits.read(5);
     }
     _checkPicture(format, quant);
+    if (paired && intra)
+      throw const FormatException('Invalid H.263 PB picture type');
+    final pb = paired
+        ? (
+            offset: bits.read(format.customClock ? 5 : 3),
+            quantFactor: 5 + bits.read(2),
+          )
+        : null;
+    if (pb?.offset == 0)
+      throw const FormatException('Invalid H.263 B-picture time');
     while (bits.flag()) bits.skip(8);
     if (format.structured) {
       h263Marker(bits);
@@ -120,6 +132,7 @@ final class H263Headers {
       longVectors: longVectors,
       sparkEscape: false,
       extended: source >= 6,
+      pb: pb,
       bits: bits,
     );
   }
@@ -158,9 +171,22 @@ final class H263Headers {
       longVectors: false,
       sparkEscape: version == 1,
       extended: false,
+      pb: null,
       bits: bits,
     );
   }
+}
+
+int h263TemporalDistance(int previous, H263Header header) =>
+    (header.temporalReference - previous) %
+    (header.format.customClock ? 1024 : 256);
+
+int h263PbDistance(int previous, H263Header header) {
+  final distance = h263TemporalDistance(previous, header);
+  if (header.pb!.offset >= distance) {
+    throw const FormatException('H.263 B-picture lies outside its references');
+  }
+  return distance;
 }
 
 H263Format _basicFormat(

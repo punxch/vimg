@@ -32,8 +32,15 @@ final class H263Decoder {
   final _transform = MpegIdct();
   final _prediction = _Mpeg4MotionCompensation();
   H263Picture? _reference;
+  int? _referenceTime;
 
-  H263Picture decode(Uint8List bytes) {
+  H263Picture decode(Uint8List bytes) =>
+      decodePair(bytes, includeBidirectional: false).picture;
+
+  ({H263Picture picture, H263Picture? bidirectional}) decodePair(
+    Uint8List bytes, {
+    required bool includeBidirectional,
+  }) {
     final header = _headers.read(bytes);
     final format = header.format;
     final picture = H263Picture._(format);
@@ -44,15 +51,29 @@ final class H263Decoder {
             reference.height != picture.height)) {
       throw const FormatException('Missing H.263 reference picture');
     }
+    final pb = header.pb == null
+        ? null
+        : _H263Pb(
+            header,
+            reference!,
+            picture,
+            _prediction,
+            h263PbDistance(_referenceTime!, header),
+            includeBidirectional ? H263Picture._(format) : null,
+          );
     _H263Macroblocks(
       header,
       picture,
       reference,
       _transform,
       _prediction,
+      pb,
     ).decode();
-    if (!header.disposable) _reference = picture;
-    return picture;
+    if (!header.disposable) {
+      _reference = picture;
+      _referenceTime = header.temporalReference;
+    }
+    return (picture: picture, bidirectional: pb?.output);
   }
 }
 
@@ -63,6 +84,7 @@ final class _H263Macroblocks {
     this.reference,
     this._transform,
     this._prediction,
+    this._pb,
   ) : _motion = _PictureMotion(picture.columns, picture.rows, false),
       _quant = header.quant;
 
@@ -71,6 +93,7 @@ final class _H263Macroblocks {
   final H263Picture? reference;
   final MpegIdct _transform;
   final _Mpeg4MotionCompensation _prediction;
+  final _H263Pb? _pb;
   final _PictureMotion _motion;
   final _coefficients = Int16List(64);
   late final _aic = [
@@ -96,20 +119,22 @@ final class _H263Macroblocks {
       final x = index % columns, y = index ~/ columns;
       final mode = _readMacroblock();
       if (mode == -1) {
+        overlap?.markMotion(index, _sliceStart);
+        _finishPrevious(index - 1);
         if (overlap != null) {
-          overlap.markInter(index, _sliceStart);
-          _finishOverlap(index - 1);
           _pendingPattern = 0;
         } else {
           _prediction.predict(picture, reference!, x, y, [
             _zeroVector,
           ], noRound: header.noRound);
         }
+        _pb?.queue(_PbMode.direct, _zeroVector, 0);
         continue;
       }
       final intra = header.intra || mode & 4 != 0;
       final aic = intra && header.format.advancedIntra;
       final fromLeft = aic ? _readIntraDirection() : null;
+      final pbBlock = _pb == null ? null : _readPbMode();
       final cbpy =
           _sac?.read(intra ? _sacIntraPattern : _sacInterPattern) ??
           _lumaPattern.read(_bits);
@@ -119,9 +144,11 @@ final class _H263Macroblocks {
       if (mode & (header.intra ? 4 : 8) != 0) {
         _readQuantChange();
       }
-      if (!intra) {
+      if (!intra || pbBlock?.mode == _PbMode.direct) {
         final vectors = _readMotion(x, y, mode & 16 != 0);
-        if (overlap == null) {
+        if (overlap != null) {
+          overlap.markMotion(index, _sliceStart);
+        } else if (!intra) {
           _prediction.predict(
             picture,
             reference!,
@@ -130,12 +157,18 @@ final class _H263Macroblocks {
             vectors,
             noRound: header.noRound,
           );
-        } else {
-          overlap.markInter(index, _sliceStart);
         }
       }
-      _finishOverlap(index - 1);
+      _finishPrevious(index - 1);
       if (overlap != null && !intra) _pendingPattern = pattern;
+      if (pbBlock != null) {
+        final predictor =
+            pbBlock.mode == _PbMode.forward && x != 0 && index != _sliceStart
+            ? _pb!.leftForward
+            : _zeroVector;
+        final motion = pbBlock.vector ? _readVector(predictor) : _zeroVector;
+        _pb!.queue(pbBlock.mode, motion, pbBlock.pattern);
+      }
       for (var block = 0; block < 6; block++) {
         final coded = pattern & (32 >> block) != 0;
         if (intra || coded) {
@@ -150,9 +183,10 @@ final class _H263Macroblocks {
           );
         }
       }
+      if (pbBlock != null) _readPbBlocks(pbBlock.pattern);
       if (header.format.loopFilter) _filterQuant[index] = _quant;
     }
-    _finishOverlap(count - 1);
+    _finishPrevious(count - 1);
     if (header.format.loopFilter) {
       _deblockH263(
         picture,
@@ -200,13 +234,21 @@ final class _H263Macroblocks {
     return _bits.flag() ? _bits.flag() : null;
   }
 
-  // Delay the previous inter macroblock until its right neighbor's mode
-  // and motion vectors are available. Only its six residuals are buffered.
-  void _finishOverlap(int index) {
+  // Finish overlapped prediction when the right neighbor's motion is known,
+  // then reconstruct the paired B macroblock before P-picture deblocking.
+  void _finishPrevious(int index) {
+    if (index < 0 || (_pendingPattern < 0 && _pb?.output == null)) return;
+    final x = index % picture.columns, y = index ~/ picture.columns;
+    _finishOverlap(x, y);
+    if (_pb?.output != null) {
+      _pb!.reconstruct(x, y, _motion, _transform);
+    }
+  }
+
+  void _finishOverlap(int x, int y) {
     final pattern = _pendingPattern;
     if (pattern < 0) return;
     final overlap = _overlap!;
-    final x = index % picture.columns, y = index ~/ picture.columns;
     overlap.predict(x, y);
     for (var block = 0; block < 6; block++) {
       if (pattern & (32 >> block) != 0) {
@@ -214,6 +256,55 @@ final class _H263Macroblocks {
       }
     }
     _pendingPattern = -1;
+  }
+
+  ({_PbMode mode, bool vector, int pattern}) _readPbMode() {
+    final sac = _sac;
+    final improved = header.extended;
+    int index;
+    if (sac != null) {
+      index = sac.read(improved ? _sacImprovedPbMode : _sacPbMode);
+    } else {
+      index = 0;
+      final limit = improved ? 5 : 2;
+      while (index < limit && _bits.flag()) {
+        index++;
+      }
+    }
+    final hasPattern = improved ? index.isOdd : index == 2;
+    var pattern = 0;
+    if (hasPattern) {
+      if (sac == null) {
+        pattern = _bits.read(6);
+      } else {
+        for (var block = 0; block < 6; block++) {
+          pattern =
+              (pattern << 1) | sac.read(block < 4 ? _sacPbLuma : _sacPbChroma);
+        }
+      }
+    }
+    final mode = improved ? _PbMode.values[index >> 1] : _PbMode.direct;
+    return (
+      mode: mode,
+      vector: improved ? mode == _PbMode.forward : index > 0,
+      pattern: pattern,
+    );
+  }
+
+  void _readPbBlocks(int pattern) {
+    final pb = _pb!;
+    final bQuant = math.min(31, _quant * header.pb!.quantFactor ~/ 4);
+    for (var block = 0; block < 6; block++) {
+      if (pattern & (32 >> block) == 0) continue;
+      _coefficients.fillRange(0, 64, 0);
+      _readTexture(mpegZigzag, -1, intra: false, advanced: false);
+      if (pb.output == null) continue;
+      final quant = block >= 4 && header.format.modifiedQuant
+          ? _h263ChromaQuant[bQuant]
+          : bQuant;
+      _inverseQuantize(quant, first: 0);
+      pb.residuals[block].setAll(0, _coefficients);
+    }
   }
 
   void _readQuantChange() {
@@ -293,16 +384,7 @@ final class _H263Macroblocks {
         i,
         h263: true,
       );
-      final _Vector vector;
-      if (_sac case final sac?) {
-        vector = sac.motion(prediction, header.longVectors);
-      } else if (header.format.unrestricted) {
-        final dx = _readUmv(), dy = _readUmv();
-        if (dx == 1 && dy == 1) h263Marker(_bits);
-        vector = (x: prediction.x + dx, y: prediction.y + dy);
-      } else {
-        vector = _motionVector(_bits, prediction, 1, long: header.longVectors);
-      }
+      final vector = _readVector(prediction);
       vectors.add(vector);
       if (split) _motion.store(x, y, i, vector);
     }
@@ -312,6 +394,16 @@ final class _H263Macroblocks {
       }
     }
     return vectors;
+  }
+
+  _Vector _readVector(_Vector prediction) {
+    if (_sac case final sac?) return sac.motion(prediction, header.longVectors);
+    if (header.format.unrestricted) {
+      final dx = _readUmv(), dy = _readUmv();
+      if (dx == 1 && dy == 1) h263Marker(_bits);
+      return (x: prediction.x + dx, y: prediction.y + dy);
+    }
+    return _motionVector(_bits, prediction, 1, long: header.longVectors);
   }
 
   int _readUmv() {
@@ -355,54 +447,64 @@ final class _H263Macroblocks {
         false => horizontalScan,
         null => mpegZigzag,
       };
-      final start = _bits.position;
-      final position = separateDc ? 0 : -1;
-      final table = advanced ? _aicEvents : _interEvents;
-      if (!_readCoefficients(
-        table,
-        scan,
-        position,
-        intra: intra,
-        advanced: advanced,
-      )) {
-        if (!intra && header.format.alternateVlc) {
-          _bits.position = start;
-          values.fillRange(0, 64, 0);
-          if (!_readCoefficients(
-            _aicEvents,
-            scan,
-            position,
-            intra: false,
-            advanced: false,
-          )) {
-            throw const FormatException(
-              'H.263 alternative VLC run exceeds the block',
-            );
-          }
-        } else {
-          throw const FormatException('H.263 run exceeds the block');
-        }
-      }
+      _readTexture(scan, separateDc ? 0 : -1, intra: intra, advanced: advanced);
     }
     final bx = luma ? x * 2 + (block & 1) : x;
     final by = luma ? y * 2 + (block >> 1) : y;
     if (advanced) {
       _reconstructAic(plane, bx, by, quant, fromLeft);
     } else if (coded) {
-      final qadd = (quant - 1) | 1;
-      for (var i = separateDc ? 1 : 0; i < 64; i++) {
-        final level = values[i];
-        if (level == 0) continue;
-        values[i] = (level.sign * (2 * quant * level.abs() + qadd)).clamp(
-          -2048,
-          2047,
-        );
-      }
+      _inverseQuantize(quant, first: separateDc ? 1 : 0);
     }
     if (_pendingPattern >= 0) {
       _overlap!.residuals[block].setAll(0, values);
     } else {
       _writeBlock(x, y, block, values, intra: intra);
+    }
+  }
+
+  void _readTexture(
+    List<int> scan,
+    int position, {
+    required bool intra,
+    required bool advanced,
+  }) {
+    final start = _bits.position;
+    final table = advanced ? _aicEvents : _interEvents;
+    if (_readCoefficients(
+      table,
+      scan,
+      position,
+      intra: intra,
+      advanced: advanced,
+    )) {
+      return;
+    }
+    if (!intra && header.format.alternateVlc) {
+      _bits.position = start;
+      _coefficients.fillRange(0, 64, 0);
+      if (_readCoefficients(
+        _aicEvents,
+        scan,
+        position,
+        intra: false,
+        advanced: false,
+      )) {
+        return;
+      }
+    }
+    throw const FormatException('H.263 run exceeds the block');
+  }
+
+  void _inverseQuantize(int quant, {required int first}) {
+    final qadd = (quant - 1) | 1;
+    for (var i = first; i < 64; i++) {
+      final level = _coefficients[i];
+      if (level == 0) continue;
+      _coefficients[i] = (level.sign * (2 * quant * level.abs() + qadd)).clamp(
+        -2048,
+        2047,
+      );
     }
   }
 
@@ -413,18 +515,7 @@ final class _H263Macroblocks {
     Int16List values, {
     required bool intra,
   }) {
-    final luma = block < 4;
-    final plane = luma ? 0 : block - 3;
-    final stride = luma ? picture.stride : picture.stride >> 1;
-    final bx = luma ? x * 2 + (block & 1) : x;
-    final by = luma ? y * 2 + (block >> 1) : y;
-    _transform.write(
-      picture.planes[plane],
-      (by * stride + bx) * 8,
-      stride,
-      values,
-      intra,
-    );
+    _writeH263Block(_transform, picture, x, y, block, values, intra);
   }
 
   bool _readCoefficients(
@@ -446,6 +537,29 @@ final class _H263Macroblocks {
       if (number < 3) number++;
     }
   }
+}
+
+void _writeH263Block(
+  MpegIdct transform,
+  H263Picture picture,
+  int x,
+  int y,
+  int block,
+  Int16List values,
+  bool intra,
+) {
+  final luma = block < 4;
+  final plane = luma ? 0 : block - 3;
+  final stride = luma ? picture.stride : picture.stride >> 1;
+  final bx = luma ? x * 2 + (block & 1) : x;
+  final by = luma ? y * 2 + (block >> 1) : y;
+  transform.write(
+    picture.planes[plane],
+    (by * stride + bx) * 8,
+    stride,
+    values,
+    intra,
+  );
 }
 
 _DctEvent _readShortEvent(Rbsp bits, _Events table, bool spark) {
