@@ -19,6 +19,7 @@ Future<void> main(List<String> arguments) async {
   _checkFormatNegotiation();
   _checkCompositing();
   _checkStandaloneAlpha();
+  _checkFloatAlpha();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
 }
@@ -1012,6 +1013,74 @@ void _checkStandaloneAlpha() {
   );
 }
 
+void _checkFloatAlpha() {
+  final source = image.Image(width: 8, height: 6, numChannels: 4);
+  for (final p in source) {
+    p.setRgba(p.x * 29, p.y * 41, p.x * 13 + p.y * 11, p.x * 19 + p.y * 23);
+  }
+  image.Image render(String graph, [image.Image? input]) => YuvImageScaler(
+    filters: VideoFilterChain.parse(graph),
+  ).filterRgb(input ?? source);
+  const format = 'format=gbrapf32le';
+  const premultiply = 'premultiply=inplace=1';
+  const masked = 'format=gbrpf32le,split[a][b];[b]hflip[m];[a][m]';
+  for (final (graph, checksum) in [
+    (format, 0x65e259ed),
+    ('format=gbrapf32be', 0x65e259ed),
+    ('$format,$premultiply', 0xa43ecb8a),
+    ('$format,$premultiply,format=rgba', 0xa43ecb8a),
+    ('$format,$premultiply,unpremultiply=inplace=1', 0x65e259ed),
+    (
+      '$format,premultiply_dynamic,format=alpha_modes=premultiplied',
+      0xa43ecb8a,
+    ),
+    ('$format,scale=4:3:flags=neighbor', 0x4dc65b27),
+    ('$format,scale=4:3:flags=bilinear', 0x8de5cbeb),
+    // Scalar mask kernels with FFmpeg's equal-mode shortcut disabled.
+    ('${masked}premultiply=planes=0x2', 0xa452ab9e),
+    ('${masked}unpremultiply', 0x1ff8d5e8),
+  ]) {
+    check(
+      getCrc32(render(graph).getBytes()) == checksum,
+      '$graph matches the scalar floating-point filter conversion',
+    );
+  }
+  final extracted = render('$format,alphaextract,format=grayf32be');
+  for (final pixel in extracted) {
+    final expected = source.getPixel(pixel.x, pixel.y).a;
+    check(
+      (pixel.r - expected).abs() <= 1 &&
+          pixel.r == pixel.g &&
+          pixel.g == pixel.b,
+      'Extracted float alpha is rendered as full-range gray',
+    );
+  }
+
+  final tinyAlpha = image.Image(
+    width: 4,
+    height: 2,
+    numChannels: 4,
+    format: image.Format.float32,
+  );
+  for (final pixel in tinyAlpha) {
+    pixel.setRgba(0.75, 0.5, 0.25, 1e-7);
+  }
+  final restored = render(
+    '$premultiply,crop=2:2:1:0,hflip,transpose=clock,'
+    'scale=4:4:flags=neighbor,unpremultiply=inplace=1',
+    tinyAlpha,
+  );
+  check(
+    restored.width == 4 &&
+        restored.height == 4 &&
+        restored.every(
+          (pixel) =>
+              pixel.r == 192 && pixel.g == 128 && pixel.b == 64 && pixel.a == 0,
+        ),
+    'Float geometry and alpha processing retain values below one 16-bit step',
+  );
+}
+
 void _checkErrors() {
   for (final chain in [
     '',
@@ -1311,6 +1380,18 @@ Future<void> _checkCli(String? executable) async {
       0xad49214e,
       0xad49214e,
     ];
+    const floatAlpha =
+        'format=gbrapf32le,premultiply=inplace=1,crop=4:4:2:2,hflip,fps=8';
+    const floatAlphaReference = [
+      0x04100c77,
+      0x04100c77,
+      0x31bc0e73,
+      0x31bc0e73,
+      0x62181088,
+      0x62181088,
+      0x7f8f10be,
+      0x7f8f10be,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1328,6 +1409,7 @@ Future<void> _checkCli(String? executable) async {
         6,
         maskedReference,
       ),
+      ('float-alpha', floatAlpha, 4, 4, floatAlphaReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1349,7 +1431,9 @@ Future<void> _checkCli(String? executable) async {
           folder,
           '--vfilter',
           filter,
-          name == 'associated-overlay' || name == 'masked-alpha'
+          name == 'associated-overlay' ||
+                  name == 'masked-alpha' ||
+                  name == 'float-alpha'
               ? transparentMotion
               : motion,
         ]);

@@ -432,13 +432,16 @@ final class _Rotate implements _SpatialFilter {
     return frame.mapComponents((plane, _, _, component) {
       final width = plane.width, height = plane.height;
       final middleX = (width - 1) / 2, middleY = (height - 1) / 2;
+      final depth = plane.floating ? 16 : plane.depth;
       final fill = switch (component) {
-        3 => (1 << plane.depth) - 1,
+        3 => (1 << depth) - 1,
         _ when frame.rgb => 0,
-        1 || 2 => 1 << (plane.depth - 1),
-        _ => frame.fullRange ? 0 : 16 << (plane.depth - 8),
+        1 || 2 => 1 << (depth - 1),
+        _ => frame.fullRange ? 0 : 16 << (depth - 8),
       };
-      final samples = _paintSamples(plane.depth, width * height);
+      final samples = plane.emptySamples(width * height);
+      final blank = plane.floating ? fill / 65535 : fill;
+      final source = plane.values;
       for (var y = 0; y < height; y++) {
         final dy = y - middleY;
         var sx = middleX - middleX * _cos + dy * _sin;
@@ -446,7 +449,7 @@ final class _Rotate implements _SpatialFilter {
         for (var x = 0; x < width; x++, sx += _cos, sy -= _sin) {
           final destination = y * width + x;
           if (sx < -0.5 || sx > width - 0.5 || sy < -0.5 || sy > height - 0.5) {
-            samples[destination] = fill;
+            samples[destination] = blank;
             continue;
           }
           final u = sx.clamp(0.0, width - 1.0);
@@ -457,14 +460,13 @@ final class _Rotate implements _SpatialFilter {
               plane.offset + top * plane.rowStep + left * plane.columnStep;
           final dx = left + 1 < width ? plane.columnStep : 0;
           final dy = top + 1 < height ? plane.rowStep : 0;
-          final a = plane.samples[at] * (1 - fx) + plane.samples[at + dx] * fx;
-          final b =
-              plane.samples[at + dy] * (1 - fx) +
-              plane.samples[at + dy + dx] * fx;
-          samples[destination] = (a * (1 - fy) + b * fy).round();
+          final a = source[at] * (1 - fx) + source[at + dx] * fx;
+          final b = source[at + dy] * (1 - fx) + source[at + dy + dx] * fx;
+          final value = a * (1 - fy) + b * fy;
+          samples[destination] = plane.floating ? value : value.round();
         }
       }
-      return _FilterPlane(samples, width, height, plane.depth, rowStep: width);
+      return plane.withSamples(samples, width, height);
     });
   }
 }
@@ -708,7 +710,10 @@ final class _Scale extends _FrameSpatialFilter {
     return frame.mapComponents((plane, sx, sy, component) {
       final chroma = !frame.rgb && (component == 1 || component == 2);
       final range =
-          component != 3 && fullRange != null && fullRange != frame.fullRange
+          !plane.floating &&
+              component != 3 &&
+              fullRange != null &&
+              fullRange != frame.fullRange
           ? _VideoSampleRange(plane.depth, frame.fullRange, fullRange, chroma)
           : null;
       return _resize(
@@ -830,6 +835,8 @@ final class _Scale extends _FrameSpatialFilter {
   }) {
     final sameSize = source.width == width && source.height == height;
     if (sameSize && range == null) return source;
+    if (source.floating)
+      return _resizeFloatPlane(source, width, height, kernel);
     final limit = (1 << source.depth) - 1;
     if (nearest || sameSize) {
       final samples = Int32List(width * height);
@@ -975,6 +982,7 @@ final class _VideoPlanes {
   int get width => planes.first.width;
   int get height => planes.first.height;
   bool get rgb => matrix == 0 && planes.length == 3;
+  bool get floating => planes.first.floating;
 
   bool get usesUnscaledRgbTable =>
       width.isEven &&
@@ -1043,12 +1051,35 @@ final class _VideoPlanes {
   );
 }
 
+const _floatSampleDepth = 32;
+
 /// A rectangular sample view. Crop, flips and transpose compose by changing
 /// the origin and signed strides. Samples are copied only when needed by RGB
 /// conversion or the separable resampler.
 final class _FilterPlane {
   _FilterPlane(
-    this.samples,
+    List<int> samples,
+    int width,
+    int height,
+    int depth, {
+    required int rowStep,
+    int columnStep = 1,
+    int offset = 0,
+  }) : this._(
+         samples,
+         width,
+         height,
+         depth,
+         rowStep: rowStep,
+         columnStep: columnStep,
+         offset: offset,
+       );
+
+  _FilterPlane.f32(Float32List samples, int width, int height)
+    : this._(samples, width, height, _floatSampleDepth, rowStep: width);
+
+  _FilterPlane._(
+    this.values,
     this.width,
     this.height,
     this.depth, {
@@ -1057,13 +1088,23 @@ final class _FilterPlane {
     this.offset = 0,
   });
 
-  final List<int> samples;
+  final List<num> values;
   final int width, height, depth, rowStep, columnStep, offset;
 
-  int at(int x, int y) => samples[offset + y * rowStep + x * columnStep];
+  bool get floating => depth == _floatSampleDepth;
+  List<int> get samples => values as List<int>;
+  List<num> emptySamples(int length) =>
+      floating ? Float32List(length) : _paintSamples(depth, length);
 
-  _FilterPlane window(int x, int y, int width, int height) => _FilterPlane(
-    samples,
+  _FilterPlane withSamples(List<num> samples, int w, int h) =>
+      _FilterPlane._(samples, w, h, depth, rowStep: w);
+
+  int at(int x, int y) => samples[offset + y * rowStep + x * columnStep];
+  double floatAt(int x, int y) =>
+      (values as Float32List)[offset + y * rowStep + x * columnStep];
+
+  _FilterPlane window(int x, int y, int width, int height) => _FilterPlane._(
+    values,
     width,
     height,
     depth,
@@ -1081,8 +1122,8 @@ final class _FilterPlane {
     final h = transpose ? width : height;
     final dx = transpose ? rowStep : columnStep;
     final dy = transpose ? columnStep : rowStep;
-    return _FilterPlane(
-      samples,
+    return _FilterPlane._(
+      values,
       w,
       h,
       depth,
@@ -1111,6 +1152,10 @@ final class _FilterPlane {
   }
 
   _FilterPlane _copy([int Function(int)? transform]) {
+    if (floating) {
+      assert(transform == null);
+      return mapFloat((value, _, _) => value);
+    }
     final copy = depth <= 8
         ? Uint8List(width * height)
         : Uint16List(width * height);
@@ -1124,5 +1169,16 @@ final class _FilterPlane {
       }
     }
     return _FilterPlane(copy, width, height, depth, rowStep: width);
+  }
+
+  _FilterPlane mapFloat(double Function(double, int, int) transform) {
+    final copy = Float32List(width * height);
+    var i = 0;
+    for (var y = 0; y < height; y++) {
+      for (var x = 0; x < width; x++) {
+        copy[i++] = transform(floatAt(x, y), x, y);
+      }
+    }
+    return _FilterPlane.f32(copy, width, height);
   }
 }

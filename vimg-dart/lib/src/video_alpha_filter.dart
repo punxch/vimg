@@ -65,6 +65,7 @@ final class _VideoAlphaFilter implements _SpatialFilter {
       'gbrap10le',
       'gbrap12le',
       'gbrap16le',
+      'gbrapf32le',
     ])
       _namedPixelFormat(name),
   ];
@@ -75,6 +76,7 @@ final class _VideoAlphaFilter implements _SpatialFilter {
     for (final depth in [9, 10, 12, 14, 16])
       for (final name in ['yuv444p', 'gbrp', 'gray'])
         _namedPixelFormat('$name${depth}le'),
+    _namedPixelFormat('gbrpf32le'),
   ];
 
   _VideoAlphaFilter withFormat(_FormatFilter format) =>
@@ -135,8 +137,25 @@ _VideoPlanes _multiplyAlphaPlanes(
   bool premultiplied, {
   int planes = 15,
 }) {
+  final rounding = frame.floating && !frame.fullRange ? Float32List(1) : null;
+  double f32(double value) {
+    rounding![0] = value;
+    return rounding[0];
+  }
+
+  final floatOffset = rounding == null ? 0.0 : f32(4096 / 65535);
   return frame.mapComponents((plane, _, _, index) {
     if (index == 3 || (planes & (1 << index)) == 0) return plane;
+    if (plane.floating) {
+      return plane.mapFloat((value, x, y) {
+        final alpha = opacity.floatAt(x, y);
+        if (!premultiplied && !(alpha > 0)) return value;
+        if (rounding == null)
+          return premultiplied ? value * alpha : value / alpha;
+        final delta = f32(value - floatOffset);
+        return f32(premultiplied ? delta * alpha : delta / alpha) + floatOffset;
+      });
+    }
     final chroma = !frame.rgb && index != 0;
     final depth = plane.depth;
     final half = 1 << (depth - 1), max = (1 << depth) - 1;

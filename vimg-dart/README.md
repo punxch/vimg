@@ -384,8 +384,9 @@ and `alpha=premultiplied` for packed RGB, planar GBR and planar YUV.
 The separate `format` filter also accepts
 `alpha_modes=straight` or `alpha_modes=premultiplied` to convert color
 samples between the two representations while keeping the alpha plane.
-Its `pix_fmts` option accepts names
-such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
+Its `pix_fmts` option accepts names such as `rgb24`, `gray`, `yuv444p`,
+`yuva420p10le`, `gbrpf32le`, `gbrapf32le` and `grayf32le`.
+The 32-bit floating-point layouts also accept the `be` suffix.
 When given a `|`-separated list, it keeps a matching input format when
 available. Otherwise it compares the color, alpha, bit-depth and chroma
 resolution losses of the candidates.
@@ -408,6 +409,8 @@ Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 Use `premultiply=inplace=1` or `unpremultiply=inplace=1` to process the
 frame's own alpha. `premultiply_dynamic` follows the downstream alpha
 mode. The `planes` bitmask selects the color planes to process.
+GBR floating-point frames keep their 32-bit samples through alpha
+processing and spatial filters until conversion to an integer format.
 By default, `premultiply` and `unpremultiply` take two equal-sized inputs
 and read the first plane of the second input as the mask. `alphaextract`
 copies a frame's alpha into a full-range grayscale mask. The two-input

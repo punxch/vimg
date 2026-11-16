@@ -163,6 +163,33 @@ final class YuvImageScaler {
     bool bgr24 = false,
   }) {
     _checkFilterSize(frame.width, frame.height);
+    if (frame.format == image.Format.float32) {
+      final channels = List.generate(
+        frame.hasAlpha ? 4 : 3,
+        (_) => Float32List(frame.width * frame.height),
+      );
+      var i = 0;
+      for (final pixel in frame) {
+        channels[0][i] = pixel.g.toDouble();
+        channels[1][i] = pixel.b.toDouble();
+        channels[2][i] = pixel.r.toDouble();
+        if (frame.hasAlpha) channels[3][i] = pixel.a.toDouble();
+        i++;
+      }
+      final planes = [
+        for (final samples in channels)
+          _FilterPlane.f32(samples, frame.width, frame.height),
+      ];
+      return _VideoPlanes(
+        planes.sublist(0, 3),
+        0,
+        0,
+        matrix: 0,
+        fullRange: true,
+        sampleAspect: sampleAspect,
+        alpha: frame.hasAlpha ? planes.last : null,
+      );
+    }
     final green = Uint8List(frame.width * frame.height);
     final blue = Uint8List(green.length);
     final red = Uint8List(green.length);
@@ -241,9 +268,10 @@ final class YuvImageScaler {
         // The unscaled 8-bit RGB kernel reads chroma directly from its grid.
         return _rgbTable(frame.matrix, frame.fullRange).writeUnscaled(frame);
       }
-      if (frame.packedRgb &&
-          (scale.algorithm != _ScaleAlgorithm.bicubic ||
-              scale._subsamplesRgb(frame, w))) {
+      if (frame.floating ||
+          frame.packedRgb &&
+              (scale.algorithm != _ScaleAlgorithm.bicubic ||
+                  scale._subsamplesRgb(frame, w))) {
         frame = scale.resize(frame, w, h);
       } else {
         outputScale = _fixedOutput(w, h, scale.algorithm);
@@ -254,6 +282,29 @@ final class YuvImageScaler {
         height: height,
         enlarge: enlarge,
       );
+    }
+    if (frame.floating) {
+      if (outputScale case final scaler?) {
+        final (w, h) = scaler._dimensions(frame.width, frame.height);
+        _checkFilterSize(w, h);
+        frame = frame.map(
+          (plane, _, _) => _resizeFloatPlane(
+            plane,
+            w,
+            h,
+            scaler._algorithm.kernel(chroma: false),
+          ),
+        );
+        outputScale = null;
+      }
+      frame = _quantizeFloatFrame(frame);
+      if (frame.rgb && frame.fullRange) {
+        frame = _packFloatRgb(
+          frame,
+          _pixelFormat(_PixelColor.rgb, 8, packedRgb: true),
+          alpha: frame.alpha != null,
+        );
+      }
     }
     if (outputScale == null &&
         frame.planes.length == 3 &&
@@ -491,6 +542,48 @@ enum _ScaleAlgorithm {
 }
 
 enum _ScaleKernel { point, triangle, cubic }
+
+_FilterPlane _resizeFloatPlane(
+  _FilterPlane source,
+  int width,
+  int height,
+  _ScaleKernel kernel,
+) {
+  if (width == source.width && height == source.height) return source;
+  if (width * source.height > 100000000) {
+    throw const FormatException(
+      'Floating-point resize exceeds the sample limit',
+    );
+  }
+  final horizontal = _axisTaps(source.width, width, 14, kernel);
+  final vertical = _axisTaps(source.height, height, 12, kernel);
+  final rows = Float32List(width * source.height);
+  var output = 0;
+  for (var y = 0; y < source.height; y++) {
+    for (final tap in horizontal) {
+      var sum = 0.0;
+      for (var k = 0; k < tap.weights.length; k++) {
+        final weight = tap.weights[k];
+        if (weight != 0) sum += source.floatAt(tap.start + k, y) * weight;
+      }
+      rows[output++] = sum / (1 << 14);
+    }
+  }
+  final result = Float32List(width * height);
+  output = 0;
+  for (final tap in vertical) {
+    for (var x = 0; x < width; x++) {
+      var sum = 0.0;
+      var sample = tap.start * width + x;
+      for (final weight in tap.weights) {
+        if (weight != 0) sum += rows[sample] * weight;
+        sample += width;
+      }
+      result[output++] = sum / (1 << 12);
+    }
+  }
+  return _FilterPlane.f32(result, width, height);
+}
 
 final class _PlaneScaler {
   _PlaneScaler(

@@ -155,37 +155,15 @@ final class _Pad implements _SpatialFilter {
 
     return frame.mapComponents((plane, sx, sy, component) {
       final paddedWidth = w >> sx, paddedHeight = h >> sy;
-      final samples = _paintSamples(plane.depth, paddedWidth * paddedHeight);
+      final samples = plane.emptySamples(paddedWidth * paddedHeight);
       samples.fillRange(
         0,
         samples.length,
-        color.sample(frame, component, plane.depth),
+        color.sampleFor(frame, component, plane),
       );
       final px = left >> sx, py = top >> sy;
-      for (var row = 0; row < plane.height; row++) {
-        final destination = (py + row) * paddedWidth + px;
-        final source = plane.offset + row * plane.rowStep;
-        if (plane.columnStep == 1) {
-          samples.setRange(
-            destination,
-            destination + plane.width,
-            plane.samples,
-            source,
-          );
-        } else {
-          for (var col = 0; col < plane.width; col++) {
-            samples[destination + col] =
-                plane.samples[source + col * plane.columnStep];
-          }
-        }
-      }
-      return _FilterPlane(
-        samples,
-        paddedWidth,
-        paddedHeight,
-        plane.depth,
-        rowStep: paddedWidth,
-      );
+      _pastePlane(plane, samples, paddedWidth, paddedHeight, px, py);
+      return plane.withSamples(samples, paddedWidth, paddedHeight);
     });
   }
 }
@@ -277,10 +255,9 @@ final class _DrawBox implements _SpatialFilter {
         return plane;
       if (component == 3 && !overwrite) return plane;
       final result = plane._copy();
-      final samples = result.samples;
-      final maximum = (1 << plane.depth) - 1;
-      final target =
-          paint?.sample(frame, component, plane.depth, box: true) ?? 0;
+      final samples = result.values;
+      final maximum = plane.floating ? 1.0 : (1 << plane.depth) - 1;
+      final target = paint?.sampleFor(frame, component, plane, box: true);
       final opacity = (paint?.alpha ?? 255) / 255;
       for (var row = top; row < endY; row++) {
         final offset = (row >> sy) * plane.width;
@@ -291,11 +268,14 @@ final class _DrawBox implements _SpatialFilter {
           final index = offset + (col >> sx);
           // A subsampled chroma sample is blended once per covered luma pixel.
           final old = samples[index];
-          samples[index] = paint == null
+          final blended = target == null
               ? maximum - old
               : overwrite || opacity == 1
               ? target
-              : ((1 - opacity) * old + opacity * target).toInt();
+              : (1 - opacity) * old + opacity * target;
+          samples[index] = plane.floating
+              ? blended.toDouble()
+              : blended.toInt();
         }
       }
       return result;
@@ -354,6 +334,7 @@ final class _Negate implements _SpatialFilter {
           ? index != 3 || alpha
           : mask & flags[index] != 0;
       if (!active) return plane;
+      if (plane.floating) return plane.mapFloat((sample, _, _) => 1 - sample);
       final maximum = (1 << plane.depth) - 1;
       return plane._copy((sample) => maximum - sample);
     });
@@ -402,6 +383,15 @@ final class _PaintColor {
     }
     return _PaintColor(rgb >> 16, (rgb >> 8) & 255, rgb & 255, alpha);
   }
+
+  num sampleFor(
+    _VideoPlanes frame,
+    int component,
+    _FilterPlane plane, {
+    bool box = false,
+  }) => plane.floating
+      ? sample(frame, component, 16, box: box) / 65535
+      : sample(frame, component, plane.depth, box: box);
 
   int sample(_VideoPlanes frame, int component, int depth, {bool box = false}) {
     final maximum = (1 << depth) - 1;

@@ -70,23 +70,22 @@ _NamedPixelFormat _namedPixelFormat(String name) {
       fullRange: layout.group(1) == 'j' ? true : null,
     );
   }
-  final gray = RegExp(r'^gray(?:(9|10|12|14|16)(?:le|be))?$').firstMatch(name);
+  final gray = RegExp(
+    r'^gray(?:(9|10|12|14|16|f32)(?:le|be))?$',
+  ).firstMatch(name);
   if (gray != null) {
     return (
-      format: _pixelFormat(_PixelColor.gray, int.parse(gray.group(1) ?? '8')),
+      format: _pixelFormat(_PixelColor.gray, _pixelDepth(gray.group(1))),
       alpha: false,
       fullRange: true,
     );
   }
   final planarRgb = RegExp(
-    r'^gbr(a?)p(?:(9|10|12|14|16)(?:le|be))?$',
+    r'^gbr(a?)p(?:(9|10|12|14|16|f32)(?:le|be))?$',
   ).firstMatch(name);
   if (planarRgb != null) {
     return (
-      format: _pixelFormat(
-        _PixelColor.rgb,
-        int.parse(planarRgb.group(2) ?? '8'),
-      ),
+      format: _pixelFormat(_PixelColor.rgb, _pixelDepth(planarRgb.group(2))),
       alpha: planarRgb.group(1) == 'a',
       fullRange: true,
     );
@@ -112,6 +111,9 @@ _NamedPixelFormat _namedPixelFormat(String name) {
     fullRange: true,
   );
 }
+
+int _pixelDepth(String? depth) =>
+    depth == 'f32' ? _floatSampleDepth : int.parse(depth ?? '8');
 
 final class _FormatFilter implements _SpatialFilter {
   factory _FormatFilter(String? source) {
@@ -385,6 +387,94 @@ typedef _ColorScale = ({
   bool fullChromaInput,
 });
 
+_FilterPlane _opaqueFloatPlane(int width, int height) {
+  final samples = Float32List(width * height);
+  samples.fillRange(0, samples.length, 1.0);
+  return _FilterPlane.f32(samples, width, height);
+}
+
+_VideoPlanes _quantizeFloatFrame(_VideoPlanes source) {
+  final scaled = Float32List(1);
+  return source.map((plane, _, _) {
+    final samples = Uint16List(plane.width * plane.height);
+    var i = 0;
+    for (var y = 0; y < plane.height; y++) {
+      for (var x = 0; x < plane.width; x++) {
+        final sample = plane.floatAt(x, y);
+        scaled[0] = sample.isNaN ? 0 : sample.clamp(0.0, 1.0) * 65535;
+        final value = scaled[0];
+        final low = value.toInt();
+        // Float input to swscale is rounded to nearest, with ties to even.
+        final fraction = value - low;
+        samples[i++] =
+            low + (fraction > 0.5 || fraction == 0.5 && low.isOdd ? 1 : 0);
+      }
+    }
+    return _FilterPlane(
+      samples,
+      plane.width,
+      plane.height,
+      16,
+      rowStep: plane.width,
+    );
+  });
+}
+
+_VideoPlanes _packFloatRgb(
+  _VideoPlanes source,
+  _VideoPixelFormat target, {
+  required bool alpha,
+}) {
+  final width = source.width, height = source.height;
+  final green = Uint8List(width * height);
+  final blue = Uint8List(green.length), red = Uint8List(green.length);
+  final opacity = alpha ? Uint8List(green.length) : null;
+  final [g, b, r] = source.planes;
+  final inputAlpha = source.alpha;
+  final (rv, bu, gu, gv) = _rgbCoefficients(6);
+  final vr = (rv + 4) >> 3, ub = (bu + 4) >> 3;
+  final ug = (gu + 4) >> 3, vg = (gv + 4) >> 3;
+  // The packed output rounds after a studio-range Q7 matrix round trip.
+  int pack(int sample) => ((sample + (1 << 21)) >> 22).clamp(0, 255);
+  var i = 0;
+  for (var y = 0; y < height; y++) {
+    for (var x = 0; x < width; x++) {
+      final rr = r.at(x, y), gg = g.at(x, y), bb = b.at(x, y);
+      final luma =
+          (_rgbProduct(_bt601RgbToYuv[0], rr, gg, bb) + (0x2001 << 14)) >> 16;
+      final cb =
+          (_rgbProduct(_bt601RgbToYuv[1], rr, gg, bb) + (0x10001 << 14)) >> 16;
+      final cr =
+          (_rgbProduct(_bt601RgbToYuv[2], rr, gg, bb) + (0x10001 << 14)) >> 16;
+      final lum = (luma - (16 << 7)) * 4 * 9539;
+      final u = (cb - (128 << 7)) * 4, v = (cr - (128 << 7)) * 4;
+      green[i] = pack(lum + ug * u + vg * v);
+      blue[i] = pack(lum + ub * u);
+      red[i] = pack(lum + vr * v);
+      if (opacity != null) {
+        opacity[i] = inputAlpha == null
+            ? 255
+            : math.min(255, (inputAlpha.at(x, y) + 128) >> 8);
+      }
+      i++;
+    }
+  }
+  _FilterPlane plane(Uint8List data) =>
+      _FilterPlane(data, width, height, 8, rowStep: width);
+  return _VideoPlanes(
+    [plane(green), plane(blue), plane(red)],
+    0,
+    0,
+    matrix: 0,
+    fullRange: true,
+    packedRgb: true,
+    bgr24: target.bgr24,
+    sampleAspect: source.sampleAspect,
+    alpha: opacity == null ? null : plane(opacity),
+    premultiplied: opacity != null && source.premultiplied,
+  );
+}
+
 final class _PixelFormatConverter {
   final _scalers = <(int, int, int, int, _ScaleKernel, int), _PlaneScaler>{};
   final _rgbScalers = <(int, int, _ScaleAlgorithm), YuvImageScaler>{};
@@ -432,6 +522,75 @@ final class _PixelFormatConverter {
     final height = scale?.height ?? source.height;
     final algorithm = scale?.algorithm ?? _ScaleAlgorithm.bicubic;
     _checkFilterSize(width, height);
+    if (target.depth == _floatSampleDepth &&
+        _frameFormat(source) == target &&
+        source.fullRange == full) {
+      final resized = source.map(
+        (plane, _, _) => _resizeFloatPlane(
+          plane,
+          width,
+          height,
+          algorithm.kernel(chroma: false),
+        ),
+        sampleAspect: scale?.sampleAspect,
+      );
+      return _VideoPlanes(
+        resized.planes,
+        0,
+        0,
+        matrix: colorMatrix,
+        fullRange: full,
+        sampleAspect: resized.sampleAspect,
+        alpha: !requestedAlpha
+            ? null
+            : resized.alpha ?? _opaqueFloatPlane(width, height),
+        premultiplied:
+            requestedAlpha && (premultiplied ?? resized.premultiplied),
+      );
+    }
+    if (source.floating) {
+      if (source.rgb &&
+          source.fullRange &&
+          full &&
+          target.packedRgb &&
+          opacityDepth == 8 &&
+          width == source.width &&
+          height == source.height &&
+          scale == null) {
+        return _packFloatRgb(
+          _quantizeFloatFrame(source),
+          target,
+          alpha: requestedAlpha,
+        );
+      }
+      source = _quantizeFloatFrame(source);
+    }
+    if (target.depth == _floatSampleDepth) {
+      final deep = convert(
+        source,
+        _pixelFormat(target.color, 16),
+        alpha: requestedAlpha,
+        matrix: colorMatrix,
+        fullRange: full,
+        scale: scale,
+        premultiplied: premultiplied,
+      );
+      return deep.map((plane, _, _) {
+        final samples = Float32List(width * height);
+        var i = 0;
+        // libswscale multiplies by a single-precision reciprocal.
+        const normalize = 1.0000152587890625 / 65536;
+        for (var y = 0; y < height; y++) {
+          for (var x = 0; x < width; x++) {
+            samples[i++] = plane.at(x, y) * normalize;
+          }
+        }
+        return _FilterPlane.f32(samples, width, height);
+      });
+    }
+    final integerOpacityDepth = opacityDepth == _floatSampleDepth
+        ? target.depth
+        : opacityDepth;
     var working = source;
     if (!source.rgb && target.color == _PixelColor.rgb) {
       working = target.depth == 8
@@ -547,26 +706,35 @@ final class _PixelFormatConverter {
       final sameSize = opacity.width == width && opacity.height == height;
       opacity = _packedAlpha(
         opacity,
-        sameSize ? opacityDepth : 14,
+        sameSize ? integerOpacityDepth : 14,
         round: sameSize,
       );
     }
     final convertedAlpha = !requestedAlpha
         ? null
         : opacity == null
-        ? _constantPlane(width, height, opacityDepth, (1 << opacityDepth) - 1)
+        ? _constantPlane(
+            width,
+            height,
+            integerOpacityDepth,
+            (1 << integerOpacityDepth) - 1,
+          )
         : (source.packedRgb || source.rgb) &&
               target.color == _PixelColor.rgb &&
               opacity.depth == 8 &&
-              opacityDepth > 8 &&
+              integerOpacityDepth > 8 &&
               opacity.width == width &&
               opacity.height == height
-        ? _expandRgbAlpha(opacity, opacityDepth, packed: source.packedRgb)
+        ? _expandRgbAlpha(
+            opacity,
+            integerOpacityDepth,
+            packed: source.packedRgb,
+          )
         : _component(
             opacity,
             width,
             height,
-            opacityDepth,
+            integerOpacityDepth,
             inputFull: true,
             outputFull: true,
             channel: native ? 3 : null,

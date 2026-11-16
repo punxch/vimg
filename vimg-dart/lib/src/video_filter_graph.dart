@@ -585,12 +585,12 @@ final class _Stack {
     _checkFilterSize(width, height);
     return first.mapComponents((plane, sx, sy, index) {
       final w = _subSize(width, sx), h = _subSize(height, sy);
-      final result = _paintSamples(plane.depth, w * h);
+      final result = plane.emptySamples(w * h);
       if (fill case final color?) {
         result.fillRange(
           0,
           result.length,
-          color.sample(first, index, plane.depth),
+          color.sampleFor(first, index, plane),
         );
       }
       for (final (i, frame) in frames.indexed) {
@@ -604,14 +604,14 @@ final class _Stack {
         final top = _subSize(offsets[i].top, sy);
         _pastePlane(input, result, w, h, left, top);
       }
-      return _FilterPlane(result, w, h, plane.depth, rowStep: w);
+      return plane.withSamples(result, w, h);
     });
   }
 }
 
 void _pastePlane(
   _FilterPlane source,
-  List<int> target,
+  List<num> target,
   int width,
   int height,
   int left,
@@ -627,12 +627,13 @@ void _pastePlane(
       target.setRange(
         start + firstX,
         start + endX,
-        source.samples,
+        source.values,
         source.offset + y * source.rowStep + firstX,
       );
     } else {
       for (var x = firstX; x < endX; x++) {
-        target[start + x] = source.at(x, y);
+        target[start + x] = source
+            .values[source.offset + y * source.rowStep + x * source.columnStep];
       }
     }
   }
