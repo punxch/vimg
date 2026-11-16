@@ -179,16 +179,19 @@ sprites, sprite brightness changes and recovery from damaged reversible
 VLC partitions remain pending.
 
 Standalone `.h263` files, 3GP, AVI and Matroska support H.263 and H.263+
-I/P pictures, the B and P parts of PB and Improved PB frames, and standalone
-H.263+ B-pictures predicted from base-layer pictures. Capture uses the temporal
-reference to place a B-picture when the container lacks its display time.
+I/P pictures, both parts of PB and Improved PB frames, and standalone H.263+
+B-pictures. Interleaved EI/EP layers support SNR and horizontal, vertical or
+two-axis spatial enhancement. Capture presents the highest available layer
+at a given time and can use enhancement pictures as B-picture references.
+The temporal reference locates each B-picture when the container lacks its
+display time.
 Decoding includes group-of-blocks resynchronization, custom sizes and
 clocks, unrestricted motion vectors, structured slices, overlapped block
 motion compensation, advanced intra prediction, in-loop deblocking, alternate
 inter VLCs, modified quantization and syntax-based arithmetic coding.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
-and disposable Spark pictures. Scalable EI/EP enhancement layers and B-pictures
-that reference them remain pending.
+and disposable Spark pictures. Reference picture resampling and reduced
+resolution updates remain pending.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS

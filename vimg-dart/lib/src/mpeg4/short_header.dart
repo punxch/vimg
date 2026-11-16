@@ -38,25 +38,34 @@ typedef H263Header = ({
   bool longVectors,
   bool sparkEscape,
   bool extended,
-  int? temporalLayer,
+  int layer,
+  int referenceLayer,
+  bool bidirectional,
+  bool enhancementIntra,
   ({int offset, int quantFactor})? pb,
   Rbsp bits,
 });
+
+extension H263PictureLayer on H263Header {
+  bool get enhancement => layer > 1 && !bidirectional;
+}
+
+typedef H263LayerState = ({H263Format format, int? lowerLayer, int bReference});
 
 final class H263Headers {
   H263Headers({
     this.spark = false,
     H263Format? previous,
-    Map<int, H263Format>? temporalLayers,
+    Map<int, H263LayerState>? layers,
   }) : _extended = previous,
-       _temporalLayers = {...?temporalLayers};
+       _layers = {...?layers};
 
   final bool spark;
   H263Format? _extended;
-  final Map<int, H263Format> _temporalLayers;
+  final Map<int, H263LayerState> _layers;
 
-  Map<int, H263Format>? snapshotTemporalLayers() =>
-      _temporalLayers.isEmpty ? null : Map.of(_temporalLayers);
+  Map<int, H263LayerState>? snapshotLayers() =>
+      _layers.isEmpty ? null : Map.of(_layers);
 
   H263Header read(Uint8List bytes) {
     final bits = Rbsp(bytes, codec: spark ? 'Sorenson Spark' : 'H.263');
@@ -70,7 +79,8 @@ final class H263Headers {
     final bool intra, longVectors, noRound, paired;
     final H263Format format;
     final int quant;
-    int? temporalLayer;
+    var layer = 1, referenceLayer = 1;
+    var bidirectional = false, enhancementIntra = false;
     if (source < 6) {
       intra = !bits.flag();
       longVectors = bits.flag();
@@ -95,7 +105,7 @@ final class H263Headers {
       if (update > 1) throw const FormatException('Invalid H.263+ UFEP');
       final options = update == 1 ? _readOptions(bits) : null;
       final type = bits.read(3);
-      if (type > 3) throw UnsupportedError('H.263+ picture type $type');
+      if (type > 5) throw UnsupportedError('H.263+ picture type $type');
       intra = type == 0;
       paired = type == 2;
       if (bits.read(2) != 0)
@@ -103,11 +113,13 @@ final class H263Headers {
       noRound = bits.flag();
       bits.skip(3); // reserved MPPTYPE bits
       _checkMultipoint(bits);
-      final bidirectional = type == 3;
+      bidirectional = type == 3;
+      enhancementIntra = type == 4;
+      final layered = type >= 3;
       format = options != null
           ? _readFormat(bits, options)
-          : bidirectional
-          ? _inheritedBFormat(bits)
+          : layered
+          ? _inheritedLayerFormat(bits, allowBase: bidirectional)
           : _extended ?? (throw const FormatException('Missing H.263+ format'));
       longVectors = false;
       if (format.customClock) temporal |= bits.read(2) << 8;
@@ -116,22 +128,31 @@ final class H263Headers {
         if (format.structured && bits.read(2) != 0)
           throw UnsupportedError('H.263+ rectangular or unordered slices');
       }
-      if (bidirectional) {
-        temporalLayer = bits.read(4);
-        if (temporalLayer == 0) {
+      if (layered) {
+        layer = bits.read(4);
+        if (layer == 0 || layer == 1 && !bidirectional) {
           throw const FormatException('Invalid H.263+ enhancement layer');
         }
-        if (options != null) {
-          final referenceLayer = bits.read(4);
-          if (referenceLayer != 1) {
-            throw UnsupportedError(
-              'H.263+ external B-picture reference layer $referenceLayer',
-            );
-          }
-          if (temporalLayer > 1) _temporalLayers[temporalLayer] = format;
+        final previous = _layers[layer];
+        referenceLayer = options != null
+            ? bits.read(4)
+            : bidirectional
+            ? previous?.bReference ?? layer
+            : previous?.lowerLayer ?? 0;
+        if (referenceLayer < 1 ||
+            referenceLayer > layer ||
+            !bidirectional && referenceLayer == layer) {
+          throw const FormatException('Invalid H.263+ reference layer');
+        }
+        if (layer > 1) {
+          _layers[layer] = (
+            format: format,
+            lowerLayer: bidirectional ? previous?.lowerLayer : referenceLayer,
+            bReference: bidirectional ? referenceLayer : layer,
+          );
         }
       }
-      if (options != null && (temporalLayer == null || temporalLayer == 1)) {
+      if (options != null && layer == 1) {
         _extended = format;
       }
       quant = bits.read(5);
@@ -159,19 +180,22 @@ final class H263Headers {
       format: format,
       temporalReference: temporal,
       intra: intra,
-      disposable: temporalLayer != null,
+      disposable: bidirectional,
       quant: quant,
       noRound: noRound,
       longVectors: longVectors,
       sparkEscape: false,
       extended: source >= 6,
-      temporalLayer: temporalLayer,
+      layer: layer,
+      referenceLayer: referenceLayer,
+      bidirectional: bidirectional,
+      enhancementIntra: enhancementIntra,
       pb: pb,
       bits: bits,
     );
   }
 
-  H263Format _inheritedBFormat(Rbsp bits) {
+  H263Format _inheritedLayerFormat(Rbsp bits, {required bool allowBase}) {
     final position = bits.position;
     final base = _extended;
     // ETR precedes ELNUM. A previously signalled layer supplies the
@@ -182,12 +206,12 @@ final class H263Headers {
       if (custom) bits.skip(2);
       final layer = bits.read(4);
       bits.position = position;
-      final candidate = layer == 1 ? base : _temporalLayers[layer];
+      final candidate = layer == 1 && allowBase ? base : _layers[layer]?.format;
       if (candidate != null && candidate.customClock == custom) {
         return candidate;
       }
     }
-    throw const FormatException('Missing H.263+ B-picture layer format');
+    throw const FormatException('Missing H.263+ layer format');
   }
 
   H263Header _readSpark(Rbsp bits) {
@@ -224,7 +248,10 @@ final class H263Headers {
       longVectors: false,
       sparkEscape: version == 1,
       extended: false,
-      temporalLayer: null,
+      layer: 1,
+      referenceLayer: 1,
+      bidirectional: false,
+      enhancementIntra: false,
       pb: null,
       bits: bits,
     );

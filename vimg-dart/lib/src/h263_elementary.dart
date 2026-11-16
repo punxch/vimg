@@ -60,24 +60,51 @@ final class H263Elementary {
     final pictures = <(int, int, bool, int)>[];
     final display = <(int, int, bool)>[];
     H263Format? format;
+    H263Format? largestLayer;
+    var topLayer = 1;
     H263Header? previous;
-    int? older;
+    final latest = <int, (int, int)>{};
+    final older = <int, (int, int)>{};
     // Accumulate at the common clock before rounding to output timestamps.
     const commonClock = 3 * _clock;
-    var elapsed = 0, olderElapsed = 0;
+    var elapsed = 0;
+    void remember(H263Header header, int time) {
+      if (latest[header.layer] case final last?) older[header.layer] = last;
+      latest[header.layer] = (header.temporalReference, time);
+    }
+
     for (var i = 1; i < offsets.length; i++) {
       final offset = offsets[i - 1];
       final size = offsets[i] - offset;
       final header = headers.read(file.read(offset, math.min(size, 1024)));
       if (format == null && !header.intra) continue;
       format ??= header.format;
-      if (header.temporalLayer != null) {
+      if (header.bidirectional) {
         var time = (elapsed + 1) ~/ 3;
-        if (older != null && previous != null) {
-          final timing = h263BTiming(older, previous.temporalReference, header);
-          final between = (elapsed - olderElapsed) * timing.offset;
-          time = (olderElapsed + between ~/ timing.distance + 1) ~/ 3;
+        final before = older[header.referenceLayer];
+        final after = latest[header.referenceLayer];
+        if (before != null && after != null) {
+          final timing = h263BTiming(before.$1, after.$1, header);
+          final between = (after.$2 - before.$2) * timing.offset;
+          time = (before.$2 + between ~/ timing.distance + 1) ~/ 3;
           display.add((time, offset, false));
+        }
+        pictures.add((offset, size, false, time));
+        continue;
+      }
+      if (header.enhancement) {
+        final lower = latest[header.referenceLayer];
+        var time = (elapsed + 1) ~/ 3;
+        if (lower != null &&
+            lower.$1 == header.temporalReference &&
+            (header.enhancementIntra || latest.containsKey(header.layer))) {
+          remember(header, lower.$2);
+          time = (lower.$2 + 1) ~/ 3;
+          display.add((time, offset, false));
+          if (header.layer >= topLayer) {
+            topLayer = header.layer;
+            largestLayer = header.format;
+          }
         }
         pictures.add((offset, size, false, time));
         continue;
@@ -86,8 +113,6 @@ final class H263Elementary {
         final prior = previous.format;
         final unit =
             prior.tickNumerator * (commonClock ~/ prior.tickDenominator);
-        older = previous.temporalReference;
-        olderElapsed = elapsed;
         if (header.pb case final pb?) {
           final delta = h263PbDistance(previous.temporalReference, header);
           final time = (elapsed + unit * pb.offset + 1) ~/ 3;
@@ -99,6 +124,7 @@ final class H263Elementary {
         }
       }
       previous = header;
+      remember(header, elapsed);
       final time = (elapsed + 1) ~/ 3;
       display.add((time, offset, false));
       pictures.add((offset, size, header.intra, time));
@@ -127,13 +153,18 @@ final class H263Elementary {
     final end = display.last.$1 + period;
     final timestamps = <int, FrameTimestamp>{};
     final pairedTimes = <int, FrameTimestamp>{};
-    for (final (i, (pts, offset, paired)) in display.indexed) {
-      final next = i + 1 < display.length ? display[i + 1].$1 : end;
+    var later = end, time = end;
+    for (var i = display.length - 1; i >= 0; i--) {
+      final (pts, offset, paired) = display[i];
+      if (pts != time || topLayer == 1) {
+        later = time;
+        time = pts;
+      }
       (paired ? pairedTimes : timestamps)[offset] = frameTimestamp(
         pts,
         1,
         _clock,
-        duration: next - pts,
+        duration: later - pts,
       );
     }
     final fixed = cadence.keys.every((delta) => (delta - period).abs() <= 1);
@@ -142,8 +173,8 @@ final class H263Elementary {
       metadata: VideoMetadata(end / _clock, [
         VideoStream(
           codec: 'h263',
-          width: format.width,
-          height: format.height,
+          width: (largestLayer ?? format).width,
+          height: (largestLayer ?? format).height,
           timeBase: '1/$_clock',
           nominalFrameRate: fixed ? _clock / period : null,
         ),

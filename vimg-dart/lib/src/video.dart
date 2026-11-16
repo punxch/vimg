@@ -98,7 +98,7 @@ final class Video {
   H263Elementary? _shortElementary;
   MpegSystemsVideo? _systems;
 
-  late final VideoMetadata metadata =
+  late final VideoMetadata _containerMetadata =
       _matroska?.metadata() ??
       _avi?.metadata() ??
       _ivf?.metadata() ??
@@ -108,8 +108,53 @@ final class Video {
       _iso!.metadata();
 
   String get codec =>
-      metadata.streams.where((stream) => !stream.attached).firstOrNull?.codec ??
+      _containerMetadata.streams
+          .where((stream) => !stream.attached)
+          .firstOrNull
+          ?.codec ??
       (throw const FormatException('No video stream'));
+
+  H263Format? _h263DisplayFormat;
+  late final VideoMetadata metadata = _presentationMetadata();
+
+  VideoMetadata _presentationMetadata() {
+    final original = _containerMetadata;
+    final primary = original.streams
+        .where((stream) => !stream.attached)
+        .firstOrNull;
+    if (primary?.codec != 'h263' ||
+        _shortElementary != null ||
+        _mixedIsoCodecs) {
+      return original;
+    }
+    final _IndexedVideo indexed;
+    try {
+      indexed = _statefulTimeline;
+    } on FormatException {
+      return original;
+    } on UnsupportedError {
+      return original;
+    }
+    final format = _h263DisplayFormat;
+    final frame = indexed.timeline.presentation.lastOrNull;
+    if (format == null || frame == null) return original;
+    final last = frame.timestamp;
+    final duration = last?.duration == null
+        ? original.duration
+        : frame.seconds + last!.duration! * last.numerator / last.denominator;
+    return VideoMetadata(duration, [
+      for (final stream in original.streams)
+        if (stream == primary)
+          VideoStream(
+            codec: stream.codec,
+            width: format.width,
+            height: format.height,
+            timeBase: stream.timeBase,
+          )
+        else
+          stream,
+    ]);
+  }
 
   String get _decodeCodec => _systems?.programCodec ?? codec;
 
@@ -185,7 +230,9 @@ final class Video {
   late final _containerCaptureClock = _readCaptureClock();
 
   CaptureRational _readCaptureClock() {
-    final stream = metadata.streams.firstWhere((stream) => !stream.attached);
+    final stream = _containerMetadata.streams.firstWhere(
+      (stream) => !stream.attached,
+    );
     final [numerator, denominator] = stream.timeBase
         .split('/')
         .map(int.parse)
@@ -1358,7 +1405,7 @@ final class Video {
         final decoder = H263Decoder(
           spark: run.codec == 'flv1',
           previous: configuration.shortVideo,
-          temporalLayers: configuration.h263TemporalLayers,
+          layers: configuration.h263Layers,
         );
         H263Picture? pairedReference;
         return (packet, selected, _) {
@@ -1379,6 +1426,7 @@ final class Video {
                 _read(packet),
                 includeBidirectional: false,
                 includeStandaloneB: selected,
+                allowMissingEnhancement: !selected,
               );
               return selected ? decoded.picture?.rgb : null;
           }
@@ -1775,14 +1823,14 @@ final class _RunConfiguration {
     this.nal,
     this.mpeg4Clock,
     this.shortVideo,
-    this.h263TemporalLayers,
+    this.h263Layers,
   });
 
   final Uint8List? bytes;
   final _NalConfiguration? nal;
   final Mpeg4Clock? mpeg4Clock;
   final H263Format? shortVideo;
-  final Map<int, H263Format>? h263TemporalLayers;
+  final Map<int, H263LayerState>? h263Layers;
 }
 
 typedef _IndexedVideo = ({

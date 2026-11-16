@@ -28,17 +28,14 @@ final class H263Decoder {
   H263Decoder({
     bool spark = false,
     H263Format? previous,
-    Map<int, H263Format>? temporalLayers,
-  }) : _headers = H263Headers(
-         spark: spark,
-         previous: previous,
-         temporalLayers: temporalLayers,
-       );
+    Map<int, H263LayerState>? layers,
+  }) : _headers = H263Headers(spark: spark, previous: previous, layers: layers);
 
   final H263Headers _headers;
   final _transform = MpegIdct();
   final _prediction = _Mpeg4MotionCompensation();
-  _H263Reference? _reference, _olderReference;
+  final _references = <int, _H263Reference>{};
+  final _olderReferences = <int, _H263Reference>{};
 
   H263Picture decode(Uint8List bytes) =>
       decodePair(bytes, includeBidirectional: false).picture!;
@@ -47,12 +44,14 @@ final class H263Decoder {
     Uint8List bytes, {
     required bool includeBidirectional,
     bool includeStandaloneB = true,
+    bool allowMissingEnhancement = false,
   }) {
     final header = _headers.read(bytes);
     final format = header.format;
-    if (header.temporalLayer != null) {
+    if (header.bidirectional) {
       if (!includeStandaloneB) return (picture: null, bidirectional: null);
-      final older = _olderReference, newest = _reference;
+      final older = _olderReferences[header.referenceLayer];
+      final newest = _references[header.referenceLayer];
       if (older == null ||
           newest == null ||
           !_h263Matches(older.picture, format) ||
@@ -72,7 +71,40 @@ final class H263Decoder {
       return (picture: picture, bidirectional: null);
     }
     final picture = H263Picture._(format);
-    final reference = header.intra ? null : _reference?.picture;
+    final previous = _references[header.layer];
+    if (header.enhancement) {
+      final lower = _references[header.referenceLayer];
+      if (lower == null ||
+          lower.temporal != header.temporalReference ||
+          !header.enhancementIntra && previous == null) {
+        if (allowMissingEnhancement) {
+          _references.remove(header.layer);
+          _olderReferences.remove(header.layer);
+          return (picture: null, bidirectional: null);
+        }
+        throw const FormatException(
+          'Missing H.263+ enhancement reference picture',
+        );
+      }
+      final forward = header.enhancementIntra ? null : previous!.picture;
+      if (forward != null && !_h263Matches(forward, format)) {
+        throw UnsupportedError(
+          'H.263+ resampling the previous enhancement picture',
+        );
+      }
+      final blocks = _H263Macroblocks(
+        header,
+        picture,
+        forward,
+        _transform,
+        _prediction,
+        null,
+      );
+      blocks.decodeEnhancement(forward, _h263Upsample(lower.picture, format));
+      _saveReference(header, picture, blocks);
+      return (picture: picture, bidirectional: null);
+    }
+    final reference = header.intra ? null : previous?.picture;
     if (!header.intra &&
         (reference == null || !_h263Matches(reference, format))) {
       throw const FormatException('Missing H.263 reference picture');
@@ -84,7 +116,7 @@ final class H263Decoder {
             reference!,
             picture,
             _prediction,
-            h263PbDistance(_reference!.temporal, header),
+            h263PbDistance(previous!.temporal, header),
             includeBidirectional ? H263Picture._(format) : null,
           );
     final macroblocks = _H263Macroblocks(
@@ -97,15 +129,26 @@ final class H263Decoder {
     );
     macroblocks.decode();
     if (!header.disposable) {
-      if (!_headers.spark) _olderReference = _reference;
-      _reference = (
-        picture: picture,
-        temporal: header.temporalReference,
-        motion: macroblocks._motion,
-        intraWithMotion: macroblocks._intraWithMotion,
-      );
+      _saveReference(header, picture, macroblocks);
     }
     return (picture: picture, bidirectional: pb?.output);
+  }
+
+  void _saveReference(
+    H263Header header,
+    H263Picture picture,
+    _H263Macroblocks blocks,
+  ) {
+    final previous = _references[header.layer];
+    if (!_headers.spark && previous != null) {
+      _olderReferences[header.layer] = previous;
+    }
+    _references[header.layer] = (
+      picture: picture,
+      temporal: header.temporalReference,
+      motion: blocks._motion,
+      intraWithMotion: blocks._intraWithMotion,
+    );
   }
 }
 
@@ -137,7 +180,8 @@ final class _H263Macroblocks {
       List<_H263IntraBlock?>.filled(picture.columns * picture.rows, null),
   ];
   late final _filterQuant = Uint8List(picture.columns * picture.rows);
-  late final _sac = header.format.arithmetic && header.temporalLayer == null
+  late final _sac =
+      header.format.arithmetic && !header.bidirectional && !header.enhancement
       ? _H263Sac(_bits)
       : null;
   late final _overlap = header.format.overlapping && reference != null

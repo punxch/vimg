@@ -16,6 +16,7 @@ part 'motion.dart';
 part 'partitions.dart';
 part 'short_annex.dart';
 part 'short_b.dart';
+part 'short_layers.dart';
 part 'short_overlap.dart';
 part 'short_pb.dart';
 part 'short_sac.dart';

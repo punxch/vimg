@@ -1,6 +1,11 @@
 part of 'video.dart';
 
-typedef _H263TimedReference = ({FramePacket packet, int temporal, int anchor});
+typedef _H263TimedReference = ({
+  FramePacket packet,
+  int temporal,
+  int anchor,
+  int position,
+});
 
 extension _Mpeg4Timeline on Video {
   _IndexedVideo _indexShortVideo(String codec, {_IsoSection? section}) {
@@ -11,12 +16,17 @@ extension _Mpeg4Timeline on Video {
     final sections = <int, int>{};
     final displayBySample = <FramePacket, List<FramePacket>>{};
     final bidirectional = <int>{};
+    final layerNumbers = <int>[];
+    final older = <int, _H263TimedReference>{};
+    final previous = <int, _H263TimedReference>{};
     var anchor = -1;
-    _H263TimedReference? older, previous;
-    void record(FramePacket packet, int requiredAnchor) {
+    var hasEnhancements = false;
+    var topLayer = 1;
+    void record(FramePacket packet, int requiredAnchor, int layer) {
       positions[packet] = decodeOrder.length;
       decodeOrder.add(packet);
       anchors.add(requiredAnchor);
+      layerNumbers.add(layer);
     }
 
     void inheritSampleProperties(FramePacket frame, FramePacket sample) {
@@ -24,16 +34,28 @@ extension _Mpeg4Timeline on Video {
       if (_isoAspects[sample] case final aspect?) _isoAspects[frame] = aspect;
     }
 
-    final display =
+    void remember(H263Header header, FramePacket frame, int requiredAnchor) {
+      if (previous[header.layer] case final last?) older[header.layer] = last;
+      previous[header.layer] = (
+        packet: frame,
+        temporal: header.temporalReference,
+        anchor: requiredAnchor,
+        position: decodeOrder.length - 1,
+      );
+    }
+
+    var display =
         _containerPackets(
               false,
               section: section,
               onSample: (packet, _) {
                 final header = headers.read(_readPrefix(packet, 1024));
                 final position = decodeOrder.length;
-                if (header.temporalLayer != null) {
+                if (header.bidirectional) {
                   var frame = packet;
-                  final before = older, after = previous;
+                  final before = older[header.referenceLayer];
+                  final after = previous[header.referenceLayer];
+                  var start = -1;
                   if (before != null && after != null) {
                     final timing = h263BTiming(
                       before.temporal,
@@ -52,23 +74,62 @@ extension _Mpeg4Timeline on Video {
                       inheritSampleProperties(frame, packet);
                       displayBySample[packet] = [frame];
                     }
+                    start = before.anchor < after.anchor
+                        ? before.anchor
+                        : after.anchor;
                   }
                   bidirectional.add(position);
-                  record(frame, before?.anchor ?? -1);
+                  record(frame, start, header.layer);
+                  return;
+                }
+                if (header.enhancement) {
+                  hasEnhancements = true;
+                  final lower = previous[header.referenceLayer];
+                  final last = previous[header.layer];
+                  var start = -1;
+                  var frame = packet;
+                  if (lower != null &&
+                      lower.temporal == header.temporalReference &&
+                      (header.enhancementIntra || last != null)) {
+                    final forward = header.enhancementIntra
+                        ? lower.anchor
+                        : last!.anchor;
+                    start = lower.anchor < forward ? lower.anchor : forward;
+                    if (start >= 0 && header.layer >= topLayer) {
+                      topLayer = header.layer;
+                      _h263DisplayFormat = header.format;
+                    }
+                    frame = _h263Retime(
+                      packet,
+                      lower.packet.seconds,
+                      lower.packet.timestamp,
+                    );
+                    if (frame != packet) {
+                      inheritSampleProperties(frame, packet);
+                      displayBySample[packet] = [frame];
+                    }
+                    final key = configurations[lower.position];
+                    if (header.enhancementIntra && key != null) {
+                      configurations[position] = key;
+                    }
+                  }
+                  record(frame, start, header.layer);
+                  remember(header, frame, start);
                   return;
                 }
                 if (header.intra) {
                   anchor = position;
                   configurations[anchor] = _RunConfiguration(
                     shortVideo: header.format,
-                    h263TemporalLayers: headers.snapshotTemporalLayers(),
+                    h263Layers: headers.snapshotLayers(),
                   );
                   sections[anchor] = 0;
                 }
-                if (header.pb != null && previous != null) {
-                  final distance = h263PbDistance(previous!.temporal, header);
+                final last = previous[1];
+                if (header.pb != null && last != null) {
+                  final distance = h263PbDistance(last.temporal, header);
                   final frames = _h263PairedPackets(
-                    previous!.packet,
+                    last.packet,
                     packet,
                     header,
                     distance,
@@ -76,19 +137,14 @@ extension _Mpeg4Timeline on Video {
                   bidirectional.add(position);
                   for (final frame in frames) {
                     inheritSampleProperties(frame, packet);
-                    record(frame, anchor);
+                    record(frame, anchor, 1);
                   }
                   displayBySample[packet] = frames;
                 } else {
-                  record(packet, anchor);
+                  record(packet, anchor, 1);
                 }
                 if (!header.disposable) {
-                  older = previous;
-                  previous = (
-                    packet: packet,
-                    temporal: header.temporalReference,
-                    anchor: anchor,
-                  );
+                  remember(header, packet, anchor);
                 }
               },
             )
@@ -101,6 +157,19 @@ extension _Mpeg4Timeline on Video {
                 ? positions[a]!.compareTo(positions[b]!)
                 : byTime;
           });
+    if (hasEnhancements) {
+      final best = <FramePacket>[];
+      for (final frame in display) {
+        if (best.isEmpty || best.last.seconds != frame.seconds) {
+          best.add(frame);
+        } else if (layerNumbers[positions[frame]!] >
+            layerNumbers[positions[best.last]!]) {
+          best[best.length - 1] = frame;
+        }
+      }
+      display = best;
+      if (_shortElementary == null) _displayRateVaries = true;
+    }
     if (bidirectional.isNotEmpty && _shortElementary == null) {
       for (var i = 0; i + 1 < display.length; i++) {
         final next = display[i + 1];
@@ -125,6 +194,27 @@ extension _Mpeg4Timeline on Video {
       ),
       sections: sections,
       configurations: configurations,
+    );
+  }
+
+  FramePacket _h263Retime(
+    FramePacket packet,
+    double seconds,
+    FrameTimestamp? timestamp,
+  ) {
+    if (seconds == packet.seconds && timestamp == packet.timestamp)
+      return packet;
+    return (
+      offset: packet.offset,
+      size: packet.size,
+      seconds: seconds,
+      timestamp: timestamp,
+      subframe: (
+        offset: 0,
+        length: packet.size,
+        displayIndex: null,
+        sampleTimestamp: packet.timestamp,
+      ),
     );
   }
 
@@ -203,18 +293,7 @@ extension _Mpeg4Timeline on Video {
     // Some muxers timestamp chunks in coding order. Recover display
     // placement from the interval between the two reference pictures.
     final time = _h263Between(before, after, header, offset, distance);
-    return (
-      offset: packet.offset,
-      size: packet.size,
-      seconds: time.seconds,
-      timestamp: time.timestamp,
-      subframe: (
-        offset: 0,
-        length: packet.size,
-        displayIndex: null,
-        sampleTimestamp: packet.timestamp,
-      ),
-    );
+    return _h263Retime(packet, time.seconds, time.timestamp);
   }
 
   ({double seconds, FrameTimestamp? timestamp}) _h263Between(
