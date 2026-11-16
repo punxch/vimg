@@ -83,7 +83,7 @@ const _h263EpModes = [
 ];
 
 extension _H263Enhancement on _H263Macroblocks {
-  void decodeEnhancement(H263Picture? previous, H263Picture upward) {
+  void decodeEnhancement(H263Picture upward) {
     final columns = _columns, count = _count;
     final ei = header.enhancementIntra;
     final modes = ei ? _h263EiMode : _h263EpMode;
@@ -122,7 +122,7 @@ extension _H263Enhancement on _H263Macroblocks {
         final vectors = texture ? _readMotion(x, y, false) : [_zeroVector];
         _prediction.predictH263(
           picture,
-          previous!,
+          reference!,
           x,
           y,
           vectors,

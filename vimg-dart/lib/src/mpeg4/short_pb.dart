@@ -3,20 +3,13 @@ part of 'decoder.dart';
 enum _PbMode { direct, forward, backward }
 
 final class _H263Pb {
-  _H263Pb(
-    this.header,
-    this.previous,
-    this.current,
-    this.sampler,
-    this.distance,
-    this.output,
-  );
+  _H263Pb(this.header, this.current, this.sampler, this.output);
 
   final H263Header header;
-  final H263Picture previous, current;
+  final H263Picture current;
   final H263Picture? output;
   final _Mpeg4MotionCompensation sampler;
-  final int distance;
+  late _H263Forward _forward;
   late final residuals = List.generate(6, (_) => Int16List(64));
   late final _blockSize = header.macroblockSize >> 1;
   late final _backward = Uint8List(_blockSize * _blockSize);
@@ -26,10 +19,11 @@ final class _H263Pb {
 
   _Vector get leftForward => _mode == _PbMode.forward ? _motion : _zeroVector;
 
-  void queue(_PbMode mode, _Vector vector, int pattern) {
+  void queue(_PbMode mode, _Vector vector, int pattern, _H263Forward forward) {
     _mode = mode;
     _motion = vector;
     _pattern = pattern;
+    _forward = forward;
   }
 
   void reconstruct(
@@ -44,7 +38,7 @@ final class _H263Pb {
       case _PbMode.direct:
         _predictDirect(picture, x, y, motion);
       case _PbMode.forward:
-        sampler.predictH263(picture, previous, x, y, [
+        sampler.predictH263(picture, _forward.picture, x, y, [
           _motion,
         ], reduced: header.reduced);
       case _PbMode.backward:
@@ -75,7 +69,7 @@ final class _H263Pb {
     _PictureMotion motion,
   ) {
     final forward = <_Vector>[], backward = <_Vector>[];
-    final offset = header.pb!.offset;
+    final (picture: previous, :offset, :distance) = _forward;
     (int, int) scale(int component, int delta) {
       final scaled = component * offset ~/ distance;
       if (delta == 0)

@@ -24,6 +24,7 @@ typedef H263Format = ({
   bool advancedIntra,
   bool loopFilter,
   bool structured,
+  bool referenceSelection,
   bool alternateVlc,
   bool modifiedQuant,
 });
@@ -43,6 +44,8 @@ const H263Resampling h263ImplicitResampling = (
 typedef H263Header = ({
   H263Format format,
   int temporalReference,
+  int? predictionTemporal,
+  bool redundant,
   bool intra,
   bool disposable,
   int quant,
@@ -67,6 +70,7 @@ extension H263PictureLayer on H263Header {
       (format.width + macroblockSize - 1) ~/ macroblockSize;
   int get macroblockRows =>
       (format.height + macroblockSize - 1) ~/ macroblockSize;
+  int get macroblockCount => macroblockColumns * macroblockRows;
 }
 
 typedef H263LayerState = ({H263Format format, int? lowerLayer, int bReference});
@@ -83,6 +87,7 @@ final class H263Headers {
   H263Format? _extended;
   final Map<int, H263LayerState> _layers;
   final _references = <int, ({H263Format format, H263Resampling? warp})>{};
+  final _lastTemporal = <int, int>{};
 
   Map<int, H263LayerState>? snapshotLayers() =>
       _layers.isEmpty ? null : Map.of(_layers);
@@ -101,6 +106,9 @@ final class H263Headers {
     final int quant;
     var layer = 1, referenceLayer = 1;
     var bidirectional = false, enhancementIntra = false, reduced = false;
+    var updateBase = false;
+    H263LayerState? layerState;
+    int? predictionTemporal;
     H263Resampling? resampling;
     if (source < 6) {
       intra = !bits.flag();
@@ -119,7 +127,7 @@ final class H263Headers {
         overlapping: overlapping,
         arithmetic: arithmetic,
       );
-      _extended = format;
+      updateBase = true;
       noRound = false;
     } else {
       final update = bits.read(3);
@@ -171,15 +179,24 @@ final class H263Headers {
           throw const FormatException('Invalid H.263+ reference layer');
         }
         if (layer > 1) {
-          _layers[layer] = (
+          layerState = (
             format: format,
             lowerLayer: bidirectional ? previous?.lowerLayer : referenceLayer,
             bReference: bidirectional ? referenceLayer : layer,
           );
         }
       }
-      if (options != null && layer == 1) {
-        _extended = format;
+      updateBase = options != null && layer == 1;
+      if (format.referenceSelection) {
+        if (options != null && bits.read(3) < 4) {
+          throw const FormatException(
+            'Invalid H.263+ reference selection flags',
+          );
+        }
+        predictionTemporal = _readPredictionTemporal(
+          bits,
+          intra || enhancementIntra,
+        );
       }
       if (explicitResampling) {
         if (intra || enhancementIntra) {
@@ -213,14 +230,24 @@ final class H263Headers {
       final count =
           ((format.width + size - 1) ~/ size) *
           ((format.height + size - 1) ~/ size);
-      if (bits.read(h263AddressBits(count)) != 0)
+      if (bits.read(_h263AddressBits(count, reduced: reduced)) != 0)
         throw const FormatException('H.263+ picture starts mid-slice');
       h263Marker(bits);
     }
-    if (!bidirectional) _references[layer] = (format: format, warp: resampling);
+    final redundant =
+        format.referenceSelection && _lastTemporal[layer] == temporal;
+    if (!redundant) {
+      _lastTemporal[layer] = temporal;
+      if (updateBase) _extended = format;
+      if (layerState != null) _layers[layer] = layerState;
+      if (!bidirectional)
+        _references[layer] = (format: format, warp: resampling);
+    }
     return (
       format: format,
       temporalReference: temporal,
+      predictionTemporal: predictionTemporal,
+      redundant: redundant,
       intra: intra,
       disposable: bidirectional,
       quant: quant,
@@ -332,6 +359,8 @@ final class H263Headers {
     return (
       format: format,
       temporalReference: temporal,
+      predictionTemporal: null,
+      redundant: false,
       intra: type == 0,
       disposable: type == 2,
       quant: quant,
@@ -424,6 +453,7 @@ H263Format _basicFormat(
   advancedIntra: false,
   loopFilter: false,
   structured: false,
+  referenceSelection: false,
   alternateVlc: false,
   modifiedQuant: false,
 );
@@ -437,6 +467,7 @@ typedef _Options = ({
   bool advancedIntra,
   bool loopFilter,
   bool structured,
+  bool referenceSelection,
   bool alternateVlc,
   bool modifiedQuant,
 });
@@ -447,10 +478,9 @@ _Options _readOptions(Rbsp bits) {
   final arithmetic = bits.flag();
   final overlapping = bits.flag(), aic = bits.flag(), loop = bits.flag();
   final structured = bits.flag();
-  if (bits.read(2) != 0)
-    throw UnsupportedError(
-      'H.263+ reference selection or independent segments',
-    );
+  final referenceSelection = bits.flag();
+  if (bits.flag())
+    throw UnsupportedError('H.263+ independent segment decoding');
   final alternate = bits.flag(), modified = bits.flag();
   if (arithmetic && (unrestricted || alternate || modified)) {
     throw const FormatException('Incompatible H.263+ arithmetic coding modes');
@@ -465,6 +495,7 @@ _Options _readOptions(Rbsp bits) {
     advancedIntra: aic,
     loopFilter: loop,
     structured: structured,
+    referenceSelection: referenceSelection,
     alternateVlc: alternate,
     modifiedQuant: modified,
   );
@@ -515,18 +546,105 @@ H263Format _readFormat(Rbsp bits, _Options options) {
     advancedIntra: options.advancedIntra,
     loopFilter: options.loopFilter,
     structured: options.structured,
+    referenceSelection: options.referenceSelection,
     alternateVlc: options.alternateVlc,
     modifiedQuant: options.modifiedQuant,
   );
 }
 
-int h263AddressBits(int macroblocks) {
-  if (macroblocks <= 48) return 6;
+int _h263AddressBits(int macroblocks, {required bool reduced}) {
+  if (reduced && macroblocks <= 12) return 5;
+  if (reduced && macroblocks <= 30) return 6;
+  if (reduced && macroblocks > 1584) return 12;
+  if (!reduced && macroblocks <= 48) return 6;
   if (macroblocks <= 99) return 7;
   if (macroblocks <= 396) return 9;
   if (macroblocks <= 1584) return 11;
   if (macroblocks <= 6336) return 13;
   return 14;
+}
+
+int? _readPredictionTemporal(Rbsp bits, bool intra) {
+  final prediction = bits.flag() ? bits.read(10) : null;
+  if (intra && prediction != null) {
+    throw const FormatException('Invalid H.263+ intra reference selection');
+  }
+  if (bits.flag()) {
+    // In-band feedback describes the opposite video stream. Its address
+    // width depends on the layout and slice mode of that stream.
+    throw UnsupportedError('H.263+ in-band reference selection feedback');
+  }
+  h263Marker(bits);
+  return prediction;
+}
+
+({int address, int quant, int? temporal}) h263ReadGroupHeader(
+  H263Header header,
+  Rbsp bits,
+) {
+  final int address, quant;
+  if (header.format.structured) {
+    h263Marker(bits);
+    final width = _h263AddressBits(
+      header.macroblockCount,
+      reduced: header.reduced,
+    );
+    address = bits.read(width);
+    if (width > 11) h263Marker(bits);
+    quant = bits.read(5);
+    h263Marker(bits);
+    bits.skip(2); // group frame identifier
+  } else {
+    final group = bits.read(5);
+    final height = header.format.height;
+    final lines = height > 800
+        ? 64
+        : height > 400 || header.reduced
+        ? 32
+        : 16;
+    address =
+        group * header.macroblockColumns * (lines ~/ header.macroblockSize);
+    bits.skip(2);
+    quant = bits.read(5);
+  }
+  int? temporal;
+  if (header.format.referenceSelection) {
+    if (bits.flag()) bits.skip(header.format.customClock ? 10 : 8);
+    temporal = _readPredictionTemporal(
+      bits,
+      header.intra || header.enhancementIntra,
+    );
+  }
+  return (address: address, quant: quant, temporal: temporal);
+}
+
+Set<int> h263PredictionReferences(H263Header header, Uint8List bytes) {
+  final references = <int>{?header.predictionTemporal};
+  final bits = Rbsp(bytes, codec: 'H.263')..position = header.bits.position;
+  // A group start can straddle byte boundaries but always contains a whole
+  // zero byte. Skip the fields of each recognized header before looking again.
+  for (var i = bits.position >> 3; i + 2 < bytes.length; i++) {
+    if (bytes[i + 1] != 0 || bytes[i + 2] == 0) continue;
+    final word = (bytes[i] << 16) | bytes[i + 2];
+    for (var shift = 7; shift >= 0; shift--) {
+      final start = i * 8 + 7 - shift;
+      if (start < bits.position || (word >> shift) & 0x1ffff != 1) continue;
+      bits.position = start + 17;
+      final kind = bits.read(5);
+      if (kind >= 30) return references;
+      bits.position -= 5;
+      final group = h263ReadGroupHeader(header, bits);
+      if (group.address <= 0 ||
+          group.address >= header.macroblockCount ||
+          group.quant == 0) {
+        throw const FormatException('Invalid H.263 reference selection group');
+      }
+      if (group.temporal case final temporal?) references.add(temporal);
+      i = (bits.position >> 3) - 1;
+      break;
+    }
+  }
+  return references;
 }
 
 void h263Marker(Rbsp bits) {

@@ -64,17 +64,13 @@ const _h263BModes = [
 ];
 
 extension _H263Bidirectional on _H263Macroblocks {
-  void decodeB(
-    H263Picture older,
-    _H263Reference latest,
-    int offset,
-    int period,
-  ) {
+  void decodeB(_H263Reference latest) {
     final columns = _columns, rows = _rows;
     final backward = _PictureMotion(columns, rows, false);
     final newer = _h263AlignReference(latest.picture, reduced: header.reduced);
     for (var index = 0; index < columns * rows; index++) {
       _startMacroblock(index);
+      final (picture: older, :offset, :distance) = _forward!;
       final x = index % columns, y = index ~/ columns;
       var mode = _h263BMode.read(_bits);
       while (mode == _h263BModes.length) {
@@ -94,7 +90,7 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (changeQuant) _readQuantChange();
       switch (prediction) {
         case _H263BPrediction.direct:
-          _predictBDirect(older, newer, latest, x, y, offset, period);
+          _predictBDirect(older, newer, latest, x, y, offset, distance);
         case _H263BPrediction.forward:
         case _H263BPrediction.both:
           final forward = _readBVector(_motion, x, y);

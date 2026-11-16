@@ -1406,6 +1406,7 @@ final class Video {
           spark: run.codec == 'flv1',
           previous: configuration.shortVideo,
           layers: configuration.h263Layers,
+          retainedReferences: configuration.h263RetainedReferences,
         );
         H263Picture? pairedReference;
         return (packet, selected, _) {
@@ -1824,6 +1825,7 @@ final class _RunConfiguration {
     this.mpeg4Clock,
     this.shortVideo,
     this.h263Layers,
+    this.h263RetainedReferences,
   });
 
   final Uint8List? bytes;
@@ -1831,6 +1833,7 @@ final class _RunConfiguration {
   final Mpeg4Clock? mpeg4Clock;
   final H263Format? shortVideo;
   final Map<int, H263LayerState>? h263Layers;
+  final Map<int, Set<int>>? h263RetainedReferences;
 }
 
 typedef _IndexedVideo = ({

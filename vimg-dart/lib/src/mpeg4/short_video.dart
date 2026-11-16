@@ -23,6 +23,8 @@ final class H263Picture extends _DctPicture {
   );
 }
 
+typedef _H263Forward = ({H263Picture picture, int offset, int distance});
+
 /// H.263 pictures and Sorenson Spark use the same macroblock syntax with
 /// distinct picture headers and escape codes.
 final class H263Decoder {
@@ -30,13 +32,17 @@ final class H263Decoder {
     bool spark = false,
     H263Format? previous,
     Map<int, H263LayerState>? layers,
-  }) : _headers = H263Headers(spark: spark, previous: previous, layers: layers);
+    Map<int, Set<int>>? retainedReferences,
+  }) : _headers = H263Headers(spark: spark, previous: previous, layers: layers),
+       _retainedReferences = retainedReferences;
 
   final H263Headers _headers;
   final _transform = MpegIdct();
   final _prediction = _Mpeg4MotionCompensation();
   final _references = <int, _H263Reference>{};
   final _olderReferences = <int, _H263Reference>{};
+  final Map<int, Set<int>>? _retainedReferences;
+  final _history = <int, Map<int, _H263Reference>>{};
 
   H263Picture decode(Uint8List bytes) =>
       decodePair(bytes, includeBidirectional: false).picture!;
@@ -48,6 +54,7 @@ final class H263Decoder {
     bool allowMissingEnhancement = false,
   }) {
     final header = _headers.read(bytes);
+    if (header.redundant) return (picture: null, bidirectional: null);
     final format = header.format;
     if (header.bidirectional) {
       if (!includeStandaloneB) return (picture: null, bidirectional: null);
@@ -58,23 +65,17 @@ final class H263Decoder {
           !_h263Matches(newest.picture, format)) {
         throw const FormatException('Missing H.263+ B-picture references');
       }
-      final timing = h263BTiming(older.temporal, newest.temporal, header);
-      // Warp the original previous anchor using the following P-picture's
-      // rounding type when the following anchor is a P-picture.
-      final reference = _h263PredictionReference(
-        older.picture,
-        header,
-        newest.resamplingRound ?? header.noRound,
-      );
+      final select = _forwardSelector(header, older, following: newest);
       final picture = H263Picture._(format, reduced: header.reduced);
       _H263Macroblocks(
         header,
         picture,
-        null,
+        select(header.predictionTemporal),
         _transform,
         _prediction,
         null,
-      ).decodeB(reference, newest, timing.offset, timing.distance);
+        selectForward: select,
+      ).decodeB(newest);
       return (
         picture: _h263AlignReference(picture, reduced: false),
         bidirectional: null,
@@ -96,19 +97,19 @@ final class H263Decoder {
           'Missing H.263+ enhancement reference picture',
         );
       }
-      final forward = header.enhancementIntra
+      final select = header.enhancementIntra
           ? null
-          : _h263PredictionReference(previous!.picture, header, header.noRound);
+          : _forwardSelector(header, previous!);
       final blocks = _H263Macroblocks(
         header,
         picture,
-        forward,
+        select?.call(header.predictionTemporal),
         _transform,
         _prediction,
         null,
+        selectForward: select,
       );
       blocks.decodeEnhancement(
-        forward,
         _h263AlignReference(
           _h263Upsample(lower.picture, format),
           reduced: header.reduced,
@@ -121,17 +122,13 @@ final class H263Decoder {
     if (!header.intra && previous == null) {
       throw const FormatException('Missing H.263 reference picture');
     }
-    final reference = header.intra
-        ? null
-        : _h263PredictionReference(previous!.picture, header, header.noRound);
+    final select = header.intra ? null : _forwardSelector(header, previous!);
     final pb = header.pb == null
         ? null
         : _H263Pb(
             header,
-            reference!,
             picture,
             _prediction,
-            h263PbDistance(previous!.temporal, header),
             includeBidirectional
                 ? H263Picture._(format, reduced: header.reduced)
                 : null,
@@ -139,10 +136,11 @@ final class H263Decoder {
     final macroblocks = _H263Macroblocks(
       header,
       picture,
-      reference,
+      select?.call(header.predictionTemporal),
       _transform,
       _prediction,
       pb,
+      selectForward: select,
     );
     macroblocks.decode();
     final decoded = _h263AlignReference(picture, reduced: false);
@@ -158,6 +156,63 @@ final class H263Decoder {
     );
   }
 
+  _H263Forward Function(int?) _forwardSelector(
+    H263Header header,
+    _H263Reference previous, {
+    _H263Reference? following,
+  }) {
+    final layer = header.bidirectional ? header.referenceLayer : header.layer;
+    final round = following?.resamplingRound ?? header.noRound;
+    final pair = header.pb;
+    final latestDistance = pair == null
+        ? 0
+        : h263PbDistance(previous.temporal, header);
+    final resolved = <int, _H263Forward>{};
+    var resampled = false;
+    return (int? temporal) {
+      final source = temporal == null || previous.temporal == temporal
+          ? previous
+          : _history[layer]?[temporal] ??
+                (throw FormatException(
+                  'Missing H.263 reference picture TR $temporal in layer $layer',
+                ));
+      return resolved.putIfAbsent(source.temporal, () {
+        final warp =
+            header.resampling != null ||
+            !_h263Matches(source.picture, header.format);
+        if ((warp || resampled) && resolved.isNotEmpty) {
+          throw const FormatException(
+            'H.263 resampling requires one reference picture',
+          );
+        }
+        resampled = warp;
+        final int offset, distance;
+        if (following != null) {
+          (offset: offset, distance: distance) = h263BTiming(
+            source.temporal,
+            following.temporal,
+            header,
+          );
+        } else if (pair != null) {
+          distance = h263TemporalDistance(source.temporal, header);
+          offset = pair.offset + distance - latestDistance;
+          if (offset <= 0 || offset >= distance) {
+            throw const FormatException(
+              'Invalid H.263 PB prediction reference',
+            );
+          }
+        } else {
+          offset = distance = 0;
+        }
+        return (
+          picture: _h263PredictionReference(source.picture, header, round),
+          offset: offset,
+          distance: distance,
+        );
+      });
+    };
+  }
+
   void _saveReference(
     H263Header header,
     H263Picture picture,
@@ -167,7 +222,7 @@ final class H263Decoder {
     if (!_headers.spark && previous != null) {
       _olderReferences[header.layer] = previous;
     }
-    _references[header.layer] = (
+    final entry = (
       picture: picture,
       temporal: header.temporalReference,
       resamplingRound: header.layer == 1 && !header.intra
@@ -177,6 +232,13 @@ final class H263Decoder {
       motion: blocks._motion,
       intraWithMotion: blocks._intraWithMotion,
     );
+    _references[header.layer] = entry;
+    final keep = _retainedReferences;
+    if (!_headers.spark &&
+        (keep == null ||
+            keep[header.layer]?.contains(entry.temporal) == true)) {
+      (_history[header.layer] ??= {})[entry.temporal] = entry;
+    }
   }
 }
 
@@ -187,20 +249,24 @@ final class _H263Macroblocks {
   _H263Macroblocks(
     this.header,
     this.picture,
-    this.reference,
+    this._forward,
     this._transform,
     this._prediction,
-    this._pb,
-  ) : _motion = _PictureMotion(
-        header.macroblockColumns,
-        header.macroblockRows,
-        false,
-      ),
-      _quant = header.quant;
+    this._pb, {
+    required _H263Forward Function(int?)? selectForward,
+  }) : _selectForward = header.format.referenceSelection ? selectForward : null,
+       _motion = _PictureMotion(
+         header.macroblockColumns,
+         header.macroblockRows,
+         false,
+       ),
+       _quant = header.quant;
 
   final H263Header header;
   final H263Picture picture;
-  final H263Picture? reference;
+  _H263Forward? _forward;
+  H263Picture? get reference => _forward?.picture;
+  final _H263Forward Function(int?)? _selectForward;
   final MpegIdct _transform;
   final _Mpeg4MotionCompensation _prediction;
   final _H263Pb? _pb;
@@ -224,8 +290,9 @@ final class _H263Macroblocks {
       ? _H263Sac(_bits)
       : null;
   late final _overlap = header.format.overlapping && reference != null
-      ? _H263Overlap(picture, reference!, _motion, _prediction, header)
+      ? _H263Overlap(picture, _motion, _prediction, header)
       : null;
+  H263Picture? _pendingReference;
   int _pendingPattern = -1;
   Uint8List? _intraWithMotion;
   Rbsp get _bits => header.bits;
@@ -243,6 +310,7 @@ final class _H263Macroblocks {
         _finishPrevious(index - 1);
         if (overlap != null) {
           _pendingPattern = 0;
+          _pendingReference = reference;
         } else {
           _prediction.predictH263(
             picture,
@@ -254,7 +322,7 @@ final class _H263Macroblocks {
             noRound: header.noRound,
           );
         }
-        _pb?.queue(_PbMode.direct, _zeroVector, 0);
+        _pb?.queue(_PbMode.direct, _zeroVector, 0, _forward!);
         continue;
       }
       final intra = header.intra || mode & 4 != 0;
@@ -290,14 +358,17 @@ final class _H263Macroblocks {
         }
       }
       _finishPrevious(index - 1);
-      if (overlap != null && !intra) _pendingPattern = pattern;
+      if (overlap != null && !intra) {
+        _pendingPattern = pattern;
+        _pendingReference = reference;
+      }
       if (pbBlock != null) {
         final predictor =
             pbBlock.mode == _PbMode.forward && x != 0 && index != _sliceStart
             ? _pb!.leftForward
             : _zeroVector;
         final motion = pbBlock.vector ? _readVector(predictor) : _zeroVector;
-        _pb!.queue(pbBlock.mode, motion, pbBlock.pattern);
+        _pb!.queue(pbBlock.mode, motion, pbBlock.pattern, _forward!);
       }
       for (var block = 0; block < 6; block++) {
         final coded = pattern & (32 >> block) != 0;
@@ -396,7 +467,7 @@ final class _H263Macroblocks {
     final pattern = _pendingPattern;
     if (pattern < 0) return;
     final overlap = _overlap!;
-    overlap.predict(x, y);
+    overlap.predict(x, y, _pendingReference!);
     for (var block = 0; block < 6; block++) {
       if (pattern & (32 >> block) != 0) {
         _writeBlock(x, y, block, overlap.residuals[block], intra: false);
@@ -484,25 +555,7 @@ final class _H263Macroblocks {
       }
       _bits.position = afterStart;
     }
-    final int address, quant;
-    if (header.format.structured) {
-      h263Marker(_bits);
-      address = _bits.read(h263AddressBits(macroblocks));
-      if (macroblocks > 1583) h263Marker(_bits);
-      quant = _bits.read(5);
-      h263Marker(_bits);
-      _bits.skip(2); // group frame identifier
-    } else {
-      final group = _bits.read(5);
-      final lines = picture.height > 800
-          ? 64
-          : picture.height > 400 || header.reduced
-          ? 32
-          : 16;
-      address = group * _columns * (lines ~/ header.macroblockSize);
-      _bits.skip(2);
-      quant = _bits.read(5);
-    }
+    final (:address, :quant, :temporal) = h263ReadGroupHeader(header, _bits);
     // A SAC interval can reach a future start code while the last
     // buffered macroblocks of the current segment are still being decoded.
     if (_sac != null && address > index && address < macroblocks) {
@@ -514,6 +567,7 @@ final class _H263Macroblocks {
     }
     _quant = quant;
     _sliceStart = index;
+    if (_selectForward case final select?) _forward = select(temporal);
     _sac?.reset();
   }
 

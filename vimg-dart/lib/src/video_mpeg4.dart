@@ -19,7 +19,8 @@ extension _Mpeg4Timeline on Video {
     final layerNumbers = <int>[];
     final older = <int, _H263TimedReference>{};
     final previous = <int, _H263TimedReference>{};
-    var anchor = -1;
+    final retainedReferences = <int, Set<int>>{};
+    var anchor = -1, firstAnchor = -1;
     var hasEnhancements = false;
     var topLayer = 1;
     void record(FramePacket packet, int requiredAnchor, int layer) {
@@ -50,7 +51,36 @@ extension _Mpeg4Timeline on Video {
               section: section,
               onSample: (packet, _) {
                 final header = headers.read(_readPrefix(packet, 1024));
+                if (header.redundant) {
+                  displayBySample[packet] = const [];
+                  return;
+                }
                 final position = decodeOrder.length;
+                final referenceLayer = header.bidirectional
+                    ? header.referenceLayer
+                    : header.layer;
+                final defaultReference = header.bidirectional
+                    ? older[referenceLayer]
+                    : previous[referenceLayer];
+                var needsHistory = false;
+                if (header.format.referenceSelection &&
+                    !header.intra &&
+                    !header.enhancementIntra) {
+                  final references = h263PredictionReferences(
+                    header,
+                    _read(packet),
+                  );
+                  references.remove(defaultReference?.temporal);
+                  if (references.isNotEmpty) {
+                    (retainedReferences[referenceLayer] ??= {}).addAll(
+                      references,
+                    );
+                    // A later intra picture need not reset Annex N's
+                    // buffer. Replay from the first independently coded
+                    // picture when any group selects another anchor.
+                    needsHistory = true;
+                  }
+                }
                 if (header.bidirectional) {
                   var frame = packet;
                   final before = older[header.referenceLayer];
@@ -77,6 +107,7 @@ extension _Mpeg4Timeline on Video {
                     start = before.anchor < after.anchor
                         ? before.anchor
                         : after.anchor;
+                    if (start >= 0 && needsHistory) start = firstAnchor;
                   }
                   bidirectional.add(position);
                   record(frame, start, header.layer);
@@ -95,6 +126,7 @@ extension _Mpeg4Timeline on Video {
                         ? lower.anchor
                         : last!.anchor;
                     start = lower.anchor < forward ? lower.anchor : forward;
+                    if (start >= 0 && needsHistory) start = firstAnchor;
                     if (start >= 0 && header.layer >= topLayer) {
                       topLayer = header.layer;
                       _h263DisplayFormat = header.format;
@@ -119,13 +151,20 @@ extension _Mpeg4Timeline on Video {
                 }
                 if (header.intra) {
                   anchor = position;
+                  if (firstAnchor < 0) firstAnchor = anchor;
                   configurations[anchor] = _RunConfiguration(
                     shortVideo: header.format,
                     h263Layers: headers.snapshotLayers(),
+                    h263RetainedReferences: retainedReferences,
                   );
                   sections[anchor] = 0;
                 }
                 final last = previous[1];
+                final requiredAnchor = needsHistory
+                    ? firstAnchor
+                    : header.intra
+                    ? anchor
+                    : last?.anchor ?? anchor;
                 if (header.pb != null && last != null) {
                   final distance = h263PbDistance(last.temporal, header);
                   final frames = _h263PairedPackets(
@@ -137,14 +176,14 @@ extension _Mpeg4Timeline on Video {
                   bidirectional.add(position);
                   for (final frame in frames) {
                     inheritSampleProperties(frame, packet);
-                    record(frame, anchor, 1);
+                    record(frame, requiredAnchor, 1);
                   }
                   displayBySample[packet] = frames;
                 } else {
-                  record(packet, anchor, 1);
+                  record(packet, requiredAnchor, 1);
                 }
                 if (!header.disposable) {
-                  remember(header, packet, anchor);
+                  remember(header, packet, requiredAnchor);
                 }
               },
             )

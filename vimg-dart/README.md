@@ -195,6 +195,10 @@ sixteenth-pixel displacement precision and all four boundary fill modes.
 Reduced-resolution updates reconstruct 32×32 macroblocks at the full display
 size in P, B, Improved PB and EP pictures. The decoder expands signed texture
 updates and motion vectors and applies the Annex Q boundary filters.
+Annex N reference picture selection uses the temporal reference signalled in
+picture, GOB and slice headers. Random access preserves older references across
+intra pictures, and redundant copies share one display frame. Multiplexed
+back-channel messages require reverse-stream configuration and remain pending.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
 and disposable Spark pictures.
 

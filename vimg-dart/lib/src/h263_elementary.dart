@@ -77,6 +77,7 @@ final class H263Elementary {
       final offset = offsets[i - 1];
       final size = offsets[i] - offset;
       final header = headers.read(file.read(offset, math.min(size, 1024)));
+      if (header.redundant) continue;
       if (format == null && !header.intra) continue;
       format ??= header.format;
       if (header.bidirectional) {

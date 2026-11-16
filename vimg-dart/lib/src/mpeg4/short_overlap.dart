@@ -1,19 +1,14 @@
 part of 'decoder.dart';
 
 final class _H263Overlap {
-  _H263Overlap(
-    this.picture,
-    this.reference,
-    this.motion,
-    this.sampler,
-    H263Header header,
-  ) : _segments = Uint16List(header.macroblockColumns * header.macroblockRows),
+  _H263Overlap(this.picture, this.motion, this.sampler, H263Header header)
+    : _segments = Uint16List(header.macroblockColumns * header.macroblockRows),
       _columns = header.macroblockColumns,
       _scale = header.reduced ? 1 : 0,
       _structured = header.format.structured,
       _noRound = header.noRound;
 
-  final H263Picture picture, reference;
+  final H263Picture picture;
   final _PictureMotion motion;
   final _Mpeg4MotionCompensation sampler;
   final int _columns, _scale;
@@ -28,7 +23,7 @@ final class _H263Overlap {
     _segments[index] = _structured ? start + 1 : 1;
   }
 
-  void predict(int x, int y) {
+  void predict(int x, int y, H263Picture reference) {
     final columns = _columns, size = 8 << _scale;
     final segment = _segments[y * columns + x];
     _Vector motionAt(int x, int y) {
@@ -50,7 +45,7 @@ final class _H263Overlap {
         return motionAt(rx, ry);
       }
 
-      _predictBlock(bx * size, by * size, [
+      _predictBlock(reference, bx * size, by * size, [
         center,
         remote(bx, by - 1),
         block < 2 ? remote(bx, by + 1) : center,
@@ -72,7 +67,12 @@ final class _H263Overlap {
     );
   }
 
-  void _predictBlock(int x, int y, List<_Vector> vectors) {
+  void _predictBlock(
+    H263Picture reference,
+    int x,
+    int y,
+    List<_Vector> vectors,
+  ) {
     final output = picture.planes[0], source = reference.planes[0];
     final stride = picture.stride, height = picture.rows * 16;
     final size = 8 << _scale;
