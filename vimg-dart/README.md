@@ -387,11 +387,13 @@ YUV formats also accept `color_spaces` (`bt709`, `bt470bg`, `smpte170m`,
 the current value when allowed. These options can be used on their own to keep
 the input's pixel layout, for example
 `--vfilter 'format=color_spaces=bt709:color_ranges=pc'`.
-Compatible `format` constraints on the same branch can share a conversion.
-They propagate through crop, flips, aspect and timing filters to an upstream
-`scale`, allowing it to resize and produce the requested format in one
-operation. For example, `scale=640:-2:out_color_matrix=bt709,format=yuv420p`
-can convert an RGB frame directly to BT.709 YUV while scaling.
+Compatible format constraints can share a conversion across crop, flips,
+aspect and timing filters, and `split`. For example,
+`scale=640:-2:out_color_matrix=bt709,format=yuv420p` converts an RGB frame
+directly to BT.709 YUV while scaling. A branch with its own incompatible
+constraint converts where needed. Stacks use the common output layout,
+matrix and range for all inputs, converting branches that require it.
+Explicit overlay formats also pass their input layout requirements upstream.
 Native YUV depth reduction uses ordered dithering.
 Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 

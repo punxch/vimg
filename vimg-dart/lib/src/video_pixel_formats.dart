@@ -133,10 +133,6 @@ final class _FormatFilter implements _SpatialFilter {
     return _FormatFilter._(commonFormats, commonMatrices, commonRanges);
   }
 
-  bool acceptsColor(int? matrix, bool? range) =>
-      (matrix == null || matrices.isEmpty || matrices.contains(matrix)) &&
-      (range == null || ranges.isEmpty || ranges.contains(range));
-
   _FormatSelection select(
     _VideoPlanes frame, {
     int? outputMatrix,
@@ -287,11 +283,17 @@ final class _PixelFormatConverter {
     _VideoPlanes source,
     _VideoPixelFormat target, {
     bool? alpha,
+    int? alphaDepth,
     bool? fullRange,
     int? matrix,
     _ColorScale? scale,
   }) {
     final requestedAlpha = alpha ?? source.alpha != null;
+    final opacityDepth =
+        alphaDepth ??
+        (scale != null && alpha == null
+            ? source.alpha?.depth ?? target.depth
+            : target.depth);
     final full =
         fullRange ??
         (target.color == _PixelColor.yuv
@@ -305,9 +307,9 @@ final class _PixelFormatConverter {
         source.fullRange == full &&
         source.matrix == colorMatrix &&
         requestedAlpha == (source.alpha != null) &&
-        (alpha == null ||
+        (alpha == null && alphaDepth == null ||
             source.alpha == null ||
-            source.alpha!.depth == target.depth) &&
+            source.alpha!.depth == opacityDepth) &&
         source.planes.every((plane) => plane.depth == target.depth)) {
       return source;
     }
@@ -386,9 +388,6 @@ final class _PixelFormatConverter {
       );
     }
     var opacity = source.alpha;
-    final opacityDepth = scale != null && alpha == null && opacity != null
-        ? opacity.depth
-        : target.depth;
     if (requestedAlpha &&
         opacity != null &&
         source.packedRgb &&

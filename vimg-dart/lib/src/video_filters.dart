@@ -599,6 +599,14 @@ final class _Scale extends _FrameSpatialFilter {
 
   bool get nearest => algorithm == _ScaleAlgorithm.neighbor;
 
+  _FormatFilter? get outputColors => outputMatrix == null && outputRange == null
+      ? null
+      : _FormatFilter._(
+          const [],
+          [if (outputMatrix case final matrix?) matrix],
+          [if (outputRange case final range?) range],
+        );
+
   @override
   _VideoPlanes applyAt(
     _VideoPlanes frame,

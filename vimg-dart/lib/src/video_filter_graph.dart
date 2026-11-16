@@ -172,55 +172,137 @@ List<_FilterStep> _orderedFilterSteps(String source) {
 }
 
 List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
-  final result = <_FilterStep>[];
-  // Track the nearest upstream format decision on each unbranched link.
-  final producers = <int, int>{};
+  final regions = <int, _FormatRegion>{0: _FormatRegion(fixed: true)};
   for (final step in steps) {
-    final upstream = step.inputs.length == 1
-        ? producers[step.inputs.single]
-        : null;
-    var filter = step.filter;
-    if (filter is _FormatFilter) {
-      if (filter.unrestricted) {
-        filter = null;
-      } else if (upstream != null) {
-        final anchor = result[upstream];
-        final negotiated = _mergeOutputFormat(anchor.filter, filter);
-        if (negotiated != null) {
-          result[upstream] = (
-            filter: negotiated,
-            inputs: anchor.inputs,
-            outputs: anchor.outputs,
-          );
-          filter = null;
-        }
-      }
-    }
-    final anchor = switch (filter) {
-      _Scale() || _ScaleFormat() || _FormatFilter() => result.length,
-      null || _TimingFilter() || _SetAspect() || _Flip() || _Crop() => upstream,
-      _ => null,
+    final filter = step.filter;
+    final region = switch (filter) {
+      final _FormatFilter format when !format.unrestricted => _FormatRegion(
+        constraints: format,
+        explicitFormat: true,
+      ),
+      final _Scale scale => _FormatRegion(constraints: scale.outputColors),
+      _Stack() => _FormatRegion(),
+      null ||
+      _TimingFilter() ||
+      _SetAspect() ||
+      _Flip() ||
+      _Crop() ||
+      _Split() ||
+      _FormatFilter() => regions[step.inputs.single]!,
+      _ => _FormatRegion(fixed: true),
     };
-    if (anchor != null) producers[step.outputs.single] = anchor;
-    result.add((filter: filter, inputs: step.inputs, outputs: step.outputs));
+    for (final output in step.outputs) {
+      regions[output] = region;
+    }
   }
-  return result;
+
+  // Competing constraints are encountered in graph declaration order.
+  // Frame evaluation still follows the dependency order in steps.
+  final order = [...steps]
+    ..sort((a, b) => a.outputs.first.compareTo(b.outputs.first));
+  final absorbed = <int>{};
+  for (final step in order) {
+    final output = regions[step.outputs.first]!;
+    switch (step.filter) {
+      case final _FormatFilter format:
+        final input = regions[step.inputs.single]!;
+        if (format.unrestricted || input.merge(output)) {
+          absorbed.add(step.outputs.first);
+        } else {
+          output.root.inheritColor(input.root.constraints);
+        }
+      case _Stack():
+        for (final input in step.inputs) {
+          output.merge(regions[input]!);
+        }
+      case final _Overlay overlay:
+        for (final (index, input) in step.inputs.indexed) {
+          if (overlay.inputFormat(secondary: index != 0) case final format?) {
+            regions[input]!.merge(
+              _FormatRegion(constraints: format, explicitFormat: true),
+            );
+          }
+        }
+    }
+  }
+
+  return [
+    for (final step in steps)
+      (
+        filter: _negotiatedFilter(
+          step.filter,
+          regions[step.outputs.first]!.root,
+          absorbed: absorbed.contains(step.outputs.first),
+        ),
+        inputs: step.inputs,
+        outputs: step.outputs,
+      ),
+  ];
 }
 
-_SpatialFilter? _mergeOutputFormat(Object? filter, _FormatFilter next) {
-  if (filter is _FormatFilter) return filter.intersect(next);
-  final scale = switch (filter) {
-    final _Scale scale => scale,
-    final _ScaleFormat bound => bound.scale,
-    _ => null,
+Object? _negotiatedFilter(
+  Object? filter,
+  _FormatRegion region, {
+  required bool absorbed,
+}) {
+  if (absorbed) return null;
+  final format = region.constraints;
+  return switch (filter) {
+    final _Scale scale when region.explicitFormat && format != null =>
+      _ScaleFormat(scale, format),
+    final _Stack stack when format != null => stack.withFormat(format),
+    _FormatFilter() => format,
+    _ => filter,
   };
-  final format = filter is _ScaleFormat ? filter.format.intersect(next) : next;
-  if (scale == null ||
-      format == null ||
-      !format.acceptsColor(scale.outputMatrix, scale.outputRange)) {
-    return null;
+}
+
+/// Links that can use the same pixel layout and YUV color properties.
+final class _FormatRegion {
+  _FormatRegion({
+    this.constraints,
+    this.fixed = false,
+    this.explicitFormat = false,
+  });
+
+  _FormatRegion? _parent;
+  _FormatFilter? constraints;
+  bool fixed, explicitFormat;
+
+  _FormatRegion get root {
+    final parent = _parent;
+    if (parent == null) return this;
+    return _parent = parent.root;
   }
-  return _ScaleFormat(scale, format);
+
+  bool merge(_FormatRegion other) {
+    final first = root, second = other.root;
+    if (identical(first, second)) return true;
+    final a = first.constraints, b = second.constraints;
+    final common = a == null
+        ? b
+        : b == null
+        ? a
+        : a.intersect(b);
+    if ((first.fixed || second.fixed) && common != null ||
+        a != null && b != null && common == null) {
+      return false;
+    }
+    second._parent = first;
+    first.constraints = common;
+    first.fixed |= second.fixed;
+    first.explicitFormat |= second.explicitFormat;
+    return true;
+  }
+
+  void inheritColor(_FormatFilter? source) {
+    final format = constraints;
+    if (source == null || format == null) return;
+    constraints = _FormatFilter._(
+      format.formats,
+      format.matrices.isEmpty ? source.matrices : format.matrices,
+      format.ranges.isEmpty ? source.ranges : format.ranges,
+    );
+  }
 }
 
 VideoFilterChain _compileFilterGraph(String source) {
@@ -394,26 +476,38 @@ final class _Stack {
     );
   }
 
-  const _Stack._(this.inputs, this.shortest, this.fill, this.positions);
+  _Stack._(
+    this.inputs,
+    this.shortest,
+    this.fill,
+    this.positions, [
+    this.format,
+  ]);
   final bool shortest;
   final int inputs;
   final _PaintColor? fill;
   final List<_StackPosition> Function(List<_VideoPlanes>) positions;
+  final _FormatFilter? format;
+  late final _converter = _PixelFormatConverter();
 
-  _VideoPlanes apply(List<_VideoPlanes> frames) {
-    final first = frames.first;
-    for (final frame in frames.skip(1)) {
-      if (frame.subX != first.subX ||
-          frame.subY != first.subY ||
-          frame.planes.length != first.planes.length ||
-          (frame.alpha == null) != (first.alpha == null) ||
-          frame.packedRgb != first.packedRgb ||
-          frame.rgb != first.rgb) {
-        throw const FormatException(
-          'Stacked inputs must have the same pixel format',
-        );
-      }
-    }
+  _Stack withFormat(_FormatFilter format) =>
+      _Stack._(inputs, shortest, fill, positions, format);
+
+  _VideoPlanes apply(List<_VideoPlanes> inputs) {
+    final first = format?.apply(inputs.first) ?? inputs.first;
+    final layout = _frameFormat(first);
+    final frames = [
+      first,
+      for (final frame in inputs.skip(1))
+        _converter.convert(
+          frame,
+          layout,
+          matrix: first.matrix,
+          fullRange: first.fullRange,
+          alpha: first.alpha != null,
+          alphaDepth: first.alpha?.depth,
+        ),
+    ];
     final offsets = positions(frames);
     var width = 0, height = 0;
     for (final (i, frame) in frames.indexed) {

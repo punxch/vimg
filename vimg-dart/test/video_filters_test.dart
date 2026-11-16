@@ -613,6 +613,58 @@ void _checkFormatNegotiation() {
     source.getBytes(),
     'Compatible format lists share one conversion',
   );
+  const split = '$scale,split[a][b]';
+  // Scalar FFmpeg output converted from its negotiated planes to capture RGB.
+  for (final (graph, channels, checksum) in [
+    ('$split;[a]format=yuv420p[l];[b]hflip[r];[l][r]hstack', 3, 0x589f4b14),
+    (
+      '$split;[a]format=yuv420p[l];[b]hflip,format=rgb24[r];[l][r]hstack',
+      3,
+      0xe3dff92f,
+    ),
+    (
+      '$split;[b]hflip,format=rgb24[r];[a]format=yuv420p[l];[l][r]hstack',
+      3,
+      0x9acd8ba7,
+    ),
+    (
+      '$split;[a]format=yuv420p|rgb24[l];[b]hflip,format=rgb24[r];[l][r]hstack',
+      3,
+      0xaef71005,
+    ),
+    (
+      '$split;[a]format=yuv420p[l];[b]format=yuv420p:bt2020nc:tv[r];[l][r]hstack',
+      3,
+      0xf07b102c,
+    ),
+    (
+      '$split;[a]hflip[l];[b]vflip[r];[l][r]hstack,format=yuv420p',
+      3,
+      0x3f257bad,
+    ),
+    (
+      '$split;[a]split[c][d];[c]hflip[l];[d]format=yuv420p[r];[b]vflip[t];'
+          '[l][r][t]xstack=inputs=3:layout=0_0|w0_0|w0+w1_0,format=yuv420p',
+      3,
+      0x52fa59c4,
+    ),
+    (
+      '$split;[a]hflip[l];[b]vflip[r];[l][r]overlay=format=yuv420',
+      4,
+      0xb8f4c6a6,
+    ),
+    (
+      'split[a][b];[a]format=yuv420p:bt709:pc[l];[b]hflip[r];[l][r]hstack',
+      3,
+      0x11157d1d,
+    ),
+  ]) {
+    final result = render(graph);
+    check(
+      result.numChannels == channels && getCrc32(result.getBytes()) == checksum,
+      '$graph matches FFmpeg across split branches',
+    );
+  }
 }
 
 void _checkCompositing() {
@@ -985,6 +1037,19 @@ Future<void> _checkCli(String? executable) async {
       0x01efe703,
       0x01efe703,
     ];
+    const splitFormatGraph =
+        '$negotiatedScale,split[a][b];[a]fps=8,format=yuv420p[l];'
+        '[b]trim=end_frame=2,fps=8,hflip,format=yuv420p[r];[l][r]hstack';
+    const splitFormatReference = [
+      0x44d18cc7,
+      0x44d18cc7,
+      0x5c75aaef,
+      0x5c75aaef,
+      0x7cacb9e0,
+      0x7cacb9e0,
+      0xff59c8f9,
+      0xff59c8f9,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -992,6 +1057,7 @@ Future<void> _checkCli(String? executable) async {
       ('color-format', color, 32, 24, colorReference),
       ('scale-color', scaleColor, 64, 24, scaleColorReference),
       ('negotiated-scale', negotiatedGraph, 32, 12, negotiatedReference),
+      ('split-formats', splitFormatGraph, 32, 12, splitFormatReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {

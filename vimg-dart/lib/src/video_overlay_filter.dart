@@ -126,6 +126,28 @@ final class _Overlay {
   final bool stopAtEof, dropSecondary, nearest;
   final _converter = _PixelFormatConverter();
 
+  _FormatFilter? inputFormat({required bool secondary}) {
+    final requested = format;
+    if (requested == null) return null;
+    final rgb = requested.color == _PixelColor.rgb;
+    final opaque = (
+      format: requested,
+      alpha: false,
+      fullRange: rgb ? true : null,
+    );
+    return _FormatFilter._(
+      [
+        if (!secondary) opaque,
+        if (!secondary && requested.packedRgb) _namedPixelFormat('bgr24'),
+        if (!secondary && !rgb && requested.depth == 8)
+          (format: requested, alpha: false, fullRange: true),
+        (format: requested, alpha: true, fullRange: opaque.fullRange),
+      ],
+      const [],
+      const [],
+    );
+  }
+
   _VideoPlanes apply(
     _VideoPlanes input,
     _VideoPlanes? secondary,
