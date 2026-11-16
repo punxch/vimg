@@ -36,12 +36,8 @@ final class H263Decoder {
   H263Picture decode(Uint8List bytes) {
     final header = _headers.read(bytes);
     final format = header.format;
-    if (format.overlapping ||
-        format.advancedIntra ||
-        format.loopFilter ||
-        format.alternateVlc ||
-        format.modifiedQuant) {
-      throw UnsupportedError('H.263 optional picture coding modes');
+    if (format.overlapping) {
+      throw UnsupportedError('H.263 overlapped motion compensation');
     }
     final picture = H263Picture._(format);
     final reference = header.intra ? null : _reference;
@@ -80,6 +76,12 @@ final class _H263Macroblocks {
   final _Mpeg4MotionCompensation _prediction;
   final _PictureMotion _motion;
   final _coefficients = Int16List(64);
+  late final _aic = [
+    List<_H263IntraBlock?>.filled(picture.columns * picture.rows * 4, null),
+    for (var plane = 0; plane < 2; plane++)
+      List<_H263IntraBlock?>.filled(picture.columns * picture.rows, null),
+  ];
+  late final _filterQuant = Uint8List(picture.columns * picture.rows);
   Rbsp get _bits => header.bits;
   int _quant, _sliceStart = 0;
 
@@ -114,19 +116,50 @@ final class _H263Macroblocks {
         continue;
       }
       final intra = header.intra || mode & 4 != 0;
+      final aic = intra && header.format.advancedIntra;
+      final fromLeft = aic && _bits.flag() ? _bits.flag() : null;
       final cbpy = _lumaPattern.read(_bits);
-      final pattern = ((intra ? cbpy : cbpy ^ 15) << 2) | (mode & 3);
+      final normalPattern =
+          intra || header.format.alternateVlc && mode & 3 == 3;
+      final pattern = ((normalPattern ? cbpy : cbpy ^ 15) << 2) | (mode & 3);
       if (mode & (header.intra ? 4 : 8) != 0) {
-        _quant = (_quant + _quantChange[_bits.read(2)]).clamp(1, 31);
+        _readQuantChange();
       }
       if (!intra) {
         _predict(x, y, mode & 16 != 0);
       }
       for (var block = 0; block < 6; block++) {
         final coded = pattern & (32 >> block) != 0;
-        if (intra || coded) _readBlock(x, y, block, intra: intra, coded: coded);
+        if (intra || coded) {
+          _readBlock(
+            x,
+            y,
+            block,
+            intra: intra,
+            coded: coded,
+            advanced: aic,
+            fromLeft: fromLeft,
+          );
+        }
       }
+      if (header.format.loopFilter) _filterQuant[index] = _quant;
     }
+    if (header.format.loopFilter) {
+      _deblockH263(
+        picture,
+        _filterQuant,
+        modifiedQuant: header.format.modifiedQuant,
+      );
+    }
+  }
+
+  void _readQuantChange() {
+    final quant = !header.format.modifiedQuant
+        ? _quant + _quantChange[_bits.read(2)]
+        : _bits.flag()
+        ? _h263QuantChange[_bits.bit()][_quant]
+        : _bits.read(5);
+    _quant = quant.clamp(1, 31);
   }
 
   void _readGroupHeader(int index, int macroblocks) {
@@ -222,31 +255,59 @@ final class _H263Macroblocks {
     int block, {
     required bool intra,
     required bool coded,
+    required bool advanced,
+    required bool? fromLeft,
   }) {
     final values = _coefficients..fillRange(0, 64, 0);
-    if (intra) {
+    final separateDc = intra && !advanced;
+    if (separateDc) {
       final dc = _bits.read(8);
       values[0] = (dc == 255 ? 128 : dc) * 8;
     }
-    if (coded) {
-      var position = intra ? 0 : -1;
-      final qadd = (_quant - 1) | 1;
-      while (true) {
-        final event = _readShortEvent(_bits, header.sparkEscape);
-        position += event.run + 1;
-        if (position >= 64)
-          throw const FormatException('H.263 run exceeds the block');
-        final level = event.value;
-        values[mpegZigzag[position]] =
-            (level.sign * (2 * _quant * level.abs() + qadd)).clamp(-2048, 2047);
-        if (event.last) break;
-      }
-    }
     final luma = block < 4;
     final plane = luma ? 0 : block - 3;
+    final quant = !luma && header.format.modifiedQuant
+        ? _h263ChromaQuant[_quant]
+        : _quant;
+    if (coded) {
+      final scan = switch (fromLeft) {
+        true => verticalScan,
+        false => horizontalScan,
+        null => mpegZigzag,
+      };
+      final start = _bits.position;
+      final position = separateDc ? 0 : -1;
+      final table = advanced ? _aicEvents : _interEvents;
+      if (!_readCoefficients(table, scan, position)) {
+        if (!intra && header.format.alternateVlc) {
+          _bits.position = start;
+          values.fillRange(0, 64, 0);
+          if (!_readCoefficients(_aicEvents, scan, position)) {
+            throw const FormatException(
+              'H.263 alternative VLC run exceeds the block',
+            );
+          }
+        } else {
+          throw const FormatException('H.263 run exceeds the block');
+        }
+      }
+    }
     final stride = luma ? picture.stride : picture.stride >> 1;
     final bx = luma ? x * 2 + (block & 1) : x;
     final by = luma ? y * 2 + (block >> 1) : y;
+    if (advanced) {
+      _reconstructAic(plane, bx, by, quant, fromLeft);
+    } else if (coded) {
+      final qadd = (quant - 1) | 1;
+      for (var i = separateDc ? 1 : 0; i < 64; i++) {
+        final level = values[i];
+        if (level == 0) continue;
+        values[i] = (level.sign * (2 * quant * level.abs() + qadd)).clamp(
+          -2048,
+          2047,
+        );
+      }
+    }
     _transform.write(
       picture.planes[plane],
       (by * stride + bx) * 8,
@@ -255,10 +316,19 @@ final class _H263Macroblocks {
       intra,
     );
   }
+
+  bool _readCoefficients(_Events table, List<int> scan, int position) {
+    while (true) {
+      final event = _readShortEvent(_bits, table, header.sparkEscape);
+      position += event.run + 1;
+      if (position >= 64) return false;
+      _coefficients[scan[position]] = event.value;
+      if (event.last) return true;
+    }
+  }
 }
 
-_DctEvent _readShortEvent(Rbsp bits, bool spark) {
-  final table = _interEvents;
+_DctEvent _readShortEvent(Rbsp bits, _Events table, bool spark) {
   final code = table._vlc.read(bits);
   if (code < table._runs.length) {
     final level = table._levels[code];

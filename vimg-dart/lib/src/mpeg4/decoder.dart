@@ -14,6 +14,7 @@ import 'tables.dart';
 part 'blocks.dart';
 part 'motion.dart';
 part 'partitions.dart';
+part 'short_annex.dart';
 part 'short_video.dart';
 
 class _DctPicture {
