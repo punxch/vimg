@@ -50,7 +50,10 @@ extension _Mpeg4Timeline on Video {
               false,
               section: section,
               onSample: (packet, _) {
-                final header = headers.read(_readPrefix(packet, 1024));
+                final header = headers.readPrefix(
+                  _readPrefix(packet, 1024),
+                  () => _read(packet),
+                );
                 if (header.redundant) {
                   displayBySample[packet] = const [];
                   return;
@@ -62,7 +65,9 @@ extension _Mpeg4Timeline on Video {
                 final defaultReference = header.bidirectional
                     ? older[referenceLayer]
                     : previous[referenceLayer];
-                var needsHistory = false;
+                // An intra picture can leave earlier Annex U buffer entries
+                // live. Replay the buffer commands before using such a key.
+                var needsHistory = header.erps != null;
                 if (header.format.referenceSelection &&
                     !header.intra &&
                     !header.enhancementIntra) {

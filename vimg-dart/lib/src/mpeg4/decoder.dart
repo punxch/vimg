@@ -7,6 +7,7 @@ import '../mpeg12/syntax.dart' show mpegZigzag;
 import '../mpeg_idct.dart';
 import '../rbsp.dart';
 import '../yuv_image.dart';
+import 'short_erps_header.dart';
 import 'short_header.dart';
 import 'syntax.dart';
 import 'tables.dart';
@@ -24,6 +25,7 @@ part 'short_resample.dart';
 part 'short_sac.dart';
 part 'short_sac_models.dart';
 part 'short_segments.dart';
+part 'short_erps.dart';
 part 'short_slices.dart';
 part 'short_video.dart';
 

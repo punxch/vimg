@@ -44,6 +44,7 @@ final class H263Decoder {
   final _olderReferences = <int, _H263Reference>{};
   final Map<int, Set<int>>? _retainedReferences;
   final _history = <int, Map<int, _H263Reference>>{};
+  final _erpsBuffers = <int, _H263ErpsBuffer>{};
 
   H263Picture decode(Uint8List bytes) =>
       decodePair(bytes, includeBidirectional: false).picture!;
@@ -57,25 +58,39 @@ final class H263Decoder {
     final header = _headers.read(bytes);
     if (header.redundant) return (picture: null, bidirectional: null);
     final format = header.format;
+    final referenceLayer = header.bidirectional
+        ? header.referenceLayer
+        : header.layer;
+    final latest = _references[referenceLayer];
+    final erps = header.erps == null
+        ? null
+        : _H263ErpsSelection(
+            header,
+            _erpsBuffers[referenceLayer] ?? _H263ErpsBuffer(),
+            latest,
+          );
     if (header.bidirectional) {
       if (!includeStandaloneB) return (picture: null, bidirectional: null);
-      final older = _olderReferences[header.referenceLayer];
-      final newest = _references[header.referenceLayer];
-      if (older == null ||
+      final older = _olderReferences[referenceLayer];
+      final newest = erps?.picture.backward ?? latest;
+      if ((erps == null && older == null) ||
           newest == null ||
           !_h263Matches(newest.picture, format)) {
         throw const FormatException('Missing H.263+ B-picture references');
       }
-      final select = _forwardSelector(header, older, following: newest);
+      final select = erps == null
+          ? _forwardSelector(header, older!, following: newest)
+          : null;
       final picture = H263Picture._(format, reduced: header.reduced);
       _H263Macroblocks(
         header,
         picture,
-        select(header.predictionTemporal),
+        erps?.picture.forward ?? select?.call(header.predictionTemporal),
         _transform,
         _prediction,
         null,
         selectForward: select,
+        erps: erps,
       ).decodeB(newest);
       return (
         picture: _h263AlignReference(picture, reduced: false),
@@ -83,7 +98,7 @@ final class H263Decoder {
       );
     }
     final picture = H263Picture._(format, reduced: header.reduced);
-    final previous = _references[header.layer];
+    final previous = latest;
     if (header.enhancement) {
       final lower = _references[header.referenceLayer];
       if (lower == null ||
@@ -92,33 +107,37 @@ final class H263Decoder {
         if (allowMissingEnhancement) {
           _references.remove(header.layer);
           _olderReferences.remove(header.layer);
+          _erpsBuffers.remove(header.layer);
           return (picture: null, bidirectional: null);
         }
         throw const FormatException(
           'Missing H.263+ enhancement reference picture',
         );
       }
-      final select = header.enhancementIntra
+      final select = header.enhancementIntra || erps != null
           ? null
           : _forwardSelector(header, previous!);
       final blocks = _H263Macroblocks(
         header,
         picture,
-        select?.call(header.predictionTemporal),
+        erps?.picture.forward ?? select?.call(header.predictionTemporal),
         _transform,
         _prediction,
         null,
         selectForward: select,
+        erps: erps,
       );
       blocks.decodeEnhancement(lower.picture);
       final decoded = _h263AlignReference(picture, reduced: false);
-      _saveReference(header, decoded, blocks);
+      _saveReference(header, decoded, blocks, erps?.buffer);
       return (picture: decoded, bidirectional: null);
     }
     if (!header.intra && previous == null) {
       throw const FormatException('Missing H.263 reference picture');
     }
-    final select = header.intra ? null : _forwardSelector(header, previous!);
+    final select = header.intra || erps != null
+        ? null
+        : _forwardSelector(header, previous!);
     final pb = header.pb == null
         ? null
         : _H263Pb(
@@ -132,16 +151,17 @@ final class H263Decoder {
     final macroblocks = _H263Macroblocks(
       header,
       picture,
-      select?.call(header.predictionTemporal),
+      erps?.picture.forward ?? select?.call(header.predictionTemporal),
       _transform,
       _prediction,
       pb,
       selectForward: select,
+      erps: erps,
     );
     macroblocks.decode();
     final decoded = _h263AlignReference(picture, reduced: false);
     if (!header.disposable) {
-      _saveReference(header, decoded, macroblocks);
+      _saveReference(header, decoded, macroblocks, erps?.buffer);
     }
     return (
       picture: decoded,
@@ -213,11 +233,8 @@ final class H263Decoder {
     H263Header header,
     H263Picture picture,
     _H263Macroblocks blocks,
+    _H263ErpsBuffer? erps,
   ) {
-    final previous = _references[header.layer];
-    if (!_headers.spark && previous != null) {
-      _olderReferences[header.layer] = previous;
-    }
     final entry = (
       picture: picture,
       temporal: header.temporalReference,
@@ -228,9 +245,25 @@ final class H263Decoder {
       motion: blocks._motion,
       intraWithMotion: blocks._intraWithMotion,
     );
+    if (erps != null) {
+      erps.save(header.erps!, entry);
+      _erpsBuffers[header.layer] = erps;
+    } else if (_erpsBuffers.containsKey(header.layer)) {
+      if (!header.intra && !header.enhancementIntra) {
+        throw const FormatException(
+          'H.263+ ERPS may only be disabled in an intra picture',
+        );
+      }
+      _erpsBuffers.remove(header.layer);
+    }
+    final previous = _references[header.layer];
+    if (!_headers.spark && previous != null) {
+      _olderReferences[header.layer] = previous;
+    }
     _references[header.layer] = entry;
     final keep = _retainedReferences;
-    if (!_headers.spark &&
+    if (erps == null &&
+        !_headers.spark &&
         (keep == null ||
             keep[header.layer]?.contains(entry.temporal) == true)) {
       (_history[header.layer] ??= {})[entry.temporal] = entry;
@@ -250,6 +283,7 @@ final class _H263Macroblocks {
     this._prediction,
     this._pb, {
     required _H263Forward Function(int?)? selectForward,
+    this.erps,
   }) : _selectForward = header.format.referenceSelection ? selectForward : null,
        _motion = _PictureMotion(
          header.macroblockColumns,
@@ -263,6 +297,18 @@ final class _H263Macroblocks {
   _H263Forward? _forward;
   H263Picture? get reference => _forward?.picture;
   final _H263Forward Function(int?)? _selectForward;
+  final _H263ErpsSelection? erps;
+  _H263Reference? _erpsBackward;
+
+  void _setErpsGroup(H263Erps group) {
+    final selection = erps!;
+    final resolved = identical(group, header.erps)
+        ? selection.picture
+        : selection.select(group);
+    _forward = resolved.forward;
+    _erpsBackward = resolved.backward;
+  }
+
   final MpegIdct _transform;
   final _Mpeg4MotionCompensation _prediction;
   final _H263Pb? _pb;
@@ -572,7 +618,7 @@ final class _H263Macroblocks {
       _bits.position = afterStart;
     }
     final group = h263ReadGroupHeader(header, _bits);
-    final (:address, :quant, width: _, temporal: _) = group;
+    final (:address, :quant, width: _, temporal: _, erps: _) = group;
     // A SAC interval can reach a future start code while the last
     // buffered macroblocks of the current segment are still being decoded.
     if (_sac != null && address > index && address < macroblocks) {
@@ -589,6 +635,7 @@ final class _H263Macroblocks {
     _quant = group.quant;
     _sliceStart = group.address;
     if (_selectForward case final select?) _forward = select(group.temporal);
+    if (group.erps case final erps?) _setErpsGroup(erps);
     _sac?.reset();
   }
 

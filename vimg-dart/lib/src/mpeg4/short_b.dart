@@ -67,9 +67,23 @@ extension _H263Bidirectional on _H263Macroblocks {
   void decodeB(_H263Reference latest) {
     final columns = _columns, rows = _rows;
     final backward = _PictureMotion(columns, rows, false);
-    final newer = _h263AlignReference(latest.picture, reduced: header.reduced);
-    for (final index in _macroblockOrder(backward: newer)) {
+    final original = _h263AlignReference(
+      latest.picture,
+      reduced: header.reduced,
+    );
+    final pictureTiming = erps?.picture.forward;
+    final backwardPictures = <H263Picture, H263Picture>{
+      latest.picture: original,
+    };
+    for (final index in _macroblockOrder(backward: original)) {
       final (picture: older, :offset, :distance) = _forward!;
+      final pastBackward = _erpsBackward ?? latest;
+      final newer = backwardPictures.putIfAbsent(
+        pastBackward.picture,
+        () =>
+            _h263AlignReference(pastBackward.picture, reduced: header.reduced),
+      );
+      _validateTemporalSegments(newer);
       final bounds = _boundsAt(index);
       final x = index % columns, y = index ~/ columns;
       var mode = _h263BMode.read(_bits);
@@ -90,7 +104,16 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (changeQuant) _readQuantChange();
       switch (prediction) {
         case _H263BPrediction.direct:
-          _predictBDirect(older, newer, latest, x, y, offset, distance, bounds);
+          _predictBDirect(
+            older,
+            newer,
+            pastBackward,
+            x,
+            y,
+            pictureTiming?.offset ?? offset,
+            pictureTiming?.distance ?? distance,
+            bounds,
+          );
         case _H263BPrediction.forward:
         case _H263BPrediction.both:
           final forward = _readBVector(_motion, x, y);

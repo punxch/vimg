@@ -6,7 +6,8 @@ extension _H263Slices on _H263Macroblocks {
   Iterable<int> _macroblockOrder({H263Picture? backward}) sync* {
     if (!header.format.rectangularSlices &&
         !header.format.arbitrarySlices &&
-        !header.format.independentSegments) {
+        !header.format.independentSegments &&
+        !(header.erps != null && header.format.structured)) {
       for (var index = 0; index < _count; index++) {
         _startMacroblock(index);
         yield index;
@@ -22,6 +23,8 @@ extension _H263Slices on _H263Macroblocks {
       if (i != 0) {
         _bits.position = slice.data;
         _beginGroup(group);
+      } else if (group.erps case final erps?) {
+        _setErpsGroup(erps);
       }
       _validateTemporalSegments(reference);
       final count = counts[group.address]!;
@@ -68,6 +71,7 @@ extension _H263Slices on _H263Macroblocks {
       width: first?.width,
       quant: header.quant,
       temporal: header.predictionTemporal,
+      erps: first?.erps ?? header.erps,
     );
     var data = _bits.position;
     final layout = <_H263Slice>[];

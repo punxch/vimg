@@ -76,7 +76,10 @@ final class H263Elementary {
     for (var i = 1; i < offsets.length; i++) {
       final offset = offsets[i - 1];
       final size = offsets[i] - offset;
-      final header = headers.read(file.read(offset, math.min(size, 1024)));
+      final header = headers.readPrefix(
+        file.read(offset, math.min(size, 1024)),
+        () => file.read(offset, size),
+      );
       if (header.redundant) continue;
       if (format == null && !header.intra) continue;
       format ??= header.format;

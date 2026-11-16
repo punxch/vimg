@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import '../rbsp.dart';
+import 'short_erps_header.dart';
 
 const _standardSize = [
   (0, 0),
@@ -26,6 +27,7 @@ typedef H263Format = ({
   bool structured,
   int sliceSubmode,
   bool referenceSelection,
+  bool enhancedReferences,
   bool independentSegments,
   bool alternateVlc,
   bool modifiedQuant,
@@ -61,10 +63,13 @@ typedef H263Header = ({
   bool enhancementIntra,
   bool reduced,
   H263Resampling? resampling,
-  ({int address, int? width})? firstSlice,
+  H263Erps? erps,
+  H263FirstSlice? firstSlice,
   ({int offset, int quantFactor})? pb,
   Rbsp bits,
 });
+
+typedef H263FirstSlice = ({int address, int? width, H263Erps? erps});
 
 extension H263PictureLayer on H263Header {
   bool get enhancement => layer > 1 && !bidirectional;
@@ -102,9 +107,21 @@ final class H263Headers {
   final Map<int, H263LayerState> _layers;
   final _references = <int, ({H263Format format, H263Resampling? warp})>{};
   final _lastTemporal = <int, int>{};
+  (int, int, int)? _lastErps;
 
   Map<int, H263LayerState>? snapshotLayers() =>
       _layers.isEmpty ? null : Map.of(_layers);
+
+  H263Header readPrefix(Uint8List prefix, Uint8List Function() full) {
+    try {
+      return read(prefix);
+    } on FormatException catch (error) {
+      if (!error.message.startsWith('Truncated ')) rethrow;
+      final bytes = full();
+      if (bytes.length == prefix.length) rethrow;
+      return read(bytes);
+    }
+  }
 
   H263Header read(Uint8List bytes) {
     final bits = Rbsp(bytes, codec: spark ? 'Sorenson Spark' : 'H.263');
@@ -124,6 +141,7 @@ final class H263Headers {
     H263LayerState? layerState;
     int? predictionTemporal;
     H263Resampling? resampling;
+    H263Erps? erps;
     if (source < 6) {
       intra = !bits.flag();
       longVectors = bits.flag();
@@ -210,6 +228,15 @@ final class H263Headers {
           intra || enhancementIntra,
         );
       }
+      final int? number;
+      if (format.enhancedReferences) {
+        if (bits.read(3) < 4) {
+          throw const FormatException('Invalid H.263+ ERPS flags');
+        }
+        number = bits.read(10);
+      } else {
+        number = null;
+      }
       if (explicitResampling) {
         if (format.independentSegments) {
           throw const FormatException(
@@ -227,6 +254,14 @@ final class H263Headers {
           lowerLayer: type == 5 ? referenceLayer : null,
         );
       }
+      if (number != null) {
+        erps = H263Erps.read(
+          bits,
+          number,
+          intra: intra || enhancementIntra,
+          bidirectional: bidirectional,
+        );
+      }
       quant = bits.read(5);
     }
     _checkPicture(format, quant);
@@ -241,7 +276,7 @@ final class H263Headers {
     if (pb?.offset == 0)
       throw const FormatException('Invalid H.263 B-picture time');
     while (bits.flag()) bits.skip(8);
-    ({int address, int? width})? firstSlice;
+    H263FirstSlice? firstSlice;
     if (format.structured) {
       if (format.independentSegments && !format.rectangularSlices) {
         throw const FormatException(
@@ -259,10 +294,21 @@ final class H263Headers {
           'H.263+ ordered slices must start at macroblock zero',
         );
       }
-      firstSlice = (address: address, width: width);
+      firstSlice = (
+        address: address,
+        width: width,
+        erps: erps?.readGroup(
+          bits,
+          intra: intra || enhancementIntra,
+          bidirectional: bidirectional,
+        ),
+      );
     }
-    final redundant =
-        format.referenceSelection && _lastTemporal[layer] == temporal;
+    final erpsIdentity = erps == null ? null : (layer, temporal, erps.number);
+    final redundant = erpsIdentity != null
+        ? erpsIdentity == _lastErps
+        : format.referenceSelection && _lastTemporal[layer] == temporal;
+    _lastErps = erpsIdentity;
     if (!redundant) {
       _lastTemporal[layer] = temporal;
       if (updateBase) _extended = format;
@@ -288,6 +334,7 @@ final class H263Headers {
       enhancementIntra: enhancementIntra,
       reduced: reduced,
       resampling: resampling,
+      erps: erps,
       firstSlice: firstSlice,
       pb: pb,
       bits: bits,
@@ -402,6 +449,7 @@ final class H263Headers {
       enhancementIntra: false,
       reduced: false,
       resampling: null,
+      erps: null,
       firstSlice: null,
       pb: null,
       bits: bits,
@@ -484,6 +532,7 @@ H263Format _basicFormat(
   structured: false,
   sliceSubmode: 0,
   referenceSelection: false,
+  enhancedReferences: false,
   independentSegments: false,
   alternateVlc: false,
   modifiedQuant: false,
@@ -499,6 +548,7 @@ typedef _Options = ({
   bool loopFilter,
   bool structured,
   bool referenceSelection,
+  bool enhancedReferences,
   bool independentSegments,
   bool alternateVlc,
   bool modifiedQuant,
@@ -516,7 +566,14 @@ _Options _readOptions(Rbsp bits) {
   if (arithmetic && (unrestricted || alternate || modified)) {
     throw const FormatException('Incompatible H.263+ arithmetic coding modes');
   }
-  if (bits.read(4) != 8) throw const FormatException('Invalid H.263+ OPPTYPE');
+  h263Marker(bits);
+  final enhancedReferences = bits.flag();
+  final partitioned = bits.flag();
+  if (bits.flag()) throw const FormatException('Invalid H.263+ OPPTYPE');
+  if (enhancedReferences && (referenceSelection || arithmetic || partitioned)) {
+    throw const FormatException('Incompatible H.263+ ERPS modes');
+  }
+  if (partitioned) throw UnsupportedError('H.263+ data-partitioned slices');
   return (
     source: source,
     customClock: customClock,
@@ -527,6 +584,7 @@ _Options _readOptions(Rbsp bits) {
     loopFilter: loop,
     structured: structured,
     referenceSelection: referenceSelection,
+    enhancedReferences: enhancedReferences,
     independentSegments: independentSegments,
     alternateVlc: alternate,
     modifiedQuant: modified,
@@ -584,6 +642,7 @@ _Options _readOptions(Rbsp bits) {
       structured: options.structured,
       sliceSubmode: sliceSubmode,
       referenceSelection: options.referenceSelection,
+      enhancedReferences: options.enhancedReferences,
       independentSegments: options.independentSegments,
       alternateVlc: options.alternateVlc,
       modifiedQuant: options.modifiedQuant,
@@ -618,7 +677,13 @@ int? _readPredictionTemporal(Rbsp bits, bool intra) {
   return prediction;
 }
 
-typedef H263GroupHeader = ({int address, int? width, int quant, int? temporal});
+typedef H263GroupHeader = ({
+  int address,
+  int? width,
+  int quant,
+  int? temporal,
+  H263Erps? erps,
+});
 
 ({int address, int? width, int quant}) _readSliceHeader(
   Rbsp bits,
@@ -689,7 +754,18 @@ H263GroupHeader h263ReadGroupHeader(H263Header header, Rbsp bits) {
       header.intra || header.enhancementIntra,
     );
   }
-  return (address: address, width: width, quant: quant, temporal: temporal);
+  final erps = header.erps?.readGroup(
+    bits,
+    intra: header.intra || header.enhancementIntra,
+    bidirectional: header.bidirectional,
+  );
+  return (
+    address: address,
+    width: width,
+    quant: quant,
+    temporal: temporal,
+    erps: erps,
+  );
 }
 
 Iterable<({int start, int data, H263GroupHeader? header})> h263GroupUnits(
