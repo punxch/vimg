@@ -215,7 +215,9 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
           absorbed.add(step.outputs.first);
         } else if (input.merge(output)) {
           // A decoded alpha input can still determine the layout at runtime.
-          if (!input.overlayOutput) absorbed.add(step.outputs.first);
+          if (!input.overlayOutput && format.alphaModes.isEmpty) {
+            absorbed.add(step.outputs.first);
+          }
         } else {
           output.root.inheritColor(input.root.constraints);
         }
@@ -224,18 +226,25 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
           output.merge(regions[input]!);
         }
       case final _Overlay overlay:
-        output.merge(regions[step.inputs.first]!);
+        final main = regions[step.inputs.first]!;
         final secondary = regions[step.inputs[1]]!;
+        final sharedInput = identical(main.root, secondary.root);
+        output.merge(main);
         if (overlay.format == null) {
-          output.merge(secondary);
-        } else {
-          secondary.merge(
-            _FormatRegion(
-              constraints: overlay.secondaryFormat,
-              explicitFormat: true,
-            ),
-          );
+          final secondaryConstraints = secondary.root.constraints;
+          final separateAlpha =
+              !sharedInput &&
+              (overlay.alphaMode != null ||
+                  (secondaryConstraints?.alphaModes.isNotEmpty ?? false));
+          if (separateAlpha) {
+            if (secondaryConstraints != null) {
+              output.restrict(secondaryConstraints.withoutAlphaModes());
+            }
+          } else {
+            output.merge(secondary);
+          }
         }
+        secondary.restrict(overlay.secondaryFormat);
     }
   }
 
@@ -265,7 +274,11 @@ Object? _negotiatedFilter(
       _ScaleFormat(scale, format),
     final _Stack stack when format != null => stack.withFormat(format),
     final _Overlay overlay when format != null => overlay.withFormat(format),
-    _FormatFilter() => format,
+    final _FormatFilter original when original.onlyAlphaMode =>
+      original.atAlphaStage(false),
+    final _FormatFilter original => format?.atAlphaStage(
+      original.alphaModes.isEmpty,
+    ),
     _ => filter,
   };
 }
@@ -310,6 +323,11 @@ final class _FormatRegion {
     return true;
   }
 
+  void restrict(_FormatFilter format) {
+    if (format.unrestricted) return;
+    merge(_FormatRegion(constraints: format, explicitFormat: true));
+  }
+
   void inheritColor(_FormatFilter? source) {
     final format = constraints;
     if (source == null || format == null) return;
@@ -317,6 +335,7 @@ final class _FormatRegion {
       format.formats,
       format.matrices.isEmpty ? source.matrices : format.matrices,
       format.ranges.isEmpty ? source.ranges : format.ranges,
+      format.alphaModes,
     );
   }
 }
@@ -522,6 +541,7 @@ final class _Stack {
           fullRange: first.fullRange,
           alpha: first.alpha != null,
           alphaDepth: first.alpha?.depth,
+          premultiplied: first.premultiplied,
         ),
     ];
     final offsets = positions(frames);

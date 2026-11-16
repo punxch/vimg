@@ -182,7 +182,15 @@ File isoFixture(
   ]);
 }
 
-File aviFixture(Directory directory, {bool raw = false}) {
+File aviFixture(Directory directory, {bool raw = false, bool rgba = false}) {
+  final (handler, width, height, bits, name) = rgba
+      ? ('RGBA', 8, 6, 32, 'rgba')
+      : raw
+      ? ('DIB ', 3, 2, 24, 'raw')
+      : ('MJPG', 32, 24, 24, 'mjpeg');
+  final rawVideo = raw || rgba;
+  final frames = rgba ? 4 : 8;
+  final rate = rgba ? 4 : 1;
   List<int> little(int value, int width) =>
       uint(value, width).reversed.toList();
   List<int> chunk(String id, List<int> data) => [
@@ -198,23 +206,23 @@ File aviFixture(Directory directory, {bool raw = false}) {
     ...ascii.encode(handler),
     ...List.filled(12, 0),
     ...little(1, 4),
-    ...little(1, 4),
+    ...little(rate, 4),
     ...List.filled(4, 0),
     ...little(count, 4),
     ...List.filled(20, 0),
   ]);
 
   final header = list('hdrl', [
-    ...list('strl', stream('auds', '    ', 8)),
+    ...list('strl', stream('auds', '    ', frames)),
     ...list('strl', [
-      ...stream('vids', raw ? 'DIB ' : 'MJPG', 8),
+      ...stream('vids', handler, frames),
       ...chunk('strf', [
         ...little(40, 4),
-        ...little(raw ? 3 : 32, 4),
-        ...little(raw ? 2 : 24, 4),
+        ...little(width, 4),
+        ...little(height, 4),
         ...little(1, 2),
-        ...little(24, 2),
-        if (raw) ...List.filled(4, 0) else ...ascii.encode('MJPG'),
+        ...little(bits, 2),
+        if (raw && !rgba) ...List.filled(4, 0) else ...ascii.encode(handler),
         ...List.filled(20, 0),
       ]),
     ]),
@@ -248,17 +256,28 @@ File aviFixture(Directory directory, {bool raw = false}) {
   ];
   final movie = list('movi', [
     ...chunk('JUNK', [1]),
-    for (var frame = 0; frame < 8; frame++)
+    for (var frame = 0; frame < frames; frame++)
       ...list('rec ', [
         ...chunk('00wb', [1, 2]),
         ...chunk(
-          raw ? '01db' : '01dc',
-          raw ? bitmap : image.encodeJpg(solidFrame(frame)),
+          rawVideo ? '01db' : '01dc',
+          rgba
+              ? [
+                  for (var y = 0; y < 6; y++)
+                    for (var x = 0; x < 8; x++) ...[
+                      29 * x,
+                      41 * y,
+                      (13 * x + 11 * y + 15 * frame) & 255,
+                      (19 * x + 23 * y + 17 * frame) & 255,
+                    ],
+                ]
+              : raw
+              ? bitmap
+              : image.encodeJpg(solidFrame(frame)),
         ),
       ]),
   ]);
-  return File('${directory.path}/${raw ? 'raw' : 'mjpeg'}.avi')
-    ..writeAsBytesSync(
-      chunk('RIFF', [...ascii.encode('AVI '), ...header, ...movie]),
-    );
+  return File('${directory.path}/$name.avi')..writeAsBytesSync(
+    chunk('RIFF', [...ascii.encode('AVI '), ...header, ...movie]),
+  );
 }

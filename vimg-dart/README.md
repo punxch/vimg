@@ -379,9 +379,13 @@ both inputs and the output share an alpha-capable layout. The supported
 layouts are 8- and 10-bit YUVA 4:2:0, 4:2:2 and 4:4:4, packed 8-bit RGBA
 and planar 8-bit GBR with alpha. Auto keeps a compatible main input layout.
 An upstream scale can produce the working layout directly, including when
-a downstream format filter selects it. Packed 8-bit RGB also supports
-`alpha=premultiplied`. The separate `format` filter accepts
-`pix_fmts` such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
+a downstream format filter selects it. Overlay accepts `alpha=straight`
+and `alpha=premultiplied` for packed RGB, planar GBR and planar YUV.
+The separate `format` filter also accepts
+`alpha_modes=straight` or `alpha_modes=premultiplied` to convert color
+samples between the two representations while keeping the alpha plane.
+Its `pix_fmts` option accepts names
+such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
 When given a `|`-separated list, it keeps a matching input format when
 available. Otherwise it compares the color, alpha, bit-depth and chroma
 resolution losses of the candidates.

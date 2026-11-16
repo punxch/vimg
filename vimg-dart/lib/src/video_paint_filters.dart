@@ -71,6 +71,7 @@ final class _SetAspect implements _SpatialFilter {
       bgr24: frame.bgr24,
       sampleAspect: sar,
       alpha: frame.alpha,
+      premultiplied: frame.premultiplied,
     );
   }
 }

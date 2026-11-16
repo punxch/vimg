@@ -47,8 +47,9 @@ final class _Overlay {
       'init' || '0' => false,
       _ => throw const FormatException('Invalid overlay evaluation mode'),
     };
-    final premultiplied = switch (options['alpha']) {
-      null || 'auto' || 'unknown' || 'straight' || '0' || '2' => false,
+    final alphaMode = switch (options['alpha']) {
+      null || 'auto' || 'unknown' || '0' => null,
+      'straight' || '2' => false,
       'premultiplied' || '1' => true,
       _ => throw const FormatException('Invalid overlay alpha mode'),
     };
@@ -101,7 +102,7 @@ final class _Overlay {
       x,
       y,
       format,
-      premultiplied,
+      alphaMode,
       evaluateFrame && dynamicPosition,
       stop,
       pass,
@@ -113,7 +114,7 @@ final class _Overlay {
     this.x,
     this.y,
     this.format,
-    this.premultiplied,
+    this.alphaMode,
     this.usesFramePosition,
     this.stopAtEof,
     this.dropSecondary,
@@ -123,7 +124,8 @@ final class _Overlay {
 
   final FilterExpression x, y;
   final _VideoPixelFormat? format;
-  final bool premultiplied, usesFramePosition;
+  final bool? alphaMode;
+  final bool usesFramePosition;
   final bool stopAtEof, dropSecondary, nearest;
   final _FormatFilter? outputFormat;
   final _converter = _PixelFormatConverter();
@@ -134,7 +136,7 @@ final class _Overlay {
     x,
     y,
     this.format,
-    premultiplied,
+    alphaMode,
     usesFramePosition,
     stopAtEof,
     dropSecondary,
@@ -160,7 +162,12 @@ final class _Overlay {
 
   _FormatFilter _inputFormat({required bool secondary}) {
     final requested = format;
-    if (requested == null) return _autoFormats;
+    final modes = [if (secondary && alphaMode != null) alphaMode!];
+    if (requested == null) {
+      return modes.isEmpty
+          ? _autoFormats
+          : _FormatFilter._(_autoFormats.formats, const [], const [], modes);
+    }
     final rgb = requested.color == _PixelColor.rgb;
     final opaque = (
       format: requested,
@@ -177,6 +184,7 @@ final class _Overlay {
       ],
       const [],
       const [],
+      modes,
     );
   }
 
@@ -207,22 +215,14 @@ final class _Overlay {
           )
         : input;
     if (secondary == null) return main;
-    final over = identical(input, secondary)
-        ? main
-        : _converter.convert(
-            secondary,
-            target,
-            alpha: format == null ? true : null,
-            fullRange: main.fullRange,
-            matrix: main.matrix,
-          );
-    if (premultiplied &&
-        over.alpha != null &&
-        (!main.packedRgb || target.depth != 8)) {
-      throw const FormatException(
-        'Premultiplied overlay requires packed 8-bit RGB',
-      );
-    }
+    final over = _converter.convert(
+      identical(input, secondary) ? main : secondary,
+      target,
+      alpha: format == null ? true : null,
+      fullRange: main.fullRange,
+      matrix: main.matrix,
+      premultiplied: alphaMode ?? main.premultiplied,
+    );
     final variables = {
       'main_w': main.width.toDouble(),
       'W': main.width.toDouble(),
@@ -284,38 +284,52 @@ final class _Overlay {
                     color + _overlayDivide((max - color) * alpha, max);
                 continue;
               }
-              if (alpha == 0) continue;
-              final straight = source!.at(col, row);
-              // FFmpeg premultiplies its straight RGB input in Q8 before blending.
-              final sample = premultiplied
-                  ? (straight * alpha + 128) >> 8
-                  : straight;
-              if (alpha == max) {
+              final sample = source!.at(col, row);
+              if (alpha == max && (main.packedRgb || !over.premultiplied)) {
                 output[dest] = sample;
                 continue;
               }
-              final under = _overlayAlpha(
-                main.alpha,
-                px + col,
-                py + row,
-                sx,
-                sy,
-                math.min(width, px + sourceWidth),
-                math.min(height, py + sourceHeight),
-                max,
-              );
-              final weight = main.alpha == null
+              final weight =
+                  main.alpha == null ||
+                      main.premultiplied ||
+                      alpha == 0 ||
+                      alpha == max
                   ? alpha
-                  : _straightOverlayWeight(alpha, under);
-              if (!premultiplied) {
+                  : _straightOverlayWeight(
+                      alpha,
+                      _overlayAlpha(
+                        main.alpha,
+                        px + col,
+                        py + row,
+                        sx,
+                        sy,
+                        math.min(width, px + sourceWidth),
+                        math.min(height, py + sourceHeight),
+                        max,
+                      ),
+                    );
+              if (!over.premultiplied) {
                 output[dest] = _overlayDivide(
                   color * (max - weight) + sample * weight,
                   max,
                 );
-              } else {
+              } else if (main.packedRgb) {
+                if (weight == 0) continue;
+                if (weight == max) {
+                  output[dest] = sample;
+                  continue;
+                }
                 output[dest] = math.min(
                   max,
                   _overlayDivide(color * (max - weight), max) + sample,
+                );
+              } else {
+                output[dest] = _blendAssociatedPlane(
+                  color,
+                  sample,
+                  weight,
+                  depth,
+                  chroma: !main.rgb && index != 0,
                 );
               }
             }
@@ -326,6 +340,25 @@ final class _Overlay {
     }
     return result;
   }
+}
+
+int _blendAssociatedPlane(
+  int color,
+  int sample,
+  int alpha,
+  int depth, {
+  required bool chroma,
+}) {
+  final mid = 1 << (depth - 1), maximum = (1 << depth) - 1;
+  final offset = chroma ? mid : 16 << (depth - 8);
+  final blended = depth > 8
+      ? (color * (maximum - alpha) + sample * alpha) ~/ maximum
+      : _overlayDivide(
+          (color - (chroma ? mid : 0)) * (maximum - alpha),
+          maximum,
+        );
+  final value = blended + sample - offset;
+  return chroma ? value.clamp(-mid, mid) + mid : value.clamp(0, maximum);
 }
 
 int? _overlayOffset(double value, int shift) =>

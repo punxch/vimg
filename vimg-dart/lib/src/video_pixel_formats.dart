@@ -101,6 +101,7 @@ final class _FormatFilter implements _SpatialFilter {
       'pix_fmts',
       'color_spaces',
       'color_ranges',
+      'alpha_modes',
     ]);
     return _FormatFilter._(
       options['pix_fmts']?.split('|').map(_namedPixelFormat).toList() ??
@@ -109,29 +110,69 @@ final class _FormatFilter implements _SpatialFilter {
           const [],
       options['color_ranges']?.split('|').map(_namedColorRange).toList() ??
           const [],
+      options['alpha_modes']?.split('|').map(_namedAlphaMode).toList() ??
+          const [],
     );
   }
 
-  _FormatFilter._(this.formats, this.matrices, this.ranges);
+  _FormatFilter._(
+    this.formats,
+    this.matrices,
+    this.ranges, [
+    this.alphaModes = const [],
+    this.restoreAlphaLayout = true,
+  ]);
   final List<_NamedPixelFormat> formats;
   final List<int> matrices;
   final List<bool> ranges;
+  final List<bool> alphaModes;
+  final bool restoreAlphaLayout;
   final _PixelFormatConverter _converter = _PixelFormatConverter();
 
   bool get unrestricted =>
-      formats.isEmpty && matrices.isEmpty && ranges.isEmpty;
+      formats.isEmpty &&
+      matrices.isEmpty &&
+      ranges.isEmpty &&
+      alphaModes.isEmpty;
+
+  bool get onlyAlphaMode =>
+      alphaModes.isNotEmpty &&
+      formats.isEmpty &&
+      matrices.isEmpty &&
+      ranges.isEmpty;
 
   _FormatFilter? intersect(_FormatFilter other) {
     final commonFormats = _intersectFormats(formats, other.formats);
     final commonMatrices = _intersectFormats(matrices, other.matrices);
     final commonRanges = _intersectFormats(ranges, other.ranges);
+    final commonAlphaModes = _intersectFormats(alphaModes, other.alphaModes);
     if (commonFormats == null ||
         commonMatrices == null ||
-        commonRanges == null) {
+        commonRanges == null ||
+        commonAlphaModes == null) {
       return null;
     }
-    return _FormatFilter._(commonFormats, commonMatrices, commonRanges);
+    return _FormatFilter._(
+      commonFormats,
+      commonMatrices,
+      commonRanges,
+      commonAlphaModes,
+    );
   }
+
+  _FormatFilter withoutAlphaModes() =>
+      alphaModes.isEmpty ? this : _FormatFilter._(formats, matrices, ranges);
+
+  _FormatFilter atAlphaStage(bool restoreLayout) =>
+      alphaModes.isEmpty || restoreLayout == restoreAlphaLayout
+      ? this
+      : _FormatFilter._(formats, matrices, ranges, alphaModes, restoreLayout);
+
+  bool? alphaMode(_VideoPlanes frame) => alphaModes.isEmpty
+      ? null
+      : alphaModes.contains(frame.premultiplied)
+      ? frame.premultiplied
+      : alphaModes.first;
 
   _FormatSelection select(
     _VideoPlanes frame, {
@@ -187,16 +228,37 @@ final class _FormatFilter implements _SpatialFilter {
   @override
   _VideoPlanes apply(_VideoPlanes frame) {
     if (unrestricted ||
-        formats.isEmpty && _frameFormat(frame).color != _PixelColor.yuv) {
+        (alphaModes.isEmpty &&
+            formats.isEmpty &&
+            _frameFormat(frame).color != _PixelColor.yuv)) {
       return frame;
     }
-    final target = select(frame);
+    var target = select(frame);
+    final convertsLayout =
+        target.format != _frameFormat(frame) ||
+        (target.alpha != null && target.alpha != (frame.alpha != null)) ||
+        (target.fullRange != null && target.fullRange != frame.fullRange) ||
+        (target.matrix != null && target.matrix != frame.matrix);
+    // A downstream alpha requirement travels through a real pixel converter.
+    // A format that already matches its input leaves association to the next stage.
+    final mode = restoreAlphaLayout && !convertsLayout
+        ? null
+        : alphaMode(frame);
+    if (mode != null && frame.alpha != null && target.alpha != false) {
+      frame = _converter.changeAlphaMode(
+        frame,
+        mode,
+        restoreLayout: restoreAlphaLayout,
+      );
+      if (formats.isEmpty) target = select(frame);
+    }
     return _converter.convert(
       frame,
       target.format,
       alpha: target.alpha,
       matrix: target.matrix,
       fullRange: target.fullRange,
+      premultiplied: mode,
     );
   }
 }
@@ -291,6 +353,12 @@ bool _namedColorRange(String name) => switch (name) {
   _ => throw FormatException('Unsupported video color range: $name'),
 };
 
+bool _namedAlphaMode(String name) => switch (name) {
+  'premultiplied' => true,
+  'straight' || 'unspecified' => false,
+  _ => throw FormatException('Unsupported video alpha mode: $name'),
+};
+
 typedef _ColorScale = ({
   int width,
   int height,
@@ -311,8 +379,12 @@ final class _PixelFormatConverter {
     bool? fullRange,
     int? matrix,
     _ColorScale? scale,
+    bool? premultiplied,
   }) {
     final requestedAlpha = alpha ?? source.alpha != null;
+    if (premultiplied != null && requestedAlpha) {
+      source = changeAlphaMode(source, premultiplied);
+    }
     final opacityDepth =
         alphaDepth ??
         (scale != null && alpha == null
@@ -449,6 +521,78 @@ final class _PixelFormatConverter {
       bgr24: target.bgr24,
       sampleAspect: scale?.sampleAspect ?? source.sampleAspect,
       alpha: convertedAlpha,
+      premultiplied:
+          convertedAlpha != null && (premultiplied ?? source.premultiplied),
+    );
+  }
+
+  _VideoPlanes changeAlphaMode(
+    _VideoPlanes source,
+    bool premultiplied, {
+    bool restoreLayout = true,
+  }) {
+    if (source.alpha == null || source.premultiplied == premultiplied) {
+      return source;
+    }
+    final layout = _frameFormat(source);
+    // Alpha association happens on the full-resolution color planes.
+    final planar = _pixelFormat(layout.color, layout.depth);
+    final frame = convert(
+      source,
+      planar,
+      alpha: true,
+      fullRange: source.fullRange,
+      matrix: source.matrix,
+    );
+    final opacity = frame.alpha!;
+    final result = frame.mapComponents((plane, _, _, index) {
+      if (index == 3) return plane;
+      final chroma = !frame.rgb && index != 0;
+      final depth = plane.depth;
+      final half = 1 << (depth - 1), max = (1 << depth) - 1;
+      final offset = chroma
+          ? half
+          : frame.fullRange
+          ? 0
+          : 16 << (depth - 8);
+      final samples = _paintSamples(depth, plane.width * plane.height);
+      var i = 0;
+      for (var y = 0; y < plane.height; y++) {
+        for (var x = 0; x < plane.width; x++) {
+          final value = plane.at(x, y), alpha = opacity.at(x, y);
+          if (premultiplied) {
+            final rounding = chroma ? 0 : half;
+            samples[i++] =
+                (((value - offset) * alpha + rounding) >> depth) + offset;
+          } else if (alpha == 0 || alpha == max) {
+            samples[i++] = value;
+          } else {
+            final delta = !chroma && offset != 0
+                ? math.max(value - offset, 0)
+                : value - offset;
+            final straight = delta * max ~/ alpha + offset;
+            samples[i++] = chroma && depth == 8
+                ? math.min(straight, max) & max
+                : straight.clamp(0, max);
+          }
+        }
+      }
+      return _FilterPlane(
+        samples,
+        plane.width,
+        plane.height,
+        depth,
+        rowStep: plane.width,
+      );
+    }, premultiplied: premultiplied);
+    if (!restoreLayout) return result;
+    return convert(
+      result,
+      layout,
+      alpha: true,
+      alphaDepth: source.alpha!.depth,
+      fullRange: source.fullRange,
+      matrix: source.matrix,
     );
   }
 
@@ -823,7 +967,7 @@ _VideoPlanes _rgbToYuv(
   // A packed RGB input can be averaged in pairs before vertical chroma scaling.
   final hasChroma = target.color == _PixelColor.yuv;
   final pair =
-      frame.packedRgb &&
+      (frame.packedRgb || red.depth == 8) &&
       hasChroma &&
       width.isEven &&
       (outputWidth >> target.subX) <= (width >> 1) &&

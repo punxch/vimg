@@ -57,6 +57,7 @@ _VideoPlanes _pointScalePackedRgb(
     [outG, outB, outR],
     outA,
     bgr24: frame.bgr24,
+    premultiplied: frame.premultiplied,
   );
 }
 
@@ -127,6 +128,7 @@ _VideoPlanes _scaleSubsampledRgb(
     [outG, outB, outR],
     outA,
     bgr24: frame.bgr24,
+    premultiplied: frame.premultiplied,
   );
 }
 
@@ -137,6 +139,7 @@ _VideoPlanes _packedRgbPlanes(
   List<Uint8List> gbr,
   Uint8List? alpha, {
   required bool bgr24,
+  required bool premultiplied,
 }) {
   _FilterPlane plane(Uint8List data) =>
       _FilterPlane(data, width, height, 8, rowStep: width);
@@ -150,6 +153,7 @@ _VideoPlanes _packedRgbPlanes(
     bgr24: bgr24,
     sampleAspect: sampleAspect,
     alpha: alpha == null ? null : plane(alpha),
+    premultiplied: premultiplied,
   );
 }
 

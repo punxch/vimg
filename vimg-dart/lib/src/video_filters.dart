@@ -414,6 +414,7 @@ final class _Transpose implements _SpatialFilter {
         horizontal: direction.isOdd,
         vertical: direction >= 2,
       ),
+      premultiplied: frame.premultiplied,
     );
   }
 }
@@ -621,13 +622,22 @@ final class _Scale extends _FrameSpatialFilter {
     );
     final target = selection?.format ?? _frameFormat(frame);
     final alpha = selection?.alpha;
+    final mode = outputFormat?.alphaMode(frame);
+    if (mode != null && alpha != false) {
+      frame = _converter.changeAlphaMode(frame, mode);
+    }
     final preserveAlpha = alpha == null || alpha == (frame.alpha != null);
     final sameLayout = target == _frameFormat(frame) && preserveAlpha;
     if (frame.rgb && target.color == _PixelColor.rgb) {
       final resized = resize(frame, w, h);
       return sameLayout
           ? resized
-          : _converter.convert(resized, target, alpha: alpha);
+          : _converter.convert(
+              resized,
+              target,
+              alpha: alpha,
+              premultiplied: mode,
+            );
     }
     final input = interpretInputColor(frame);
     // For planar output, default to the color properties of the source link.
@@ -655,6 +665,7 @@ final class _Scale extends _FrameSpatialFilter {
       alpha: alpha,
       matrix: matrix,
       fullRange: target.color == _PixelColor.rgb ? true : fullRange,
+      premultiplied: mode,
       scale: (
         width: w,
         height: h,
@@ -949,10 +960,12 @@ final class _VideoPlanes {
     this.bgr24 = false,
     this.sampleAspect = 1,
     this.alpha,
+    this.premultiplied = false,
   });
   final List<_FilterPlane> planes;
   final int subX, subY;
   final _FilterPlane? alpha;
+  final bool premultiplied;
   final int matrix;
   final bool fullRange;
   final bool packedRgb;
@@ -984,6 +997,7 @@ final class _VideoPlanes {
       bgr24: bgr24,
       sampleAspect: sampleAspect,
       alpha: alpha,
+      premultiplied: premultiplied,
     );
   }
 
@@ -1010,6 +1024,7 @@ final class _VideoPlanes {
   _VideoPlanes mapComponents(
     _FilterPlane Function(_FilterPlane, int, int, int) transform, {
     double? sampleAspect,
+    bool? premultiplied,
   }) => _VideoPlanes(
     [
       transform(planes.first, 0, 0, 0),
@@ -1024,6 +1039,7 @@ final class _VideoPlanes {
     bgr24: bgr24,
     sampleAspect: sampleAspect ?? this.sampleAspect,
     alpha: alpha == null ? null : transform(alpha!, 0, 0, 3),
+    premultiplied: premultiplied ?? this.premultiplied,
   );
 }
 

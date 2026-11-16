@@ -836,6 +836,43 @@ void _checkCompositing() {
       'Automatic overlay matches FFmpeg $format partial alpha blend',
     );
   }
+  for (final (filter, checksum) in [
+    ('format=alpha_modes=premultiplied', 0xd7eb4aee),
+    (
+      'format=alpha_modes=premultiplied,format=alpha_modes=straight',
+      0x127f7c0c,
+    ),
+    (
+      'format=yuva420p:alpha_modes=premultiplied,format=alpha_modes=straight',
+      0x90b2a9b7,
+    ),
+    (
+      '$prepare,format=alpha_modes=premultiplied[x];[a][x]overlay=-1:1:format=rgb',
+      0x73cb3eaa,
+    ),
+    (
+      'format=rgba,$prepare[x];[a][x]overlay=-1:1:format=auto:alpha=premultiplied',
+      0xda7e70b6,
+    ),
+  ]) {
+    check(
+      getCrc32(render(filter).getBytes()) == checksum,
+      '$filter matches FFmpeg alpha mode conversion',
+    );
+  }
+  for (final (format, offset, checksum) in [
+    ('yuva420p', '2:0', 0x77e8dc69),
+    ('yuva420p10le', '2:1', 0x9f08ad74),
+    ('gbrap', '-1:1', 0x3aa669ab),
+  ]) {
+    final filter =
+        'format=$format,$prepare[x];'
+        '[a][x]overlay=$offset:format=auto:alpha=premultiplied';
+    check(
+      getCrc32(render(filter).getBytes()) == checksum,
+      '$format premultiplied overlay matches FFmpeg',
+    );
+  }
 
   final input = [
     for (var j = 0; j < 6; j++)
@@ -1152,6 +1189,21 @@ Future<void> _checkCli(String? executable) async {
       0x939ff366,
       0x939ff366,
     ];
+    final transparentMotion = aviFixture(temp, rgba: true).path;
+    const associatedOverlay =
+        'format=gbrap,split[a][b];[a]fps=8[m];'
+        '[b]trim=start_frame=1:end_frame=3,crop=4:4:2:2,hflip[x];'
+        '[m][x]overlay=-1:1:format=gbrp:alpha=premultiplied:eof_action=pass';
+    const associatedReference = [
+      0xab7b1ecb,
+      0xab7b1ecb,
+      0x2f68268b,
+      0x2f68268b,
+      0x5f382840,
+      0xc2b222a9,
+      0xd1002446,
+      0xd1002446,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1161,6 +1213,7 @@ Future<void> _checkCli(String? executable) async {
       ('negotiated-scale', negotiatedGraph, 32, 12, negotiatedReference),
       ('split-formats', splitFormatGraph, 32, 12, splitFormatReference),
       ('auto-overlay', automaticOverlay, 16, 12, autoOverlayReference),
+      ('associated-overlay', associatedOverlay, 8, 6, associatedReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1182,7 +1235,7 @@ Future<void> _checkCli(String? executable) async {
           folder,
           '--vfilter',
           filter,
-          motion,
+          name == 'associated-overlay' ? transparentMotion : motion,
         ]);
         final outputs = ordered(folder);
         check(outputs.length == checksums.length, '$command $name frames');
