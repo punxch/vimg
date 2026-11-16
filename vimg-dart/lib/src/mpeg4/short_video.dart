@@ -328,6 +328,8 @@ final class _H263Macroblocks {
   final _H263ErpsSelection? erps;
   _H263ErpsGroup? _segmentErps;
   _H263PartitionBlock? _partition;
+  Rbsp? _partitionBits;
+  bool _readingPartitionTexture = false;
   _H263ErpsGroup? get _erpsGroup => _segmentErps ?? erps?.picture;
   bool get _multiplePrediction => _erpsGroup?.syntax.multiple == true;
   bool _unmarkedShortcut = false;
@@ -382,6 +384,7 @@ final class _H263Macroblocks {
   final _H263Pb? _pb;
   final _PictureMotion _motion;
   final _coefficients = Int16List(64);
+  late final _partitionCoefficients = List.generate(12, (_) => Int16List(64));
   late final _columns = header.macroblockColumns;
   late final _rows = header.macroblockRows;
   late final _count = _columns * _rows;
@@ -412,19 +415,29 @@ final class _H263Macroblocks {
   List<H263Picture>? _pendingLumaReferences;
   int _pendingPattern = -1;
   Uint8List? _intraWithMotion;
-  Rbsp get _bits => header.bits;
+  Rbsp get _bits => _partitionBits ?? header.bits;
   int _quant, _sliceStart = 0;
 
   void decode() {
     final columns = _columns, count = _count;
     final overlap = _overlap;
     var previous = -1;
-    for (final index in _macroblockOrder()) {
+    _decodeMacroblocks((index) {
       final preceding = previous;
-      previous = index;
       final x = index % columns, y = index ~/ columns;
       final (mode, shortcut) = _readMacroblock();
       if (mode == -1) {
+        _readingPartitionTexture = false;
+        previous = index;
+        if (header.intra) {
+          _finishPrevious(preceding);
+          _coefficients.fillRange(0, 64, 0);
+          _coefficients[0] = 8 * 128;
+          for (var block = 0; block < 6; block++) {
+            _writeBlock(x, y, block, _coefficients, intra: true);
+          }
+          return;
+        }
         overlap?.markMotion(index, _sliceStart);
         _finishPrevious(preceding);
         final forward = _forwardAt(shortcut);
@@ -433,7 +446,7 @@ final class _H263Macroblocks {
         if (shortcut != 0 && (header.reduced || header.format.loopFilter)) {
           _filterQuant[index] = _quant;
         }
-        continue;
+        return;
       }
       final intra = header.intra || mode & 4 != 0;
       final aic = intra && header.format.advancedIntra;
@@ -448,6 +461,14 @@ final class _H263Macroblocks {
       if (mode & (header.intra ? 4 : 8) != 0) {
         _readQuantChange();
       }
+      _stagePartitionTexture(
+        pattern,
+        intra: intra,
+        advanced: aic,
+        fromLeft: fromLeft,
+        pairedPattern: pbBlock?.pattern ?? 0,
+      );
+      previous = index;
       _H263Forward? primary;
       List<_Vector>? vectors;
       List<H263Picture>? lumaReferences;
@@ -513,7 +534,7 @@ final class _H263Macroblocks {
       if (pbBlock != null) _readPbBlocks(pbBlock.pattern);
       if (header.reduced || header.format.loopFilter)
         _filterQuant[index] = _quant;
-    }
+    });
     _finishPrevious(previous);
     _finishFilter();
   }
@@ -693,8 +714,11 @@ final class _H263Macroblocks {
     final bQuant = math.min(31, _quant * header.pb!.quantFactor ~/ 4);
     for (var block = 0; block < 6; block++) {
       if (pattern & (32 >> block) == 0) continue;
-      _coefficients.fillRange(0, 64, 0);
-      _readTexture(mpegZigzag, -1, intra: false, advanced: false);
+      if (_partition != null) {
+        _coefficients.setAll(0, _partitionCoefficients[block + 6]);
+      } else {
+        _readPbCoefficients();
+      }
       if (pb.output == null) continue;
       final quant = block >= 4 && header.format.modifiedQuant
           ? _h263ChromaQuant[bQuant]
@@ -702,6 +726,11 @@ final class _H263Macroblocks {
       _inverseQuantize(quant, first: 0);
       pb.residuals[block].setAll(0, _coefficients);
     }
+  }
+
+  void _readPbCoefficients() {
+    _coefficients.fillRange(0, 64, 0);
+    _readTexture(mpegZigzag, -1, intra: false, advanced: false);
   }
 
   void _readQuantChange() {
@@ -799,29 +828,23 @@ final class _H263Macroblocks {
     required bool advanced,
     required bool? fromLeft,
   }) {
-    final values = _coefficients..fillRange(0, 64, 0);
-    final separateDc = intra && !advanced;
-    if (separateDc) {
-      if (_sac case final sac?) {
-        values[0] = (sac.read(_sacDc) + 1) * 8;
-      } else {
-        final dc = _bits.read(8);
-        values[0] = (dc == 255 ? 128 : dc) * 8;
-      }
+    final values = _coefficients;
+    if (_partition != null) {
+      values.setAll(0, _partitionCoefficients[block]);
+    } else {
+      _readBlockCoefficients(
+        intra: intra,
+        coded: coded,
+        advanced: advanced,
+        fromLeft: fromLeft,
+      );
     }
+    final separateDc = intra && !advanced;
     final luma = block < 4;
     final plane = luma ? 0 : block - 3;
     final quant = !luma && header.format.modifiedQuant
         ? _h263ChromaQuant[_quant]
         : _quant;
-    if (coded) {
-      final scan = switch (fromLeft) {
-        true => verticalScan,
-        false => horizontalScan,
-        null => mpegZigzag,
-      };
-      _readTexture(scan, separateDc ? 0 : -1, intra: intra, advanced: advanced);
-    }
     final bx = luma ? x * 2 + (block & 1) : x;
     final by = luma ? y * 2 + (block >> 1) : y;
     if (advanced) {
@@ -833,6 +856,62 @@ final class _H263Macroblocks {
       _overlap!.residuals[block].setAll(0, values);
     } else {
       _writeBlock(x, y, block, values, intra: intra);
+    }
+  }
+
+  // Annex V places all texture together. Read one complete macroblock before
+  // updating the picture, motion predictors, or the paired B reconstruction.
+  void _stagePartitionTexture(
+    int pattern, {
+    required bool intra,
+    required bool advanced,
+    required bool? fromLeft,
+    int pairedPattern = 0,
+  }) {
+    if (!_readingPartitionTexture) return;
+    for (var block = 0; block < 6; block++) {
+      final coded = pattern & (32 >> block) != 0;
+      if (intra || coded) {
+        _readBlockCoefficients(
+          intra: intra,
+          coded: coded,
+          advanced: advanced,
+          fromLeft: fromLeft,
+        );
+        _partitionCoefficients[block].setAll(0, _coefficients);
+      }
+    }
+    for (var block = 0; block < 6; block++) {
+      if (pairedPattern & (32 >> block) == 0) continue;
+      _readPbCoefficients();
+      _partitionCoefficients[block + 6].setAll(0, _coefficients);
+    }
+    _readingPartitionTexture = false;
+  }
+
+  void _readBlockCoefficients({
+    required bool intra,
+    required bool coded,
+    required bool advanced,
+    required bool? fromLeft,
+  }) {
+    final values = _coefficients..fillRange(0, 64, 0);
+    final separateDc = intra && !advanced;
+    if (separateDc) {
+      if (_sac case final sac?) {
+        values[0] = (sac.read(_sacDc) + 1) * 8;
+      } else {
+        final dc = _bits.read(8);
+        values[0] = (dc == 255 ? 128 : dc) * 8;
+      }
+    }
+    if (coded) {
+      final scan = switch (fromLeft) {
+        true => verticalScan,
+        false => horizontalScan,
+        null => mpegZigzag,
+      };
+      _readTexture(scan, separateDc ? 0 : -1, intra: intra, advanced: advanced);
     }
   }
 

@@ -3,7 +3,7 @@ part of 'decoder.dart';
 typedef _H263Slice = ({H263GroupHeader header, int data, int end});
 
 extension _H263Slices on _H263Macroblocks {
-  Iterable<int> _macroblockOrder() sync* {
+  void _decodeMacroblocks(void Function(int) decode) {
     if (!header.format.rectangularSlices &&
         !header.format.arbitrarySlices &&
         !header.format.independentSegments &&
@@ -11,12 +11,14 @@ extension _H263Slices on _H263Macroblocks {
         !(header.erps != null && header.format.structured)) {
       for (var index = 0; index < _count; index++) {
         _startMacroblock(index);
-        yield index;
+        decode(index);
       }
       return;
     }
     final (:layout, :counts) = _preparedSlices;
     final sac = _sac;
+    var readable = 0;
+    FormatException? firstFailure;
     for (final (i, slice) in layout.indexed) {
       final group = slice.header;
       _sliceStart = group.address;
@@ -28,21 +30,86 @@ extension _H263Slices on _H263Macroblocks {
       }
       _validateTemporalSegments(reference);
       final count = counts[group.address]!;
-      final partitions = header.format.partitioned
-          ? _readDataPartitions(count, slice.end)
-          : null;
+      if (header.format.partitioned) {
+        final bits = _bits;
+        final bounded = Rbsp(bits.bytes, codec: bits.codec, end: slice.end)
+          ..position = bits.position;
+        _partitionBits = bounded;
+        try {
+          final (:decoded, :error) = _decodePartitionSlice(
+            group,
+            count,
+            slice.end,
+            decode,
+          );
+          readable += decoded;
+          firstFailure ??= error;
+          bits.position = slice.end;
+        } finally {
+          _partitionBits = null;
+          _partition = null;
+          _readingPartitionTexture = false;
+        }
+        continue;
+      }
       for (var mb = 0; mb < count; mb++) {
         final address = _sliceAddressAt(group, mb);
         _filterSlices?[address] = _sliceStart;
-        _partition = partitions?[mb];
-        yield address;
+        decode(address);
         if (_bits.position > slice.end) {
           throw const FormatException('H.263+ macroblock exceeds its slice');
         }
       }
-      _partition = null;
       if (sac == null) _finishSlice(slice.end);
     }
+    if (readable == 0 && firstFailure != null) throw firstFailure;
+  }
+
+  ({int decoded, FormatException? error}) _decodePartitionSlice(
+    H263GroupHeader group,
+    int count,
+    int end,
+    void Function(int) decode,
+  ) {
+    var decoded = 0;
+    FormatException? error;
+    List<_H263PartitionBlock>? partitions;
+    try {
+      partitions = _readDataPartitions(count, end);
+    } on FormatException catch (failure) {
+      error = failure;
+    }
+    if (partitions != null) {
+      for (; decoded < count; decoded++) {
+        final address = _sliceAddressAt(group, decoded);
+        _filterSlices?[address] = _sliceStart;
+        _partition = partitions[decoded];
+        _readingPartitionTexture = true;
+        final quant = _quant;
+        try {
+          decode(address);
+        } on FormatException catch (failure) {
+          if (!_readingPartitionTexture) rethrow;
+          _quant = quant;
+          error = failure;
+          break;
+        }
+      }
+    }
+    if (error == null) return (decoded: decoded, error: null);
+    // At this point the damaged macroblock has not touched prediction state.
+    // Use the ordinary skipped mode in each picture type to conceal the gap.
+    _partition = _H263PartitionBlock(
+      header.enhancement || header.bidirectional ? 0 : -1,
+      0,
+    );
+    _readingPartitionTexture = false;
+    for (var mb = decoded; mb < count; mb++) {
+      final address = _sliceAddressAt(group, mb);
+      _filterSlices?[address] = _sliceStart;
+      decode(address);
+    }
+    return (decoded: decoded, error: error);
   }
 
   ({List<_H263Slice> layout, Map<int, int> counts}) _prepareSlices() {
@@ -138,7 +205,7 @@ extension _H263Slices on _H263Macroblocks {
     final stuffing = multiple ? 11 : (header.intra ? 9 : 10);
     // Annex U inserts PR0=0 after COD=0, even for a stuffing macroblock.
     final word = multiple ? 0x201 : 1;
-    while (!header.format.partitioned && end - _bits.position >= stuffing) {
+    while (end - _bits.position >= stuffing) {
       if (_bits.read(stuffing) != word) {
         throw const FormatException('Unexpected data after H.263+ slice');
       }

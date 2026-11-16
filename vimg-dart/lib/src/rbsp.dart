@@ -2,7 +2,12 @@ import 'dart:typed_data';
 
 /// Bit reader for H.264 and HEVC raw byte sequence payloads.
 final class Rbsp {
-  Rbsp(this.bytes, {this.codec = 'H.264', this.preventionOffsets = const []});
+  Rbsp(
+    this.bytes, {
+    this.codec = 'H.264',
+    this.preventionOffsets = const [],
+    int? end,
+  }) : _end = end ?? bytes.length * 8;
 
   factory Rbsp.fromNal(
     Uint8List nal, {
@@ -41,9 +46,10 @@ final class Rbsp {
   final Uint8List bytes;
   final String codec;
   final List<int> preventionOffsets;
+  final int _end;
   var position = 0;
 
-  int get remaining => bytes.length * 8 - position;
+  int get remaining => _end - position;
 
   int bit() {
     if (remaining <= 0) throw FormatException('Truncated $codec bitstream');

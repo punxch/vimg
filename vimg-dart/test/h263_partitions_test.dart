@@ -11,6 +11,7 @@ import 'fixtures.dart';
 const _input = 'test/fixtures/h263-dps-b.h263';
 const _inter = 'test/fixtures/h263-dps-p.h263';
 const _recoveredB = 'test/fixtures/h263-dps-recover-b.h263';
+const _recoveredSlices = 'test/fixtures/h263-dps-recover-slices.h263';
 
 Future<void> main(List<String> arguments) async {
   // An arbitrary-order rectangle can contain no MVs, one MV, or a
@@ -56,7 +57,13 @@ Future<void> main(List<String> arguments) async {
     (48, 32),
     [(0, 2068204920), (2, 1175256506), (4, 2620488000)],
   );
-  _verifyInvalidPartitions();
+  await _verify(
+    _recoveredSlices,
+    (64, 48),
+    [(0, 2149761827), (2, 967149101), (4, 840275573)],
+  );
+  _verifyRecoveredPlanes();
+  _verifyConcealedPartitions();
   if (arguments.firstOrNull case final cli?) {
     final directory = Directory.systemTemp.createTempSync('vimg-h263-dps-');
     try {
@@ -70,7 +77,7 @@ Future<void> main(List<String> arguments) async {
         '-t160ms',
         '-o',
         output.path,
-        _recoveredB,
+        _recoveredSlices,
       ]);
       check(
         result.exitCode == 0,
@@ -124,46 +131,117 @@ Future<void> _verify(
   }
 }
 
-void _verifyInvalidPartitions() {
-  final bytes = File(_inter).readAsBytesSync();
-  final offsets = [
-    for (var i = 0; i + 2 < bytes.length; i++)
-      if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] & 0xfc == 0x80) i,
+void _verifyRecoveredPlanes() {
+  final bytes = File(_recoveredSlices).readAsBytesSync();
+  final [intra, predicted] = _pictureUnits(bytes);
+  final decoder = H263Decoder();
+  final anchor = decoder.decode(intra);
+  final (:picture, :bidirectional) = decoder.decodePair(
+    predicted,
+    includeBidirectional: true,
+  );
+  // The I frame retains its first macroblock and last slice. The PB frame
+  // also retains the valid prefix and final slice when a paired block fails.
+  const expected = [
+    [2578231546, 1810497639, 4233545759],
+    [4171025462, 3936048452, 917335351],
+    [1010188664, 438121571, 2475324487],
   ];
-  final intra = Uint8List.sublistView(bytes, offsets[0], offsets[1]);
-  final predicted = Uint8List.sublistView(bytes, offsets[1]);
+  for (final (frame, decoded) in [anchor, bidirectional!, picture!].indexed) {
+    for (final (plane, samples) in decoded.planes.indexed) {
+      check(
+        getCrc32(samples) == expected[frame][plane],
+        'H.263+ recovered frame $frame, plane $plane',
+      );
+    }
+  }
+
+  final header = H263Headers().read(intra);
+  final groups = h263GroupUnits(header, intra).toList();
+  final damaged = Uint8List.fromList(intra);
+  _flipBit(damaged, header.bits.position + 4 + 8);
+  _flipBit(damaged, groups.last.data + 8 + 8);
+  var rejected = false;
+  try {
+    H263Decoder().decode(damaged);
+  } on FormatException {
+    rejected = true;
+  }
+  check(rejected, 'H.263+ picture without any readable macroblocks');
+}
+
+void _verifyConcealedPartitions() {
+  final bytes = File(_inter).readAsBytesSync();
+  final [intra, predicted] = _pictureUnits(bytes);
+  final decoder = H263Decoder();
+  final anchor = decoder.decode(intra);
+  final intact = decoder.decode(predicted);
   final reader = H263Headers()..read(intra);
   // The first slice has one INTER macroblock, one skipped macroblock,
   // and the only vector encodes (0, 1) in four bits.
   final headerMarker = reader.read(predicted).bits.position + 4;
   final motionMarker = headerMarker + 9 + 4;
-  for (final (offset, expected) in [
-    (headerMarker + 8, 'Too many macroblocks in H.263+ header partition'),
-    (motionMarker + 9, 'Invalid H.263+ motion partition marker'),
-  ]) {
+  for (final offset in [headerMarker + 8, motionMarker + 9]) {
     final damaged = Uint8List.fromList(predicted);
-    damaged[offset >> 3] ^= 1 << (7 - (offset & 7));
-    _expectError(intra, damaged, expected);
+    _flipBit(damaged, offset);
+    _verifyConcealedRectangle(intra, damaged, anchor, intact, (
+      left: 32,
+      top: 0,
+      right: 64,
+      bottom: 16,
+    ));
   }
   final damaged = File(
     'test/fixtures/h263-dps-bad-last-vector.packet',
   ).readAsBytesSync();
-  _expectError(
-    intra,
-    damaged,
-    'H.263+ motion partition has an inconsistent last vector',
-  );
+  _verifyConcealedRectangle(intra, damaged, anchor, intact, (
+    left: 0,
+    top: 0,
+    right: 32,
+    bottom: 48,
+  ));
 }
 
-void _expectError(Uint8List intra, Uint8List damaged, String message) {
+void _verifyConcealedRectangle(
+  Uint8List intra,
+  Uint8List damaged,
+  H263Picture anchor,
+  H263Picture intact,
+  ({int left, int top, int right, int bottom}) rectangle,
+) {
   final decoder = H263Decoder()..decode(intra);
-  try {
-    decoder.decode(damaged);
-    throw StateError('Accepted an invalid H.263+ partition');
-  } on FormatException catch (failure) {
-    check(
-      failure.message == message,
-      'partition validation ${failure.message}',
-    );
+  final recovered = decoder.decode(damaged);
+  final (:left, :top, :right, :bottom) = rectangle;
+  for (final (plane, samples) in recovered.planes.indexed) {
+    final sub = plane == 0 ? 0 : 1;
+    final stride = recovered.stride >> sub;
+    for (var y = 0; y < recovered.height >> sub; y++) {
+      for (var x = 0; x < recovered.width >> sub; x++) {
+        final concealed =
+            x >= left >> sub &&
+            x < right >> sub &&
+            y >= top >> sub &&
+            y < bottom >> sub;
+        final expected = (concealed ? anchor : intact).planes[plane];
+        final index = y * stride + x;
+        check(samples[index] == expected[index], 'plane $plane at $x,$y');
+      }
+    }
   }
+}
+
+List<Uint8List> _pictureUnits(Uint8List bytes) {
+  final offsets = [
+    for (var i = 0; i + 2 < bytes.length; i++)
+      if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] & 0xfc == 0x80) i,
+    bytes.length,
+  ];
+  return [
+    for (var i = 0; i + 1 < offsets.length; i++)
+      Uint8List.sublistView(bytes, offsets[i], offsets[i + 1]),
+  ];
+}
+
+void _flipBit(Uint8List bytes, int bit) {
+  bytes[bit >> 3] ^= 1 << (7 - (bit & 7));
 }

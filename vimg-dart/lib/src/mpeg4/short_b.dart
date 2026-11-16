@@ -79,7 +79,7 @@ extension _H263Bidirectional on _H263Macroblocks {
     }
 
     late final pictureTiming = erps?.directTiming();
-    for (final index in _macroblockOrder()) {
+    _decodeMacroblocks((index) {
       final bounds = _boundsAt(index);
       final x = index % columns, y = index ~/ columns;
       final (mode, shortcut) = _readLayerMacroblock(
@@ -97,7 +97,7 @@ extension _H263Bidirectional on _H263Macroblocks {
           bounds: bounds,
         );
         if (header.reduced) _filterQuant[index] = _quant;
-        continue;
+        return;
       }
       final (prediction, texture, changeQuant) = _h263BModes[mode];
       final intra = prediction == _H263BPrediction.intra;
@@ -111,6 +111,12 @@ extension _H263Bidirectional on _H263Macroblocks {
         pattern = ((normal ? luma : luma ^ 15) << 2) | chroma;
       }
       if (changeQuant) _readQuantChange();
+      _stagePartitionTexture(
+        pattern,
+        intra: intra,
+        advanced: aic,
+        fromLeft: fromLeft,
+      );
       switch (prediction) {
         case _H263BPrediction.direct:
           final forward = _forwardAt();
@@ -172,7 +178,7 @@ extension _H263Bidirectional on _H263Macroblocks {
         }
       }
       if (header.reduced && mode != 0) _filterQuant[index] = _quant;
-    }
+    });
     _finishFilter();
   }
 

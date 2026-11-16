@@ -215,8 +215,12 @@ Annex V decodes separate macroblock, motion and coefficient partitions,
 including reordered rectangular slices, Improved PB frames and scalability
 layers. When the motion marker is intact, the decoder keeps the readable
 forward prefix and can recover primary vectors backward from the repeated
-last vector. Missing vectors fall back to zero motion. Recovery of damaged
-macroblock headers and coefficients remains pending.
+last vector. Missing vectors fall back to zero motion. If an error interrupts
+the coefficient partition, decoding keeps the completed macroblocks and
+conceals the rest of the slice. An unreadable header or motion partition
+can be concealed as a whole slice. Decoding resumes at the next valid slice
+boundary. Recovery requires readable slice headers and at least one
+readable macroblock in the picture.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
 and disposable Spark pictures.
 

@@ -95,7 +95,7 @@ extension _H263Enhancement on _H263Macroblocks {
     final ei = header.enhancementIntra;
     final modes = ei ? _h263EiMode : _h263EpMode;
     final stuffing = ei ? 17 : _h263EpModes.length;
-    for (final index in _macroblockOrder()) {
+    _decodeMacroblocks((index) {
       final (code, shortcut) = _readLayerMacroblock(modes, stuffing);
       final (prediction, texture, changeQuant) = ei
           ? (
@@ -117,6 +117,12 @@ extension _H263Enhancement on _H263Macroblocks {
         pattern = ((normal ? cbpy : cbpy ^ 15) << 2) | chroma;
       }
       if (changeQuant) _readQuantChange();
+      _stagePartitionTexture(
+        pattern,
+        intra: intra,
+        advanced: advanced,
+        fromLeft: fromLeft,
+      );
       final x = index % columns, y = index ~/ columns;
       final usesForward =
           prediction == _LayerPrediction.forward ||
@@ -166,7 +172,7 @@ extension _H263Enhancement on _H263Macroblocks {
           (code != 0 || shortcut != 0)) {
         _filterQuant[index] = _quant;
       }
-    }
+    });
     _finishFilter();
   }
 }
