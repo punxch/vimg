@@ -12,6 +12,7 @@ import 'tables.dart';
 
 part 'blocks.dart';
 part 'motion.dart';
+part 'partitions.dart';
 
 final class Mpeg4Picture {
   Mpeg4Picture._(this.volume, this.pts)
@@ -75,9 +76,6 @@ final class Mpeg4Decoder {
       }
       if (header.type == Mpeg4PictureType.sprite)
         throw UnsupportedError('MPEG-4 sprite pictures');
-      if (header.volume.partitioned && !bidirectional) {
-        throw UnsupportedError('MPEG-4 data partitioning');
-      }
       final old = header.type == Mpeg4PictureType.intra
           ? null
           : bidirectional
@@ -141,6 +139,11 @@ final class _VopDecoder {
   int _sliceStart = 0;
 
   void decode() {
+    if (header.volume.partitioned &&
+        header.type != Mpeg4PictureType.bidirectional) {
+      _decodePartitions();
+      return;
+    }
     for (var y = 0; y < picture.rows; y++) {
       _rowVectors.fillRange(0, 4, _zeroVector);
       for (var x = 0; x < _columns; x++) {
@@ -164,7 +167,7 @@ final class _VopDecoder {
     }
   }
 
-  void _readPacketHeader(int index) {
+  bool _readPacketHeader(int index) {
     final zeroes = switch (header.type) {
       Mpeg4PictureType.intra => 16,
       Mpeg4PictureType.bidirectional =>
@@ -176,17 +179,17 @@ final class _VopDecoder {
     final addressBits = (picture.columns * picture.rows - 1).bitLength;
     if (_bits.remaining <
         pad + zeroes + addressBits + header.volume.quantBits + 2)
-      return;
+      return false;
     if (_bits.read(pad) != (1 << (pad - 1)) - 1 ||
         _bits.read(zeroes + 1) != 1) {
       _bits.position = saved;
-      return;
+      return false;
     }
     final address = _bits.read(addressBits);
     if (address != index) {
       _bits.position = saved;
       // A skipped B macroblock consumes no bits before the next packet.
-      if (future?.motion.skipped[index] == 1 && address > index) return;
+      if (future?.motion.skipped[index] == 1 && address > index) return false;
       throw const FormatException('Invalid MPEG-4 video packet address');
     }
     _sliceStart = index;
@@ -209,6 +212,7 @@ final class _VopDecoder {
         throw const FormatException('Invalid MPEG-4 video packet motion range');
       }
     }
+    return true;
   }
 
   void _adjustQuant(int delta) {
@@ -221,6 +225,25 @@ final class _VopDecoder {
     final separateDc = _quant < _threshold;
     if (changeQuant) _adjustQuant(_quantChange[_bits.read(2)]);
     final fieldDct = header.volume.interlaced && _bits.flag();
+    _readIntraBlocks(
+      x,
+      y,
+      pattern,
+      separateDc: separateDc,
+      acPrediction: acPrediction,
+      fieldDct: fieldDct,
+    );
+  }
+
+  void _readIntraBlocks(
+    int x,
+    int y,
+    int pattern, {
+    required bool separateDc,
+    required bool acPrediction,
+    bool fieldDct = false,
+    List<int>? dc,
+  }) {
     for (var block = 0; block < 6; block++) {
       _readBlock(
         x,
@@ -231,6 +254,7 @@ final class _VopDecoder {
         separateDc: separateDc,
         acPrediction: acPrediction,
         fieldDct: fieldDct,
+        dcDifference: dc?[block],
       );
     }
   }
@@ -286,6 +310,19 @@ final class _VopDecoder {
       _readResidual(x, y, pattern, fieldDct);
       return;
     }
+    final vectors = _readFrameVectors(x, y, index, split);
+    _prediction.predict(
+      picture,
+      reference,
+      x,
+      y,
+      vectors,
+      noRound: header.noRound,
+    );
+    _readResidual(x, y, pattern, fieldDct);
+  }
+
+  List<_Vector> _readFrameVectors(int x, int y, int index, bool split) {
     final vectors = <_Vector>[];
     for (var block = 0; block < (split ? 4 : 1); block++) {
       final vector = _motionVector(
@@ -303,15 +340,7 @@ final class _VopDecoder {
         picture.motion.store(x, y, block, vectors.single);
       }
     }
-    _prediction.predict(
-      picture,
-      reference,
-      x,
-      y,
-      vectors,
-      noRound: header.noRound,
-    );
-    _readResidual(x, y, pattern, fieldDct);
+    return vectors;
   }
 
   void _readBidirectional(int x, int y, int index) {

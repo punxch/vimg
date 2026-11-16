@@ -24,6 +24,7 @@ class Mpeg4Volume {
     this.sprite,
     this.resync,
     this.partitioned,
+    this.reversibleVlc,
     this.quantBits,
     this.intraMatrix,
     this.interMatrix,
@@ -36,7 +37,7 @@ class Mpeg4Volume {
   final int? fixedIncrement;
   final double aspect;
   final Mpeg4Signal signal;
-  final bool interlaced, quarter, resync, partitioned;
+  final bool interlaced, quarter, resync, partitioned, reversibleVlc;
   final int sprite, quantBits;
   final List<int>? intraMatrix, interMatrix;
   final int complexityIntra, complexityPredictive, complexityBidirectional;
@@ -146,7 +147,7 @@ class Mpeg4Volume {
     }
     final resync = !bits.flag();
     final partitioned = bits.flag();
-    if (partitioned) bits.skip(1); // reversible VLC
+    final reversibleVlc = partitioned && bits.flag();
     if (version != 1) {
       if (bits.flag()) throw UnsupportedError('MPEG-4 NEWPRED');
       if (bits.flag()) throw UnsupportedError('MPEG-4 reduced resolution VOP');
@@ -166,6 +167,7 @@ class Mpeg4Volume {
       sprite,
       resync,
       partitioned,
+      reversibleVlc,
       quantBits,
       intra,
       inter,
@@ -216,7 +218,7 @@ typedef Mpeg4CodedVop = ({
   int offset,
   int length,
   Uint8List? configuration,
-  Mpeg4Clock? clock,
+  Mpeg4Clock clock,
 });
 
 /// Tracks the VOL and VOP clock in coded order, including B pictures.
@@ -256,17 +258,19 @@ final class Mpeg4Headers {
           ...?_visualObject,
           ...Uint8List.sublistView(bytes, unit.start, unit.end),
         ]);
+      } else if (unit.code == 0xb3) {
+        final hours = bits.read(5), minutes = bits.read(6);
+        mpeg4Marker(bits);
+        _base = hours * 3600 + minutes * 60 + bits.read(6);
       } else if (unit.code == 0xb6) {
         final layer =
             volume ??
             (throw const FormatException('Missing MPEG-4 VOL header'));
-        final clock = layer.interlaced
-            ? (
-                base: _base,
-                reference: _lastReference,
-                fieldInterval: _fieldInterval,
-              )
-            : null;
+        final clock = (
+          base: _base,
+          reference: _lastReference,
+          fieldInterval: _fieldInterval,
+        );
         final header = _readVop(bits, layer);
         yield (
           header: header,

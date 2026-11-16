@@ -28,12 +28,33 @@ final _motionCode = _Vlc(motionCode);
 
 final _intraEvents = _Events(intraCoefficients, intraRuns, intraLevels, 67);
 final _interEvents = _Events(interCoefficients, interRuns, interLevels, 58);
+final _intraReversibleEvents = _Events(
+  intraReversibleCoefficients,
+  intraReversibleRuns,
+  intraReversibleLevels,
+  103,
+  reversible: true,
+);
+final _interReversibleEvents = _Events(
+  interReversibleCoefficients,
+  interReversibleRuns,
+  interReversibleLevels,
+  103,
+  reversible: true,
+);
 
 typedef _DctEvent = ({int run, int value, bool last});
 
 final class _Events {
-  _Events(List<int> words, this._runs, this._levels, this._firstLast)
-    : _vlc = _Vlc(words) {
+  _Events(
+    List<int> words,
+    this._runs,
+    this._levels,
+    this._firstLast, {
+    bool reversible = false,
+  }) : _reversible = reversible,
+       _vlc = _Vlc(words) {
+    if (reversible) return;
     for (var i = 0; i < _runs.length; i++) {
       final plane = i >= _firstLast ? 64 : 0;
       final run = _runs[i], level = _levels[i];
@@ -45,13 +66,23 @@ final class _Events {
   final _Vlc _vlc;
   final List<int> _runs, _levels;
   final int _firstLast;
+  final bool _reversible;
   final _maxLevel = Uint8List(128), _maxRun = Uint8List(128);
 
   _DctEvent read(Rbsp bits) {
     var code = _vlc.read(bits);
     var extendedLevel = false, extendedRun = false;
     if (code == _runs.length) {
-      if (!bits.flag()) {
+      if (_reversible) {
+        mpeg4Marker(bits);
+        final last = bits.flag(), run = bits.read(6);
+        mpeg4Marker(bits);
+        final level = bits.read(11);
+        if (level == 0 || bits.read(5) != 0x10) {
+          throw const FormatException('Invalid MPEG-4 reversible VLC escape');
+        }
+        return (run: run, value: bits.flag() ? -level : level, last: last);
+      } else if (!bits.flag()) {
         extendedLevel = true;
       } else if (!bits.flag()) {
         extendedRun = true;
@@ -83,6 +114,14 @@ final class _Events {
 
 typedef _IntraBlock = ({int dc, int quant, Int16List edges});
 
+int _readDcDifference(Rbsp bits, bool luma) {
+  final size = (luma ? _lumaDc : _chromaDc).read(bits);
+  if (size == 0) return 0;
+  final value = bits.read(size);
+  if (size > 8) mpeg4Marker(bits);
+  return value < (1 << (size - 1)) ? value + 1 - (1 << size) : value;
+}
+
 extension _DctBlocks on _VopDecoder {
   void _readBlock(
     int x,
@@ -93,6 +132,7 @@ extension _DctBlocks on _VopDecoder {
     bool separateDc = false,
     bool acPrediction = false,
     bool fieldDct = false,
+    int? dcDifference,
   }) {
     final luma = block < 4;
     final plane = luma ? 0 : block - 3;
@@ -121,14 +161,7 @@ extension _DctBlocks on _VopDecoder {
       neighbor = predictTop ? top : left;
       dc = neighbor?.dc ?? 1024;
       if (separateDc) {
-        final signedSize = (luma ? _lumaDc : _chromaDc).read(_bits);
-        if (signedSize > 0) {
-          final value = _bits.read(signedSize);
-          values[0] = value < 1 << (signedSize - 1)
-              ? value + 1 - (1 << signedSize)
-              : value;
-          if (signedSize > 8) mpeg4Marker(_bits);
-        }
+        values[0] = dcDifference ?? _readDcDifference(_bits, luma);
       }
     } else {
       neighbor = null;
@@ -140,7 +173,12 @@ extension _DctBlocks on _VopDecoder {
         ? horizontalScan
         : mpegZigzag;
     if (coded) {
-      final events = intra ? _intraEvents : _interEvents;
+      final reversible =
+          header.volume.reversibleVlc &&
+          header.type != Mpeg4PictureType.bidirectional;
+      final events = reversible
+          ? (intra ? _intraReversibleEvents : _interReversibleEvents)
+          : (intra ? _intraEvents : _interEvents);
       var position = separateDc ? 0 : -1;
       while (true) {
         final event = events.read(_bits);

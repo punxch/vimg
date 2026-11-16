@@ -167,7 +167,9 @@ packets and AVI chunks that pack multiple VOPs. The timeline orders B
 pictures by presentation time and restores earlier references across open
 GOPs. Interlaced capture reconstructs both fields in the same frame with
 field DCT, motion prediction, and direct B-VOP prediction in either field
-order. Sprite motion and data partitioning remain pending.
+order. Progressive I/P pictures support data partitioning with ordinary
+and reversible VLCs, including reversible escape codes. Sprite motion
+and recovery from damaged reversible VLC partitions remain pending.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS
