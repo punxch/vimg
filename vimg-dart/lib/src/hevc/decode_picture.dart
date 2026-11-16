@@ -41,7 +41,7 @@ final class HevcStreamDecoder {
 
   final HevcConfiguration configuration;
   final _order = HevcPictureOrder();
-  final _references = HevcDecodedPictures();
+  final _references = [HevcDecodedPictures()];
 
   HevcPicture? decode(Uint8List sample) {
     final slices = configuration.slices(sample);
@@ -54,26 +54,60 @@ final class HevcStreamDecoder {
       references: _references,
       poc: order.poc,
     );
-    _references.update(first, order.poc, picture);
     return order.output ? picture : null;
   }
 }
 
 HevcPicture _reconstruct(
   List<HevcSliceHeader> slices, {
-  HevcDecodedPictures? references,
+  List<HevcDecodedPictures>? references,
   int poc = 0,
 }) {
   final first = slices.first, sps = first.sps;
-  if (sps.separateColourPlane) {
-    throw UnsupportedError('Unsupported HEVC separate colour planes');
-  }
   if (sps.codedWidth * sps.codedHeight > 36 * 1024 * 1024) {
     throw const FormatException('Oversized HEVC picture');
   }
+  if (!sps.separateColourPlane) {
+    final dpb = references?.first;
+    final picture = _reconstructPlane(slices, dpb, poc);
+    dpb?.update(first, poc, picture);
+    if (references != null && references.length > 1) references.length = 1;
+    return picture;
+  }
+
+  // Slice segments can interleave across planes. Every plane has its own
+  // monochrome reconstruction, motion field and reference-picture buffer.
+  final planes = List.generate(3, (_) => <HevcSliceHeader>[]);
+  for (final slice in slices) {
+    planes[slice.parameters.colourPlane].add(slice);
+  }
+  if (planes.any((plane) => plane.isEmpty)) {
+    throw const FormatException('Missing HEVC colour plane');
+  }
+  if (references != null && references.length == 1) {
+    references.addAll([HevcDecodedPictures(), HevcDecodedPictures()]);
+  }
+  final pictures = [
+    for (final (index, plane) in planes.indexed)
+      _reconstructPlane(plane, references?[index], poc),
+  ];
+  if (references != null) {
+    for (final (index, plane) in planes.indexed) {
+      references[index].update(plane.first, poc, pictures[index]);
+    }
+  }
+  return HevcPicture.fromPlanes(pictures[0], pictures[1], pictures[2]);
+}
+
+HevcPicture _reconstructPlane(
+  List<HevcSliceHeader> slices,
+  HevcDecodedPictures? references,
+  int poc,
+) {
+  final first = slices.first;
   // For a field sequence the SPS dimensions describe one coded field.
   final picture = HevcPicture(
-    sps,
+    first.sps,
     inter: slices.any((s) => s.parameters.kind != HevcSliceKind.intra),
   );
   final decoder = _Reconstruction(picture, first, references, poc);

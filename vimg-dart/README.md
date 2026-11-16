@@ -132,7 +132,9 @@ transform-skip rotation and CABAC contexts, persistent Rice adaptation,
 cross-component prediction, coding-unit chroma QP adjustments and
 high-precision weighted prediction offsets. The decoder supports up to
 16-bit samples, extended transform precision and CABAC bypass alignment.
-Separate colour planes and hardware capture backends remain pending.
+HEVC 4:4:4 supports separate colour planes with interleaved slices and
+independent motion prediction for each plane. Hardware capture backends
+remain pending.
 
 MPEG-TS supports H.264, HEVC, MPEG-1 Video, MPEG-2 Video and MPEG-4 Visual in 188-byte TS,
 192-byte M2TS and 204-byte transport packets. Capture uses the first

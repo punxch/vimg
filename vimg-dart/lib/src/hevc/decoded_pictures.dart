@@ -118,8 +118,10 @@ final class HevcDecodedPictures {
     if (current.codedWidth != previous.codedWidth ||
         current.codedHeight != previous.codedHeight ||
         current.chromaArrayType != previous.chromaArrayType ||
+        current.separateColourPlane != previous.separateColourPlane ||
         current.lumaDepth != previous.lumaDepth ||
-        current.chromaDepth != previous.chromaDepth)
+        (!current.separateColourPlane &&
+            current.chromaDepth != previous.chromaDepth))
       throw const FormatException('Incompatible HEVC reference picture format');
     return picture;
   }

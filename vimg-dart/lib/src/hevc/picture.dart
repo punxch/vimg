@@ -25,6 +25,13 @@ final class HevcPicture {
             ),
       motion = inter ? HevcMotionField(sps.codedWidth, sps.codedHeight) : null;
 
+  HevcPicture.fromPlanes(HevcPicture y, HevcPicture blue, HevcPicture red)
+    : sps = y.sps,
+      luma = y.luma,
+      cb = blue.luma,
+      cr = red.luma,
+      motion = y.motion;
+
   final HevcSps sps;
   final HevcPlane luma;
   final HevcPlane? cb, cr;
@@ -43,7 +50,7 @@ final class HevcPicture {
     matrix: sps.colour.matrix,
     fullRange: sps.colour.fullRange,
     lumaDepth: sps.lumaDepth,
-    chromaDepth: sps.chromaDepth,
+    chromaDepth: cb?.depth ?? sps.chromaDepth,
     subsamplingX: sps.chromaShiftX,
     subsamplingY: sps.chromaShiftY,
     sampleAspect: sps.sampleAspect,

@@ -118,7 +118,10 @@ final class HevcConfiguration {
                   previous.sps != slice.sps ||
                   previous.nal.type != slice.nal.type ||
                   previous.nal.temporalId != slice.nal.temporalId ||
-                  previous.parameters.pocLsb != slice.parameters.pocLsb))) {
+                  previous.parameters.pocLsb != slice.parameters.pocLsb ||
+                  (slice.sps.separateColourPlane &&
+                      previous.parameters.output !=
+                          slice.parameters.output)))) {
         throw const FormatException(
           'HEVC sample contains unrelated slice segments',
         );

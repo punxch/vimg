@@ -60,7 +60,10 @@ final class HevcSliceHeader {
     final total = sps.ctbWidth * sps.ctbHeight;
     final dependent = !first && pps.dependentSlices && bits.flag();
     final address = first ? 0 : bits.read((total - 1).bitLength);
-    if (address >= total || (!first && address == 0)) {
+    // Only the first segment in the access unit carries the first-slice
+    // flag. The first segments of the other colour planes signal address zero.
+    if (address >= total ||
+        (address == 0 && !first && (dependent || !sps.separateColourPlane))) {
       throw const FormatException('Invalid HEVC slice segment address');
     }
     final HevcSliceParameters parameters;
