@@ -97,9 +97,42 @@ image.Image _previewFrame(
   YuvImageScaler scaler,
   void Function(String stage)? mark,
 ) {
+  try {
+    if (video.indexedPreviewPackets(seconds) case final indexed?) {
+      mark?.call('cue_index');
+      return _decodePreview(
+        video,
+        indexed,
+        seconds,
+        scaler,
+        mark,
+        indexed: true,
+      );
+    }
+  } catch (error) {
+    if (_previewError(error) == null) rethrow;
+    mark?.call('cue_fallback');
+  }
+  return _decodePreview(
+    video,
+    video.packets(preview: true),
+    seconds,
+    scaler,
+    mark,
+  );
+}
+
+image.Image _decodePreview(
+  Video video,
+  Iterable<FramePacket> packets,
+  int seconds,
+  YuvImageScaler scaler,
+  void Function(String stage)? mark, {
+  bool indexed = false,
+}) {
   FramePacket? previous, next;
   try {
-    for (final packet in video.packets(preview: true)) {
+    for (final packet in packets) {
       if (packet.seconds >= seconds) {
         next = packet;
         break;
@@ -109,7 +142,7 @@ image.Image _previewFrame(
       }
     }
   } catch (error) {
-    if (previous == null || _previewError(error) == null) rethrow;
+    if (indexed || previous == null || _previewError(error) == null) rethrow;
   } finally {
     mark?.call('seek');
   }

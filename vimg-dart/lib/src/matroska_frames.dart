@@ -26,11 +26,13 @@ Iterable<FramePacket> matroskaFrames(
   bool keyframes = false,
   FrameVisitor? onSample,
   MatroskaAlphaVisitor? onAlpha,
+  void Function(Uint8List)? onCodecState,
+  MatroskaCue? start,
 }) sync* {
-  int? trackNumber;
-  int? frameDuration;
-  var timestampScale = 1000000;
-  for (final element in media.segmentElements()) {
+  var trackNumber = start?.trackNumber;
+  var frameDuration = start?.defaultDuration;
+  var timestampScale = start?.timestampScale ?? 1000000;
+  for (final element in media.segmentElements(start: start?.clusterOffset)) {
     switch (element.id) {
       case 0x1549a966:
         timestampScale =
@@ -44,49 +46,101 @@ Iterable<FramePacket> matroskaFrames(
         frameDuration = media.number(track[0x23e383]);
       case matroskaCluster:
         if (trackNumber == null) continue;
-        // Timestamp can occur anywhere in a Cluster.
-        final timestamp = media
-            .elements(element.data, element.end)
-            .where((child) => child.id == 0xe7)
-            .firstOrNull;
-        final clusterTime = media.number(timestamp);
-        if (clusterTime == null)
-          throw const FormatException('Missing Cluster timestamp');
-        for (final child in media.elements(element.data, element.end)) {
-          if (child.id == 0xa3) {
-            yield* _block(
-              media,
-              child,
-              trackNumber,
-              clusterTime,
-              timestampScale,
-              frameDuration,
-              keyframes: keyframes,
-              onSample: onSample,
-            );
-          } else if (child.id == 0xa0) {
-            final group = media.fields(child);
-            final block = group[0xa1];
-            if (block == null) continue;
-            final sync = !group.containsKey(0xfb);
-            if (keyframes && !sync) continue;
-            final duration = media.number(group[0x9b]);
-            yield* _block(
-              media,
-              block,
-              trackNumber,
-              clusterTime,
-              timestampScale,
-              frameDuration,
-              blockDuration: duration,
-              groupKeyframe: sync,
-              additions: group[0x75a1],
-              onSample: onSample,
-              onAlpha: onAlpha,
-            );
-          }
-        }
+        yield* _clusterFrames(
+          media,
+          element,
+          trackNumber,
+          timestampScale,
+          frameDuration,
+          keyframes: keyframes,
+          cue: start,
+          onSample: onSample,
+          onAlpha: onAlpha,
+          onCodecState: onCodecState,
+        );
+        start = null;
     }
+  }
+}
+
+Iterable<FramePacket> _clusterFrames(
+  Matroska media,
+  EbmlElement cluster,
+  int trackNumber,
+  int timestampScale,
+  int? frameDuration, {
+  required bool keyframes,
+  required MatroskaCue? cue,
+  FrameVisitor? onSample,
+  MatroskaAlphaVisitor? onAlpha,
+  void Function(Uint8List)? onCodecState,
+}) sync* {
+  // Timestamp can occur anywhere in a Cluster.
+  final timestamp = media
+      .elements(cluster.data, cluster.end)
+      .where((child) => child.id == 0xe7)
+      .firstOrNull;
+  final clusterTime = media.number(timestamp);
+  if (clusterTime == null)
+    throw const FormatException('Missing Cluster timestamp');
+
+  var offset = cluster.data, blockNumber = 0;
+  for (final child in media.elements(cluster.data, cluster.end)) {
+    final relative = offset - cluster.data;
+    offset = child.end;
+    if (child.id != 0xa3 && child.id != 0xa0) continue;
+    blockNumber++;
+    if (cue != null &&
+        ((cue.relativePosition != null && cue.relativePosition != relative) ||
+            (cue.blockNumber != null && cue.blockNumber != blockNumber))) {
+      continue;
+    }
+    final group = child.id == 0xa0 ? media.fields(child) : null;
+    final block = group == null ? child : group[0xa1];
+    if (block == null) continue;
+    final sync = group == null ? null : !group.containsKey(0xfb);
+    if (keyframes && sync == false) continue;
+    final duration = media.number(group?[0x9b]);
+    if (cue != null) {
+      final first = _block(
+        media,
+        block,
+        trackNumber,
+        clusterTime,
+        timestampScale,
+        frameDuration,
+        keyframes: true,
+        groupKeyframe: sync,
+        blockDuration: duration,
+      ).firstOrNull;
+      if (first?.seconds != cue.ticks * (timestampScale / 1e9) ||
+          (cue.codecState?.end ?? 0) > child.end) {
+        continue;
+      }
+      cue = null;
+    }
+    if (group?[0xa4] case final state? when onCodecState != null) {
+      if (media.vint(block.data, block.end).value == trackNumber) {
+        onCodecState(media.codecState(state));
+      }
+    }
+    yield* _block(
+      media,
+      block,
+      trackNumber,
+      clusterTime,
+      timestampScale,
+      frameDuration,
+      keyframes: keyframes,
+      groupKeyframe: sync,
+      blockDuration: duration,
+      additions: group?[0x75a1],
+      onSample: onSample,
+      onAlpha: onAlpha,
+    );
+  }
+  if (cue != null) {
+    throw const FormatException('Cue does not point to a Matroska keyframe');
   }
 }
 

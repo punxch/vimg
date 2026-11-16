@@ -11,6 +11,7 @@ import 'metadata.dart';
 import 'raw_video.dart';
 
 part 'matroska_compression.dart';
+part 'matroska_cues.dart';
 
 const _ebml = 0x1a45dfa3;
 const _segment = 0x18538067;
@@ -41,6 +42,7 @@ final class Matroska {
   Matroska(this.file);
 
   final BinaryFile file;
+  late final _segmentRoot = _readSegment();
 
   late final firstVideoTrack = segmentElements()
       .where((element) => element.id == 0x1654ae6b)
@@ -154,7 +156,7 @@ final class Matroska {
     }
   }
 
-  Iterable<EbmlElement> segmentElements() sync* {
+  EbmlElement _readSegment() {
     final header = element(0, file.length);
     if (header.id != _ebml || header.unknownSize) {
       throw const FormatException('Invalid Matroska header');
@@ -164,37 +166,38 @@ final class Matroska {
       throw FormatException('Unsupported EBML document type: $type');
     }
     for (final root in elements(header.end, file.length)) {
-      if (root.id != _segment) continue;
-      var offset = root.data;
-      while (offset < root.end) {
-        var child = element(offset, root.end);
-        if (child.id == matroskaCluster && child.unknownSize) {
-          // A live muxer may omit the cluster size. The next Segment-level
-          // element closes it.
-          var boundary = child.data;
-          while (boundary < root.end) {
-            final next = element(boundary, root.end);
-            if (_segmentIds.contains(next.id)) break;
-            if (next.unknownSize) {
-              throw const FormatException(
-                'Unknown size within Matroska cluster',
-              );
-            }
-            boundary = next.end;
-          }
-          child = (
-            id: child.id,
-            data: child.data,
-            end: boundary,
-            unknownSize: true,
-          );
-        }
-        yield child;
-        offset = child.end;
-      }
-      return;
+      if (root.id == _segment) return root;
     }
     throw const FormatException('Missing Matroska segment');
+  }
+
+  Iterable<EbmlElement> segmentElements({int? start}) sync* {
+    final root = _segmentRoot;
+    var offset = start ?? root.data;
+    while (offset < root.end) {
+      var child = element(offset, root.end);
+      if (child.id == matroskaCluster && child.unknownSize) {
+        // A live muxer may omit the cluster size. The next Segment-level
+        // element closes it.
+        var boundary = child.data;
+        while (boundary < root.end) {
+          final next = element(boundary, root.end);
+          if (_segmentIds.contains(next.id)) break;
+          if (next.unknownSize) {
+            throw const FormatException('Unknown size within Matroska cluster');
+          }
+          boundary = next.end;
+        }
+        child = (
+          id: child.id,
+          data: child.data,
+          end: boundary,
+          unknownSize: true,
+        );
+      }
+      yield child;
+      offset = child.end;
+    }
   }
 
   static const _segmentIds = {
@@ -202,7 +205,7 @@ final class Matroska {
     0x114d9b74,
     0x1549a966,
     0x1654ae6b,
-    0x1c53bb6b,
+    _cuesId,
     0x1941a469,
     0x1043a770,
     0x1254c367,
@@ -238,21 +241,34 @@ final class Matroska {
     };
   }
 
-  VideoMetadata metadata() {
+  late final _metadata = _readMetadata();
+  late final int _timestampScale;
+  EbmlElement? _cues;
+
+  VideoMetadata metadata() => _metadata;
+
+  VideoMetadata _readMetadata() {
     var scale = 1000000;
     double? durationTicks;
     final tracks =
         <({String codec, int width, int height, int? frameDuration})>[];
     final attachments = <VideoStream>[];
+    var cueCount = 0, infoCount = 0, tracksCount = 0;
+    var hasCluster = false, headersBeforeClusters = true;
+    EbmlElement? cues;
     for (final child in segmentElements()) {
       switch (child.id) {
         case 0x1549a966:
+          infoCount++;
+          if (hasCluster) headersBeforeClusters = false;
           final info = fields(child);
           scale = number(info[0x2ad7b1]) ?? scale;
           if (scale <= 0)
             throw const FormatException('Invalid Matroska timestamp scale');
           durationTicks = floating(info[0x4489]);
         case 0x1654ae6b:
+          tracksCount++;
+          if (hasCluster) headersBeforeClusters = false;
           for (final track in videoTracks(child)) {
             final video = fields(track[0xe0]!);
             tracks.add((
@@ -267,8 +283,21 @@ final class Matroska {
             final attached = _attachment(entry);
             if (attached != null) attachments.add(attached);
           }
+        case _cuesId:
+          cueCount++;
+          cues = child;
+        case matroskaCluster:
+          hasCluster = true;
       }
     }
+    _timestampScale = scale;
+    _cues =
+        cueCount == 1 &&
+            infoCount == 1 &&
+            tracksCount == 1 &&
+            headersBeforeClusters
+        ? cues
+        : null;
     final duration = durationTicks == null ? null : durationTicks * scale / 1e9;
     final base = timeBase(scale, 1000000000);
     return VideoMetadata(

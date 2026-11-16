@@ -238,6 +238,13 @@ navigation remain pending.
 
 Matroska and WebM capture apply the selected track's pixel crop and rectangular
 projection roll or mirror before user filters and tile sizing.
+Static previews for AVC, HEVC and independently coded Matroska tracks seek to
+a validated video cue before the target. Scanning forward from that cue preserves
+frame selection with sparse indexes. AVC and HEVC can initialize from a
+`CueCodecState` reference and apply updates from `CodecState` blocks at
+random-access pictures. Missing or unusable indexes fall back to sequential
+selection. `preview --timings` includes the `cue_index` stage for indexed
+attempts.
 Matroska restores zlib, bzip2, LZO1X and header-stripped video frames and
 codec private data before decoding, including tracks with multiple compression
 layers.

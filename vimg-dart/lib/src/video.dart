@@ -601,6 +601,26 @@ final class Video {
     );
   }
 
+  Iterable<FramePacket>? indexedPreviewPackets(int seconds) {
+    final matroska = _matroska;
+    if (matroska == null || seconds <= 0) return null;
+    final name = codec;
+    final nal = name == 'h264' || name == 'hevc';
+    if (!nal && !_independentPreviewCodec(name)) return null;
+    final cue = matroska.previewCue(seconds);
+    if (cue == null) return null;
+    if (nal) return _nalPackets(preview: true, matroskaStart: cue);
+    if (cue.codecState != null) return null;
+    return matroskaFrames(matroska, start: cue);
+  }
+
+  bool _independentPreviewCodec(String name) =>
+      name == 'mjpeg' ||
+      name == 'png' ||
+      name == 'prores' ||
+      name == 'rawvideo' ||
+      isHuffYuvCodec(name);
+
   Iterable<FramePacket> _orderedIfNeeded(Iterable<FramePacket> packets) =>
       _iso?.hasOverlappingVideoFragments == true ||
           _ivf?.outOfOrder == true ||
@@ -675,6 +695,8 @@ final class Video {
     bool keyframes, {
     FrameVisitor? onSample,
     MatroskaAlphaVisitor? onAlpha,
+    void Function(Uint8List)? onMatroskaConfiguration,
+    MatroskaCue? matroskaStart,
     void Function(MediaBox)? onDescription,
     _IsoSection? section,
   }) {
@@ -697,6 +719,8 @@ final class Video {
         keyframes: keyframes,
         onSample: onSample,
         onAlpha: onAlpha,
+        onCodecState: onMatroskaConfiguration,
+        start: matroskaStart,
       );
     }
     final iso = _iso!;
@@ -819,6 +843,7 @@ final class Video {
     bool preview = false,
     void Function(FramePacket, int?, bool, _NalConfiguration?, bool)? onSample,
     _IsoSection? section,
+    MatroskaCue? matroskaStart,
   }) sync* {
     if (_aviNal case final avi?) {
       for (final frame in avi.frames) {
@@ -866,7 +891,11 @@ final class Video {
     void configure([MediaBox? description]) =>
         configureRecord(_configuration(name, description));
 
-    if (_matroska != null) configure();
+    if (matroskaStart?.codecState case final state?) {
+      configureRecord(_matroska!.codecState(state));
+    } else if (_matroska != null) {
+      configure();
+    }
     final encodedFrames = _matroska?.hasEncodedFrames ?? false;
 
     int? type;
@@ -878,6 +907,8 @@ final class Video {
       false,
       section: section,
       onDescription: configure,
+      onMatroskaConfiguration: configureRecord,
+      matroskaStart: matroskaStart,
       onSample: (packet, sync) {
         if (_flv case final flv?) {
           final bytes = flv.avcConfiguration(packet);
@@ -925,6 +956,12 @@ final class Video {
         display = packet;
         fieldPair = false;
         final field = avcSample?.field;
+        if (matroskaStart != null &&
+            ((!hasPicture && !keyframe) || field != null)) {
+          throw const FormatException(
+            'Matroska seek requires a complete random-access picture',
+          );
+        }
         if (field != null) {
           final previous = pendingField;
           if (previous != null &&
