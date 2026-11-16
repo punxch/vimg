@@ -58,17 +58,21 @@ Map<String, Object> writePreview(
         ((metadata.duration ?? 0) * (skip + (attached ? 0 : 5)) / 100).floor();
     final image.Image frame;
     try {
+      final cover = attached ? video.cover() : null;
+      if (attached) mark?.call('cover');
       frame =
-          (attached ? video.cover() : null) ?? _previewFrame(video, seconds);
-    } on UnsupportedError catch (error) {
-      return {
-        ...response,
-        'preview_fallback': error.message ?? error.toString(),
-      };
-    } on FormatException catch (error) {
-      return {...response, 'preview_fallback': error.message};
+          cover ??
+          _previewFrame(
+            video,
+            seconds,
+            YuvImageScaler(width: width, height: height, enlarge: false),
+            mark,
+          );
+    } catch (error) {
+      final message = _previewError(error);
+      if (message == null) rethrow;
+      return {...response, 'preview_fallback': message};
     }
-    mark?.call('decode');
     final scaled = resizeToFit(
       frame,
       width: width,
@@ -87,15 +91,54 @@ Map<String, Object> writePreview(
   }
 }
 
-image.Image _previewFrame(Video video, int seconds) {
-  FramePacket? last;
-  for (final packet in video.packets(preview: true)) {
-    last = packet;
-    if (packet.seconds >= seconds) break;
+image.Image _previewFrame(
+  Video video,
+  int seconds,
+  YuvImageScaler scaler,
+  void Function(String stage)? mark,
+) {
+  FramePacket? previous, next;
+  try {
+    for (final packet in video.packets(preview: true)) {
+      if (packet.seconds >= seconds) {
+        next = packet;
+        break;
+      }
+      if (previous == null || packet.seconds >= previous.seconds) {
+        previous = packet;
+      }
+    }
+  } catch (error) {
+    if (previous == null || _previewError(error) == null) rethrow;
+  } finally {
+    mark?.call('seek');
   }
-  if (last == null) throw const FormatException('No video frames');
-  return video.decode(last, preview: true);
+  image.Image decode(FramePacket packet, String stage) {
+    try {
+      return video.decode(packet, preview: true, previewScaler: scaler);
+    } finally {
+      mark?.call(stage);
+    }
+  }
+
+  final first = next ?? previous;
+  if (first == null) throw const FormatException('No video frames');
+  try {
+    return decode(first, 'decode');
+  } catch (error) {
+    if (next == null || previous == null || _previewError(error) == null) {
+      rethrow;
+    }
+    return decode(previous, 'decode_retry');
+  }
 }
+
+String? _previewError(Object error) => switch (error) {
+  final FormatException failure => failure.message,
+  final UnsupportedError failure => failure.message ?? failure.toString(),
+  final image.ImageException failure => failure.toString(),
+  _ => null,
+};
 
 const defaultCaptureThreads = 4;
 

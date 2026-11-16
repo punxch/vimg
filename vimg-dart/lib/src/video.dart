@@ -1689,7 +1689,11 @@ final class Video {
         file.read(packet.offset, packet.size);
   }
 
-  image.Image decode(FramePacket packet, {bool preview = false}) {
+  image.Image decode(
+    FramePacket packet, {
+    bool preview = false,
+    YuvImageScaler? previewScaler,
+  }) {
     if (_mixedIsoCodecs) {
       final section = _isoSectionByPacket[packet];
       if (section == null) throw const FormatException('Unknown video packet');
@@ -1721,13 +1725,19 @@ final class Video {
     if (codec == 'h264') {
       final config = _avcDecoderConfig(_previewNalConfigurations[packet]!);
       final picture = H264IdrDecoder(config).decode(_read(packet));
-      return picture?.rgb(scaler: _previewScaler) ??
+      final scaler = previewScaler == null
+          ? _previewScaler
+          : _presentationScaler(previewScaler);
+      return picture?.rgb(scaler: scaler) ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'hevc') {
       final config = _hevcDecoderConfig(_previewNalConfigurations[packet]!);
       final picture = HevcIntraDecoder(config).decode(_read(packet));
-      return picture?.rgb(scaler: _previewScaler) ??
+      final scaler = previewScaler == null
+          ? _previewScaler
+          : _presentationScaler(previewScaler);
+      return picture?.rgb(scaler: scaler) ??
           decodeSelected([packet]).single.frame;
     }
     if (codec == 'av1') {

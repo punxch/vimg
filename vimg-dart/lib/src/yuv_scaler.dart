@@ -20,13 +20,14 @@ bool _needsChromaResampling(
 
 /// Resize video samples before RGB conversion. Reuse filter taps across frames.
 final class YuvImageScaler {
-  YuvImageScaler({this.width, this.height, this.filters})
+  YuvImageScaler({this.width, this.height, this.filters, this.enlarge = true})
     : _exact = false,
       _algorithm = _ScaleAlgorithm.bicubic,
       _sampleAspect = null;
 
   YuvImageScaler._fixed(int this.width, int this.height, this._algorithm)
     : _exact = true,
+      enlarge = true,
       _sampleAspect = null,
       filters = null;
 
@@ -35,6 +36,7 @@ final class YuvImageScaler {
     this.height,
     this.filters,
     this._sampleAspect,
+    this.enlarge,
   ) : _exact = false,
       _algorithm = _ScaleAlgorithm.bicubic;
 
@@ -50,19 +52,26 @@ final class YuvImageScaler {
         ? scaler?.filters
         : VideoFilterChain._presentation(crop, orientation, scaler?.filters),
     sampleAspect,
+    scaler?.enlarge ?? true,
   );
 
   final int? width, height;
   final VideoFilterChain? filters;
   final double? _sampleAspect;
-  final bool _exact;
+  final bool enlarge, _exact;
   final _ScaleAlgorithm _algorithm;
   YuvImageScaler? _outputScale;
   late final YuvImageScaler? unscaled = filters == null
       ? null
       : width == null && height == null
       ? this
-      : YuvImageScaler._presentation(null, null, filters, _sampleAspect);
+      : YuvImageScaler._presentation(
+          null,
+          null,
+          filters,
+          _sampleAspect,
+          enlarge,
+        );
   _YuvGeometry? _geometry;
   late _PlaneScaler _luma;
   _PlaneScaler? _chroma;
@@ -147,6 +156,7 @@ final class YuvImageScaler {
       outputScale = _outputScale ??= YuvImageScaler(
         width: width,
         height: height,
+        enlarge: enlarge,
       );
     }
     if (outputScale == null &&
@@ -218,7 +228,13 @@ final class YuvImageScaler {
 
   (int, int) _dimensions(int sourceWidth, int sourceHeight) => _exact
       ? (width!, height!)
-      : fitDimensions(sourceWidth, sourceHeight, width: width, height: height);
+      : fitDimensions(
+          sourceWidth,
+          sourceHeight,
+          width: width,
+          height: height,
+          enlarge: enlarge,
+        );
 
   image.Image _resize({
     required List<int> y,

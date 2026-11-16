@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:image/image.dart' as image;
+import 'package:vimg_dart/src/video.dart';
 
 import 'fixtures.dart';
 
@@ -49,6 +50,103 @@ Future<void> main(List<String> arguments) async {
       check(
         preview.getPixel(0, 0).b > 200,
         'Preview selected the 2-second frame',
+      );
+    }
+    final source = Video(mkv.path);
+    final packets = source.packets().toList();
+    source.close();
+    final damaged = File('${temp.path}/damaged.mkv');
+    final original = mkv.readAsBytesSync();
+    void damageFrames(List<int> indices) {
+      final bytes = original.toList();
+      for (final index in indices) {
+        final packet = packets[index];
+        bytes.fillRange(packet.offset, packet.offset + packet.size, 0);
+      }
+      damaged.writeAsBytesSync(bytes);
+    }
+
+    damageFrames([2]);
+    final recovered = await run([
+      'preview',
+      '--output',
+      jpeg.path,
+      '--skip',
+      '20',
+      '--timings',
+      damaged.path,
+    ]);
+    final recoveredMetadata = jsonDecode(recovered.stdout as String) as Map;
+    check(recoveredMetadata['preview_written'] == true, 'Preview recovery');
+    final pixel = image.decodeJpg(jpeg.readAsBytesSync())!.getPixel(0, 0);
+    check(pixel.g > 200 && pixel.b < 30, 'Retry uses the previous frame');
+    const prefix = 'vimg-preview-timing ';
+    final timing =
+        jsonDecode((recovered.stderr as String).substring(prefix.length))
+            as Map;
+    final stages = (timing['stages_ms'] as List)
+        .map((stage) => (stage as List).first)
+        .toList();
+    check(
+      stages.indexOf('seek') < stages.indexOf('decode') &&
+          stages.indexOf('decode') < stages.indexOf('decode_retry') &&
+          stages.indexOf('decode_retry') < stages.indexOf('publish'),
+      'Preview seek and both decode attempts have separate timings',
+    );
+
+    damageFrames([1, 2]);
+    final oldJpeg = base64Encode(jpeg.readAsBytesSync());
+    final failed = await run([
+      'preview',
+      '--output',
+      jpeg.path,
+      '--skip',
+      '20',
+      damaged.path,
+    ]);
+    final failedMetadata = jsonDecode(failed.stdout as String) as Map;
+    check(
+      failedMetadata['preview_written'] == false &&
+          failedMetadata['preview_fallback'] is String &&
+          base64Encode(jpeg.readAsBytesSync()) == oldJpeg,
+      'Both failed attempts leave the existing preview file intact',
+    );
+
+    for (final path in [
+      'test/fixtures/avc-422-cavlc.mp4',
+      'test/fixtures/hevc-all-intra.mkv',
+    ]) {
+      final video = Video(path);
+      final first = video.decode(
+        video.packets(preview: true).first,
+        preview: true,
+      );
+      video.close();
+      final native = await run(['preview', '--output', jpeg.path, path]);
+      final nativeMetadata = jsonDecode(native.stdout as String) as Map;
+      final full = image.decodeJpg(jpeg.readAsBytesSync())!;
+      check(
+        nativeMetadata['preview_written'] == true &&
+            (full.width, full.height) == (first.width, first.height),
+        'Preview preserves native dimensions inside the bounds for $path',
+      );
+      await run([
+        'preview',
+        '--output',
+        jpeg.path,
+        '--max-width',
+        '33',
+        '--max-height',
+        '33',
+        path,
+      ]);
+      final small = image.decodeJpg(jpeg.readAsBytesSync())!;
+      final ratio = full.width >= full.height
+          ? (33, (33 * full.height / full.width).round())
+          : ((33 * full.width / full.height).round(), 33);
+      check(
+        (small.width, small.height) == ratio,
+        'Preview bounds preserve the aspect ratio for $path',
       );
     }
     final rawProbe = await run(['probe', raw.path]);

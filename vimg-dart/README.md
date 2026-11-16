@@ -30,7 +30,11 @@ formats depend on the Dart image library's encoders and decoders.
 
 - `vimg preview --output preview.jpg video.mov` writes a bounded JPEG and
   returns the Yazi metadata response. It can read embedded cover art and VP8
-  keyframes as well as the video codecs below.
+  keyframes as well as the video codecs below. If the preview frame at or
+  after the target fails, it tries the closest preceding frame once. AVC
+  and HEVC keyframes decoded directly use bounded YUV scaling before RGB
+  conversion. `--timings` reports seek and decode attempts separately on
+  stderr.
 - `vimg extract -n3 --output-dir frames video.mkv` writes sampled BMP frames.
 - `vimg vcs -c3 -H160 -n9 video.mkv -o grid.avif` writes an animated AVIF.
   Pass `-f1` for a still, `--webp 1` for WebP or choose a `.jpg` output for JPEG.
