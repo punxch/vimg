@@ -47,6 +47,7 @@ extension _H263Prediction on _Mpeg4MotionCompensation {
     bool average = false,
     _MotionBounds? bounds,
     bool extend = true,
+    List<H263Picture>? lumaReferences,
   }) {
     final blockSize = reduced ? 16 : 8;
     final physical = reduced
@@ -78,6 +79,7 @@ extension _H263Prediction on _Mpeg4MotionCompensation {
       average: average,
       truncateAverage: average,
       bounds: bounds,
+      lumaReferences: lumaReferences,
     );
   }
 }

@@ -492,14 +492,23 @@ int h263TemporalDistance(int previous, H263Header header) =>
   int previous,
   int following,
   H263Header header,
+) =>
+    h263BInterval(previous, following, header) ??
+    (throw const FormatException(
+      'H.263+ B-picture lies outside its references',
+    ));
+
+({int offset, int distance})? h263BInterval(
+  int previous,
+  int following,
+  H263Header header,
 ) {
   final wrap = header.format.customClock ? 1024 : 256;
   final offset = (header.temporalReference - previous) % wrap;
   final distance = (following - previous) % wrap;
-  if (offset == 0 || offset >= distance) {
-    throw const FormatException('H.263+ B-picture lies outside its references');
-  }
-  return (offset: offset, distance: distance);
+  return offset > 0 && offset < distance
+      ? (offset: offset, distance: distance)
+      : null;
 }
 
 int h263PbDistance(int previous, H263Header header) {

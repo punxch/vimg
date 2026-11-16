@@ -206,8 +206,9 @@ intra pictures, and redundant copies share one display frame. Multiplexed
 back-channel messages require reverse-stream configuration and remain pending.
 Annex U supports whole-picture buffers with sliding-window and adaptive
 short- and long-term references. Picture, GOB and slice headers can remap
-the reference order for single-reference prediction in each direction.
-Macroblock-level reference selection and sub-picture removal remain pending.
+the reference order. P, Improved PB, EP and B pictures can select references
+per macroblock, including four-reference luma prediction and two selectable
+backward references in B pictures. Sub-picture removal remains pending.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
 and disposable Spark pictures.
 

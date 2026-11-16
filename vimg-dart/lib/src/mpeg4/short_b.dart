@@ -67,28 +67,37 @@ extension _H263Bidirectional on _H263Macroblocks {
   void decodeB(_H263Reference latest) {
     final columns = _columns, rows = _rows;
     final backward = _PictureMotion(columns, rows, false);
-    final original = _h263AlignReference(
-      latest.picture,
-      reduced: header.reduced,
-    );
-    final pictureTiming = erps?.picture.forward;
-    final backwardPictures = <H263Picture, H263Picture>{
-      latest.picture: original,
-    };
-    for (final index in _macroblockOrder(backward: original)) {
-      final (picture: older, :offset, :distance) = _forward!;
-      final pastBackward = _erpsBackward ?? latest;
-      final newer = backwardPictures.putIfAbsent(
-        pastBackward.picture,
-        () =>
-            _h263AlignReference(pastBackward.picture, reduced: header.reduced),
+    final backwardPictures = <H263Picture, H263Picture>{};
+    (H263Picture, _H263Reference) backwardAt(int index) {
+      final source = erps?.backward(_erpsGroup!, index) ?? latest;
+      final aligned = backwardPictures.putIfAbsent(
+        source.picture,
+        () => _h263AlignReference(source.picture, reduced: header.reduced),
       );
-      _validateTemporalSegments(newer);
+      _validateTemporalSegments(aligned);
+      return (aligned, source);
+    }
+
+    late final pictureTiming = erps?.directTiming();
+    for (final index in _macroblockOrder()) {
       final bounds = _boundsAt(index);
       final x = index % columns, y = index ~/ columns;
-      var mode = _h263BMode.read(_bits);
-      while (mode == _h263BModes.length) {
-        mode = _h263BMode.read(_bits);
+      final (mode, shortcut) = _readLayerMacroblock(
+        _h263BMode,
+        _h263BModes.length,
+      );
+      if (shortcut != 0) {
+        _prediction.predictH263(
+          picture,
+          _forwardAt(shortcut).picture,
+          x,
+          y,
+          [_zeroVector],
+          reduced: header.reduced,
+          bounds: bounds,
+        );
+        if (header.reduced) _filterQuant[index] = _quant;
+        continue;
       }
       final (prediction, texture, changeQuant) = _h263BModes[mode];
       final intra = prediction == _H263BPrediction.intra;
@@ -104,54 +113,49 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (changeQuant) _readQuantChange();
       switch (prediction) {
         case _H263BPrediction.direct:
+          final forward = _forwardAt();
+          final (newer, source) = backwardAt(0);
           _predictBDirect(
-            older,
+            forward.picture,
             newer,
-            pastBackward,
+            source,
             x,
             y,
-            pictureTiming?.offset ?? offset,
-            pictureTiming?.distance ?? distance,
+            pictureTiming?.offset ?? forward.offset,
+            pictureTiming?.distance ?? forward.distance,
             bounds,
           );
         case _H263BPrediction.forward:
         case _H263BPrediction.both:
-          final forward = _readBVector(_motion, x, y);
+          final forward = _forwardAt(_readErpsMotionReference());
+          final vector = _readBVector(_motion, x, y);
           _prediction.predictH263(
             picture,
-            older,
-            x,
-            y,
-            [forward],
-            reduced: header.reduced,
-            bounds: bounds,
-          );
-          if (prediction == _H263BPrediction.both) {
-            final vector = _readBVector(backward, x, y);
-            _prediction.predictH263(
-              picture,
-              newer,
-              x,
-              y,
-              [vector],
-              reduced: header.reduced,
-              average: true,
-              bounds: bounds,
-            );
-          }
-        case _H263BPrediction.backward:
-          final vector = _readBVector(backward, x, y);
-          _prediction.predictH263(
-            picture,
-            newer,
+            forward.picture,
             x,
             y,
             [vector],
             reduced: header.reduced,
             bounds: bounds,
           );
+        case _H263BPrediction.backward:
         case _H263BPrediction.intra:
           break;
+      }
+      if (prediction == _H263BPrediction.both ||
+          prediction == _H263BPrediction.backward) {
+        final (newer, _) = backwardAt(_readErpsBackwardReference());
+        final vector = _readBVector(backward, x, y);
+        _prediction.predictH263(
+          picture,
+          newer,
+          x,
+          y,
+          [vector],
+          reduced: header.reduced,
+          average: prediction == _H263BPrediction.both,
+          bounds: bounds,
+        );
       }
       for (var block = 0; block < 6; block++) {
         final coded = pattern & (32 >> block) != 0;
@@ -170,6 +174,19 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (header.reduced && mode != 0) _filterQuant[index] = _quant;
     }
     _finishFilter();
+  }
+
+  int _readErpsBackwardReference() {
+    if (_erpsGroup?.syntax.twoBackward != true) return 0;
+    final position = _bits.position;
+    final index = _bits.bit();
+    if (index == 0 && !header.format.unrestricted) {
+      _bits.position = position - 5;
+      final zeroes = _bits.read(5) == 0;
+      _bits.skip(1);
+      if (zeroes) h263Marker(_bits);
+    }
+    return index;
   }
 
   _Vector _readBVector(_PictureMotion motion, int x, int y) {

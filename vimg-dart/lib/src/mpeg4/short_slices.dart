@@ -3,7 +3,7 @@ part of 'decoder.dart';
 typedef _H263Slice = ({H263GroupHeader header, int data, int end});
 
 extension _H263Slices on _H263Macroblocks {
-  Iterable<int> _macroblockOrder({H263Picture? backward}) sync* {
+  Iterable<int> _macroblockOrder() sync* {
     if (!header.format.rectangularSlices &&
         !header.format.arbitrarySlices &&
         !header.format.independentSegments &&
@@ -15,7 +15,6 @@ extension _H263Slices on _H263Macroblocks {
       return;
     }
     final (:layout, :counts) = _preparedSlices;
-    _validateTemporalSegments(backward);
     final sac = _sac;
     for (final (i, slice) in layout.indexed) {
       final group = slice.header;
@@ -129,9 +128,12 @@ extension _H263Slices on _H263Macroblocks {
   }
 
   void _finishSlice(int end) {
-    final stuffing = header.intra ? 9 : 10;
+    final multiple = _multiplePrediction;
+    final stuffing = multiple ? 11 : (header.intra ? 9 : 10);
+    // Annex U inserts PR0=0 after COD=0, even for a stuffing macroblock.
+    final word = multiple ? 0x201 : 1;
     while (end - _bits.position >= stuffing) {
-      if (_bits.read(stuffing) != 1) {
+      if (_bits.read(stuffing) != word) {
         throw const FormatException('Unexpected data after H.263+ slice');
       }
     }

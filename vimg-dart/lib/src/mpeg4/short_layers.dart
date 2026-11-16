@@ -96,10 +96,7 @@ extension _H263Enhancement on _H263Macroblocks {
     final modes = ei ? _h263EiMode : _h263EpMode;
     final stuffing = ei ? 17 : _h263EpModes.length;
     for (final index in _macroblockOrder()) {
-      var code = modes.read(_bits);
-      while (code == stuffing) {
-        code = modes.read(_bits);
-      }
+      final (code, shortcut) = _readLayerMacroblock(modes, stuffing);
       final (prediction, texture, changeQuant) = ei
           ? (
               code >= 9 ? _LayerPrediction.intra : _LayerPrediction.upward,
@@ -125,10 +122,11 @@ extension _H263Enhancement on _H263Macroblocks {
           prediction == _LayerPrediction.forward ||
           prediction == _LayerPrediction.blend;
       if (usesForward) {
+        final referenceIndex = texture ? _readErpsMotionReference() : shortcut;
         final vectors = texture ? _readMotion(x, y, false) : [_zeroVector];
         _prediction.predictH263(
           picture,
-          reference!,
+          _forwardAt(referenceIndex).picture,
           x,
           y,
           vectors,
@@ -164,7 +162,8 @@ extension _H263Enhancement on _H263Macroblocks {
           );
         }
       }
-      if ((header.reduced || header.format.loopFilter) && code != 0) {
+      if ((header.reduced || header.format.loopFilter) &&
+          (code != 0 || shortcut != 0)) {
         _filterQuant[index] = _quant;
       }
     }

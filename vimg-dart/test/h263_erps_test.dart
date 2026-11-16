@@ -8,6 +8,7 @@ import 'package:vimg_dart/src/video.dart';
 import 'fixtures.dart';
 
 const _input = 'test/fixtures/h263-erps-whole.h263';
+const _multiple = 'test/fixtures/h263-erps-multiple.h263';
 
 Future<void> main(List<String> arguments) async {
   // Inter- and B-pictures choose older anchors across intra pictures,
@@ -35,6 +36,45 @@ Future<void> main(List<String> arguments) async {
     (32, 32),
     [(0, 3297136590), (4, 2188566787), (8, 1429583243)],
   );
+  // Four luma references in an overlapped P prediction, two backward
+  // anchors for B, and macroblock emulation prevention bits.
+  await _verify(
+    _multiple,
+    (48, 48),
+    [
+      (0, 3051300694),
+      (4, 2423074036),
+      (6, 2164495757),
+      (7, 2976680510),
+      (8, 1996439153),
+      (12, 191463258),
+    ],
+  );
+  // Improved PB uses separate PR and PRB fields and the latest anchor's
+  // temporal interval for direct predictions from an older reference.
+  await _verify(
+    'test/fixtures/h263-erps-paired.h263',
+    (48, 32),
+    [(0, 147444639), (4, 1083431100), (6, 2458478402), (8, 3028833305)],
+  );
+  await _verify(
+    'test/fixtures/h263-erps-ep.h263',
+    (32, 32),
+    [(0, 4130403365), (4, 174037254), (8, 3688018285)],
+  );
+  // Annex J permits four different luma references without overlap.
+  // Both chroma planes use the primary luma reference.
+  await _verify(
+    'test/fixtures/h263-erps-four-luma.h263',
+    (32, 32),
+    [
+      (0, 3553379717),
+      (4, 2439526410),
+      (8, 3164132516),
+      (12, 1427980596),
+      (16, 2535081388),
+    ],
+  );
   _checkEviction();
   if (arguments.firstOrNull case final cli?) {
     final directory = Directory.systemTemp.createTempSync('vimg-h263-erps-');
@@ -49,7 +89,7 @@ Future<void> main(List<String> arguments) async {
         '-t160ms',
         '-o',
         output.path,
-        _input,
+        _multiple,
       ]);
       check(result.exitCode == 0, 'H.263 ERPS capture ${result.stderr}');
       check(

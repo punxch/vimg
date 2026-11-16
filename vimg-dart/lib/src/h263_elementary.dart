@@ -65,10 +65,12 @@ final class H263Elementary {
     H263Header? previous;
     final latest = <int, (int, int)>{};
     final older = <int, (int, int)>{};
+    final third = <int, (int, int)>{};
     // Accumulate at the common clock before rounding to output timestamps.
     const commonClock = 3 * _clock;
     var elapsed = 0;
     void remember(H263Header header, int time) {
+      if (older[header.layer] case final second?) third[header.layer] = second;
       if (latest[header.layer] case final last?) older[header.layer] = last;
       latest[header.layer] = (header.temporalReference, time);
     }
@@ -85,8 +87,17 @@ final class H263Elementary {
       format ??= header.format;
       if (header.bidirectional) {
         var time = (elapsed + 1) ~/ 3;
-        final before = older[header.referenceLayer];
-        final after = latest[header.referenceLayer];
+        final layer = header.referenceLayer;
+        var before = older[layer];
+        var after = latest[layer];
+        if (header.erps != null &&
+            before != null &&
+            after != null &&
+            h263BInterval(before.$1, after.$1, header) == null) {
+          // Annex U can transmit two future reference pictures before this B.
+          after = before;
+          before = third[layer];
+        }
         if (before != null && after != null) {
           final timing = h263BTiming(before.$1, after.$1, header);
           final between = (after.$2 - before.$2) * timing.offset;

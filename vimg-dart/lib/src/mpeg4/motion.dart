@@ -219,6 +219,7 @@ final class _Mpeg4MotionCompensation {
     bool truncateAverage = false,
     int blockSize = 8,
     _MotionBounds? bounds,
+    List<_DctPicture>? lumaReferences,
   }) {
     final stride = output.stride, lines = output.rows * 16;
     final split = vectors.length == 4;
@@ -230,7 +231,7 @@ final class _Mpeg4MotionCompensation {
       sumY += quarter ? vector.y ~/ 2 : vector.y;
       luma(
         output.planes[0],
-        reference.planes[0],
+        (lumaReferences?[i] ?? reference).planes[0],
         stride,
         lines,
         blockSize * (x * 2 + (i & 1)),

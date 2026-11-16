@@ -18,6 +18,7 @@ extension _Mpeg4Timeline on Video {
     final bidirectional = <int>{};
     final layerNumbers = <int>[];
     final older = <int, _H263TimedReference>{};
+    final third = <int, _H263TimedReference>{};
     final previous = <int, _H263TimedReference>{};
     final retainedReferences = <int, Set<int>>{};
     var anchor = -1, firstAnchor = -1;
@@ -36,6 +37,7 @@ extension _Mpeg4Timeline on Video {
     }
 
     void remember(H263Header header, FramePacket frame, int requiredAnchor) {
+      if (older[header.layer] case final second?) third[header.layer] = second;
       if (previous[header.layer] case final last?) older[header.layer] = last;
       previous[header.layer] = (
         packet: frame,
@@ -88,8 +90,16 @@ extension _Mpeg4Timeline on Video {
                 }
                 if (header.bidirectional) {
                   var frame = packet;
-                  final before = older[header.referenceLayer];
-                  final after = previous[header.referenceLayer];
+                  var before = older[referenceLayer];
+                  var after = previous[referenceLayer];
+                  if (header.erps != null &&
+                      before != null &&
+                      after != null &&
+                      h263BInterval(before.temporal, after.temporal, header) ==
+                          null) {
+                    after = before;
+                    before = third[referenceLayer];
+                  }
                   var start = -1;
                   if (before != null && after != null) {
                     final timing = h263BTiming(

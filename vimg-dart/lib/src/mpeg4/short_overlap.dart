@@ -24,7 +24,13 @@ final class _H263Overlap {
     _segments[index] = _segmented ? start + 1 : 1;
   }
 
-  void predict(int x, int y, H263Picture reference, _MotionBounds? bounds) {
+  void predict(
+    int x,
+    int y,
+    H263Picture reference,
+    _MotionBounds? bounds,
+    List<H263Picture>? lumaReferences,
+  ) {
     final columns = _columns, size = 8 << _scale;
     final segment = _segments[y * columns + x];
     _Vector motionAt(int x, int y) {
@@ -46,7 +52,7 @@ final class _H263Overlap {
         return motionAt(rx, ry);
       }
 
-      _predictBlock(reference, bx * size, by * size, [
+      _predictBlock(lumaReferences?[block] ?? reference, bx * size, by * size, [
         center,
         remote(bx, by - 1),
         block < 2 ? remote(bx, by + 1) : center,

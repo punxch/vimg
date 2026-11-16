@@ -9,7 +9,7 @@ final class _H263Pb {
   final H263Picture current;
   final H263Picture? output;
   final _Mpeg4MotionCompensation sampler;
-  late _H263Forward _forward;
+  _H263Forward? _forward;
   late final residuals = List.generate(6, (_) => Int16List(64));
   late final _blockSize = header.macroblockSize >> 1;
   late final _backward = Uint8List(_blockSize * _blockSize);
@@ -19,7 +19,7 @@ final class _H263Pb {
 
   _Vector get leftForward => _mode == _PbMode.forward ? _motion : _zeroVector;
 
-  void queue(_PbMode mode, _Vector vector, int pattern, _H263Forward forward) {
+  void queue(_PbMode mode, _Vector vector, int pattern, _H263Forward? forward) {
     _mode = mode;
     _motion = vector;
     _pattern = pattern;
@@ -41,7 +41,7 @@ final class _H263Pb {
       case _PbMode.forward:
         sampler.predictH263(
           picture,
-          _forward.picture,
+          _forward!.picture,
           x,
           y,
           [_motion],
@@ -84,7 +84,7 @@ final class _H263Pb {
     _MotionBounds? bounds,
   ) {
     final forward = <_Vector>[], backward = <_Vector>[];
-    final (picture: previous, :offset, :distance) = _forward;
+    final (picture: previous, :offset, :distance) = _forward!;
     (int, int) scale(int component, int delta) {
       final scaled = component * offset ~/ distance;
       if (delta == 0)

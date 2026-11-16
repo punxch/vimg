@@ -9,9 +9,9 @@ final class _Vlc {
 
   final Map<int, int> _values;
 
-  int read(Rbsp bits) {
-    var key = 1;
-    for (var count = 0; count < 16; count++) {
+  int read(Rbsp bits, {bool leadingZero = false}) {
+    var key = leadingZero ? 2 : 1;
+    for (var count = leadingZero ? 1 : 0; count < 16; count++) {
       key = (key << 1) | bits.bit();
       if (_values[key] case final index?) return index;
     }

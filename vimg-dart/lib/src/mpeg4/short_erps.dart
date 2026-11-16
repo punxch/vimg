@@ -103,7 +103,11 @@ final class _H263ErpsBuffer {
   }
 }
 
-typedef _H263ErpsForward = ({_H263Forward? forward, _H263Reference? backward});
+typedef _H263ErpsGroup = ({
+  H263Erps syntax,
+  List<_H263Reference> references,
+  int backwardCount,
+});
 
 final class _H263ErpsSelection {
   _H263ErpsSelection(this.header, this.buffer, this.latest);
@@ -113,57 +117,85 @@ final class _H263ErpsSelection {
   final _H263Reference? latest;
   final _resolved = <H263Picture, H263Picture>{};
   var _resampled = false;
-  late final picture = select(header.erps!);
+  late final picture = _select(header.erps!);
 
-  _H263ErpsForward select(H263Erps layer) {
-    if (layer.multiple) {
-      throw UnsupportedError('H.263+ ERPS macroblock reference selection');
+  _H263ErpsGroup select(H263Erps layer) =>
+      identical(layer, header.erps) ? picture : _select(layer);
+
+  _H263ErpsGroup _select(H263Erps layer) => (
+    syntax: layer,
+    references: buffer.ordered(layer),
+    backwardCount: header.bidirectional ? (layer.twoBackward ? 2 : 1) : 0,
+  );
+
+  _H263Reference _at(_H263ErpsGroup group, int index) {
+    if (index >= group.references.length) {
+      throw FormatException('Missing H.263+ ERPS prediction reference $index');
     }
-    if (header.intra || header.enhancementIntra) {
-      return (forward: null, backward: null);
-    }
-    final references = buffer.ordered(layer);
-    final bidirectional = header.bidirectional;
-    if (references.length < (bidirectional ? 2 : 1)) {
-      throw const FormatException('Missing H.263+ ERPS prediction references');
-    }
-    final backward = bidirectional ? references[0] : null;
-    final source = references[bidirectional ? 1 : 0];
-    if (backward != null && !_h263Matches(backward.picture, header.format)) {
+    return group.references[index];
+  }
+
+  _H263Reference backward(_H263ErpsGroup group, int index) {
+    final source = _at(group, index);
+    if (!_h263Matches(source.picture, header.format)) {
       throw const FormatException(
         'Invalid H.263+ ERPS backward reference size',
       );
     }
+    return source;
+  }
+
+  _H263Forward forward(_H263ErpsGroup group, int index) {
+    final source = _at(group, group.backwardCount + index);
+    final warp =
+        header.resampling != null ||
+        !_h263Matches(source.picture, header.format);
+    if (warp &&
+        (header.erps!.multiple ||
+            group.syntax.multiple ||
+            source != _at(picture, picture.backwardCount))) {
+      throw const FormatException(
+        'H.263+ ERPS resampling requires one reference picture',
+      );
+    }
     final reference = _resolved.putIfAbsent(source.picture, () {
-      final warp =
-          header.resampling != null ||
-          !_h263Matches(source.picture, header.format);
       if ((_resampled || warp) && _resolved.isNotEmpty) {
         throw const FormatException(
           'H.263+ ERPS resampling requires one reference picture',
         );
       }
       _resampled = warp;
+      final round = header.bidirectional
+          ? backward(picture, 0).resamplingRound
+          : header.noRound;
       return _h263PredictionReference(
         source.picture,
         header,
-        backward?.resamplingRound ?? header.noRound,
+        round ?? header.noRound,
       );
     });
-    int offset = 0, distance = 0;
-    if (backward != null && identical(layer, header.erps)) {
-      (offset: offset, distance: distance) = h263BTiming(
-        source.temporal,
-        backward.temporal,
-        header,
+    return (
+      picture: reference,
+      offset: header.pb?.offset ?? 0,
+      distance: header.pb == null
+          ? 0
+          : h263PbDistance(latest!.temporal, header),
+    );
+  }
+
+  ({int offset, int distance}) directTiming() {
+    final ahead = backward(picture, 0).temporal;
+    final behind = _at(picture, picture.backwardCount).temporal;
+    final wrap = header.format.customClock ? 1024 : 256;
+    final distance = (ahead - behind) % wrap;
+    if (distance == 0) {
+      throw const FormatException(
+        'Invalid H.263+ ERPS direct prediction interval',
       );
-    } else if (header.pb case final pair?) {
-      offset = pair.offset;
-      distance = h263PbDistance(latest!.temporal, header);
     }
     return (
-      forward: (picture: reference, offset: offset, distance: distance),
-      backward: backward,
+      offset: (header.temporalReference - behind) % wrap,
+      distance: distance,
     );
   }
 }

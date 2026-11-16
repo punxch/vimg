@@ -72,10 +72,10 @@ final class H263Decoder {
     if (header.bidirectional) {
       if (!includeStandaloneB) return (picture: null, bidirectional: null);
       final older = _olderReferences[referenceLayer];
-      final newest = erps?.picture.backward ?? latest;
+      final newest = latest;
       if ((erps == null && older == null) ||
           newest == null ||
-          !_h263Matches(newest.picture, format)) {
+          (erps == null && !_h263Matches(newest.picture, format))) {
         throw const FormatException('Missing H.263+ B-picture references');
       }
       final select = erps == null
@@ -85,7 +85,7 @@ final class H263Decoder {
       _H263Macroblocks(
         header,
         picture,
-        erps?.picture.forward ?? select?.call(header.predictionTemporal),
+        select?.call(header.predictionTemporal),
         _transform,
         _prediction,
         null,
@@ -120,7 +120,7 @@ final class H263Decoder {
       final blocks = _H263Macroblocks(
         header,
         picture,
-        erps?.picture.forward ?? select?.call(header.predictionTemporal),
+        select?.call(header.predictionTemporal),
         _transform,
         _prediction,
         null,
@@ -151,7 +151,7 @@ final class H263Decoder {
     final macroblocks = _H263Macroblocks(
       header,
       picture,
-      erps?.picture.forward ?? select?.call(header.predictionTemporal),
+      select?.call(header.predictionTemporal),
       _transform,
       _prediction,
       pb,
@@ -298,15 +298,53 @@ final class _H263Macroblocks {
   H263Picture? get reference => _forward?.picture;
   final _H263Forward Function(int?)? _selectForward;
   final _H263ErpsSelection? erps;
-  _H263Reference? _erpsBackward;
+  _H263ErpsGroup? _segmentErps;
+  _H263ErpsGroup? get _erpsGroup => _segmentErps ?? erps?.picture;
+  bool get _multiplePrediction => _erpsGroup?.syntax.multiple == true;
+  bool _unmarkedShortcut = false;
 
   void _setErpsGroup(H263Erps group) {
-    final selection = erps!;
-    final resolved = identical(group, header.erps)
-        ? selection.picture
-        : selection.select(group);
-    _forward = resolved.forward;
-    _erpsBackward = resolved.backward;
+    _segmentErps = erps!.select(group);
+  }
+
+  _H263Forward _forwardAt([int index = 0]) {
+    final selection = erps;
+    if (selection == null) return _forward!;
+    final forward = selection.forward(_erpsGroup!, index);
+    _validateTemporalSegments(forward.picture);
+    return forward;
+  }
+
+  int _readErpsShortcut() {
+    final index = h263ErpsVlc(_bits);
+    final marker =
+        index == 1 && (header.format.structured || _unmarkedShortcut);
+    if (marker) h263Marker(_bits);
+    _unmarkedShortcut = index == 1 && !marker;
+    return index;
+  }
+
+  int _readErpsMotionReference() {
+    if (!_multiplePrediction) return 0;
+    final index = h263ErpsVlc(_bits);
+    if (index == 1 && !header.format.unrestricted) h263Marker(_bits);
+    return index;
+  }
+
+  (int, int) _readLayerMacroblock(_Vlc table, int stuffing) {
+    while (true) {
+      final int code;
+      if (_multiplePrediction) {
+        if (_bits.flag()) return (0, 0);
+        // Figure U.7 places PR0 directly before MBTYPE in B- and EP-pictures.
+        final index = h263ErpsVlc(_bits);
+        if (index != 0) return (0, index);
+        code = table.read(_bits, leadingZero: true);
+      } else {
+        code = table.read(_bits);
+      }
+      if (code != stuffing) return (code, 0);
+    }
   }
 
   final MpegIdct _transform;
@@ -337,10 +375,11 @@ final class _H263Macroblocks {
       header.format.arithmetic && !header.bidirectional && !header.enhancement
       ? _H263Sac(_bits)
       : null;
-  late final _overlap = header.format.overlapping && reference != null
+  late final _overlap = header.format.overlapping && !header.intra
       ? _H263Overlap(picture, _motion, _prediction, header)
       : null;
   H263Picture? _pendingReference;
+  List<H263Picture>? _pendingLumaReferences;
   int _pendingPattern = -1;
   Uint8List? _intraWithMotion;
   Rbsp get _bits => header.bits;
@@ -354,27 +393,16 @@ final class _H263Macroblocks {
       final preceding = previous;
       previous = index;
       final x = index % columns, y = index ~/ columns;
-      final mode = _readMacroblock();
+      final (mode, shortcut) = _readMacroblock();
       if (mode == -1) {
         overlap?.markMotion(index, _sliceStart);
         _finishPrevious(preceding);
-        if (overlap != null) {
-          _pendingPattern = 0;
-          _pendingReference = reference;
-        } else {
-          _prediction.predictH263(
-            picture,
-            reference!,
-            x,
-            y,
-            [_zeroVector],
-            reduced: header.reduced,
-            noRound: header.noRound,
-            bounds: _boundsAt(index),
-            extend: header.canExtendMotion,
-          );
+        final forward = _forwardAt(shortcut);
+        _predictInter(index, x, y, [_zeroVector], forward.picture, 0);
+        _pb?.queue(_PbMode.direct, _zeroVector, 0, forward);
+        if (shortcut != 0 && (header.reduced || header.format.loopFilter)) {
+          _filterQuant[index] = _quant;
         }
-        _pb?.queue(_PbMode.direct, _zeroVector, 0, _forward!);
         continue;
       }
       final intra = header.intra || mode & 4 != 0;
@@ -390,39 +418,51 @@ final class _H263Macroblocks {
       if (mode & (header.intra ? 4 : 8) != 0) {
         _readQuantChange();
       }
+      _H263Forward? primary;
+      List<_Vector>? vectors;
+      List<H263Picture>? lumaReferences;
       if (!intra || pbBlock?.mode == _PbMode.direct) {
-        final vectors = _readMotion(x, y, mode & 16 != 0);
+        final split = mode & 16 != 0;
+        final indices = _multiplePrediction ? <int>[] : null;
+        vectors = _readMotion(x, y, split, references: indices);
+        primary = _forwardAt(indices?.first ?? 0);
+        if (split && indices != null) {
+          lumaReferences = [
+            primary.picture,
+            for (var block = 1; block < 4; block++)
+              _forwardAt(indices[block]).picture,
+          ];
+        }
         if (intra) {
           (_intraWithMotion ??= Uint8List(count))[index] = 1;
         }
-        if (overlap != null) {
-          overlap.markMotion(index, _sliceStart);
-        } else if (!intra) {
-          _prediction.predictH263(
-            picture,
-            reference!,
-            x,
-            y,
-            vectors,
-            reduced: header.reduced,
-            noRound: header.noRound,
-            bounds: _boundsAt(index),
-            extend: header.canExtendMotion,
-          );
-        }
+        overlap?.markMotion(index, _sliceStart);
       }
       _finishPrevious(preceding);
-      if (overlap != null && !intra) {
-        _pendingPattern = pattern;
-        _pendingReference = reference;
+      if (!intra) {
+        _predictInter(
+          index,
+          x,
+          y,
+          vectors!,
+          primary!.picture,
+          pattern,
+          lumaReferences: lumaReferences,
+        );
       }
       if (pbBlock != null) {
         final predictor =
             pbBlock.mode == _PbMode.forward && _inCurrentSegment(x - 1, y)
             ? _pb!.leftForward
             : _zeroVector;
+        final referenceIndex = pbBlock.vector ? _readErpsMotionReference() : 0;
         final motion = pbBlock.vector ? _readVector(predictor) : _zeroVector;
-        _pb!.queue(pbBlock.mode, motion, pbBlock.pattern, _forward!);
+        final forward = switch (pbBlock.mode) {
+          _PbMode.direct => primary!,
+          _PbMode.forward => _forwardAt(referenceIndex),
+          _PbMode.backward => null,
+        };
+        _pb!.queue(pbBlock.mode, motion, pbBlock.pattern, forward);
       }
       for (var block = 0; block < 6; block++) {
         final coded = pattern & (32 >> block) != 0;
@@ -444,6 +484,35 @@ final class _H263Macroblocks {
     }
     _finishPrevious(previous);
     _finishFilter();
+  }
+
+  void _predictInter(
+    int index,
+    int x,
+    int y,
+    List<_Vector> vectors,
+    H263Picture reference,
+    int pattern, {
+    List<H263Picture>? lumaReferences,
+  }) {
+    if (_overlap != null) {
+      _pendingPattern = pattern;
+      _pendingReference = reference;
+      _pendingLumaReferences = lumaReferences;
+      return;
+    }
+    _prediction.predictH263(
+      picture,
+      reference,
+      x,
+      y,
+      vectors,
+      reduced: header.reduced,
+      noRound: header.noRound,
+      bounds: _boundsAt(index),
+      extend: header.canExtendMotion,
+      lumaReferences: lumaReferences,
+    );
   }
 
   void _startMacroblock(int index) {
@@ -469,13 +538,13 @@ final class _H263Macroblocks {
     }
   }
 
-  int _readMacroblock() {
+  (int, int) _readMacroblock() {
     final sac = _sac;
     if (header.intra) {
       while (true) {
         final code =
             sac?.read(_sacIntraMacroblock) ?? _intraMacroblock.read(_bits);
-        if (code != 8) return code;
+        if (code != 8) return (code, 0);
       }
     }
     final format = header.format;
@@ -483,18 +552,25 @@ final class _H263Macroblocks {
         ? _sacInterMacroblock4mvq
         : _sacInterMacroblock;
     while (true) {
-      if (sac == null ? _bits.flag() : sac.read(_sacCod) != 0) return -1;
+      if (sac == null ? _bits.flag() : sac.read(_sacCod) != 0) {
+        _unmarkedShortcut = false;
+        return (-1, 0);
+      }
       if (sac == null) {
+        if (_multiplePrediction) {
+          final index = _readErpsShortcut();
+          if (index != 0) return (-1, index);
+        }
         final code = _interMacroblock.read(_bits);
-        if (code != 20) return code;
+        if (code != 20) return (code, 0);
       } else {
         final index = sac.read(table);
         if (index < 20) {
           // Table 8 lists INTER, INTER+Q, INTER4V, INTRA and INTRA+Q.
           const mode = [0, 8, 16, 4, 12];
-          return mode[index >> 2] | (index & 3);
+          return (mode[index >> 2] | (index & 3), 0);
         }
-        if (index > 20) return index + 3;
+        if (index > 20) return (index + 3, 0);
       }
     }
   }
@@ -529,7 +605,13 @@ final class _H263Macroblocks {
     final pattern = _pendingPattern;
     if (pattern < 0) return;
     final overlap = _overlap!;
-    overlap.predict(x, y, _pendingReference!, _boundsAt(y * _columns + x));
+    overlap.predict(
+      x,
+      y,
+      _pendingReference!,
+      _boundsAt(y * _columns + x),
+      _pendingLumaReferences,
+    );
     for (var block = 0; block < 6; block++) {
       if (pattern & (32 >> block) != 0) {
         _writeBlock(x, y, block, overlap.residuals[block], intra: false);
@@ -635,13 +717,15 @@ final class _H263Macroblocks {
     _quant = group.quant;
     _sliceStart = group.address;
     if (_selectForward case final select?) _forward = select(group.temporal);
+    _unmarkedShortcut = false;
     if (group.erps case final erps?) _setErpsGroup(erps);
     _sac?.reset();
   }
 
-  List<_Vector> _readMotion(int x, int y, bool split) {
+  List<_Vector> _readMotion(int x, int y, bool split, {List<int>? references}) {
     final vectors = <_Vector>[];
     for (var i = 0; i < (split ? 4 : 1); i++) {
+      references?.add(_readErpsMotionReference());
       final prediction = _h263MotionPrediction(_motion, x, y, i);
       final vector = _readVector(prediction);
       vectors.add(vector);
