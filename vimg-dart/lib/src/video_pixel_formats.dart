@@ -173,9 +173,17 @@ bool _namedColorRange(String name) => switch (name) {
   _ => throw FormatException('Unsupported video color range: $name'),
 };
 
+typedef _ColorScale = ({
+  int width,
+  int height,
+  double sampleAspect,
+  _ScaleAlgorithm algorithm,
+  bool fullChromaInput,
+});
+
 final class _PixelFormatConverter {
-  final _scalers = <(int, int, int, int), _PlaneScaler>{};
-  final _rgbScalers = <(int, int, int, int), YuvImageScaler>{};
+  final _scalers = <(int, int, int, int, _ScaleKernel, int), _PlaneScaler>{};
+  final _rgbScalers = <(int, int, _ScaleAlgorithm), YuvImageScaler>{};
 
   _VideoPlanes convert(
     _VideoPlanes source,
@@ -183,6 +191,7 @@ final class _PixelFormatConverter {
     bool? alpha,
     bool? fullRange,
     int? matrix,
+    _ColorScale? scale,
   }) {
     final requestedAlpha = alpha ?? source.alpha != null;
     final full =
@@ -193,7 +202,8 @@ final class _PixelFormatConverter {
     final colorMatrix = target.color == _PixelColor.rgb
         ? 0
         : matrix ?? (source.matrix == 0 ? 6 : source.matrix);
-    if (_frameFormat(source) == target &&
+    if (scale == null &&
+        _frameFormat(source) == target &&
         source.fullRange == full &&
         source.matrix == colorMatrix &&
         requestedAlpha == (source.alpha != null) &&
@@ -204,23 +214,43 @@ final class _PixelFormatConverter {
       return source;
     }
 
-    final width = source.width, height = source.height;
+    final width = scale?.width ?? source.width;
+    final height = scale?.height ?? source.height;
+    final algorithm = scale?.algorithm ?? _ScaleAlgorithm.bicubic;
     _checkFilterSize(width, height);
     var working = source;
     if (!source.rgb && target.color == _PixelColor.rgb) {
-      working = _toRgb(source);
+      working = _toRgb(source, width, height, algorithm);
     } else if (!source.rgb &&
         source.planes.length == 3 &&
         target.color == _PixelColor.yuv &&
         _rgbCoefficients(source.matrix) != _rgbCoefficients(colorMatrix)) {
       // libswscale cascades both matrices through RGB, using 16-bit channels
       // when the requested YUV output has more than eight bits per component.
+      // Resize in the stage that keeps the intermediate at the smaller size.
+      final reduce = width * height < source.width * source.height;
+      final w = reduce ? width : source.width;
+      final h = reduce ? height : source.height;
       working = target.depth > 8
-          ? _toDeepRgb(source)
-          : _toRgb(source, bgr24: source.alpha == null || !requestedAlpha);
+          ? _toDeepRgb(source, w, h, algorithm)
+          : _toRgb(
+              source,
+              w,
+              h,
+              algorithm,
+              bgr24: source.alpha == null || !requestedAlpha,
+            );
     }
     if (working.rgb && target.color != _PixelColor.rgb) {
-      working = _rgbToYuv(working, target, colorMatrix, full);
+      working = _rgbToYuv(
+        working,
+        target,
+        colorMatrix,
+        full,
+        outputWidth: width,
+        outputHeight: height,
+        fullChromaInput: scale?.fullChromaInput ?? false,
+      );
     }
     final count = target.color == _PixelColor.gray ? 1 : 3;
     final native = identical(working, source) && !source.rgb;
@@ -246,6 +276,7 @@ final class _PixelFormatConverter {
                 outputFull: full,
                 channel: native ? i : null,
                 resamplesChroma: resamplesChroma,
+                scale: scale?.algorithm,
               )
             : _constantPlane(w, h, target.depth, 1 << (target.depth - 1)),
       );
@@ -263,11 +294,12 @@ final class _PixelFormatConverter {
             opacity,
             width,
             height,
-            target.depth,
+            scale == null ? target.depth : opacity.depth,
             inputFull: true,
             outputFull: true,
             channel: native ? 3 : null,
             resamplesChroma: resamplesChroma,
+            scale: scale?.algorithm,
           );
     return _VideoPlanes(
       planes,
@@ -277,7 +309,7 @@ final class _PixelFormatConverter {
       fullRange: full,
       packedRgb: target.packedRgb,
       bgr24: target.bgr24,
-      sampleAspect: source.sampleAspect,
+      sampleAspect: scale?.sampleAspect ?? source.sampleAspect,
       alpha: convertedAlpha,
     );
   }
@@ -292,6 +324,7 @@ final class _PixelFormatConverter {
     required bool outputFull,
     int? channel,
     bool resamplesChroma = false,
+    _ScaleAlgorithm? scale,
   }) {
     final sameLevels = inputFull == outputFull && source.depth == depth;
     final sameSize = width == source.width && height == source.height;
@@ -323,9 +356,16 @@ final class _PixelFormatConverter {
     }
     final preserveRange = !inputFull && !outputFull;
     var sampledDepth = srcDepth;
+    var sampledFull = inputFull;
     _FilterPlane sampled = source;
     if (!sameSize) {
-      sampledDepth = preserveRange || filterDither ? depth : srcDepth;
+      sampledDepth = scale != null || preserveRange || filterDither
+          ? depth
+          : srcDepth;
+      final range = scale == null || inputFull == outputFull
+          ? null
+          : _ScaleSampleRange(depth, inputFull, outputFull, chroma);
+      if (range != null) sampledFull = outputFull;
       sampled = _FilterPlane(
         _resample(
           source,
@@ -333,6 +373,9 @@ final class _PixelFormatConverter {
           height,
           sampledDepth - 8,
           ditherOffset: filterDither ? phase : null,
+          kernel: scale?.kernel(chroma: chroma) ?? _ScaleKernel.cubic,
+          precision: scale != null && depth > 14 ? 19 : 15,
+          range: range,
         ),
         width,
         height,
@@ -342,10 +385,10 @@ final class _PixelFormatConverter {
     }
     // Range conversion maps the endpoints of the coded interval, including
     // for chroma where the full-range midpoint falls between two codes.
-    final changingRange = inputFull != outputFull;
+    final changingRange = sampledFull != outputFull;
     final (lo, span) = _componentLevels(
       sampledDepth,
-      inputFull,
+      sampledFull,
       chroma,
       fromMinimum: changingRange,
     );
@@ -375,13 +418,23 @@ final class _PixelFormatConverter {
     int height,
     int fractionBits, {
     int? ditherOffset,
+    _ScaleKernel kernel = _ScaleKernel.cubic,
+    int precision = 15,
+    _ScaleSampleRange? range,
   }) {
     if (width * source.height > 100000000) {
       throw const FormatException(
         'Pixel format conversion exceeds the sample limit',
       );
     }
-    final geometry = (source.width, source.height, width, height);
+    final geometry = (
+      source.width,
+      source.height,
+      width,
+      height,
+      kernel,
+      precision,
+    );
     if (_scalers.length == 6 && !_scalers.containsKey(geometry))
       _scalers.clear();
     final scaler = _scalers.putIfAbsent(
@@ -391,7 +444,8 @@ final class _PixelFormatConverter {
         source.height,
         width,
         height,
-        kernel: _ScaleKernel.cubic,
+        kernel: kernel,
+        precision: precision,
       ),
     );
     final input = source.forward;
@@ -402,22 +456,28 @@ final class _PixelFormatConverter {
       input.depth,
       fractionBits,
       ditherOffset: ditherOffset,
+      range: range,
     );
   }
 
-  _VideoPlanes _toRgb(_VideoPlanes frame, {bool bgr24 = false}) {
+  _VideoPlanes _toRgb(
+    _VideoPlanes frame,
+    int width,
+    int height,
+    _ScaleAlgorithm algorithm, {
+    bool bgr24 = false,
+  }) {
     final y = frame.planes.first.atOrigin;
     final cb = frame.planes.length == 3 ? frame.planes[1].packed : null;
     final cr = frame.planes.length == 3 ? frame.planes[2].packed : null;
-    final width = y.width, height = y.height;
-    final geometry = (width, height, frame.subX, frame.subY);
+    final geometry = (width, height, algorithm);
     if (_rgbScalers.length == 4 && !_rgbScalers.containsKey(geometry)) {
       _rgbScalers.clear();
     }
     // Convert using the same two-stage chroma resampler as the video scaler.
     final scaler = _rgbScalers.putIfAbsent(
       geometry,
-      () => YuvImageScaler._fixed(width, height, _ScaleAlgorithm.bicubic),
+      () => YuvImageScaler._fixed(width, height, algorithm),
     );
     final result = scaler._resize(
       y: y.samples,
@@ -425,8 +485,8 @@ final class _PixelFormatConverter {
       cr: cr?.samples ?? const [],
       stride: y.rowStep,
       chromaStride: cb?.width ?? 0,
-      sourceWidth: width,
-      sourceHeight: height,
+      sourceWidth: y.width,
+      sourceHeight: y.height,
       width: width,
       height: height,
       cropLeft: 0,
@@ -447,15 +507,46 @@ final class _PixelFormatConverter {
     );
   }
 
-  _VideoPlanes _toDeepRgb(_VideoPlanes frame) {
-    final width = frame.width, height = frame.height;
+  _VideoPlanes _toDeepRgb(
+    _VideoPlanes frame,
+    int width,
+    int height,
+    _ScaleAlgorithm algorithm,
+  ) {
     final paired = width.isEven && (frame.subX != 0 || frame.subY != 0);
     final chromaWidth = paired ? width >> 1 : width;
     final y = frame.planes.first;
     // Match the precision of the packed RGB48 conversion. The chroma
     // resampler returns Q9 values on an eight-bit sample scale.
-    final u = _resample(frame.planes[1], chromaWidth, height, 9);
-    final v = _resample(frame.planes[2], chromaWidth, height, 9);
+    final resizing = width != frame.width || height != frame.height;
+    final lumaSamples = resizing
+        ? _resample(
+            y,
+            width,
+            height,
+            9,
+            kernel: algorithm.kernel(chroma: false),
+            precision: 19,
+          )
+        : null;
+    final kernel = algorithm.kernel(chroma: true);
+    final precision = resizing ? 19 : 15;
+    final u = _resample(
+      frame.planes[1],
+      chromaWidth,
+      height,
+      9,
+      kernel: kernel,
+      precision: precision,
+    );
+    final v = _resample(
+      frame.planes[2],
+      chromaWidth,
+      height,
+      9,
+      kernel: kernel,
+      precision: precision,
+    );
     final (rv, bu, gu, gv) = _rgbCoefficients(frame.matrix);
     int coefficient(int value) =>
         ((frame.fullRange ? value * 224 ~/ 255 : value) + 4) >> 3;
@@ -471,7 +562,8 @@ final class _PixelFormatConverter {
     for (var row = 0; row < height; row++) {
       for (var x = 0; x < width; x++) {
         final c = row * chromaWidth + (paired ? x >> 1 : x);
-        final luma = ((y.at(x, row) << (17 - y.depth)) - black) * yc;
+        final luma =
+            ((lumaSamples?[i] ?? y.at(x, row) << (17 - y.depth)) - black) * yc;
         final cb = u[c] - (128 << 9), cr = v[c] - (128 << 9);
         red[i] = sample(luma + vr * cr);
         blue[i] = sample(luma + ub * cb);
@@ -558,14 +650,22 @@ _VideoPlanes _rgbToYuv(
   _VideoPlanes frame,
   _VideoPixelFormat target,
   int matrix,
-  bool outputFull,
-) {
+  bool outputFull, {
+  required int outputWidth,
+  required int outputHeight,
+  required bool fullChromaInput,
+}) {
   final width = frame.width, height = frame.height;
   final green = frame.planes[0], blue = frame.planes[1], red = frame.planes[2];
   // Keep six fraction bits while making limited-range BT.601 components.
   // A packed RGB input can be averaged in pairs before vertical chroma scaling.
   final hasChroma = target.color == _PixelColor.yuv;
-  final pair = frame.packedRgb && hasChroma && width.isEven && target.subX != 0;
+  final pair =
+      frame.packedRgb &&
+      hasChroma &&
+      width.isEven &&
+      (outputWidth >> target.subX) <= (width >> 1) &&
+      !fullChromaInput;
   final sub = pair ? 1 : 0;
   final cw = _subSize(width, sub);
   final (kr, kb) = _filterLumaWeights(matrix);
@@ -584,7 +684,9 @@ _VideoPlanes _rgbToYuv(
               (b * 32768 / 255).round(),
             ),
         ];
-  if (frame.bgr24 &&
+  if (width == outputWidth &&
+      height == outputHeight &&
+      frame.bgr24 &&
       frame.fullRange &&
       width.isEven &&
       !outputFull &&

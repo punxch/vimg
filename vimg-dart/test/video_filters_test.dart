@@ -450,9 +450,10 @@ void _checkColorFormats() {
   image.Image render(int depth, String filter) {
     List<int> samples(int w, int h, int base, int dx, int dy, int wrap) => [
       for (var y = 0; y < h; y++)
-        for (var x = 0; x < w; x++) base + (dx * x + dy * y) % wrap,
+        for (var x = 0; x < w; x++)
+          (base + (dx * x + dy * y) % wrap) << (depth == 16 ? 6 : 0),
     ];
-    final deep = depth == 10;
+    final deep = depth > 8;
     return yuvImage(
       y: deep
           ? samples(8, 6, 120, 37, 23, 1024)
@@ -511,6 +512,56 @@ void _checkColorFormats() {
       getCrc32(converted.getBytes()) == checksum,
       '$depth-bit YUV color conversion to $matrix/$range',
     );
+  }
+  const inputColor = 'in_color_matrix=bt709:in_range=full';
+  const outputColor = 'out_color_matrix=bt2020:out_range=mpeg';
+  for (final (depth, rgb, resized, sameMatrix, changedMatrix) in [
+    (8, 0x651e1dbc, 0xeb07f388, 0xc472e4e9, 0xf824d68a),
+    (10, 0xc6a1e907, 0x7d14f7a1, 0xabe2ee26, 0x14d513c7),
+  ]) {
+    for (final (filter, checksum) in [
+      ('scale=8:6:$inputColor:$outputColor', rgb),
+      ('scale=6:4:flags=neighbor:$inputColor', resized),
+      ('scale=8:6:$inputColor,setsar=1', sameMatrix),
+      ('scale=8:6:$inputColor:$outputColor,setsar=1', changedMatrix),
+    ]) {
+      check(
+        getCrc32(render(depth, filter).getBytes()) == checksum,
+        '$depth-bit $filter matches FFmpeg',
+      );
+    }
+  }
+  for (final (depth, expanded, compressed) in [
+    (8, 0xd2d6696a, 0x2391fd2a),
+    (10, 0x85a979fe, 0x0bf8d803),
+    (16, 0xa1f051c1, 0x8c29cfcb),
+  ]) {
+    for (final (input, output, checksum) in [
+      ('1', 'jpeg', expanded),
+      ('2', 'limited', compressed),
+    ]) {
+      final filter =
+          'scale=12:10:flags=bilinear:in_range=$input:out_range=$output,setsar=1';
+      check(
+        getCrc32(render(depth, filter).getBytes()) == checksum,
+        '$depth-bit bilinear range conversion from $input to $output',
+      );
+    }
+  }
+  for (final (depth, smaller, larger) in [
+    (8, 0x81a92159, 0x238b84d4),
+    (10, 0x356a9d11, 0xc8d52ebc),
+  ]) {
+    for (final (size, checksum) in [
+      ('6:4:flags=bilinear', smaller),
+      ('12:10:flags=bicubic', larger),
+    ]) {
+      final filter = 'scale=$size:out_color_matrix=bt709:out_range=pc,setsar=1';
+      check(
+        getCrc32(render(depth, filter).getBytes()) == checksum,
+        '$depth-bit matrix and range conversion while scaling to $size',
+      );
+    }
   }
 }
 
@@ -655,6 +706,8 @@ void _checkErrors() {
     'scale=4:2:force_divisible_by=0',
     'scale=4:2:force_divisible_by=257',
     'scale=4:2:reset_sar=2',
+    'scale=in_color_matrix=invalid',
+    'scale=out_range=invalid',
     'scale=w=iw-n:h=ih',
     'crop=5:2:w=4',
     'crop=iw-n:ih',
@@ -848,11 +901,25 @@ Future<void> _checkCli(String? executable) async {
       0x51c4c9a5,
       0x51c4c9a5,
     ];
+    const scaleColor =
+        '$color,split[left][right];[left][right]hstack,'
+        'scale=64:24:in_color_matrix=bt601:in_range=pc:out_color_matrix=bt2020';
+    const scaleColorReference = [
+      0x39ab8400,
+      0x39ab8400,
+      0x46cae2aa,
+      0x46cae2aa,
+      0xefad4027,
+      0xefad4027,
+      0x521a9f8d,
+      0x521a9f8d,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
       ('delayed-overlay', delayedOverlay, 32, 24, delayedReference),
       ('color-format', color, 32, 24, colorReference),
+      ('scale-color', scaleColor, 64, 24, scaleColorReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {

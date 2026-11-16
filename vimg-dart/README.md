@@ -318,6 +318,13 @@ to fit inside a bounding box with even dimensions. `increase` scales to cover
 the box. Add `reset_sar=1` to use the input display aspect ratio for
 proportional scaling and set square pixels for downstream filters.
 
+Set `in_color_matrix` or `in_range` to override how scale interprets decoded
+YUV samples. For example, `scale=640:-2:in_color_matrix=bt709:in_range=full`
+interprets the source as full-range BT.709 before resizing. For planar YUV
+output, `out_color_matrix` and `out_range` select the output matrix and coding
+range. Terminal scale filters that render directly to RGB use the input
+interpretation and output full-range RGB.
+
 For packed RGB, `neighbor`, `bilinear` and `bicublin` use FFmpeg's paired chroma
 sampling when reducing an even width by at least half. Add `+full_chroma_inp`
 to sample the RGB channels at full resolution.

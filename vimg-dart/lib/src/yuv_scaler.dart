@@ -228,10 +228,25 @@ final class YuvImageScaler {
     YuvImageScaler? outputScale;
     if (scale != null) {
       // The terminal scale can upsample chroma while converting to RGB.
+      // RGB output uses the input interpretation and has its own full range.
+      frame = scale.interpretInputColor(frame);
       final (w, h) = scale.dimensions(
         frame,
         scale.usesFramePosition ? position : null,
       );
+      if (w == frame.width &&
+          h == frame.height &&
+          w.isEven &&
+          h.isEven &&
+          frame.subX == 1 &&
+          frame.subY <= 1 &&
+          !frame.rgb &&
+          frame.planes.length == 3 &&
+          frame.planes.every((plane) => plane.depth == 8) &&
+          (frame.alpha?.depth ?? 8) == 8) {
+        // The unscaled 8-bit RGB kernel reads chroma directly from its grid.
+        return _rgbTable(frame.matrix, frame.fullRange).writeUnscaled(frame);
+      }
       if (frame.packedRgb && scale.algorithm != _ScaleAlgorithm.bicubic) {
         frame = scale.resize(frame, w, h);
       } else {
@@ -320,6 +335,15 @@ final class YuvImageScaler {
           height: height,
           enlarge: enlarge,
         );
+
+  _RgbTable _rgbTable(int matrix, bool fullRange) {
+    final color = (matrix: matrix, fullRange: fullRange);
+    if (_tableColor != color) {
+      _table = _RgbTable(matrix, fullRange);
+      _tableColor = color;
+    }
+    return _table;
+  }
 
   image.Image _resize({
     required List<int> y,
@@ -421,12 +445,7 @@ final class YuvImageScaler {
       numChannels: alpha == null ? 3 : 4,
     );
     if (useTable) {
-      final color = (matrix: matrix, fullRange: fullRange);
-      if (_tableColor != color) {
-        _table = _RgbTable(matrix, fullRange);
-        _tableColor = color;
-      }
-      _table.write(pixels, luma, blueChroma!, redChroma!);
+      _rgbTable(matrix, fullRange).write(pixels, luma, blueChroma!, redChroma!);
     } else {
       _writeRgb(
         pixels,
@@ -484,13 +503,16 @@ final class _PlaneScaler {
     this.width,
     int height, {
     required _ScaleKernel kernel,
+    this.precision = 15,
   }) : horizontal = _axisTaps(sourceWidth, width, 14, kernel),
        vertical = _axisTaps(sourceHeight, height, 12, kernel),
-       intermediate = Int16List(sourceHeight * width);
+       intermediate = precision == 15
+           ? Int16List(sourceHeight * width)
+           : Int32List(sourceHeight * width);
 
-  final int width;
+  final int width, precision;
   final List<({int start, Int16List weights})> horizontal, vertical;
-  final Int16List intermediate;
+  final List<int> intermediate;
 
   Int32List resize(
     List<int> source,
@@ -499,8 +521,10 @@ final class _PlaneScaler {
     int depth,
     int fractionalBits, {
     int? ditherOffset,
+    _ScaleSampleRange? range,
   }) {
-    final horizontalShift = depth - 1;
+    final horizontalShift = depth + 14 - precision;
+    final maximum = (1 << precision) - 1;
     var output = 0;
     for (var row = 0; row < intermediate.length; row += width) {
       for (final tap in horizontal) {
@@ -509,12 +533,13 @@ final class _PlaneScaler {
         for (var i = 0; i < tap.weights.length; i++) {
           sum += source[start + i] * tap.weights[i];
         }
-        intermediate[output++] = math.min(32767, sum >> horizontalShift);
+        final filtered = math.min(maximum, sum >> horizontalShift);
+        intermediate[output++] = range?.convert(filtered) ?? filtered;
       }
       offset += stride;
     }
     final result = Int32List(width * vertical.length);
-    final shift = 19 - fractionalBits;
+    final shift = precision + 4 - fractionalBits;
     final rounding = 1 << (shift - 1);
     output = 0;
     for (var row = 0; row < vertical.length; row++) {
@@ -523,7 +548,8 @@ final class _PlaneScaler {
       for (var x = 0; x < width; x++) {
         var sum = ditherOffset == null
             ? rounding
-            : _conversionDither[row & 7][(x + ditherOffset) & 7] << 13;
+            : _conversionDither[row & 7][(x + ditherOffset) & 7] <<
+                  (precision - 2);
         var sample = start + x;
         for (final weight in tap.weights) {
           sum += intermediate[sample] * weight;
@@ -636,15 +662,36 @@ final class _RgbTable {
   void write(image.Image pixels, Int32List y, Int32List cb, Int32List cr) {
     var offset = 0;
     for (final pixel in pixels) {
-      final u = cb[offset >> 1].clamp(0, 255);
-      final v = cr[offset >> 1].clamp(0, 255);
-      final luma = y[offset++] * scale + bias;
-      pixel.setRgb(
-        ((luma + red[v] * scale) >> 16).clamp(0, 255),
-        ((luma + (greenU[u] + greenV[v]) * scale) >> 16).clamp(0, 255),
-        ((luma + blue[u] * scale) >> 16).clamp(0, 255),
-      );
+      final u = cb[offset >> 1], v = cr[offset >> 1];
+      _writePixel(pixel, y[offset++], u, v);
     }
+  }
+
+  image.Image writeUnscaled(_VideoPlanes frame) {
+    final pixels = image.Image(
+      width: frame.width,
+      height: frame.height,
+      numChannels: frame.alpha == null ? 3 : 4,
+    );
+    final y = frame.planes[0], cb = frame.planes[1], cr = frame.planes[2];
+    final alpha = frame.alpha;
+    for (final pixel in pixels) {
+      final x = pixel.x >> frame.subX, row = pixel.y >> frame.subY;
+      _writePixel(pixel, y.at(pixel.x, pixel.y), cb.at(x, row), cr.at(x, row));
+      if (alpha != null) pixel.a = alpha.at(pixel.x, pixel.y);
+    }
+    return pixels;
+  }
+
+  void _writePixel(image.Pixel pixel, int y, int u, int v) {
+    u = u.clamp(0, 255);
+    v = v.clamp(0, 255);
+    final luma = y * scale + bias;
+    pixel.setRgb(
+      ((luma + red[v] * scale) >> 16).clamp(0, 255),
+      ((luma + (greenU[u] + greenV[v]) * scale) >> 16).clamp(0, 255),
+      ((luma + blue[u] * scale) >> 16).clamp(0, 255),
+    );
   }
 }
 
