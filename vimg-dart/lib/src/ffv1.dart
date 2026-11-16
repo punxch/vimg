@@ -398,15 +398,35 @@ final class Ffv1Picture {
 
   image.Image rgb({YuvImageScaler? scaler, int? matrix, bool? fullRange}) {
     final floating = _config.floatingPoint;
+    final bayer = _config.bayer;
+    final rgb = _config.rgb || bayer;
+    final colorMatrix = rgb ? 0 : matrix ?? 6;
+    final range = rgb || (fullRange ?? floating);
+    final opacity = alpha;
+    if (floating &&
+        scaler != null &&
+        scaler.filters != null &&
+        (rgb || cb.isEmpty)) {
+      Float32List plane(List<int> samples) =>
+          _floatVideoSamples(samples, _config.depth);
+      return scaler.filterFloatPlanes(
+        [
+          plane(y),
+          if (cb.isNotEmpty) ...[plane(cb), plane(cr)],
+        ],
+        width: width,
+        height: height,
+        matrix: colorMatrix,
+        fullRange: range,
+        alpha: opacity == null ? null : plane(opacity),
+      );
+    }
     final depth = floating ? 16 : _config.depth;
     List<int> samples(List<int> source) =>
         floating ? _floatToVideoSamples(source, _config.depth) : source;
-    final bayer = _config.bayer;
     final (luma, blue, red) = bayer
         ? _demosaicRggb(y, width, height)
         : (samples(y), samples(cb), samples(cr));
-    final opacity = alpha;
-    final rgb = _config.rgb || bayer;
     final shiftX = bayer ? 0 : _config.shiftX;
     final shiftY = bayer ? 0 : _config.shiftY;
     return yuvImage(
@@ -420,8 +440,8 @@ final class Ffv1Picture {
       height: height,
       cropLeft: 0,
       cropTop: 0,
-      matrix: rgb ? 0 : matrix ?? 6,
-      fullRange: rgb || (fullRange ?? floating),
+      matrix: colorMatrix,
+      fullRange: range,
       lumaDepth: depth,
       chromaDepth: depth,
       alphaDepth: depth,

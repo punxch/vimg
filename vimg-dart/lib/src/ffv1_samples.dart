@@ -81,25 +81,36 @@ final class _SampleMap {
 
 Uint16List _floatToVideoSamples(List<int> samples, int depth) {
   final converted = Uint16List(samples.length);
-  if (depth == 32) {
-    final values = Float32List.sublistView(samples as Uint32List);
-    for (var i = 0; i < samples.length; i++) {
-      converted[i] = _normalizedSample(values[i]);
-    }
-  } else {
-    for (var i = 0; i < samples.length; i++) {
-      final bits = samples[i];
-      if (bits & 0x8000 != 0) continue;
-      final fraction = bits & 0x03ff;
-      final exponent = bits >> 10;
-      converted[i] = switch (exponent) {
-        31 => fraction == 0 ? 65535 : 0,
-        0 => _normalizedSample(fraction / (1 << 24)),
-        _ => _normalizedSample((1024 + fraction) * _halfFloatScales[exponent]),
-      };
-    }
+  final floats = depth == 32
+      ? Float32List.sublistView(samples as Uint32List)
+      : null;
+  for (var i = 0; i < samples.length; i++) {
+    converted[i] = _normalizedSample(
+      floats?[i] ?? _halfVideoSample(samples[i]),
+    );
   }
   return converted;
+}
+
+Float32List _floatVideoSamples(List<int> samples, int depth) {
+  if (depth == 32) return Float32List.sublistView(samples as Uint32List);
+  final values = Float32List(samples.length);
+  for (var i = 0; i < values.length; i++) {
+    values[i] = _halfVideoSample(samples[i]);
+  }
+  return values;
+}
+
+double _halfVideoSample(int bits) {
+  final negative = bits & 0x8000 != 0;
+  final exponent = (bits >> 10) & 31;
+  final fraction = bits & 0x03ff;
+  final value = switch (exponent) {
+    31 => fraction == 0 ? double.infinity : double.nan,
+    0 => fraction / (1 << 24),
+    _ => (1024 + fraction) * _halfFloatScales[exponent],
+  };
+  return negative ? -value : value;
 }
 
 final _halfFloatScales = List<double>.generate(

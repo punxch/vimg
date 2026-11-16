@@ -157,6 +157,36 @@ final class YuvImageScaler {
     );
   }
 
+  /// Receive full-size grayscale or planar GBR samples in G, B, R order.
+  image.Image filterFloatPlanes(
+    List<Float32List> samples, {
+    required int width,
+    required int height,
+    required int matrix,
+    required bool fullRange,
+    Float32List? alpha,
+  }) {
+    _checkFilterSize(width, height);
+    final count = width * height;
+    if ((samples.length != 1 && (samples.length != 3 || matrix != 0)) ||
+        samples.any((plane) => plane.length != count) ||
+        (alpha != null && alpha.length != count)) {
+      throw const FormatException('Invalid planar float video frame');
+    }
+    final frame = _VideoPlanes(
+      [for (final plane in samples) _FilterPlane.f32(plane, width, height)],
+      0,
+      0,
+      matrix: matrix,
+      fullRange: fullRange,
+      sampleAspect: _sampleAspect ?? 1,
+      alpha: alpha == null ? null : _FilterPlane.f32(alpha, width, height),
+    );
+    return filters == null
+        ? _convertFiltered(frame, null, null)
+        : _renderFiltered(frame);
+  }
+
   static _VideoPlanes _imagePlanes(
     image.Image frame,
     double sampleAspect, {

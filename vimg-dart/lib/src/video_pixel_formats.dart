@@ -522,8 +522,11 @@ final class _PixelFormatConverter {
     final height = scale?.height ?? source.height;
     final algorithm = scale?.algorithm ?? _ScaleAlgorithm.bicubic;
     _checkFilterSize(width, height);
+    final replicateGray =
+        source.planes.length == 1 && target.color == _PixelColor.rgb;
     if (target.depth == _floatSampleDepth &&
-        _frameFormat(source) == target &&
+        source.floating &&
+        (_frameFormat(source) == target || replicateGray) &&
         source.fullRange == full) {
       final resized = source.map(
         (plane, _, _) => _resizeFloatPlane(
@@ -535,7 +538,7 @@ final class _PixelFormatConverter {
         sampleAspect: scale?.sampleAspect,
       );
       return _VideoPlanes(
-        resized.planes,
+        replicateGray ? List.filled(3, resized.planes.first) : resized.planes,
         0,
         0,
         matrix: colorMatrix,

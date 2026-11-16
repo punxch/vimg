@@ -99,7 +99,9 @@ multiple slices and CRC checking. Experimental FFV1 v4 supports
 chroma-aligned slices, per-slice RGB transforms, raw PCM, sample remapping
 and FFmpeg's alternate CRC seed. It also decodes 16-bit floating-point
 grayscale and RGB, 32-bit floating-point RGB and 16-bit RGGB Bayer.
-Float previews and captures clamp channels to the display range [0, 1].
+The filter graph receives native 32-bit floating-point samples and promotes
+16-bit floating-point samples exactly to 32-bit. The rendered image clamps
+channels to the display range [0, 1].
 Bayer capture uses bilinear demosaicing. Random access rebuilds entropy
 contexts from the preceding FFV1 keyframe.
 Matroska and MP4/MOV support 8–14-bit H.264 I/P/B pictures

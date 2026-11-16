@@ -2,11 +2,13 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/ffv1.dart';
 import 'package:vimg_dart/src/matroska.dart';
 import 'package:vimg_dart/src/video.dart';
 import 'package:vimg_dart/src/video_configuration.dart';
+import 'package:vimg_dart/src/yuv_image.dart';
 
 import 'fixtures.dart';
 
@@ -16,6 +18,16 @@ const _grayAlpha = 'test/fixtures/ffv1-v4-yaf16.mkv';
 const _bayer = 'test/fixtures/ffv1-v4-rggb16.mkv';
 const _width = 22;
 const _height = 18;
+const _floatMaskGraph =
+    'format=gbrpf32le,split[a][b];[b]hflip[m];[a][m]premultiply=planes=1';
+// FFmpeg's scalar GBR float mask kernel with the equal-mode bypass disabled.
+const _maskedSamples = [
+  0xd9fccdfc,
+  0x86bc196a,
+  0x5ef8024f,
+  0xc2d2d61f,
+  0xdb56ecdf,
+];
 const _colors = [
   [0.0, 1 / 1024, 0.1, 0.5, 1.0, 1.5, 2.0, -0.125, -0.5, -1.0],
   [0.0, 0.25, 1.0, 2.125, -0.25, 0.125, 0.8, 0.001, 0.000001],
@@ -59,6 +71,16 @@ Future<void> _checkVideo(String path) async {
     final decoder = Ffv1Decoder(_width, _height, config);
     final packets = video.packets().toList();
     check(packets.length == 5, '$path frame count');
+    final nativeFilters = switch (path) {
+      _half || _float => VideoFilterChain.parse(_floatMaskGraph),
+      _grayAlpha => VideoFilterChain.parse(
+        'format=gbrapf32le,premultiply=inplace=1',
+      ),
+      _ => null,
+    };
+    final scaler = nativeFilters == null
+        ? null
+        : YuvImageScaler(filters: nativeFilters);
     var lastRgb = Uint8List(0);
     for (final (frame, packet) in packets.indexed) {
       final picture = decoder.decode(
@@ -70,8 +92,24 @@ Future<void> _checkVideo(String path) async {
           _checkBayer(frame, picture, rendered);
         case _grayAlpha:
           _checkGrayAlpha(frame, picture, rendered);
+          if (frame == 4) {
+            final filtered = picture.rgb(scaler: scaler);
+            final pixel = filtered.getPixel(9, 0); // Y=16, alpha=1/8.
+            check(
+              pixel.r == 255 &&
+                  pixel.g == 255 &&
+                  pixel.b == 255 &&
+                  pixel.a == 32,
+              'FFV1 float gray survives promotion to GBRA before multiplication',
+            );
+          }
         default:
           _checkFloatingRgb(path, frame, picture, rendered);
+          check(
+            getCrc32(picture.rgb(scaler: scaler).getBytes()) ==
+                _maskedSamples[frame],
+            '$path frame $frame applies its mask before clamping native samples',
+          );
       }
       lastRgb = rendered.getBytes();
     }
@@ -210,6 +248,29 @@ Future<void> _checkCommands(String cli) async {
         'Half-float BMP alpha',
       );
     }
+    final maskedDir = '${temp.path}/masked';
+    await run([
+      'extract',
+      '-n1',
+      '-f5',
+      '-t1s',
+      '-T2',
+      '--output-dir',
+      maskedDir,
+      '--vfilter',
+      _floatMaskGraph,
+      _float,
+    ]);
+    final masked = Directory(maskedDir).listSync().whereType<File>().toList()
+      ..sort((a, b) => a.path.compareTo(b.path));
+    check(masked.length == _maskedSamples.length, 'Float mask capture count');
+    for (final (i, file) in masked.indexed) {
+      final bitmap = image.decodeBmp(file.readAsBytesSync())!;
+      check(
+        getCrc32(bitmap.getBytes()) == _maskedSamples[i],
+        'Float mask capture $i matches the source precision reference',
+      );
+    }
     await run([
       'vcs',
       '-c2',
@@ -217,6 +278,8 @@ Future<void> _checkCommands(String cli) async {
       '-n3',
       '-f3',
       '-t500ms',
+      '--vfilter',
+      _floatMaskGraph,
       '-o',
       avif,
       _float,
