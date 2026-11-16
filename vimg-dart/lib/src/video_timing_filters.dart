@@ -4,6 +4,44 @@ abstract interface class _TimingFilter {
   CaptureTimeline apply(CaptureTimeline input);
 }
 
+typedef _TimelineTransform =
+    CaptureTimelineEvent? Function(CaptureTimelineEvent);
+
+typedef _TimelineTransition = ({
+  CaptureRational timeBase,
+  double? frameRate,
+  _TimelineTransform Function() createTransform,
+});
+
+CaptureTimeline _applyTransition(
+  CaptureTimeline input,
+  _TimelineTransition transition,
+) => CaptureTimeline(
+  _transitionEvents(input.events, transition),
+  transition.timeBase,
+  transition.frameRate,
+);
+
+Iterable<CaptureTimelineEvent> _transitionEvents(
+  Iterable<CaptureTimelineEvent> input,
+  _TimelineTransition transition,
+) sync* {
+  final transform = transition.createTransform();
+  for (final event in input) {
+    final output = transform(event);
+    if (output != null) yield output;
+    if (output is CaptureTimelineEnd) return;
+  }
+}
+
+abstract class _ImmediateTimingFilter implements _TimingFilter {
+  _TimelineTransition transition(CaptureTimeline input);
+
+  @override
+  CaptureTimeline apply(CaptureTimeline input) =>
+      _applyTransition(input, transition(input));
+}
+
 final class _RecordFramePosition implements _TimingFilter {
   const _RecordFramePosition();
 
@@ -22,7 +60,7 @@ final class _RecordFramePosition implements _TimingFilter {
   }
 }
 
-final class _Trim implements _TimingFilter {
+final class _Trim extends _ImmediateTimingFilter {
   factory _Trim(String? args) {
     final options = _filterOptions(args, [
       'start',
@@ -62,10 +100,7 @@ final class _Trim implements _TimingFilter {
   final int? start, end, startPts, endPts, duration, startFrame, endFrame;
 
   @override
-  CaptureTimeline apply(CaptureTimeline input) =>
-      CaptureTimeline(_events(input), input.timeBase, input.frameRate);
-
-  Iterable<CaptureTimelineEvent> _events(CaptureTimeline input) sync* {
+  _TimelineTransition transition(CaptureTimeline input) {
     int? ticks(int? us) => us == null
         ? null
         : rescaleCaptureTicks(us, captureMicroseconds, input.timeBase);
@@ -80,30 +115,34 @@ final class _Trim implements _TimingFilter {
     final length = ticks(duration) ?? 0;
     final checkStart = first != null || startFrame != null;
     final checkEnd = last != null || endFrame != null || length > 0;
-    var index = 0;
-    int? firstKept;
-    for (final event in input.events) {
-      if (event is CaptureTimelineEnd) {
-        yield event;
-        return;
-      }
-      final position = index++;
-      final pts = event.pts;
-      if (checkStart &&
-          !(first != null && pts >= first ||
-              startFrame != null && position >= startFrame!)) {
-        continue;
-      }
-      firstKept ??= pts;
-      if (checkEnd &&
-          !(last != null && pts < last ||
-              endFrame != null && position < endFrame! ||
-              length > 0 && pts - firstKept < length)) {
-        yield CaptureTimelineEnd(pts);
-        return;
-      }
-      yield event;
+    _TimelineTransform createTransform() {
+      var index = 0;
+      int? firstKept;
+      return (event) {
+        if (event is CaptureTimelineEnd) return event;
+        final position = index++;
+        final pts = event.pts;
+        if (checkStart &&
+            !(first != null && pts >= first ||
+                startFrame != null && position >= startFrame!)) {
+          return null;
+        }
+        final kept = firstKept ??= pts;
+        if (checkEnd &&
+            !(last != null && pts < last ||
+                endFrame != null && position < endFrame! ||
+                length > 0 && pts - kept < length)) {
+          return CaptureTimelineEnd(pts);
+        }
+        return event;
+      };
     }
+
+    return (
+      timeBase: input.timeBase,
+      frameRate: input.frameRate,
+      createTransform: createTransform,
+    );
   }
 }
 
@@ -123,7 +162,7 @@ const _setPtsVariables = {
   'FR',
 };
 
-final class _SetPts implements _TimingFilter {
+final class _SetPts extends _ImmediateTimingFilter {
   factory _SetPts(String? args) {
     final options = _filterOptions(args, ['expr', 'strip_fps']);
     final strip = switch (options['strip_fps']) {
@@ -142,49 +181,49 @@ final class _SetPts implements _TimingFilter {
   final bool stripRate;
 
   @override
-  CaptureTimeline apply(CaptureTimeline input) => CaptureTimeline(
-    _events(input),
-    input.timeBase,
-    stripRate ? null : input.frameRate,
-  );
-
-  Iterable<CaptureTimelineEvent> _events(CaptureTimeline input) sync* {
+  _TimelineTransition transition(CaptureTimeline input) {
     final tb = input.timeBase.value;
     final rate = input.frameRate ?? double.nan;
-    final variables = <String, double>{
-      'TB': tb,
-      'FRAME_RATE': rate,
-      'FR': rate,
-    };
-    var index = 0;
-    for (final event in input.events) {
-      final pts = event is CaptureTimelineEnd && !event.known
-          ? double.nan
-          : event.pts.toDouble();
-      final seconds = pts * tb;
-      variables['STARTPTS'] ??= pts;
-      variables['STARTT'] ??= seconds;
-      variables['T_CHANGE'] ??= seconds;
-      variables['PTS'] = pts;
-      variables['T'] = seconds;
-      variables['N'] = index.toDouble();
-      final value = expression(variables);
-      if (event is CaptureTimelineEnd && !event.known && value.isNaN) {
-        yield event;
-        return;
-      }
-      final output = checkedCaptureTick(value, truncate: true);
-      if (event is! CaptureTimedFrame) {
-        yield CaptureTimelineEnd(output);
-        return;
-      }
-      yield event.retime(output, duration: stripRate ? 0 : null);
-      variables['PREV_INPTS'] = pts;
-      variables['PREV_INT'] = seconds;
-      variables['PREV_OUTPTS'] = output.toDouble();
-      variables['PREV_OUTT'] = output * tb;
-      index++;
+    _TimelineTransform createTransform() {
+      final variables = <String, double>{
+        'TB': tb,
+        'FRAME_RATE': rate,
+        'FR': rate,
+      };
+      var index = 0;
+      return (event) {
+        final pts = event is CaptureTimelineEnd && !event.known
+            ? double.nan
+            : event.pts.toDouble();
+        final seconds = pts * tb;
+        variables['STARTPTS'] ??= pts;
+        variables['STARTT'] ??= seconds;
+        variables['T_CHANGE'] ??= seconds;
+        variables['PTS'] = pts;
+        variables['T'] = seconds;
+        variables['N'] = index.toDouble();
+        final value = expression(variables);
+        if (event is CaptureTimelineEnd && !event.known && value.isNaN) {
+          return event;
+        }
+        final output = checkedCaptureTick(value, truncate: true);
+        if (event is! CaptureTimedFrame) {
+          return CaptureTimelineEnd(output);
+        }
+        variables['PREV_INPTS'] = pts;
+        variables['PREV_INT'] = seconds;
+        variables['PREV_OUTPTS'] = output.toDouble();
+        variables['PREV_OUTT'] = output * tb;
+        index++;
+        return event.retime(output, duration: stripRate ? 0 : null);
+      };
     }
+
+    return (
+      timeBase: input.timeBase,
+      frameRate: stripRate ? null : input.frameRate,
+      createTransform: createTransform,
+    );
   }
 }
 
@@ -320,7 +359,7 @@ final class _Fps implements _TimingFilter {
   }
 }
 
-final class _SetTimeBase implements _TimingFilter {
+final class _SetTimeBase extends _ImmediateTimingFilter {
   factory _SetTimeBase(String? args) {
     final options = _filterOptions(args, ['expr'], {'tb': 'expr'});
     return _SetTimeBase._(
@@ -332,7 +371,7 @@ final class _SetTimeBase implements _TimingFilter {
   final FilterExpression expression;
 
   @override
-  CaptureTimeline apply(CaptureTimeline input) {
+  _TimelineTransition transition(CaptureTimeline input) {
     final timeBase = captureRational(
       expression({
         'AVTB': captureMicroseconds.value,
@@ -342,27 +381,29 @@ final class _SetTimeBase implements _TimingFilter {
       maximum: 0x7fffffff,
       description: 'settb time base',
     );
-    if (timeBase == input.timeBase) return input;
-    return CaptureTimeline(
-      input.events.map((event) {
-        final pts = rescaleCaptureTicks(event.pts, input.timeBase, timeBase);
-        return switch (event) {
-          final CaptureTimedFrame frame => frame.retime(
-            pts,
-            duration: rescaleCaptureTicks(
-              frame.duration,
-              input.timeBase,
-              timeBase,
-            ),
+    CaptureTimelineEvent transform(CaptureTimelineEvent event) {
+      if (timeBase == input.timeBase) return event;
+      final pts = rescaleCaptureTicks(event.pts, input.timeBase, timeBase);
+      return switch (event) {
+        final CaptureTimedFrame frame => frame.retime(
+          pts,
+          duration: rescaleCaptureTicks(
+            frame.duration,
+            input.timeBase,
+            timeBase,
           ),
-          CaptureTimelineEnd(:final known) => CaptureTimelineEnd(
-            pts,
-            known: known,
-          ),
-        };
-      }),
-      timeBase,
-      input.frameRate,
+        ),
+        CaptureTimelineEnd(:final known) => CaptureTimelineEnd(
+          pts,
+          known: known,
+        ),
+      };
+    }
+
+    return (
+      timeBase: timeBase,
+      frameRate: input.frameRate,
+      createTransform: () => transform,
     );
   }
 }

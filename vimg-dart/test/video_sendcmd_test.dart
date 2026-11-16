@@ -215,6 +215,113 @@ Future<void> main(List<String> args) async {
         _twice([0x2ae8724e, 0x296b659d, 0xbf0a814a, 0x7108b370]),
         alpha,
       ),
+      (
+        'overlay-prefetch',
+        'split[a][b];[a]fps=8[m];[b]trim=start_frame=1:end_frame=3,'
+            "sendcmd='0.25 overlay@o x 2,overlay@o enable 1;0.5 overlay@o y 2',"
+            'crop=4:4:2:2,hflip[s];[m][s]overlay@o=0:0:format=rgb:enable=0',
+        (8, 6),
+        _twice([0x8fd11bb7, 0xc304b9cc, 0xbf0a814a, 0xdb683617]),
+        alpha,
+      ),
+      (
+        'overlay-prefetch-clock',
+        'split[a][b];[a]fps=8[m];[b]trim=start_frame=1:end_frame=3,'
+            "settb=1/16,setpts=PTS-1,sendcmd='0.125 overlay@o x 2;0.375 overlay@o y 2',"
+            'crop=4:4:2:2,hflip[s];[m][s]overlay@o=0:0:format=rgb',
+        (8, 6),
+        _twice([0x8fd11bb7, 0xc304b9cc, 0xbf0a814a, 0xdb683617]),
+        alpha,
+      ),
+      (
+        'overlay-prefetch-nested',
+        'split[a][b];[a]fps=8[m];[b]split[c][d];[c]trim=start_frame=1:end_frame=3,'
+            "sendcmd='0.25 overlay@o x 2;0.5 overlay@o y 2',crop=4:4:2:2,hflip[s];"
+            '[m][s]overlay@o=0:0:format=rgb[r];[r][d]hstack',
+        (16, 6),
+        _twice([0x45910872, 0xb44c625b, 0x0790bf5b, 0xb0ba000e]),
+        alpha,
+      ),
+      (
+        'overlay-prefetch-nearest',
+        'split[a][b];[a]fps=8[m];[b]trim=start_frame=1:end_frame=3,'
+            "settb=1/16,setpts=PTS-1,sendcmd='0.125 overlay@o x 2;0.375 overlay@o y 2',"
+            'crop=4:4:2:2,hflip[s];[m][s]overlay@o=0:0:format=rgb:ts_sync_mode=nearest',
+        (8, 6),
+        [
+          0x8fd11bb7,
+          0x8fd11bb7,
+          0xc304b9cc,
+          0xfa54785b,
+          0xbf0a814a,
+          0xbf0a814a,
+          0xdb683617,
+          0xdb683617,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-two-rates',
+        'split[a][b];[a]fps=8[m];[b]fps=6,trim=start_frame=1:end_frame=4,'
+            "sendcmd='0.25 overlay@o x 2;0.5 overlay@o y 2',"
+            'crop=4:4:2:2,hflip[s];[m][s]overlay@o=0:0:format=rgb',
+        (8, 6),
+        [
+          0x8fd11bb7,
+          0x8fd11bb7,
+          0xc704776f,
+          0xc304b9cc,
+          0xbf0a814a,
+          0xbf0a814a,
+          0xdb683617,
+          0xdb683617,
+        ],
+        alpha,
+      ),
+      (
+        'target-before-sender',
+        'split[a][b];[a]hflip@h=enable=0[m];'
+            "[b]sendcmd='0.25 hflip@h enable 1'[s];[m][s]hstack",
+        (16, 6),
+        _twice([0x45910872, 0x2a3a6d68, 0x28567243, 0x9b8b6523]),
+        alpha,
+      ),
+      (
+        'sender-before-target',
+        "split[a][b];[b]sendcmd='0.25 hflip@h enable 1'[s];"
+            '[a]hflip@h=enable=0[m];[m][s]hstack',
+        (16, 6),
+        _twice([0x45910872, 0x3f068ce7, 0x28567243, 0x9b8b6523]),
+        alpha,
+      ),
+      (
+        'overlay-cut-after-fps',
+        'split[a][b];[a]fps=8[m];'
+            "[b]sendcmd='0.25 overlay@o x 1;0.5 overlay@o x 2;0.75 overlay@o x 3',"
+            'fps=4,trim=end_frame=1,crop=4:4:2:2,hflip[s];[m][s]overlay@o=0:0:format=rgb',
+        (8, 6),
+        [
+          0x7aef2060,
+          0x6cd6979a,
+          0xc704776f,
+          0xc704776f,
+          0xc4c84b64,
+          0xc4c84b64,
+          0x3204c86d,
+          0x3204c86d,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-cut-after-join',
+        'split=3[a][b][c];[a]fps=8[m];'
+            "[b]sendcmd='0.25 overlay@o x 1;0.5 overlay@o x 2;0.75 overlay@o x 3'[r];"
+            '[c]trim=end_frame=1[c0];[r][c0]overlay=0:0:format=rgb:shortest=1,'
+            'crop=4:4:2:2,hflip[s];[m][s]overlay@o=0:0:format=rgb',
+        (8, 6),
+        _twice([0xa5a7c227, 0x09ae9285, 0x0db7bdb2, 0x7bbc5c16]),
+        alpha,
+      ),
     ]) {
       for (final command in [
         'extract',
@@ -223,6 +330,7 @@ Future<void> main(List<String> args) async {
           'secondary',
           'overlay-relative',
           'overlay-expr',
+          'overlay-prefetch',
         }.contains(name))
           'vcs',
       ]) {

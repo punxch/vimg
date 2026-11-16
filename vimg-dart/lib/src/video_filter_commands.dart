@@ -62,47 +62,52 @@ final class _SendCmd {
   final List<_CommandInterval> intervals;
 
   CaptureTimeline apply(CaptureTimeline input, _FilterCommandState state) =>
-      CaptureTimeline(_events(input, state), input.timeBase, input.frameRate);
+      _applyTransition(input, transition(input, state));
 
-  Iterable<CaptureTimelineEvent> _events(
+  _TimelineTransition transition(
     CaptureTimeline input,
     _FilterCommandState state,
-  ) sync* {
-    final previous = List.filled(intervals.length, false);
-    var frameCount = 0;
-    for (final event in input.events) {
-      if (event is! CaptureTimedFrame) {
-        yield event;
-        continue;
-      }
-      frameCount++;
-      final tick = rescaleCaptureTicks(
-        event.pts,
-        input.timeBase,
-        captureMicroseconds,
-      );
-      final picture = _pictureOf(event);
-      for (final (i, interval) in intervals.indexed) {
-        final inside = tick >= interval.start && tick < interval.end;
-        var flags = inside ? _commandExpr : 0;
-        if (inside != previous[i])
-          flags |= inside ? _commandEnter : _commandLeave;
-        previous[i] = inside;
-        if (flags == 0) continue;
-        for (final command in interval.commands) {
-          if ((command.flags & flags) == 0) continue;
-          state.send(
-            command,
-            interval,
-            picture,
-            frameCount,
-            event.pts,
-            input.timeBase,
-          );
+  ) {
+    _TimelineTransform createTransform() {
+      final previous = List.filled(intervals.length, false);
+      var frameCount = 0;
+      return (event) {
+        if (event is! CaptureTimedFrame) return event;
+        frameCount++;
+        final tick = rescaleCaptureTicks(
+          event.pts,
+          input.timeBase,
+          captureMicroseconds,
+        );
+        final picture = _pictureOf(event);
+        for (final (i, interval) in intervals.indexed) {
+          final inside = tick >= interval.start && tick < interval.end;
+          var flags = inside ? _commandExpr : 0;
+          if (inside != previous[i])
+            flags |= inside ? _commandEnter : _commandLeave;
+          previous[i] = inside;
+          if (flags == 0) continue;
+          for (final command in interval.commands) {
+            if ((command.flags & flags) == 0) continue;
+            state.send(
+              command,
+              interval,
+              picture,
+              frameCount,
+              event.pts,
+              input.timeBase,
+            );
+          }
         }
-      }
-      yield event.withPicture(picture);
+        return event.withPicture(picture);
+      };
     }
+
+    return (
+      timeBase: input.timeBase,
+      frameRate: input.frameRate,
+      createTransform: createTransform,
+    );
   }
 }
 
