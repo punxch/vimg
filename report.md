@@ -1,5 +1,20 @@
 # Performance Optimization Report
 
+## 2026-11-16 Dart 接触表流式合成
+
+以 `6702985` 编译的 Dart CLI 为基线，在同一台 macOS 机器上使用同一份
+素材和相同参数。AVIF 对照前已运行过同一命令。表中每个版本各记录一次，
+耗时为父进程记录的端到端墙钟时间，峰值 RSS 来自子进程资源统计。
+
+| 工作负载 | 基线耗时 | 流式合成耗时 | 基线峰值 RSS | 流式合成峰值 RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `vimg vcs -c3 -H160 -n9 sample/input.mkv --output output.avif` | 56.60 s | 54.88 s | 324.7 MiB | 326.7 MiB |
+| `vimg vcs -c1 -H384 -n1 -f80 -t10ms --webp 1 vimg-dart/test/fixtures/cabac-b-spatial.mkv --output output.webp` | 722 ms | 48 ms | 121.4 MiB | 37.0 MiB |
+
+两组输出分别逐字节一致。AVIF 在所需画面到齐后即可合成，测试中的峰值 RSS
+增加了约 2 MiB。WebP 的短取帧窗口反复选到同一张图，因而充分利用了压缩帧复用。
+测量反映这两组单次对照的结果。
+
 ## 2026-10-25：按需探测与 Cues 小规模原型，冷态收益未证实，未采用
 
 **两个原型减少了准备阶段的工作，组合热态补测 44.57→39.90ms（−10.48%），但没有证明稳定的

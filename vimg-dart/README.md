@@ -344,6 +344,10 @@ spatial evaluations, and branched graphs are pending.
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered
 BMPs before tile resizing. Authority recording uses the fixed Preview profile.
+The contact sheet composes each animation frame as soon as its tiles are
+available. A scheduled capture can supply several grid positions and is freed
+after its final use. Animated WebP keeps encoded frames and reuses the encoded
+payload when the grid repeats.
 
 The authority manifest identifies the capture backend as
 `production-dart-capture`. Its `input_frame_index` is the zero-based index

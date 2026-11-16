@@ -31,26 +31,53 @@ final class VideoCaptureDecoder {
   Stream<_SelectedFrame> decode(Iterable<FramePacket> selected) =>
       _decode(selected, null);
 
-  Stream<_SelectedFrame> decodeCaptures(Iterable<CaptureFrame> selected) {
+  Stream<_SelectedFrame> decodeCaptures(
+    Iterable<CaptureFrame> selected, {
+    Map<FramePacket, int>? firstUse,
+  }) {
     final captures = <FramePacket, Set<CaptureFrame>>{};
     var dynamicFilters = false;
     for (final frame in selected) {
       captures.putIfAbsent(frame.packet, () => {}).add(frame);
       if (frame.positions.isNotEmpty) dynamicFilters = true;
     }
-    return _decode(captures.keys, dynamicFilters ? captures : null);
+    return _decode(
+      captures.keys,
+      dynamicFilters ? captures : null,
+      firstUse: firstUse,
+    );
   }
 
   Stream<_SelectedFrame> _decode(
     Iterable<FramePacket> selected,
-    Map<FramePacket, Set<CaptureFrame>>? captures,
-  ) async* {
+    Map<FramePacket, Set<CaptureFrame>>? captures, {
+    Map<FramePacket, int>? firstUse,
+  }) async* {
     if (_closed || _busy) throw StateError('Capture decoder is unavailable');
     _busy = true;
     var finished = false;
     try {
       final runs = _video._decodeRuns(selected).toList();
       final active = _limit < runs.length ? _limit : runs.length;
+      if (firstUse != null && runs.length > 1) {
+        final priorities = <_DecodeRun, int>{};
+        for (final run in runs) {
+          var first = firstUse[run.packets[run.targets.first]]!;
+          for (final target in run.targets) {
+            final rank = firstUse[run.packets[target]]!;
+            if (rank < first) first = rank;
+          }
+          priorities[run] = first;
+        }
+        // Prioritize the earliest grid. Among runs needed by the same grid,
+        // give longer GOPs a head start to balance decoding work.
+        runs.sort((a, b) {
+          final order = priorities[a]!.compareTo(priorities[b]!);
+          return order == 0
+              ? b.packets.length.compareTo(a.packets.length)
+              : order;
+        });
+      }
       if (active <= 1) {
         for (final run in runs) {
           for (final frame in _video._decodeRun(
@@ -64,8 +91,10 @@ final class VideoCaptureDecoder {
         }
       } else {
         await _startWorkers(active);
-        // Start longer GOPs early and let workers take the next available run.
-        runs.sort((a, b) => b.packets.length.compareTo(a.packets.length));
+        if (firstUse == null) {
+          // Start longer GOPs early when the consumer accepts any order.
+          runs.sort((a, b) => b.packets.length.compareTo(a.packets.length));
+        }
         void send(int worker, _DecodeRun run) {
           _workers[worker].send((
             run: run,
@@ -88,6 +117,8 @@ final class VideoCaptureDecoder {
             case final _DecodedFrame result:
               final frame = _unpackImage(result.frame);
               final original = result.original;
+              // Permit one frame of lookahead while the grid is encoded.
+              if (firstUse != null) _workers[result.worker].send(true);
               yield (
                 packet: result.capture.packet,
                 capture: result.capture,
@@ -96,8 +127,7 @@ final class VideoCaptureDecoder {
                     ? _unpackImage(original)
                     : (_includeOriginal ? frame : null),
               );
-              // A worker keeps at most one frame waiting in the mailbox.
-              _workers[result.worker].send(true);
+              if (firstUse == null) _workers[result.worker].send(true);
             case final int worker:
               if (next < runs.length) {
                 send(worker, runs[next++]);

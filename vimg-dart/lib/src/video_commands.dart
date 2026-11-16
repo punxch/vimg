@@ -1,5 +1,6 @@
 import 'dart:io';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:image/image.dart' as image;
 import 'package:path/path.dart' as paths;
@@ -11,6 +12,7 @@ import 'frame_packet.dart';
 import 'grid.dart';
 import 'output.dart';
 import 'video.dart';
+import 'webp_animation.dart';
 import 'yuv_image.dart';
 
 String videoStem(String input) {
@@ -310,17 +312,19 @@ Future<void> writeContactSheet(
   CaptureSelection? onSelect,
   GridFrameVisitor? onGrid,
 }) async {
-  final image.Encoder? encoder;
-  switch (format ?? ContactSheetFormat.forPath(output)) {
-    case ContactSheetFormat.jpeg:
-      if (options.frames != 1)
-        throw const FormatException('JPEG requires one frame per capture');
-      encoder = image.JpegEncoder();
-    case ContactSheetFormat.webp:
-      encoder = image.WebPEncoder(lossless: false, quality: webp, method: 1);
-    case ContactSheetFormat.avif:
-      encoder = null;
+  final outputFormat = format ?? ContactSheetFormat.forPath(output);
+  if (outputFormat == ContactSheetFormat.jpeg && options.frames != 1) {
+    throw const FormatException('JPEG requires one frame per capture');
   }
+  final stillEncoder = switch (outputFormat) {
+    ContactSheetFormat.jpeg => image.JpegEncoder(),
+    ContactSheetFormat.webp when options.frames == 1 => image.WebPEncoder(
+      lossless: false,
+      quality: webp,
+      method: 1,
+    ),
+    _ => null,
+  };
   _checkOutput(input, output);
   final video = Video(input);
   VideoCaptureDecoder? decoder;
@@ -338,71 +342,41 @@ Future<void> writeContactSheet(
     }
     decoder = VideoCaptureDecoder(
       video,
-      threads: threads,
+      threads: inter
+          ? threads
+          : math.min(
+              threads == 0 ? Platform.numberOfProcessors : threads,
+              selected.length,
+            ),
       scaler:
           scaleInDecoder && (spatial != null || width != null || height != null)
           ? YuvImageScaler(width: width, height: height, filters: spatial)
           : null,
       includeOriginal: paths != null && scaleInDecoder,
     );
-    final cached = <CaptureFrame, image.Image>{};
-    if (inter) {
-      var decodedBytes = 0;
-      await for (final result in decoder.decodeCaptures(
-        selected.expand((tile) => tile),
-      )) {
-        final frame = result.frame;
-        decodedBytes += frame.width * frame.height * frame.numChannels;
-        if (decodedBytes > _decodedFrameLimit) {
-          throw const FormatException(
-            'Contact sheet exceeds 256 MiB of decoded tiles',
-          );
-        }
-        cached[result.capture] = frame;
-        if (paths != null) {
-          _publishCaptures(paths[result.capture]!, result.original!);
-        }
-      }
-    }
     final labels = plan.starts
         .map((start) => timestampLabel(start.floor()))
         .toList();
-    final tiles = List<image.Image?>.filled(selected.length, null);
-    final last = List<CaptureFrame?>.filled(selected.length, null);
-    image.Image? animation, previousGrid;
+    // Round absolute endpoints so non-integer WebP frame durations do not drift.
+    int webpDuration(int frame) =>
+        ((frame + 1) * 1000 / fps).round() - (frame * 1000 / fps).round();
+    image.Image? still, previousGrid;
     AvifEncoder? avif;
+    WebpAnimationEncoder? animation;
     GridComposer? composer;
-    for (var frame = 0; frame < options.frames; frame++) {
-      final missing = <CaptureFrame, List<int>>{};
-      var changed = false;
-      for (var tile = 0; tile < tiles.length; tile++) {
-        final packet = selected[tile][frame];
-        if (last[tile] == packet) continue;
-        last[tile] = packet;
-        if (inter) {
-          tiles[tile] = cached[packet]!;
-        } else {
-          missing.putIfAbsent(packet, () => []).add(tile);
-        }
-        changed = true;
-      }
-      if (missing.isNotEmpty) {
-        await for (final result in decoder.decodeCaptures(missing.keys)) {
-          final captures = paths?.remove(result.capture);
-          if (captures != null) {
-            _publishCaptures(captures, result.original ?? result.frame);
-          }
-          final tile = scaleInDecoder
-              ? result.frame
-              : resizeToFit(result.frame, width: width, height: height);
-          for (final index in missing[result.capture]!) {
-            tiles[index] = tile;
-          }
-        }
-      }
-      final first = tiles.first!;
-      if (!changed && avif != null) {
-        avif.repeatFrame();
+    var index = 0;
+    await for (final tiles in _contactSheetTiles(
+      decoder,
+      selected,
+      paths,
+      width: scaleInDecoder ? null : width,
+      height: scaleInDecoder ? null : height,
+    )) {
+      final frame = index++;
+      if ((avif != null || animation != null) &&
+          selected.every((tile) => tile[frame] == tile[frame - 1])) {
+        avif?.repeatFrame();
+        animation?.repeatFrame(webpDuration(frame));
         onGrid?.call(
           frame,
           previousGrid!,
@@ -411,6 +385,7 @@ Future<void> writeContactSheet(
         );
         continue;
       }
+      final first = tiles.first;
       composer ??= GridComposer(
         first.width,
         first.height,
@@ -418,20 +393,19 @@ Future<void> writeContactSheet(
         columns,
         labels,
       );
-      if (encoder != null &&
+      if (outputFormat != ContactSheetFormat.avif &&
           frame == 0 &&
-          composer.width * composer.height * options.frames * 3 >
-              _decodedFrameLimit) {
-        throw const FormatException(
-          'Contact sheet exceeds 256 MiB of decoded frames',
-        );
+          composer.width * composer.height * 3 > _decodedFrameLimit) {
+        throw const FormatException('Contact sheet frame exceeds 256 MiB');
       }
-      final grid = composer.compose(tiles.cast<image.Image>(), fitTiles: true);
+      final grid = composer.compose(tiles, fitTiles: true);
       if (onGrid != null) {
         onGrid(frame, grid, composer.tileWidth, composer.tileHeight);
         previousGrid = grid;
       }
-      if (encoder == null) {
+      if (stillEncoder != null) {
+        still = grid;
+      } else if (outputFormat == ContactSheetFormat.avif) {
         avif ??= AvifEncoder(
           grid.width,
           grid.height,
@@ -440,21 +414,20 @@ Future<void> writeContactSheet(
           preset: avifPreset ?? defaultAvifPreset,
         );
         avif.addFrame(grid);
-        continue;
-      }
-      // Round absolute endpoints so non-integer frame durations do not drift.
-      grid.frameDuration =
-          ((frame + 1) * 1000 / fps).round() - (frame * 1000 / fps).round();
-      if (animation == null) {
-        animation = grid;
       } else {
-        animation.addFrame(grid);
+        animation ??= WebpAnimationEncoder(
+          grid.width,
+          grid.height,
+          quality: webp,
+        );
+        animation.addFrame(grid, webpDuration(frame));
       }
     }
     mark?.call(
-      avif == null ? 'decode_and_compose' : 'decode_compose_and_encode',
+      stillEncoder != null ? 'decode_and_compose' : 'decode_compose_and_encode',
     );
-    final bytes = avif?.finish() ?? encoder!.encode(animation!);
+    final bytes =
+        avif?.finish() ?? animation?.finish() ?? stillEncoder!.encode(still!);
     mark?.call('encode');
     File(output).absolute.parent.createSync(recursive: true);
     publishBytes(output, bytes);
@@ -466,4 +439,64 @@ Future<void> writeContactSheet(
       video.close();
     }
   }
+}
+
+Stream<List<image.Image>> _contactSheetTiles(
+  VideoCaptureDecoder decoder,
+  List<List<CaptureFrame>> selected,
+  Map<CaptureFrame, List<String>>? paths, {
+  int? width,
+  int? height,
+}) async* {
+  final frames = selected.first.length;
+  final remaining = Int32List(frames);
+  final uses = <CaptureFrame, List<int>>{};
+  final firstUse = <FramePacket, int>{};
+  for (var frame = 0; frame < frames; frame++) {
+    remaining[frame] = selected.length;
+    for (final tile in selected) {
+      final capture = tile[frame];
+      uses.putIfAbsent(capture, () => []).add(frame);
+      firstUse.putIfAbsent(capture.packet, () => frame);
+    }
+  }
+  final ready = <CaptureFrame, ({image.Image tile, int last})>{};
+  var bytes = 0, next = 0;
+  int pixelBytes(image.Image tile) =>
+      tile.width * tile.height * tile.numChannels;
+  await for (final result in decoder.decodeCaptures(
+    uses.keys,
+    firstUse: firstUse,
+  )) {
+    final occurrences = uses.remove(result.capture);
+    if (occurrences == null)
+      throw const FormatException('Unexpected captured tile');
+    final output = paths?.remove(result.capture);
+    if (output != null)
+      _publishCaptures(output, result.original ?? result.frame);
+    final tile = resizeToFit(result.frame, width: width, height: height);
+    ready[result.capture] = (tile: tile, last: occurrences.last);
+    bytes += pixelBytes(tile);
+    for (final frame in occurrences) {
+      remaining[frame]--;
+    }
+    while (next < frames && remaining[next] == 0) {
+      final row = [for (final capture in selected) ready[capture[next]]!.tile];
+      for (final capture in selected) {
+        final key = capture[next];
+        if (ready[key] case final frame? when frame.last == next) {
+          ready.remove(key);
+          bytes -= pixelBytes(frame.tile);
+        }
+      }
+      next++;
+      yield row;
+    }
+    if (bytes > _decodedFrameLimit) {
+      throw const FormatException(
+        'Contact sheet exceeds 256 MiB of queued tiles',
+      );
+    }
+  }
+  if (next != frames) throw const FormatException('Missing captured tiles');
 }
