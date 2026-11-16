@@ -946,6 +946,19 @@ void _checkStandaloneAlpha() {
       'format=gbrap16le,unpremultiply=inplace=1,scale=4:3:flags=neighbor',
       0xfcede330,
     ),
+    (
+      'format=gbrap12le,premultiply=inplace=1,scale=11:8:flags=bilinear',
+      0x2a8215c1,
+    ),
+    (
+      'format=gbrap12le,premultiply=inplace=1,scale=11:8:flags=bilinear,format=rgba',
+      0x2a8215c1,
+    ),
+    (
+      'format=gbrap16le,unpremultiply=inplace=1,scale=5:4:flags=bicubic,format=rgba',
+      0x31b489aa,
+    ),
+    ('format=gbrap10le,scale=23:17:flags=bicublin', 0xd7a26c32),
     // FFmpeg's native YUVA planes rendered by the Dart RGB converter.
     ('format=yuva444p10le,unpremultiply=inplace=1', 0x78324ce2),
     (
@@ -1061,6 +1074,7 @@ void _checkFloatAlpha() {
     ),
     ('$format,scale=4:3:flags=neighbor', 0x4dc65b27),
     ('$format,scale=4:3:flags=bilinear', 0x8de5cbeb),
+    ('$format,$premultiply,scale=11:8:flags=bicubic', 0x713688d1),
     // Scalar mask kernels with FFmpeg's equal-mode shortcut disabled.
     ('${masked}premultiply=planes=0x2', 0xa452ab9e),
     ('${masked}unpremultiply', 0x1ff8d5e8),
@@ -1447,6 +1461,19 @@ Future<void> _checkCli(String? executable) async {
       0xddf22480,
       0xddf22480,
     ];
+    const scaledAlpha =
+        'format=gbrap12le,premultiply=inplace=1,'
+        'scale=11:8:flags=bilinear,format=rgba,fps=8';
+    const scaledAlphaReference = [
+      0xae6e38d9,
+      0xae6e38d9,
+      0x56743dc4,
+      0x56743dc4,
+      0x8a07401d,
+      0x8a07401d,
+      0x0d3e430c,
+      0x0d3e430c,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1467,6 +1494,7 @@ Future<void> _checkCli(String? executable) async {
       ('float-alpha', floatAlpha, 4, 4, floatAlphaReference),
       ('implicit-alpha', implicitAlpha, 8, 6, implicitAlphaReference),
       ('packed-alpha', packedAlpha, 8, 6, packedAlphaReference),
+      ('scaled-alpha', scaledAlpha, 11, 8, scaledAlphaReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1492,7 +1520,8 @@ Future<void> _checkCli(String? executable) async {
                   name == 'masked-alpha' ||
                   name == 'float-alpha' ||
                   name == 'implicit-alpha' ||
-                  name == 'packed-alpha'
+                  name == 'packed-alpha' ||
+                  name == 'scaled-alpha'
               ? transparentMotion
               : motion,
         ]);

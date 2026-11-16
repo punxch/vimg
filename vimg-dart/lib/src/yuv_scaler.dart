@@ -9,6 +9,7 @@ typedef _YuvGeometry = ({
   int chromaHeight,
   int outputChromaWidth,
   _ScaleKernel chromaKernel,
+  bool scalarTaps,
 });
 
 bool _needsChromaResampling(
@@ -298,7 +299,7 @@ final class YuvImageScaler {
         // The unscaled 8-bit RGB kernel reads chroma directly from its grid.
         return _rgbTable(frame.matrix, frame.fullRange).writeUnscaled(frame);
       }
-      if (frame.floating ||
+      if (frame.floating && !frame.usesDeepRgbPacking ||
           frame.usesDeepRgbPacking && scale.nearest ||
           frame.packedRgb &&
               (scale.algorithm != _ScaleAlgorithm.bicubic ||
@@ -315,7 +316,7 @@ final class YuvImageScaler {
       );
     }
     if (frame.floating) {
-      if (outputScale case final scaler?) {
+      if (outputScale case final scaler? when !frame.usesDeepRgbPacking) {
         final (w, h) = scaler._dimensions(frame.width, frame.height);
         _checkFilterSize(w, h);
         frame = frame.map(
@@ -431,6 +432,7 @@ final class YuvImageScaler {
     required int cropTop,
     required int matrix,
     required bool fullRange,
+    bool packedRgb = false,
     required int lumaDepth,
     required int chromaDepth,
     required int subsamplingX,
@@ -447,6 +449,16 @@ final class YuvImageScaler {
       );
     }
     final gbr = matrix == 0 && cb.isNotEmpty;
+    final studio =
+        gbr &&
+            !packedRgb &&
+            fullRange &&
+            lumaDepth > 8 &&
+            lumaDepth == chromaDepth &&
+            subsamplingX == 0 &&
+            subsamplingY == 0
+        ? _RgbStudioConverter(lumaDepth)
+        : null;
     // FFmpeg reuses chroma across pixel pairs for even-width RGB output when
     // the input already has chroma subsampling.
     final halfChroma =
@@ -462,24 +474,30 @@ final class YuvImageScaler {
       chromaWidth: (sourceWidth + (1 << subsamplingX) - 1) >> subsamplingX,
       chromaHeight: (sourceHeight + (1 << subsamplingY) - 1) >> subsamplingY,
       outputChromaWidth: cb.isEmpty ? 0 : (halfChroma ? width >> 1 : width),
-      chromaKernel: _algorithm.kernel(chroma: !gbr),
+      chromaKernel: _algorithm.kernel(chroma: !gbr || studio != null),
+      scalarTaps: studio != null,
     );
     if (geometry != _geometry) {
+      final lumaKernel = _algorithm.kernel(chroma: false);
       _luma = _PlaneScaler(
         sourceWidth,
         sourceHeight,
         width,
         height,
-        kernel: _algorithm.kernel(chroma: false),
+        kernel: lumaKernel,
+        scalarTaps: geometry.scalarTaps,
       );
       _chroma = cb.isEmpty
           ? null
+          : studio != null && geometry.chromaKernel == lumaKernel
+          ? _luma
           : _PlaneScaler(
               geometry.chromaWidth,
               geometry.chromaHeight,
               geometry.outputChromaWidth,
               height,
               kernel: geometry.chromaKernel,
+              scalarTaps: geometry.scalarTaps,
             );
       _geometry = geometry;
     }
@@ -488,35 +506,74 @@ final class YuvImageScaler {
     final useTable =
         halfChroma && (_exact || lumaDepth == 8 && chromaDepth == 8);
     final fractionalBits = useTable ? 0 : 9;
-    final luma = _luma.resize(
-      y,
-      stride,
-      cropTop * stride + cropLeft,
-      lumaDepth,
-      fractionalBits,
-    );
+    final lumaOffset = cropTop * stride + cropLeft;
     final chromaOffset =
         (cropTop >> subsamplingY) * chromaStride + (cropLeft >> subsamplingX);
-    final blueChroma = _chroma?.resize(
-      cb,
-      chromaStride,
-      chromaOffset,
-      chromaDepth,
+    (Uint16List, Uint16List, Uint16List)? studioPlanes;
+    if (studio != null) {
+      final y16 = Uint16List(sourceWidth * sourceHeight);
+      final u16 = Uint16List(y16.length), v16 = Uint16List(y16.length);
+      var index = 0;
+      for (var row = 0; row < sourceHeight; row++) {
+        final yi = lumaOffset + row * stride;
+        final ci = chromaOffset + row * chromaStride;
+        for (var x = 0; x < sourceWidth; x++) {
+          final (luma, u, v) = studio.toStudio(
+            cr[ci + x],
+            y[yi + x],
+            cb[ci + x],
+          );
+          y16[index] = luma;
+          u16[index] = u;
+          v16[index++] = v;
+        }
+      }
+      studioPlanes = (y16, u16, v16);
+    }
+    bool truncateMatrix(int row) =>
+        _luma.hasPackedPair(row) && _chroma!.hasPackedPair(row);
+    final truncateRows = studio == null ? null : truncateMatrix;
+    final luma = _luma.resize(
+      studioPlanes?.$1 ?? y,
+      studio == null ? stride : sourceWidth,
+      studio == null ? lumaOffset : 0,
+      studio?.studioDepth ?? lumaDepth,
       fractionalBits,
+      truncateRows: truncateRows,
+    );
+    final blueChroma = _chroma?.resize(
+      studioPlanes?.$2 ?? cb,
+      studio == null ? chromaStride : sourceWidth,
+      studio == null ? chromaOffset : 0,
+      studio?.studioDepth ?? chromaDepth,
+      fractionalBits,
+      truncateRows: truncateRows,
     );
     final redChroma = _chroma?.resize(
-      cr,
-      chromaStride,
-      chromaOffset,
-      chromaDepth,
+      studioPlanes?.$3 ?? cr,
+      studio == null ? chromaStride : sourceWidth,
+      studio == null ? chromaOffset : 0,
+      studio?.studioDepth ?? chromaDepth,
       fractionalBits,
+      truncateRows: truncateRows,
     );
     final pixels = image.Image(
       width: width,
       height: height,
       numChannels: alpha == null ? 3 : 4,
     );
-    if (useTable) {
+    if (studio != null) {
+      var i = 0;
+      for (final pixel in pixels) {
+        final (r, g, b) = studio.fromStudio(
+          luma[i],
+          blueChroma![i],
+          redChroma![i],
+        );
+        pixel.setRgb(r, g, b);
+        i++;
+      }
+    } else if (useTable) {
       _rgbTable(matrix, fullRange).write(pixels, luma, blueChroma!, redChroma!);
     } else {
       _writeRgb(
@@ -537,15 +594,17 @@ final class YuvImageScaler {
       final scaled = _luma.resize(
         alpha,
         stride,
-        cropTop * stride + cropLeft,
+        lumaOffset,
         alphaDepth,
-        fractionalBits,
+        studio == null ? fractionalBits : 0,
       );
       final maximum = ((1 << alphaDepth) - 1) << (17 - alphaDepth);
       var index = 0;
       for (final pixel in pixels) {
-        final sample = scaled[index++].clamp(0, maximum);
-        pixel.a = (sample * 255 + (maximum >> 1)) ~/ maximum;
+        final sample = scaled[index++];
+        pixel.a = studio == null
+            ? (sample.clamp(0, maximum) * 255 + (maximum >> 1)) ~/ maximum
+            : sample.clamp(0, 255);
       }
     }
     return pixels;
@@ -618,15 +677,35 @@ final class _PlaneScaler {
     int height, {
     required _ScaleKernel kernel,
     this.precision = 15,
-  }) : horizontal = _axisTaps(sourceWidth, width, 14, kernel),
-       vertical = _axisTaps(sourceHeight, height, 12, kernel),
+    bool scalarTaps = false,
+  }) : horizontal = _axisTaps(
+         sourceWidth,
+         width,
+         14,
+         kernel,
+         scalar: scalarTaps,
+       ),
+       vertical = _axisTaps(
+         sourceHeight,
+         height,
+         12,
+         kernel,
+         scalar: scalarTaps,
+       ),
        intermediate = precision == 15
            ? Int16List(sourceHeight * width)
            : Int32List(sourceHeight * width);
 
   final int width, precision;
-  final List<({int start, Int16List weights})> horizontal, vertical;
+  final List<_AxisTap> horizontal, vertical;
   final List<int> intermediate;
+  bool hasPackedPair(int row) {
+    final weights = vertical[row].weights;
+    return weights.length == 2 &&
+        weights[1] >= 0 &&
+        weights[1] <= 4096 &&
+        weights[0] + weights[1] == 4096;
+  }
 
   Int32List resize(
     List<int> source,
@@ -636,6 +715,7 @@ final class _PlaneScaler {
     int fractionalBits, {
     int? ditherOffset,
     _VideoSampleRange? range,
+    bool Function(int)? truncateRows,
   }) {
     final horizontalShift = depth + 14 - precision;
     final maximum = (1 << precision) - 1;
@@ -659,9 +739,11 @@ final class _PlaneScaler {
     for (var row = 0; row < vertical.length; row++) {
       final tap = vertical[row];
       final start = tap.start * width;
+      // The packed RGB two-tap kernel truncates the interpolated Q9 values.
+      final rowRounding = truncateRows?.call(row) == true ? 0 : rounding;
       for (var x = 0; x < width; x++) {
         var sum = ditherOffset == null
-            ? rounding
+            ? rowRounding
             : _conversionDither[row & 7][(x + ditherOffset) & 7] <<
                   (precision - 2);
         var sample = start + x;
@@ -681,14 +763,22 @@ int _scaleStep(int from, int to) => ((from << 16) + (to >> 1)) ~/ to;
 int _nearestIndex(int index, int step, int size) =>
     math.min(size - 1, ((2 * index + 1) * step) >> 17);
 
-List<({int start, Int16List weights})> _axisTaps(
+List<_AxisTap> _axisTaps(
   int from,
   int to,
   int bits,
-  _ScaleKernel kernel,
-) {
+  _ScaleKernel kernel, {
+  bool scalar = false,
+}) {
   final unit = 1 << bits;
   final step = _scaleStep(from, to);
+  if (scalar && (step - 65536).abs() < 10) {
+    final identity = Int16List.fromList([unit]);
+    return List.generate(
+      to,
+      (x) => (start: math.min(x, from - 1), weights: identity),
+    );
+  }
   if (from == to || from == 1 || kernel == _ScaleKernel.point) {
     final identity = Int16List.fromList([unit]);
     return List.generate(
@@ -698,7 +788,11 @@ List<({int start, Int16List weights})> _axisTaps(
   }
   final scale = math.min(1.0, to / from);
   final support = kernel == _ScaleKernel.triangle ? 2 : 4;
-  final count = math.min(math.max(1, from - 2), 1 + (support / scale).ceil());
+  final filterSize = scalar
+      ? (support * math.max(from, to) + to - 1) ~/ to
+      : (support / scale).ceil();
+  final count = math.min(math.max(1, from - 2), 1 + filterSize);
+  if (scalar) return _scalarAxisTaps(from, to, unit, step, count, kernel);
   return List.generate(to, (x) {
     // A pixel center is at x + 0.5. Widen the kernel when shrinking.
     final center = (2 * x + 1) * step - 65536;

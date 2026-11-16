@@ -628,6 +628,26 @@ final class _Scale extends _FrameSpatialFilter {
     if (mode != null && alpha != false) {
       frame = _converter.changeAlphaMode(frame, mode);
     }
+    final geometry = (
+      width: w,
+      height: h,
+      sampleAspect: _outputAspect(frame, w, h),
+      algorithm: algorithm,
+      fullChromaInput: fullChromaInput,
+    );
+    if (frame.usesDeepRgbPacking &&
+        target.packedRgb &&
+        target.depth == 8 &&
+        !nearest &&
+        (w != frame.width || h != frame.height)) {
+      return _converter.convert(
+        frame,
+        target,
+        alpha: alpha,
+        premultiplied: mode,
+        scale: geometry,
+      );
+    }
     final preserveAlpha = alpha == null || alpha == (frame.alpha != null);
     final sameLayout = target == _frameFormat(frame) && preserveAlpha;
     if (frame.rgb && target.color == _PixelColor.rgb) {
@@ -668,13 +688,7 @@ final class _Scale extends _FrameSpatialFilter {
       matrix: matrix,
       fullRange: target.color == _PixelColor.rgb ? true : fullRange,
       premultiplied: mode,
-      scale: (
-        width: w,
-        height: h,
-        sampleAspect: _outputAspect(frame, w, h),
-        algorithm: algorithm,
-        fullChromaInput: fullChromaInput,
-      ),
+      scale: geometry,
     );
   }
 

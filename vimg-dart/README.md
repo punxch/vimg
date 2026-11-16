@@ -409,6 +409,9 @@ Native YUV depth reduction uses ordered dithering.
 Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 Unscaled full-range planar GBR uses the scalar matrix and alpha rounding
 when converting between 8-bit RGB and higher component depths.
+Resizing high-depth GBR into packed RGB uses scalar fixed-point taps and
+filters the studio-range components before packing. Bicublin uses distinct
+luma and chroma taps. Alpha retains its own full-range rounding.
 
 Use `premultiply=inplace=1` or `unpremultiply=inplace=1` to process the
 frame's own alpha. `premultiply_dynamic` follows the downstream alpha

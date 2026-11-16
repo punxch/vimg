@@ -451,34 +451,37 @@ _VideoPlanes _quantizeFloatFrame(_VideoPlanes source) {
 /// Scalar RGB depth conversion via the studio-range matrix.
 final class _RgbStudioConverter {
   _RgbStudioConverter(int depth, {int outputDepth = 8})
-    : _shift = depth == 16 ? 16 : depth + 1,
-      _q7Shift = depth == 16 ? 0 : 1,
+    : studioDepth = depth == 16 ? 16 : 14,
+      _inputShift = depth == 16 ? 15 : depth + 1,
       _outputShift = 30 - outputDepth,
       _rounding = 1 << (29 - outputDepth),
       _maximum = (1 << outputDepth) - 1,
       _lumaBias = (16 << (depth + 7)) + (1 << (depth == 16 ? 14 : depth)),
       _chromaBias = (128 << (depth + 7)) + (1 << (depth == 16 ? 14 : depth));
 
-  final int _shift, _q7Shift, _lumaBias, _chromaBias;
+  final int studioDepth, _inputShift, _lumaBias, _chromaBias;
   final int _outputShift, _rounding, _maximum;
   static final _inverse = (() {
     final (rv, bu, gu, gv) = _rgbCoefficients(6);
     return ((rv + 4) >> 3, (bu + 4) >> 3, (gu + 4) >> 3, (gv + 4) >> 3);
   })();
 
+  (int, int, int) toStudio(int r, int g, int b) => (
+    (_rgbProduct(_bt601RgbToYuv[0], r, g, b) + _lumaBias) >> _inputShift,
+    (_rgbProduct(_bt601RgbToYuv[1], r, g, b) + _chromaBias) >> _inputShift,
+    (_rgbProduct(_bt601RgbToYuv[2], r, g, b) + _chromaBias) >> _inputShift,
+  );
+
   (int, int, int) rgb(int r, int g, int b) {
+    final (y, u, v) = toStudio(r, g, b);
     // The horizontal identity filter expands Q6 and truncates Q8 to Q7.
-    final luma =
-        ((_rgbProduct(_bt601RgbToYuv[0], r, g, b) + _lumaBias) >> _shift) <<
-        _q7Shift;
-    final cb =
-        ((_rgbProduct(_bt601RgbToYuv[1], r, g, b) + _chromaBias) >> _shift) <<
-        _q7Shift;
-    final cr =
-        ((_rgbProduct(_bt601RgbToYuv[2], r, g, b) + _chromaBias) >> _shift) <<
-        _q7Shift;
-    final lum = (luma - (16 << 7)) * 4 * 9539;
-    final u = (cb - (128 << 7)) * 4, v = (cr - (128 << 7)) * 4;
+    int q9(int sample) => (studioDepth == 16 ? sample >> 1 : sample << 1) << 2;
+    return fromStudio(q9(y), q9(u), q9(v));
+  }
+
+  (int, int, int) fromStudio(int y, int cb, int cr) {
+    final lum = (y - (16 << 9)) * 9539;
+    final u = cb - (128 << 9), v = cr - (128 << 9);
     final (vr, ub, ug, vg) = _inverse;
     return (
       _sample(lum + vr * v),
@@ -639,7 +642,22 @@ final class _PixelFormatConverter {
         source.fullRange &&
         full &&
         opacityDepth == target.depth &&
-        scale == null) {
+        (packsDeepRgb || scale == null)) {
+      if (scale != null && (width != source.width || height != source.height)) {
+        return _toRgb(
+          source,
+          width,
+          height,
+          algorithm,
+          bgr24: target.bgr24,
+          includeAlpha: requestedAlpha,
+        ).mapComponents(
+          (plane, _, _, _) => plane,
+          sampleAspect: scale.sampleAspect,
+          premultiplied:
+              requestedAlpha && (premultiplied ?? source.premultiplied),
+        );
+      }
       return _convertRgbViaStudio(
         source,
         target,
@@ -1015,6 +1033,7 @@ final class _PixelFormatConverter {
     int height,
     _ScaleAlgorithm algorithm, {
     bool bgr24 = false,
+    bool includeAlpha = false,
   }) {
     final geometry = (width, height, algorithm);
     if (_rgbScalers.length == 4 && !_rgbScalers.containsKey(geometry)) {
@@ -1037,9 +1056,14 @@ final class _PixelFormatConverter {
         bgr24: bgr24,
       );
     }
-    final y = frame.planes.first.atOrigin;
+    final y = includeAlpha
+        ? frame.planes.first.packed
+        : frame.planes.first.atOrigin;
     final cb = frame.planes.length == 3 ? frame.planes[1].packed : null;
     final cr = frame.planes.length == 3 ? frame.planes[2].packed : null;
+    final alpha = includeAlpha
+        ? frame.alpha?.packed ?? _constantPlane(y.width, y.height, 8, 255)
+        : null;
     final result = scaler._resize(
       y: y.samples,
       cb: cb?.samples ?? const [],
@@ -1054,12 +1078,13 @@ final class _PixelFormatConverter {
       cropTop: 0,
       matrix: frame.matrix,
       fullRange: frame.fullRange,
+      packedRgb: frame.packedRgb,
       lumaDepth: y.depth,
       chromaDepth: cb?.depth ?? y.depth,
       subsamplingX: frame.subX,
       subsamplingY: frame.subY,
-      alpha: null,
-      alphaDepth: 8,
+      alpha: alpha?.samples,
+      alphaDepth: alpha?.depth ?? 8,
     );
     return YuvImageScaler._imagePlanes(
       result,

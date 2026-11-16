@@ -10,6 +10,7 @@ import 'package:vimg_dart/src/iso_media.dart';
 import 'package:vimg_dart/src/matroska.dart';
 import 'package:vimg_dart/src/video.dart';
 import 'package:vimg_dart/src/video_configuration.dart';
+import 'package:vimg_dart/src/yuv_image.dart';
 
 import 'fixtures.dart';
 
@@ -26,6 +27,13 @@ const _v4Rgb10Display = [
   0xb624bace,
   0xe1a1a798,
   0x2bfdbfba,
+];
+const _v4Rgb10Scaled = [
+  0x4082bada,
+  0xd1a706dc,
+  0xc2434587,
+  0xfdc5615b,
+  0xac2d4a9e,
 ];
 // Raw slices over the same source planes as the seeded-CRC fixture.
 const _v4Pcm = 'test/fixtures/ffv1-v4-pcm.mkv';
@@ -82,6 +90,7 @@ Future<void> _checkVideo(String path) async {
       );
     }
     final expectedRgb = <Uint8List>[];
+    final scaler = YuvImageScaler(height: 10);
     for (final (frame, packet) in packets.indexed) {
       final picture = decoder.decode(
         video.file.read(packet.offset, packet.size),
@@ -115,6 +124,13 @@ Future<void> _checkVideo(String path) async {
         check(
           getCrc32(rgb) == _v4Rgb10Display[frame],
           'High-depth FFV1 display matches scalar FFmpeg RGB24',
+        );
+        final scaled = picture.rgb(scaler: scaler);
+        check(
+          scaled.width == 12 &&
+              scaled.height == 10 &&
+              getCrc32(scaled.getBytes()) == _v4Rgb10Scaled[frame],
+          'Native GBR resized to a capture tile matches scalar FFmpeg',
         );
       }
       expectedRgb.add(rgb);
