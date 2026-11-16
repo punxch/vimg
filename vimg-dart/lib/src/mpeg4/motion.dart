@@ -216,17 +216,39 @@ final class _Mpeg4MotionCompensation {
         average,
       );
     }
+    _predictChroma(
+      output,
+      reference,
+      x,
+      y,
+      (x: sumX, y: sumY),
+      split: split,
+      noRound: noRound,
+      average: average,
+    );
+  }
+
+  void _predictChroma(
+    _DctPicture output,
+    _DctPicture reference,
+    int x,
+    int y,
+    _Vector sum, {
+    required bool split,
+    required bool noRound,
+    bool average = false,
+  }) {
     const chromaRound = [0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1];
     int reduce(int value) => split
         ? (value >> 3) + chromaRound[value & 15]
         : (value >> 1) | (value & 1);
-    final chromaX = reduce(sumX), chromaY = reduce(sumY);
+    final chromaX = reduce(sum.x), chromaY = reduce(sum.y);
     for (var plane = 1; plane < 3; plane++) {
       _half(
         output.planes[plane],
         reference.planes[plane],
-        stride >> 1,
-        lines >> 1,
+        output.stride >> 1,
+        output.rows * 8,
         x * 8,
         y * 8,
         8,
@@ -437,6 +459,7 @@ final class _Mpeg4MotionCompensation {
     bool average, {
     _FieldPair? field,
     int? rows,
+    bool packed = false,
   }) {
     final dx = mx & 1, dy = my & 1;
     final sx = x + (mx >> 1), sy = y + (my >> 1);
@@ -448,7 +471,9 @@ final class _Mpeg4MotionCompensation {
       final source = (sy + j) * step + sourceField;
       final top = source.clamp(0, height - 1) * stride;
       final bottom = (source + dy * step).clamp(0, height - 1) * stride;
-      final target = ((y + j) * step + destinationField) * stride + x;
+      final target = packed
+          ? j * size
+          : ((y + j) * step + destinationField) * stride + x;
       for (var i = 0; i < size; i++) {
         final left = (sx + i).clamp(0, stride - 1);
         final right = (sx + i + dx).clamp(0, stride - 1);

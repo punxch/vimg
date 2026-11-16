@@ -180,11 +180,12 @@ VLC partitions remain pending.
 
 Standalone `.h263` files, 3GP, AVI and Matroska support H.263 and H.263+
 I/P pictures, including group-of-blocks resynchronization, custom sizes and
-clocks, unrestricted motion vectors, structured slices, advanced intra
-prediction, in-loop deblocking, alternate inter VLCs and modified quantization.
+clocks, unrestricted motion vectors, structured slices, overlapped block
+motion compensation, advanced intra prediction, in-loop deblocking, alternate
+inter VLCs and modified quantization.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
-and disposable Spark pictures. H.263 arithmetic coding, overlapped motion and
-PB pictures remain pending.
+and disposable Spark pictures. H.263 arithmetic coding and PB pictures remain
+pending.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS

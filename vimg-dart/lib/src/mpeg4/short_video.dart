@@ -36,9 +36,6 @@ final class H263Decoder {
   H263Picture decode(Uint8List bytes) {
     final header = _headers.read(bytes);
     final format = header.format;
-    if (format.overlapping) {
-      throw UnsupportedError('H.263 overlapped motion compensation');
-    }
     final picture = H263Picture._(format);
     final reference = header.intra ? null : _reference;
     if (!header.intra &&
@@ -82,12 +79,17 @@ final class _H263Macroblocks {
       List<_H263IntraBlock?>.filled(picture.columns * picture.rows, null),
   ];
   late final _filterQuant = Uint8List(picture.columns * picture.rows);
+  late final _overlap = header.format.overlapping && reference != null
+      ? _H263Overlap(picture, reference!, _motion, _prediction, header)
+      : null;
+  int _pendingPattern = -1;
   Rbsp get _bits => header.bits;
   int _quant, _sliceStart = 0;
 
   void decode() {
     final columns = picture.columns;
     final count = columns * picture.rows;
+    final overlap = _overlap;
     for (var index = 0; index < count; index++) {
       if (index != 0) _readGroupHeader(index, count);
       final x = index % columns, y = index ~/ columns;
@@ -110,9 +112,15 @@ final class _H263Macroblocks {
         mode = code;
       }
       if (mode == -1) {
-        _prediction.predict(picture, reference!, x, y, [
-          _zeroVector,
-        ], noRound: header.noRound);
+        if (overlap != null) {
+          overlap.markInter(index, _sliceStart);
+          _finishOverlap(index - 1);
+          _pendingPattern = 0;
+        } else {
+          _prediction.predict(picture, reference!, x, y, [
+            _zeroVector,
+          ], noRound: header.noRound);
+        }
         continue;
       }
       final intra = header.intra || mode & 4 != 0;
@@ -126,8 +134,22 @@ final class _H263Macroblocks {
         _readQuantChange();
       }
       if (!intra) {
-        _predict(x, y, mode & 16 != 0);
+        final vectors = _readMotion(x, y, mode & 16 != 0);
+        if (overlap == null) {
+          _prediction.predict(
+            picture,
+            reference!,
+            x,
+            y,
+            vectors,
+            noRound: header.noRound,
+          );
+        } else {
+          overlap.markInter(index, _sliceStart);
+        }
       }
+      _finishOverlap(index - 1);
+      if (overlap != null && !intra) _pendingPattern = pattern;
       for (var block = 0; block < 6; block++) {
         final coded = pattern & (32 >> block) != 0;
         if (intra || coded) {
@@ -144,6 +166,7 @@ final class _H263Macroblocks {
       }
       if (header.format.loopFilter) _filterQuant[index] = _quant;
     }
+    _finishOverlap(count - 1);
     if (header.format.loopFilter) {
       _deblockH263(
         picture,
@@ -151,6 +174,22 @@ final class _H263Macroblocks {
         modifiedQuant: header.format.modifiedQuant,
       );
     }
+  }
+
+  // Delay the previous inter macroblock until its right neighbor's mode
+  // and motion vectors are available. Only its six residuals are buffered.
+  void _finishOverlap(int index) {
+    final pattern = _pendingPattern;
+    if (pattern < 0) return;
+    final overlap = _overlap!;
+    final x = index % picture.columns, y = index ~/ picture.columns;
+    overlap.predict(x, y);
+    for (var block = 0; block < 6; block++) {
+      if (pattern & (32 >> block) != 0) {
+        _writeBlock(x, y, block, overlap.residuals[block], intra: false);
+      }
+    }
+    _pendingPattern = -1;
   }
 
   void _readQuantChange() {
@@ -200,7 +239,7 @@ final class _H263Macroblocks {
     _sliceStart = index;
   }
 
-  void _predict(int x, int y, bool split) {
+  List<_Vector> _readMotion(int x, int y, bool split) {
     final vectors = <_Vector>[];
     for (var i = 0; i < (split ? 4 : 1); i++) {
       final prediction = _motionPrediction(
@@ -228,14 +267,7 @@ final class _H263Macroblocks {
         _motion.store(x, y, i, vectors.single);
       }
     }
-    _prediction.predict(
-      picture,
-      reference!,
-      x,
-      y,
-      vectors,
-      noRound: header.noRound,
-    );
+    return vectors;
   }
 
   int _readUmv() {
@@ -292,7 +324,6 @@ final class _H263Macroblocks {
         }
       }
     }
-    final stride = luma ? picture.stride : picture.stride >> 1;
     final bx = luma ? x * 2 + (block & 1) : x;
     final by = luma ? y * 2 + (block >> 1) : y;
     if (advanced) {
@@ -308,6 +339,25 @@ final class _H263Macroblocks {
         );
       }
     }
+    if (_pendingPattern >= 0) {
+      _overlap!.residuals[block].setAll(0, values);
+    } else {
+      _writeBlock(x, y, block, values, intra: intra);
+    }
+  }
+
+  void _writeBlock(
+    int x,
+    int y,
+    int block,
+    Int16List values, {
+    required bool intra,
+  }) {
+    final luma = block < 4;
+    final plane = luma ? 0 : block - 3;
+    final stride = luma ? picture.stride : picture.stride >> 1;
+    final bx = luma ? x * 2 + (block & 1) : x;
+    final by = luma ? y * 2 + (block >> 1) : y;
     _transform.write(
       picture.planes[plane],
       (by * stride + bx) * 8,
