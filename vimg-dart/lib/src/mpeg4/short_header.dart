@@ -28,6 +28,18 @@ typedef H263Format = ({
   bool modifiedQuant,
 });
 
+typedef H263Resampling = ({
+  int precisionBits,
+  List<({int x, int y})> parameters,
+  ({int y, int cb, int cr})? fill,
+});
+
+const H263Resampling h263ImplicitResampling = (
+  precisionBits: 4,
+  parameters: [(x: 0, y: 0), (x: 0, y: 0), (x: 0, y: 0), (x: 0, y: 0)],
+  fill: null,
+);
+
 typedef H263Header = ({
   H263Format format,
   int temporalReference,
@@ -42,6 +54,7 @@ typedef H263Header = ({
   int referenceLayer,
   bool bidirectional,
   bool enhancementIntra,
+  H263Resampling? resampling,
   ({int offset, int quantFactor})? pb,
   Rbsp bits,
 });
@@ -63,6 +76,7 @@ final class H263Headers {
   final bool spark;
   H263Format? _extended;
   final Map<int, H263LayerState> _layers;
+  final _references = <int, ({H263Format format, H263Resampling? warp})>{};
 
   Map<int, H263LayerState>? snapshotLayers() =>
       _layers.isEmpty ? null : Map.of(_layers);
@@ -81,6 +95,7 @@ final class H263Headers {
     final int quant;
     var layer = 1, referenceLayer = 1;
     var bidirectional = false, enhancementIntra = false;
+    H263Resampling? resampling;
     if (source < 6) {
       intra = !bits.flag();
       longVectors = bits.flag();
@@ -108,8 +123,9 @@ final class H263Headers {
       if (type > 5) throw UnsupportedError('H.263+ picture type $type');
       intra = type == 0;
       paired = type == 2;
-      if (bits.read(2) != 0)
-        throw UnsupportedError('H.263+ resampled reference or scaled update');
+      final explicitResampling = bits.flag();
+      if (bits.flag())
+        throw UnsupportedError('H.263+ reduced-resolution update');
       noRound = bits.flag();
       bits.skip(3); // reserved MPPTYPE bits
       _checkMultipoint(bits);
@@ -155,6 +171,18 @@ final class H263Headers {
       if (options != null && layer == 1) {
         _extended = format;
       }
+      if (explicitResampling) {
+        if (intra || enhancementIntra) {
+          throw const FormatException(
+            'Invalid H.263+ intra reference resampling',
+          );
+        }
+        resampling = _readResampling(
+          bits,
+          format,
+          lowerLayer: type == 5 ? referenceLayer : null,
+        );
+      }
       quant = bits.read(5);
     }
     _checkPicture(format, quant);
@@ -176,6 +204,7 @@ final class H263Headers {
         throw const FormatException('H.263+ picture starts mid-slice');
       h263Marker(bits);
     }
+    if (!bidirectional) _references[layer] = (format: format, warp: resampling);
     return (
       format: format,
       temporalReference: temporal,
@@ -190,9 +219,57 @@ final class H263Headers {
       referenceLayer: referenceLayer,
       bidirectional: bidirectional,
       enhancementIntra: enhancementIntra,
+      resampling: resampling,
       pb: pb,
       bits: bits,
     );
+  }
+
+  H263Resampling _readResampling(
+    Rbsp bits,
+    H263Format format, {
+    required int? lowerLayer,
+  }) {
+    final precisionBits = switch (bits.read(2)) {
+      2 => 1,
+      3 => 4,
+      _ => throw const FormatException('Invalid H.263+ resampling accuracy'),
+    };
+    if (lowerLayer != null) {
+      final lower = _references[lowerLayer];
+      final lowerFormat =
+          lower?.format ??
+          (lowerLayer == 1 ? _extended : _layers[lowerLayer]?.format);
+      if (lowerFormat == null) {
+        throw const FormatException(
+          'Missing H.263+ resampling reference layer',
+        );
+      }
+      final warp = lower?.warp ?? h263ImplicitResampling;
+      final horizontal = format.width == 2 * lowerFormat.width;
+      final vertical = format.height == 2 * lowerFormat.height;
+      return (
+        precisionBits: precisionBits,
+        parameters: [
+          for (final (x: x, y: y) in warp.parameters)
+            (
+              x: horizontal ? 2 * x + bits.bit() : x,
+              y: vertical ? 2 * y + bits.bit() : y,
+            ),
+        ],
+        fill: warp.fill,
+      );
+    }
+    final parameters = [
+      for (var i = 0; i < 4; i++) h263ReversibleVector(bits, maximum: 4095),
+    ];
+    final fill = switch (bits.read(2)) {
+      0 => _readFillColor(bits),
+      1 => (y: 16, cb: 128, cr: 128),
+      2 => (y: 128, cb: 128, cr: 128),
+      _ => null,
+    };
+    return (precisionBits: precisionBits, parameters: parameters, fill: fill);
   }
 
   H263Format _inheritedLayerFormat(Rbsp bits, {required bool allowBase}) {
@@ -252,10 +329,38 @@ final class H263Headers {
       referenceLayer: 1,
       bidirectional: false,
       enhancementIntra: false,
+      resampling: null,
       pb: null,
       bits: bits,
     );
   }
+}
+
+({int y, int cb, int cr}) _readFillColor(Rbsp bits) {
+  final y = bits.read(8);
+  h263Marker(bits);
+  final cb = bits.read(8);
+  h263Marker(bits);
+  return (y: y, cb: cb, cr: bits.read(8));
+}
+
+({int x, int y}) h263ReversibleVector(Rbsp bits, {int maximum = 16383}) {
+  final x = _readReversibleComponent(bits, maximum);
+  final y = _readReversibleComponent(bits, maximum);
+  if (x == 1 && y == 1) h263Marker(bits);
+  return (x: x, y: y);
+}
+
+int _readReversibleComponent(Rbsp bits, int maximum) {
+  if (bits.flag()) return 0;
+  var value = 2 + bits.bit();
+  while (bits.flag()) {
+    value = (value << 1) | bits.bit();
+    if ((value >> 1) > maximum) {
+      throw const FormatException('Oversized H.263 reversible VLC value');
+    }
+  }
+  return value.isOdd ? -(value >> 1) : value >> 1;
 }
 
 int h263TemporalDistance(int previous, H263Header header) =>

@@ -189,9 +189,11 @@ Decoding includes group-of-blocks resynchronization, custom sizes and
 clocks, unrestricted motion vectors, structured slices, overlapped block
 motion compensation, advanced intra prediction, in-loop deblocking, alternate
 inter VLCs, modified quantization and syntax-based arithmetic coding.
+Reference picture resampling handles implicit resolution changes and explicit
+warps in P, B, Improved PB and EP pictures. It includes half-pixel and
+sixteenth-pixel displacement precision and all four boundary fill modes.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
-and disposable Spark pictures. Reference picture resampling and reduced
-resolution updates remain pending.
+and disposable Spark pictures. Reduced-resolution updates remain pending.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS

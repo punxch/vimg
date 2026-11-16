@@ -54,11 +54,17 @@ final class H263Decoder {
       final newest = _references[header.referenceLayer];
       if (older == null ||
           newest == null ||
-          !_h263Matches(older.picture, format) ||
           !_h263Matches(newest.picture, format)) {
         throw const FormatException('Missing H.263+ B-picture references');
       }
       final timing = h263BTiming(older.temporal, newest.temporal, header);
+      // Warp the original previous anchor using the following P-picture's
+      // rounding type when the following anchor is a P-picture.
+      final reference = _h263PredictionReference(
+        older.picture,
+        header,
+        newest.resamplingRound ?? header.noRound,
+      );
       final picture = H263Picture._(format);
       _H263Macroblocks(
         header,
@@ -67,7 +73,7 @@ final class H263Decoder {
         _transform,
         _prediction,
         null,
-      ).decodeB(older.picture, newest, timing.offset, timing.distance);
+      ).decodeB(reference, newest, timing.offset, timing.distance);
       return (picture: picture, bidirectional: null);
     }
     final picture = H263Picture._(format);
@@ -86,12 +92,9 @@ final class H263Decoder {
           'Missing H.263+ enhancement reference picture',
         );
       }
-      final forward = header.enhancementIntra ? null : previous!.picture;
-      if (forward != null && !_h263Matches(forward, format)) {
-        throw UnsupportedError(
-          'H.263+ resampling the previous enhancement picture',
-        );
-      }
+      final forward = header.enhancementIntra
+          ? null
+          : _h263PredictionReference(previous!.picture, header, header.noRound);
       final blocks = _H263Macroblocks(
         header,
         picture,
@@ -104,11 +107,12 @@ final class H263Decoder {
       _saveReference(header, picture, blocks);
       return (picture: picture, bidirectional: null);
     }
-    final reference = header.intra ? null : previous?.picture;
-    if (!header.intra &&
-        (reference == null || !_h263Matches(reference, format))) {
+    if (!header.intra && previous == null) {
       throw const FormatException('Missing H.263 reference picture');
     }
+    final reference = header.intra
+        ? null
+        : _h263PredictionReference(previous!.picture, header, header.noRound);
     final pb = header.pb == null
         ? null
         : _H263Pb(
@@ -146,6 +150,9 @@ final class H263Decoder {
     _references[header.layer] = (
       picture: picture,
       temporal: header.temporalReference,
+      resamplingRound: header.layer == 1 && !header.intra
+          ? header.noRound
+          : null,
       motion: blocks._motion,
       intraWithMotion: blocks._intraWithMotion,
     );
@@ -482,22 +489,10 @@ final class _H263Macroblocks {
   _Vector _readVector(_Vector prediction) {
     if (_sac case final sac?) return sac.motion(prediction, header.longVectors);
     if (header.extended && header.format.unrestricted) {
-      final dx = _readUmv(), dy = _readUmv();
-      if (dx == 1 && dy == 1) h263Marker(_bits);
+      final (x: dx, y: dy) = h263ReversibleVector(_bits);
       return (x: prediction.x + dx, y: prediction.y + dy);
     }
     return _motionVector(_bits, prediction, 1, long: header.longVectors);
-  }
-
-  int _readUmv() {
-    if (_bits.flag()) return 0;
-    var value = 2 + _bits.bit();
-    while (_bits.flag()) {
-      value = (value << 1) | _bits.bit();
-      if (value >= 32768)
-        throw const FormatException('Oversized H.263 motion difference');
-    }
-    return value.isOdd ? -(value >> 1) : value >> 1;
   }
 
   void _readBlock(

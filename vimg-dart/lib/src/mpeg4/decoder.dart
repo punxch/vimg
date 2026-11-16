@@ -19,6 +19,7 @@ part 'short_b.dart';
 part 'short_layers.dart';
 part 'short_overlap.dart';
 part 'short_pb.dart';
+part 'short_resample.dart';
 part 'short_sac.dart';
 part 'short_sac_models.dart';
 part 'short_video.dart';

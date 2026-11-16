@@ -3,6 +3,7 @@ part of 'decoder.dart';
 typedef _H263Reference = ({
   H263Picture picture,
   int temporal,
+  bool? resamplingRound,
   _PictureMotion motion,
   Uint8List? intraWithMotion,
 });
