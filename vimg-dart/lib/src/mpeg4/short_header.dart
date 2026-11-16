@@ -25,6 +25,7 @@ typedef H263Format = ({
   bool advancedIntra,
   bool loopFilter,
   bool structured,
+  bool partitioned,
   int sliceSubmode,
   bool referenceSelection,
   bool enhancedReferences,
@@ -475,13 +476,13 @@ final class H263Headers {
 }
 
 ({int x, int y}) h263ReversibleVector(Rbsp bits, {int maximum = 16383}) {
-  final x = _readReversibleComponent(bits, maximum);
-  final y = _readReversibleComponent(bits, maximum);
+  final x = h263ReversibleComponent(bits, maximum);
+  final y = h263ReversibleComponent(bits, maximum);
   if (x == 1 && y == 1) h263Marker(bits);
   return (x: x, y: y);
 }
 
-int _readReversibleComponent(Rbsp bits, int maximum) {
+int h263ReversibleComponent(Rbsp bits, [int maximum = 16383]) {
   if (bits.flag()) return 0;
   var value = 2 + bits.bit();
   while (bits.flag()) {
@@ -548,6 +549,7 @@ H263Format _basicFormat(
   advancedIntra: false,
   loopFilter: false,
   structured: false,
+  partitioned: false,
   sliceSubmode: 0,
   referenceSelection: false,
   enhancedReferences: false,
@@ -565,6 +567,7 @@ typedef _Options = ({
   bool advancedIntra,
   bool loopFilter,
   bool structured,
+  bool partitioned,
   bool referenceSelection,
   bool enhancedReferences,
   bool independentSegments,
@@ -591,7 +594,9 @@ _Options _readOptions(Rbsp bits) {
   if (enhancedReferences && (referenceSelection || arithmetic || partitioned)) {
     throw const FormatException('Incompatible H.263+ ERPS modes');
   }
-  if (partitioned) throw UnsupportedError('H.263+ data-partitioned slices');
+  if (partitioned && (!structured || arithmetic)) {
+    throw const FormatException('Incompatible H.263+ data partitioning modes');
+  }
   return (
     source: source,
     customClock: customClock,
@@ -601,6 +606,7 @@ _Options _readOptions(Rbsp bits) {
     advancedIntra: aic,
     loopFilter: loop,
     structured: structured,
+    partitioned: partitioned,
     referenceSelection: referenceSelection,
     enhancedReferences: enhancedReferences,
     independentSegments: independentSegments,
@@ -658,6 +664,7 @@ _Options _readOptions(Rbsp bits) {
       advancedIntra: options.advancedIntra,
       loopFilter: options.loopFilter,
       structured: options.structured,
+      partitioned: options.partitioned,
       sliceSubmode: sliceSubmode,
       referenceSelection: options.referenceSelection,
       enhancedReferences: options.enhancedReferences,

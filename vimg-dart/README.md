@@ -211,6 +211,9 @@ per macroblock, including four-reference luma prediction and two selectable
 backward references in B pictures. Sub-picture removal frees unused sample
 tiles from short- and long-term references. Buffer capacity is measured in
 sub-picture units.
+Annex V decodes separate macroblock, motion and coefficient partitions,
+including reordered rectangular slices, Improved PB frames and scalability
+layers. Recovery by reading damaged partitions backward remains pending.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
 and disposable Spark pictures.
 

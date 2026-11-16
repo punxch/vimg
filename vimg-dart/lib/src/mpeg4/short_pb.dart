@@ -2,6 +2,13 @@ part of 'decoder.dart';
 
 enum _PbMode { direct, forward, backward }
 
+_PbMode _h263PbPrediction(int index, {required bool improved}) =>
+    improved ? _PbMode.values[index >> 1] : _PbMode.direct;
+
+bool _h263PbHasVector(int index, {required bool improved}) => improved
+    ? _h263PbPrediction(index, improved: true) == _PbMode.forward
+    : index > 0;
+
 final class _H263Pb {
   _H263Pb(this.header, this.current, this.sampler, this.output);
 

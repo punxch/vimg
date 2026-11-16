@@ -145,7 +145,7 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (prediction == _H263BPrediction.both ||
           prediction == _H263BPrediction.backward) {
         final (newer, _) = backwardAt(_readErpsBackwardReference());
-        final vector = _readBVector(backward, x, y);
+        final vector = _readBVector(backward, x, y, reverse: true);
         _prediction.predictH263(
           picture,
           newer,
@@ -189,9 +189,16 @@ extension _H263Bidirectional on _H263Macroblocks {
     return index;
   }
 
-  _Vector _readBVector(_PictureMotion motion, int x, int y) {
-    final guess = _h263MotionPrediction(motion, x, y, 0);
-    final vector = _readVector(guess);
+  _Vector _readBVector(
+    _PictureMotion motion,
+    int x,
+    int y, {
+    bool reverse = false,
+  }) {
+    final vectors = _partition?.motion;
+    final vector = vectors != null && !reverse
+        ? vectors.single
+        : _readSecondaryVector(_h263MotionPrediction(motion, x, y, 0));
     for (var block = 0; block < 4; block++) {
       motion.store(x, y, block, vector);
     }

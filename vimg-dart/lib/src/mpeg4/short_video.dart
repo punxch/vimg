@@ -327,6 +327,7 @@ final class _H263Macroblocks {
   final _H263Forward Function(int?)? _selectForward;
   final _H263ErpsSelection? erps;
   _H263ErpsGroup? _segmentErps;
+  _H263PartitionBlock? _partition;
   _H263ErpsGroup? get _erpsGroup => _segmentErps ?? erps?.picture;
   bool get _multiplePrediction => _erpsGroup?.syntax.multiple == true;
   bool _unmarkedShortcut = false;
@@ -360,6 +361,7 @@ final class _H263Macroblocks {
   }
 
   (int, int) _readLayerMacroblock(_Vlc table, int stuffing) {
+    if (_partition case final partition?) return (partition.mode, 0);
     while (true) {
       final int code;
       if (_multiplePrediction) {
@@ -484,7 +486,9 @@ final class _H263Macroblocks {
             ? _pb!.leftForward
             : _zeroVector;
         final referenceIndex = pbBlock.vector ? _readErpsMotionReference() : 0;
-        final motion = pbBlock.vector ? _readVector(predictor) : _zeroVector;
+        final motion = pbBlock.vector
+            ? _readSecondaryVector(predictor)
+            : _zeroVector;
         final forward = switch (pbBlock.mode) {
           _PbMode.direct => primary!,
           _PbMode.forward => _forwardAt(referenceIndex),
@@ -567,6 +571,7 @@ final class _H263Macroblocks {
   }
 
   (int, int) _readMacroblock() {
+    if (_partition case final partition?) return (partition.mode, 0);
     final sac = _sac;
     if (header.intra) {
       while (true) {
@@ -652,7 +657,9 @@ final class _H263Macroblocks {
     final sac = _sac;
     final improved = header.extended;
     int index;
-    if (sac != null) {
+    if (_partition case final partition?) {
+      index = partition.pbMode;
+    } else if (sac != null) {
       index = sac.read(improved ? _sacImprovedPbMode : _sacPbMode);
     } else {
       index = 0;
@@ -673,10 +680,10 @@ final class _H263Macroblocks {
         }
       }
     }
-    final mode = improved ? _PbMode.values[index >> 1] : _PbMode.direct;
+    final mode = _h263PbPrediction(index, improved: improved);
     return (
       mode: mode,
-      vector: improved ? mode == _PbMode.forward : index > 0,
+      vector: _h263PbHasVector(index, improved: improved),
       pattern: pattern,
     );
   }
@@ -751,6 +758,13 @@ final class _H263Macroblocks {
   }
 
   List<_Vector> _readMotion(int x, int y, bool split, {List<int>? references}) {
+    if (_partition case final partition?) {
+      final vectors = partition.motion;
+      for (var i = 0; i < 4; i++) {
+        _motion.store(x, y, i, vectors[split ? i : 0]);
+      }
+      return vectors;
+    }
     final vectors = <_Vector>[];
     for (var i = 0; i < (split ? 4 : 1); i++) {
       references?.add(_readErpsMotionReference());

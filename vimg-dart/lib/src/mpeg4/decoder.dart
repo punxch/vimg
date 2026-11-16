@@ -27,6 +27,7 @@ part 'short_sac.dart';
 part 'short_sac_models.dart';
 part 'short_segments.dart';
 part 'short_erps.dart';
+part 'short_partitions.dart';
 part 'short_slices.dart';
 part 'short_subpictures.dart';
 part 'short_video.dart';

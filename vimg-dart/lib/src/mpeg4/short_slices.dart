@@ -7,6 +7,7 @@ extension _H263Slices on _H263Macroblocks {
     if (!header.format.rectangularSlices &&
         !header.format.arbitrarySlices &&
         !header.format.independentSegments &&
+        !header.format.partitioned &&
         !(header.erps != null && header.format.structured)) {
       for (var index = 0; index < _count; index++) {
         _startMacroblock(index);
@@ -27,14 +28,19 @@ extension _H263Slices on _H263Macroblocks {
       }
       _validateTemporalSegments(reference);
       final count = counts[group.address]!;
+      final partitions = header.format.partitioned
+          ? _readDataPartitions(count, slice.end)
+          : null;
       for (var mb = 0; mb < count; mb++) {
         final address = _sliceAddressAt(group, mb);
         _filterSlices?[address] = _sliceStart;
+        _partition = partitions?[mb];
         yield address;
         if (_bits.position > slice.end) {
           throw const FormatException('H.263+ macroblock exceeds its slice');
         }
       }
+      _partition = null;
       if (sac == null) _finishSlice(slice.end);
     }
   }
@@ -132,7 +138,7 @@ extension _H263Slices on _H263Macroblocks {
     final stuffing = multiple ? 11 : (header.intra ? 9 : 10);
     // Annex U inserts PR0=0 after COD=0, even for a stuffing macroblock.
     final word = multiple ? 0x201 : 1;
-    while (end - _bits.position >= stuffing) {
+    while (!header.format.partitioned && end - _bits.position >= stuffing) {
       if (_bits.read(stuffing) != word) {
         throw const FormatException('Unexpected data after H.263+ slice');
       }
