@@ -84,12 +84,11 @@ const _h263EpModes = [
 
 extension _H263Enhancement on _H263Macroblocks {
   void decodeEnhancement(H263Picture upward) {
-    final columns = _columns, count = _count;
+    final columns = _columns;
     final ei = header.enhancementIntra;
     final modes = ei ? _h263EiMode : _h263EpMode;
     final stuffing = ei ? 17 : _h263EpModes.length;
-    for (var index = 0; index < count; index++) {
-      _startMacroblock(index);
+    for (final index in _macroblockOrder()) {
       var code = modes.read(_bits);
       while (code == stuffing) {
         code = modes.read(_bits);

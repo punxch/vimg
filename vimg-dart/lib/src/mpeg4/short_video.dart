@@ -285,6 +285,7 @@ final class _H263Macroblocks {
   late final _filterSlices = header.reduced && header.format.structured
       ? Uint16List(_count)
       : null;
+  Uint16List? _sliceOwners;
   late final _sac =
       header.format.arithmetic && !header.bidirectional && !header.enhancement
       ? _H263Sac(_bits)
@@ -301,13 +302,15 @@ final class _H263Macroblocks {
   void decode() {
     final columns = _columns, count = _count;
     final overlap = _overlap;
-    for (var index = 0; index < count; index++) {
-      _startMacroblock(index);
+    var previous = -1;
+    for (final index in _macroblockOrder()) {
+      final preceding = previous;
+      previous = index;
       final x = index % columns, y = index ~/ columns;
       final mode = _readMacroblock();
       if (mode == -1) {
         overlap?.markMotion(index, _sliceStart);
-        _finishPrevious(index - 1);
+        _finishPrevious(preceding);
         if (overlap != null) {
           _pendingPattern = 0;
           _pendingReference = reference;
@@ -357,14 +360,14 @@ final class _H263Macroblocks {
           );
         }
       }
-      _finishPrevious(index - 1);
+      _finishPrevious(preceding);
       if (overlap != null && !intra) {
         _pendingPattern = pattern;
         _pendingReference = reference;
       }
       if (pbBlock != null) {
         final predictor =
-            pbBlock.mode == _PbMode.forward && x != 0 && index != _sliceStart
+            pbBlock.mode == _PbMode.forward && _inCurrentSegment(x - 1, y)
             ? _pb!.leftForward
             : _zeroVector;
         final motion = pbBlock.vector ? _readVector(predictor) : _zeroVector;
@@ -388,7 +391,7 @@ final class _H263Macroblocks {
       if (header.reduced || header.format.loopFilter)
         _filterQuant[index] = _quant;
     }
-    _finishPrevious(count - 1);
+    _finishPrevious(previous);
     _finishFilter();
   }
 
@@ -555,7 +558,8 @@ final class _H263Macroblocks {
       }
       _bits.position = afterStart;
     }
-    final (:address, :quant, :temporal) = h263ReadGroupHeader(header, _bits);
+    final group = h263ReadGroupHeader(header, _bits);
+    final (:address, :quant, width: _, temporal: _) = group;
     // A SAC interval can reach a future start code while the last
     // buffered macroblocks of the current segment are still being decoded.
     if (_sac != null && address > index && address < macroblocks) {
@@ -565,24 +569,20 @@ final class _H263Macroblocks {
     if (address != index || quant == 0) {
       throw const FormatException('Invalid H.263 group address or quantizer');
     }
-    _quant = quant;
-    _sliceStart = index;
-    if (_selectForward case final select?) _forward = select(temporal);
+    _beginGroup(group);
+  }
+
+  void _beginGroup(H263GroupHeader group) {
+    _quant = group.quant;
+    _sliceStart = group.address;
+    if (_selectForward case final select?) _forward = select(group.temporal);
     _sac?.reset();
   }
 
   List<_Vector> _readMotion(int x, int y, bool split) {
     final vectors = <_Vector>[];
     for (var i = 0; i < (split ? 4 : 1); i++) {
-      final prediction = _motionPrediction(
-        _motion,
-        _columns,
-        _sliceStart,
-        x,
-        y,
-        i,
-        h263: true,
-      );
+      final prediction = _h263MotionPrediction(_motion, x, y, i);
       final vector = _readVector(prediction);
       vectors.add(vector);
       if (split) _motion.store(x, y, i, vector);

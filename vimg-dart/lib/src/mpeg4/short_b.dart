@@ -68,8 +68,7 @@ extension _H263Bidirectional on _H263Macroblocks {
     final columns = _columns, rows = _rows;
     final backward = _PictureMotion(columns, rows, false);
     final newer = _h263AlignReference(latest.picture, reduced: header.reduced);
-    for (var index = 0; index < columns * rows; index++) {
-      _startMacroblock(index);
+    for (final index in _macroblockOrder()) {
       final (picture: older, :offset, :distance) = _forward!;
       final x = index % columns, y = index ~/ columns;
       var mode = _h263BMode.read(_bits);
@@ -137,15 +136,7 @@ extension _H263Bidirectional on _H263Macroblocks {
   }
 
   _Vector _readBVector(_PictureMotion motion, int x, int y) {
-    final guess = _motionPrediction(
-      motion,
-      _columns,
-      _sliceStart,
-      x,
-      y,
-      0,
-      h263: true,
-    );
+    final guess = _h263MotionPrediction(motion, x, y, 0);
     final vector = _readVector(guess);
     for (var block = 0; block < 4; block++) {
       motion.store(x, y, block, vector);

@@ -8,7 +8,7 @@ extension _H263AdvancedIntra on _H263Macroblocks {
     final columns = _columns << sub;
     final blocks = _aic[plane];
     _H263IntraBlock? neighbor(int x, int y) {
-      if (x < 0 || y < 0 || (y >> sub) * _columns + (x >> sub) < _sliceStart) {
+      if (!_inCurrentSegment(x >> sub, y >> sub)) {
         return null;
       }
       return blocks[y * columns + x];

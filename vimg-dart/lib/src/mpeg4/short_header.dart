@@ -24,6 +24,7 @@ typedef H263Format = ({
   bool advancedIntra,
   bool loopFilter,
   bool structured,
+  int sliceSubmode,
   bool referenceSelection,
   bool alternateVlc,
   bool modifiedQuant,
@@ -59,6 +60,7 @@ typedef H263Header = ({
   bool enhancementIntra,
   bool reduced,
   H263Resampling? resampling,
+  ({int address, int? width})? firstSlice,
   ({int offset, int quantFactor})? pb,
   Rbsp bits,
 });
@@ -71,6 +73,11 @@ extension H263PictureLayer on H263Header {
   int get macroblockRows =>
       (format.height + macroblockSize - 1) ~/ macroblockSize;
   int get macroblockCount => macroblockColumns * macroblockRows;
+}
+
+extension H263SliceStructure on H263Format {
+  bool get rectangularSlices => sliceSubmode & 2 != 0;
+  bool get arbitrarySlices => sliceSubmode & 1 != 0;
 }
 
 typedef H263LayerState = ({H263Format format, int? lowerLayer, int bReference});
@@ -150,17 +157,15 @@ final class H263Headers {
         );
       }
       final layered = type >= 3;
-      format = options != null
-          ? _readFormat(bits, options)
-          : layered
-          ? _inheritedLayerFormat(bits, allowBase: bidirectional)
-          : _extended ?? (throw const FormatException('Missing H.263+ format'));
       longVectors = false;
-      if (format.customClock) temporal |= bits.read(2) << 8;
       if (options != null) {
-        if (format.unrestricted && !bits.flag()) bits.skip(1);
-        if (format.structured && bits.read(2) != 0)
-          throw UnsupportedError('H.263+ rectangular or unordered slices');
+        (format, temporal) = _readFormat(bits, options, temporal);
+      } else {
+        format = layered
+            ? _inheritedLayerFormat(bits, allowBase: bidirectional)
+            : _extended ??
+                  (throw const FormatException('Missing H.263+ format'));
+        if (format.customClock) temporal |= bits.read(2) << 8;
       }
       if (layered) {
         layer = bits.read(4);
@@ -224,15 +229,20 @@ final class H263Headers {
     if (pb?.offset == 0)
       throw const FormatException('Invalid H.263 B-picture time');
     while (bits.flag()) bits.skip(8);
+    ({int address, int? width})? firstSlice;
     if (format.structured) {
-      h263Marker(bits);
-      final size = reduced ? 32 : 16;
-      final count =
-          ((format.width + size - 1) ~/ size) *
-          ((format.height + size - 1) ~/ size);
-      if (bits.read(_h263AddressBits(count, reduced: reduced)) != 0)
-        throw const FormatException('H.263+ picture starts mid-slice');
-      h263Marker(bits);
+      final (:address, :width, quant: _) = _readSliceHeader(
+        bits,
+        format,
+        reduced: reduced,
+        pictureQuant: quant,
+      );
+      if (!format.arbitrarySlices && address != 0) {
+        throw const FormatException(
+          'H.263+ ordered slices must start at macroblock zero',
+        );
+      }
+      firstSlice = (address: address, width: width);
     }
     final redundant =
         format.referenceSelection && _lastTemporal[layer] == temporal;
@@ -261,6 +271,7 @@ final class H263Headers {
       enhancementIntra: enhancementIntra,
       reduced: reduced,
       resampling: resampling,
+      firstSlice: firstSlice,
       pb: pb,
       bits: bits,
     );
@@ -374,6 +385,7 @@ final class H263Headers {
       enhancementIntra: false,
       reduced: false,
       resampling: null,
+      firstSlice: null,
       pb: null,
       bits: bits,
     );
@@ -453,6 +465,7 @@ H263Format _basicFormat(
   advancedIntra: false,
   loopFilter: false,
   structured: false,
+  sliceSubmode: 0,
   referenceSelection: false,
   alternateVlc: false,
   modifiedQuant: false,
@@ -501,7 +514,7 @@ _Options _readOptions(Rbsp bits) {
   );
 }
 
-H263Format _readFormat(Rbsp bits, _Options options) {
+(H263Format, int) _readFormat(Rbsp bits, _Options options, int temporal) {
   final source = options.source;
   final int width, height;
   final double aspect;
@@ -533,22 +546,29 @@ H263Format _readFormat(Rbsp bits, _Options options) {
   final denominator = options.customClock ? 1800000 : 30000;
   if (numerator == 0)
     throw const FormatException('Invalid H.263+ picture clock');
+  if (options.customClock) temporal |= bits.read(2) << 8;
+  if (options.unrestricted && !bits.flag()) bits.skip(1);
+  final sliceSubmode = options.structured ? bits.read(2) : 0;
   return (
-    width: width,
-    height: height,
-    aspect: aspect,
-    tickNumerator: numerator,
-    tickDenominator: denominator,
-    customClock: options.customClock,
-    unrestricted: options.unrestricted,
-    overlapping: options.overlapping,
-    arithmetic: options.arithmetic,
-    advancedIntra: options.advancedIntra,
-    loopFilter: options.loopFilter,
-    structured: options.structured,
-    referenceSelection: options.referenceSelection,
-    alternateVlc: options.alternateVlc,
-    modifiedQuant: options.modifiedQuant,
+    (
+      width: width,
+      height: height,
+      aspect: aspect,
+      tickNumerator: numerator,
+      tickDenominator: denominator,
+      customClock: options.customClock,
+      unrestricted: options.unrestricted,
+      overlapping: options.overlapping,
+      arithmetic: options.arithmetic,
+      advancedIntra: options.advancedIntra,
+      loopFilter: options.loopFilter,
+      structured: options.structured,
+      sliceSubmode: sliceSubmode,
+      referenceSelection: options.referenceSelection,
+      alternateVlc: options.alternateVlc,
+      modifiedQuant: options.modifiedQuant,
+    ),
+    temporal,
   );
 }
 
@@ -578,23 +598,57 @@ int? _readPredictionTemporal(Rbsp bits, bool intra) {
   return prediction;
 }
 
-({int address, int quant, int? temporal}) h263ReadGroupHeader(
-  H263Header header,
+typedef H263GroupHeader = ({int address, int? width, int quant, int? temporal});
+
+({int address, int? width, int quant}) _readSliceHeader(
   Rbsp bits,
-) {
+  H263Format format, {
+  required bool reduced,
+  int? pictureQuant,
+}) {
+  final size = reduced ? 32 : 16;
+  final columns = (format.width + size - 1) ~/ size;
+  final rows = (format.height + size - 1) ~/ size;
+  final addressBits = _h263AddressBits(columns * rows, reduced: reduced);
+  h263Marker(bits);
+  final address = bits.read(addressBits);
+  final rectangular = format.rectangularSlices;
+  if (pictureQuant == null ? addressBits > 11 : rectangular) h263Marker(bits);
+  final quant = pictureQuant ?? bits.read(5);
+  final int? width;
+  if (rectangular) {
+    // Table K.3 width transitions for the ordinary and reduced grids.
+    final widthBits = columns <= (reduced ? 6 : 11)
+        ? 4
+        : columns <= (reduced ? 11 : 22)
+        ? 5
+        : columns <= (reduced ? 22 : 44)
+        ? 6
+        : 7;
+    width = bits.read(widthBits - (reduced ? 1 : 0)) + 1;
+  } else {
+    width = null;
+  }
+  h263Marker(bits);
+  if (pictureQuant == null) bits.skip(2);
+  if (address >= columns * rows ||
+      (width != null && address % columns + width > columns)) {
+    throw const FormatException('Invalid H.263+ slice position or width');
+  }
+  return (address: address, width: width, quant: quant);
+}
+
+H263GroupHeader h263ReadGroupHeader(H263Header header, Rbsp bits) {
   final int address, quant;
+  final int? width;
   if (header.format.structured) {
-    h263Marker(bits);
-    final width = _h263AddressBits(
-      header.macroblockCount,
+    (address: address, width: width, quant: quant) = _readSliceHeader(
+      bits,
+      header.format,
       reduced: header.reduced,
     );
-    address = bits.read(width);
-    if (width > 11) h263Marker(bits);
-    quant = bits.read(5);
-    h263Marker(bits);
-    bits.skip(2); // group frame identifier
   } else {
+    width = null;
     final group = bits.read(5);
     final height = header.format.height;
     final lines = height > 800
@@ -615,11 +669,13 @@ int? _readPredictionTemporal(Rbsp bits, bool intra) {
       header.intra || header.enhancementIntra,
     );
   }
-  return (address: address, quant: quant, temporal: temporal);
+  return (address: address, width: width, quant: quant, temporal: temporal);
 }
 
-Set<int> h263PredictionReferences(H263Header header, Uint8List bytes) {
-  final references = <int>{?header.predictionTemporal};
+Iterable<({int start, int data, H263GroupHeader? header})> h263GroupUnits(
+  H263Header header,
+  Uint8List bytes,
+) sync* {
   final bits = Rbsp(bytes, codec: 'H.263')..position = header.bits.position;
   // A group start can straddle byte boundaries but always contains a whole
   // zero byte. Skip the fields of each recognized header before looking again.
@@ -631,21 +687,32 @@ Set<int> h263PredictionReferences(H263Header header, Uint8List bytes) {
       if (start < bits.position || (word >> shift) & 0x1ffff != 1) continue;
       bits.position = start + 17;
       final kind = bits.read(5);
-      if (kind >= 30) return references;
+      if (kind >= 30) {
+        yield (start: start, data: bits.position, header: null);
+        return;
+      }
+      if (header.format.structured && start & 7 != 0) {
+        bits.position = start + 17;
+        continue;
+      }
       bits.position -= 5;
       final group = h263ReadGroupHeader(header, bits);
-      if (group.address <= 0 ||
+      if ((group.address == 0 && !header.format.arbitrarySlices) ||
           group.address >= header.macroblockCount ||
           group.quant == 0) {
-        throw const FormatException('Invalid H.263 reference selection group');
+        throw const FormatException('Invalid H.263 group address or quantizer');
       }
-      if (group.temporal case final temporal?) references.add(temporal);
+      yield (start: start, data: bits.position, header: group);
       i = (bits.position >> 3) - 1;
       break;
     }
   }
-  return references;
 }
+
+Set<int> h263PredictionReferences(H263Header header, Uint8List bytes) => {
+  ?header.predictionTemporal,
+  for (final unit in h263GroupUnits(header, bytes)) ?unit.header?.temporal,
+};
 
 void h263Marker(Rbsp bits) {
   if (!bits.flag()) throw const FormatException('Missing H.263 marker bit');

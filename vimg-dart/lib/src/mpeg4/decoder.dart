@@ -23,6 +23,7 @@ part 'short_reduced.dart';
 part 'short_resample.dart';
 part 'short_sac.dart';
 part 'short_sac_models.dart';
+part 'short_slices.dart';
 part 'short_video.dart';
 
 class _DctPicture {

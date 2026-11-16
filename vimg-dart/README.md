@@ -189,6 +189,9 @@ Decoding includes group-of-blocks resynchronization, custom sizes and
 clocks, unrestricted motion vectors, structured slices, overlapped block
 motion compensation, advanced intra prediction, in-loop deblocking, alternate
 inter VLCs, modified quantization and syntax-based arithmetic coding.
+Annex K supports rectangular slices and arbitrary ordering for both
+rectangular and free-running slices. Intra and motion predictors respect
+slice boundaries.
 Reference picture resampling handles implicit resolution changes and explicit
 warps in P, B, Improved PB and EP pictures. It includes half-pixel and
 sixteenth-pixel displacement precision and all four boundary fill modes.
