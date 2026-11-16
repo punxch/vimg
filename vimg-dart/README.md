@@ -405,6 +405,15 @@ Explicit overlay formats also pass their input layout requirements upstream.
 Native YUV depth reduction uses ordered dithering.
 Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 
+Use `premultiply=inplace=1` or `unpremultiply=inplace=1` to process the
+frame's own alpha. `premultiply_dynamic` follows the downstream alpha
+mode. The `planes` bitmask selects the color planes to process.
+By default, `premultiply` and `unpremultiply` take two equal-sized inputs
+and read the first plane of the second input as the mask. `alphaextract`
+copies a frame's alpha into a full-range grayscale mask. The two-input
+implementation applies the documented mask operation when stock FFmpeg's
+equal-alpha-mode shortcut would leave the color samples as they were.
+
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered
 BMPs before tile resizing. Authority recording uses the fixed Preview profile.

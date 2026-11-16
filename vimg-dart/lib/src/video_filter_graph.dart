@@ -57,7 +57,8 @@ Object? _graphFilter(String specification) {
       .split('@')
       .first;
   final args = equal < 0 ? null : specification.substring(equal + 1);
-  if ((name == 'null' || name == 'hflip' || name == 'vflip') && args != null) {
+  if (const {'null', 'hflip', 'vflip', 'alphaextract'}.contains(name) &&
+      args != null) {
     throw FormatException('$name takes no options');
   }
   return switch (name) {
@@ -79,6 +80,10 @@ Object? _graphFilter(String specification) {
     'split' => _Split(args),
     'hstack' || 'vstack' || 'xstack' => _Stack(args, name),
     'overlay' => _Overlay(args),
+    'alphaextract' => const _ExtractAlpha(),
+    'premultiply' ||
+    'unpremultiply' ||
+    'premultiply_dynamic' => _VideoAlphaFilter(name, args),
     _ => throw FormatException('Unsupported video filter: $name'),
   };
 }
@@ -96,6 +101,7 @@ List<_FilterStep> _orderedFilterSteps(String source) {
     final inputCount = switch (filter) {
       final _Stack stack => stack.inputs,
       _Overlay() => 2,
+      final _VideoAlphaFilter alpha => alpha.inputs,
       _ => 1,
     };
     final outputCount = filter is _Split ? filter.outputs : 1;
@@ -181,6 +187,10 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
         explicitFormat: true,
       ),
       final _Scale scale => _FormatRegion(constraints: scale.outputColors),
+      final _VideoAlphaFilter alpha => _FormatRegion(
+        constraints: alpha.format,
+        explicitFormat: true,
+      ),
       final _Overlay overlay => _FormatRegion(
         constraints: overlay.mainFormat,
         explicitFormat: true,
@@ -225,6 +235,12 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
         for (final input in step.inputs) {
           output.merge(regions[input]!);
         }
+      case _VideoAlphaFilter():
+        for (final input in step.inputs) {
+          if (regions[input]!.root.constraints case final constraint?) {
+            output.restrict(constraint.withoutAlphaModes());
+          }
+        }
       case final _Overlay overlay:
         final main = regions[step.inputs.first]!;
         final secondary = regions[step.inputs[1]]!;
@@ -245,6 +261,15 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
           }
         }
         secondary.restrict(overlay.secondaryFormat);
+    }
+  }
+
+  for (final step in steps.reversed) {
+    if (step.filter is! _VideoAlphaFilter) continue;
+    final layout = regions[step.outputs.single]!.root.constraints!
+        .withoutAlphaModes();
+    for (final input in step.inputs) {
+      regions[input]!.restrict(layout);
     }
   }
 
@@ -274,6 +299,9 @@ Object? _negotiatedFilter(
       _ScaleFormat(scale, format),
     final _Stack stack when format != null => stack.withFormat(format),
     final _Overlay overlay when format != null => overlay.withFormat(format),
+    final _VideoAlphaFilter alpha when format != null => alpha.withFormat(
+      format,
+    ),
     final _FormatFilter original when original.onlyAlphaMode =>
       original.atAlphaStage(false),
     final _FormatFilter original => format?.atAlphaStage(
@@ -422,6 +450,10 @@ _VideoPlanes _applyFilterStep(
     inputs[0],
     inputs.elementAtOrNull(1),
     position,
+  ),
+  final _VideoAlphaFilter filter when !filter.inplace => filter.applyMask(
+    inputs[0],
+    inputs[1],
   ),
   final _FrameSpatialFilter filter => filter.applyAt(inputs.single, position),
   final _SpatialFilter filter => filter.apply(inputs.single),

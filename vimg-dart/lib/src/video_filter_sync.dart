@@ -24,7 +24,9 @@ final class _SynchronizedFilterGraph {
       }
       active[step.outputs.single] = switch (filter) {
         final _TimingFilter filter => filter.apply(inputs.single),
-        _Stack() || _Overlay() => _synchronize(index, inputs),
+        _Stack() ||
+        _Overlay() ||
+        _VideoAlphaFilter(inplace: false) => _synchronize(index, inputs),
         _SpatialFilter() => _spatial(index, inputs.single),
         _ => inputs.single,
       };
@@ -59,17 +61,30 @@ final class _SynchronizedFilterGraph {
   CaptureTimeline _synchronize(int step, List<CaptureTimeline> timelines) {
     final filter = steps[step].filter;
     final overlay = filter is _Overlay ? filter : null;
+    final baseTimestamps = filter is _VideoAlphaFilter;
     final primary = timelines.first;
     final clock = overlay != null
         ? primary.timeBase
         : timelines.map((input) => input.timeBase).reduce(_sharedFilterClock);
+    final outputClock = baseTimestamps ? primary.timeBase : clock;
     final rate = primary.frameRate;
     final sameRate = timelines.every((input) => input.frameRate == rate);
-    final outputRate = overlay != null || sameRate ? rate : null;
-    final stop = overlay?.stopAtEof ?? (filter as _Stack).shortest;
+    final outputRate = overlay != null || baseTimestamps || sameRate
+        ? rate
+        : null;
+    final stop = overlay?.stopAtEof ?? (filter is _Stack && filter.shortest);
     return CaptureTimeline(
-      _joinEvents(step, timelines, clock, outputRate, overlay, stop),
-      clock,
+      _joinEvents(
+        step,
+        timelines,
+        clock,
+        outputClock,
+        outputRate,
+        overlay,
+        stop,
+        baseTimestamps: baseTimestamps,
+      ),
+      outputClock,
       outputRate,
     );
   }
@@ -78,10 +93,12 @@ final class _SynchronizedFilterGraph {
     int step,
     List<CaptureTimeline> sources,
     CaptureRational clock,
+    CaptureRational outputClock,
     double? outputRate,
     _Overlay? overlay,
-    bool stop,
-  ) sync* {
+    bool stop, {
+    required bool baseTimestamps,
+  }) sync* {
     final inputs = [
       for (final source in sources) _FilterSyncInput(source, clock),
     ];
@@ -105,7 +122,9 @@ final class _SynchronizedFilterGraph {
       }
       if (nextTime == null || active == 0) {
         yield CaptureTimelineEnd(
-          reportedEnd ?? (lastOutput ?? -1) + 1,
+          reportedEnd == null
+              ? (lastOutput ?? -1) + 1
+              : rescaleCaptureTicks(reportedEnd, clock, outputClock),
           known: reportedEnd != null,
         );
         return;
@@ -139,9 +158,14 @@ final class _SynchronizedFilterGraph {
           overlay == null && inputs.any((input) => input.frame == null))
         continue;
       final first = main.frame!;
+      final pts = baseTimestamps
+          ? rescaleCaptureTicks(first.pts, clock, outputClock)
+          : nextTime;
       final primary = first.retime(
-        nextTime,
-        duration: overlay == null ? stackDuration : first.duration,
+        pts,
+        duration: overlay == null && !baseTimestamps
+            ? stackDuration
+            : first.duration,
       );
       final picture = FilterOperationPicture(
         step,
@@ -149,9 +173,9 @@ final class _SynchronizedFilterGraph {
           for (final input in inputs)
             if (input.frame case final frame?) _pictureOf(frame),
         ],
-        (index: main.index, seconds: nextTime * clock.value),
+        (index: main.index, seconds: pts * outputClock.value),
       );
-      lastOutput = nextTime;
+      lastOutput = pts;
       yield primary.withPicture(picture);
     }
   }

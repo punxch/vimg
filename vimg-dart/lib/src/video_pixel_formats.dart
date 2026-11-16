@@ -78,19 +78,37 @@ _NamedPixelFormat _namedPixelFormat(String name) {
       fullRange: true,
     );
   }
-  final packed = switch (name) {
-    'gbrp' || 'gbrap' => false,
-    'rgb24' || 'bgr24' || 'rgba' || 'bgra' || 'argb' || 'abgr' => true,
-    _ => throw FormatException('Unsupported video pixel format: $name'),
-  };
+  final planarRgb = RegExp(
+    r'^gbr(a?)p(?:(9|10|12|14|16)(?:le|be))?$',
+  ).firstMatch(name);
+  if (planarRgb != null) {
+    return (
+      format: _pixelFormat(
+        _PixelColor.rgb,
+        int.parse(planarRgb.group(2) ?? '8'),
+      ),
+      alpha: planarRgb.group(1) == 'a',
+      fullRange: true,
+    );
+  }
+  if (!const {
+    'rgb24',
+    'bgr24',
+    'rgba',
+    'bgra',
+    'argb',
+    'abgr',
+  }.contains(name)) {
+    throw FormatException('Unsupported video pixel format: $name');
+  }
   return (
     format: _pixelFormat(
       _PixelColor.rgb,
       8,
-      packedRgb: packed,
+      packedRgb: true,
       bgr24: name == 'bgr24',
     ),
-    alpha: const {'gbrap', 'rgba', 'bgra', 'argb', 'abgr'}.contains(name),
+    alpha: name != 'rgb24' && name != 'bgr24',
     fullRange: true,
   );
 }
@@ -416,7 +434,23 @@ final class _PixelFormatConverter {
     _checkFilterSize(width, height);
     var working = source;
     if (!source.rgb && target.color == _PixelColor.rgb) {
-      working = _toRgb(source, width, height, algorithm);
+      working = target.depth == 8
+          ? _toRgb(source, width, height, algorithm)
+          : source.planes.length == 1
+          ? _VideoPlanes(
+              List.filled(3, source.planes.first),
+              0,
+              0,
+              matrix: 0,
+              fullRange: source.fullRange,
+            )
+          : _toDeepRgb(
+              source,
+              width,
+              height,
+              algorithm,
+              rgb48: !requestedAlpha,
+            );
     } else if (!source.rgb &&
         source.planes.length == 3 &&
         target.color == _PixelColor.yuv &&
@@ -442,6 +476,23 @@ final class _PixelFormatConverter {
               algorithm,
               bgr24: source.alpha == null || !requestedAlpha,
             );
+    }
+    if (source.rgb &&
+        source.planes.first.depth == 8 &&
+        target.color == _PixelColor.rgb &&
+        target.depth == 16) {
+      // The 16-bit planar output reconstructs RGB from studio-range Q6
+      // components before quantizing the destination samples.
+      final yuv = _rgbToYuv(
+        source,
+        _pixelFormat(_PixelColor.yuv, 16),
+        6,
+        false,
+        outputWidth: width,
+        outputHeight: height,
+        fullChromaInput: true,
+      );
+      working = _toDeepRgb(yuv, width, height, algorithm, rgb48: false);
     }
     if (working.rgb && target.color != _PixelColor.rgb) {
       working = _rgbToYuv(
@@ -479,6 +530,10 @@ final class _PixelFormatConverter {
                 channel: native ? i : null,
                 resamplesChroma: resamplesChroma,
                 scale: scale?.algorithm,
+                expandRgb:
+                    target.color == _PixelColor.rgb &&
+                    working.planes[i].depth == 8 &&
+                    target.depth > 8,
               )
             : _constantPlane(w, h, target.depth, 1 << (target.depth - 1)),
       );
@@ -500,6 +555,13 @@ final class _PixelFormatConverter {
         ? null
         : opacity == null
         ? _constantPlane(width, height, opacityDepth, (1 << opacityDepth) - 1)
+        : (source.packedRgb || source.rgb) &&
+              target.color == _PixelColor.rgb &&
+              opacity.depth == 8 &&
+              opacityDepth > 8 &&
+              opacity.width == width &&
+              opacity.height == height
+        ? _expandRgbAlpha(opacity, opacityDepth, packed: source.packedRgb)
         : _component(
             opacity,
             width,
@@ -544,47 +606,7 @@ final class _PixelFormatConverter {
       fullRange: source.fullRange,
       matrix: source.matrix,
     );
-    final opacity = frame.alpha!;
-    final result = frame.mapComponents((plane, _, _, index) {
-      if (index == 3) return plane;
-      final chroma = !frame.rgb && index != 0;
-      final depth = plane.depth;
-      final half = 1 << (depth - 1), max = (1 << depth) - 1;
-      final offset = chroma
-          ? half
-          : frame.fullRange
-          ? 0
-          : 16 << (depth - 8);
-      final samples = _paintSamples(depth, plane.width * plane.height);
-      var i = 0;
-      for (var y = 0; y < plane.height; y++) {
-        for (var x = 0; x < plane.width; x++) {
-          final value = plane.at(x, y), alpha = opacity.at(x, y);
-          if (premultiplied) {
-            final rounding = chroma ? 0 : half;
-            samples[i++] =
-                (((value - offset) * alpha + rounding) >> depth) + offset;
-          } else if (alpha == 0 || alpha == max) {
-            samples[i++] = value;
-          } else {
-            final delta = !chroma && offset != 0
-                ? math.max(value - offset, 0)
-                : value - offset;
-            final straight = delta * max ~/ alpha + offset;
-            samples[i++] = chroma && depth == 8
-                ? math.min(straight, max) & max
-                : straight.clamp(0, max);
-          }
-        }
-      }
-      return _FilterPlane(
-        samples,
-        plane.width,
-        plane.height,
-        depth,
-        rowStep: plane.width,
-      );
-    }, premultiplied: premultiplied);
+    final result = _multiplyAlphaPlanes(frame, frame.alpha!, premultiplied);
     if (!restoreLayout) return result;
     return convert(
       result,
@@ -607,6 +629,7 @@ final class _PixelFormatConverter {
     int? channel,
     bool resamplesChroma = false,
     _ScaleAlgorithm? scale,
+    bool expandRgb = false,
   }) {
     final sameLevels = inputFull == outputFull && source.depth == depth;
     final sameSize = width == source.width && height == source.height;
@@ -644,7 +667,11 @@ final class _PixelFormatConverter {
     _FilterPlane sampled = source;
     if (!sameSize || range != null) {
       sampledDepth =
-          scale != null || range != null || preserveRange || filterDither
+          scale != null ||
+              range != null ||
+              preserveRange ||
+              filterDither ||
+              expandRgb
           ? depth
           : srcDepth;
       sampled = _FilterPlane(
@@ -655,7 +682,9 @@ final class _PixelFormatConverter {
           sampledDepth - 8,
           ditherOffset: filterDither ? phase : null,
           kernel: scale?.kernel(chroma: chroma) ?? _ScaleKernel.cubic,
-          precision: (scale != null || range != null) && depth > 14 ? 19 : 15,
+          precision: (scale != null || range != null || expandRgb) && depth > 14
+              ? 19
+              : 15,
           range: range,
         ),
         width,
@@ -673,6 +702,8 @@ final class _PixelFormatConverter {
         out[index++] =
             (lo == newLo && span == newSpan
                     ? value
+                    : expandRgb && range == null
+                    ? value << (depth - sampledDepth)
                     : newLo + _roundComponent((value - lo) * newSpan, span))
                 .clamp(0, limit);
       }
@@ -922,6 +953,27 @@ _FilterPlane _packedAlpha(_FilterPlane source, int depth, {bool round = true}) {
     }
   }
   return _FilterPlane(out, width, height, depth, rowStep: width);
+}
+
+_FilterPlane _expandRgbAlpha(
+  _FilterPlane source,
+  int depth, {
+  required bool packed,
+}) {
+  final width = source.width, height = source.height;
+  final values = Uint16List(width * height);
+  final maximum = (1 << depth) - 1;
+  var i = 0;
+  for (var y = 0; y < height; y++) {
+    for (var x = 0; x < width; x++) {
+      final value = source.at(x, y);
+      final scaled = packed ? value * 257 & ~3 : value << 8;
+      values[i++] = depth == 16
+          ? scaled
+          : math.min(maximum, (scaled + 128) >> (16 - depth));
+    }
+  }
+  return _FilterPlane(values, width, height, depth, rowStep: width);
 }
 
 _FilterPlane _constantPlane(int width, int height, int depth, int sample) {

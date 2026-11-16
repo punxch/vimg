@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
+import 'package:vimg_dart/src/capture_timeline.dart';
 import 'package:vimg_dart/src/yuv_image.dart';
 
 import 'fixtures.dart';
@@ -17,6 +18,7 @@ Future<void> main(List<String> arguments) async {
   _checkColorFormats();
   _checkFormatNegotiation();
   _checkCompositing();
+  _checkStandaloneAlpha();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
 }
@@ -916,6 +918,100 @@ void _checkCompositing() {
   );
 }
 
+const _timedAlphaMask =
+    'split[a][b];[a]fps=2,format=gray[base];'
+    '[b]trim=start_frame=1,alphaextract,hflip[mask];[base][mask]premultiply';
+
+void _checkStandaloneAlpha() {
+  final source = image.Image(width: 8, height: 6, numChannels: 4);
+  for (final p in source) {
+    p.setRgba(p.x * 29, p.y * 41, p.x * 13 + p.y * 11, p.x * 19 + p.y * 23);
+  }
+  image.Image render(String graph) =>
+      YuvImageScaler(filters: VideoFilterChain.parse(graph)).filterRgb(source);
+  for (final (filter, checksum) in [
+    ('premultiply=inplace=1', 0xd7eb4aee),
+    ('unpremultiply=inplace=1', 0x127f7c0c),
+    ('format=yuva420p,premultiply=inplace=1', 0x8a97ecff),
+    ('premultiply=planes=8:inplace=1', 0x8fd11bb7),
+    ('format=gbrap10le,premultiply=inplace=1', 0xe7e6bcab),
+    ('format=gbrap16le,premultiply=inplace=1', 0x4147faf7),
+    (
+      'format=yuva444p10le,premultiply=inplace=1,unpremultiply=inplace=1',
+      0xa1f06cdd,
+    ),
+    ('premultiply_dynamic,format=alpha_modes=premultiplied', 0xd7eb4aee),
+    ('format=alpha_modes=premultiplied,premultiply=inplace=1', 0x1dab83f7),
+  ]) {
+    check(
+      getCrc32(render(filter).getBytes()) == checksum,
+      '$filter matches FFmpeg full-resolution alpha processing',
+    );
+  }
+  const mask = 'format=gray,split[a][b];[b]hflip[m];[a][m]';
+  // Scalar mask kernels, with the equal-mode bypass disabled for external masks.
+  for (final (filter, checksum) in [
+    ('${mask}premultiply', 0x9cea3a6b),
+    ('${mask}unpremultiply', 0x40cef823),
+    (
+      'format=gbrp,split[a][b];[b]hflip[m];[a][m]premultiply=planes=0x2',
+      0x73b02bc6,
+    ),
+    (
+      'split[a][b];[a]format=gray[x];[b]hflip,format=gbrp[m];[x][m]premultiply',
+      0x9cea3a6b,
+    ),
+  ]) {
+    final result = render(filter);
+    check(
+      result.numChannels == 3 && getCrc32(result.getBytes()) == checksum,
+      '$filter applies the first plane of the selected mask',
+    );
+  }
+  final extracted = render('alphaextract');
+  for (final pixel in extracted) {
+    final alpha = source.getPixel(pixel.x, pixel.y).a;
+    check(
+      pixel.r == alpha && pixel.g == alpha && pixel.b == alpha,
+      'Alpha extraction preserves the entire opacity range',
+    );
+  }
+  _fails(
+    () => render('format=gray,split[a][b];[b]crop=4:4[m];[a][m]premultiply'),
+    'The mask must match the video dimensions',
+  );
+
+  final timeline = CaptureTimeline(
+    [
+      for (var i = 0; i < 4; i++)
+        CaptureTimedFrame(i, 1, (
+          index: i,
+          frame: CaptureFrame((
+            seconds: i / 4,
+            offset: i,
+            size: 1,
+            timestamp: null,
+            subframe: null,
+          )),
+        )),
+      const CaptureTimelineEnd(4),
+    ],
+    (numerator: 1, denominator: 4),
+    4,
+  );
+  final joined = VideoFilterChain.parse(_timedAlphaMask).filterTiming(timeline);
+  final frames = joined.events.whereType<CaptureTimedFrame>().toList();
+  check(
+    joined.timeBase == (numerator: 1, denominator: 2) &&
+        frames.map((frame) => frame.pts).join(',') == '0,1,1',
+    'A delayed mask updates the image on its own clock and preserves base PTS',
+  );
+  check(
+    frames.last.source.frame.picture!.sourcePackets().length == 2,
+    'A mask-only update retains both decoded frame dependencies',
+  );
+}
+
 void _checkErrors() {
   for (final chain in [
     '',
@@ -1204,6 +1300,17 @@ Future<void> _checkCli(String? executable) async {
       0xd1002446,
       0xd1002446,
     ];
+    // The capture window repeats the final masked frame after the graph ends.
+    const maskedReference = [
+      0x83f21ea2,
+      0x3bd320a6,
+      0xad49214e,
+      0xad49214e,
+      0xad49214e,
+      0xad49214e,
+      0xad49214e,
+      0xad49214e,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1214,6 +1321,13 @@ Future<void> _checkCli(String? executable) async {
       ('split-formats', splitFormatGraph, 32, 12, splitFormatReference),
       ('auto-overlay', automaticOverlay, 16, 12, autoOverlayReference),
       ('associated-overlay', associatedOverlay, 8, 6, associatedReference),
+      (
+        'masked-alpha',
+        '$_timedAlphaMask,settb=1/8,setpts=N,fps=8',
+        8,
+        6,
+        maskedReference,
+      ),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1235,7 +1349,9 @@ Future<void> _checkCli(String? executable) async {
           folder,
           '--vfilter',
           filter,
-          name == 'associated-overlay' ? transparentMotion : motion,
+          name == 'associated-overlay' || name == 'masked-alpha'
+              ? transparentMotion
+              : motion,
         ]);
         final outputs = ordered(folder);
         check(outputs.length == checksums.length, '$command $name frames');
