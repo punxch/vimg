@@ -219,6 +219,10 @@ final class RawVideoPicture {
         matrix: format.matrix,
         fullRange: format.fullRange,
         packedRgb: format._layout == _Layout.packedRgb && format.depth == 8,
+        bgr24:
+            format._layout == _Layout.packedRgb &&
+            format._order == 'bgr' &&
+            format.depth == 8,
         lumaDepth: format.depth,
         chromaDepth: format.depth,
         alphaDepth: format.depth,

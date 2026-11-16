@@ -146,8 +146,22 @@ final class YuvImageScaler {
     }
   }
 
-  image.Image filterRgb(image.Image frame, {double sampleAspect = 1}) {
+  image.Image filterRgb(
+    image.Image frame, {
+    double sampleAspect = 1,
+    bool bgr24 = false,
+  }) {
     if (filters == null) return frame;
+    return _renderFiltered(
+      _imagePlanes(frame, _sampleAspect ?? sampleAspect, bgr24: bgr24),
+    );
+  }
+
+  static _VideoPlanes _imagePlanes(
+    image.Image frame,
+    double sampleAspect, {
+    bool bgr24 = false,
+  }) {
     _checkFilterSize(frame.width, frame.height);
     final green = Uint8List(frame.width * frame.height);
     final blue = Uint8List(green.length);
@@ -161,7 +175,7 @@ final class YuvImageScaler {
       alpha?[i] = pixel.a.toInt();
       i++;
     }
-    final planes = _VideoPlanes(
+    return _VideoPlanes(
       [
         for (final samples in [green, blue, red])
           _FilterPlane(
@@ -177,7 +191,8 @@ final class YuvImageScaler {
       matrix: 0,
       fullRange: true,
       packedRgb: true,
-      sampleAspect: _sampleAspect ?? sampleAspect,
+      bgr24: bgr24,
+      sampleAspect: sampleAspect,
       alpha: alpha == null
           ? null
           : _FilterPlane(
@@ -188,7 +203,6 @@ final class YuvImageScaler {
               rowStep: frame.width,
             ),
     );
-    return _renderFiltered(planes);
   }
 
   image.Image _renderFiltered(_VideoPlanes source) {
@@ -483,8 +497,9 @@ final class _PlaneScaler {
     int stride,
     int offset,
     int depth,
-    int fractionalBits,
-  ) {
+    int fractionalBits, {
+    int? ditherOffset,
+  }) {
     final horizontalShift = depth - 1;
     var output = 0;
     for (var row = 0; row < intermediate.length; row += width) {
@@ -502,10 +517,13 @@ final class _PlaneScaler {
     final shift = 19 - fractionalBits;
     final rounding = 1 << (shift - 1);
     output = 0;
-    for (final tap in vertical) {
+    for (var row = 0; row < vertical.length; row++) {
+      final tap = vertical[row];
       final start = tap.start * width;
       for (var x = 0; x < width; x++) {
-        var sum = rounding;
+        var sum = ditherOffset == null
+            ? rounding
+            : _conversionDither[row & 7][(x + ditherOffset) & 7] << 13;
         var sample = start + x;
         for (final weight in tap.weights) {
           sum += intermediate[sample] * weight;

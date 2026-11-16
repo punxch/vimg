@@ -50,11 +50,14 @@ _VideoPlanes _pointScalePackedRgb(
     }
   }
 
-  return _packedRgbPlanes(width, height, sampleAspect, [
-    outG,
-    outB,
-    outR,
-  ], outA);
+  return _packedRgbPlanes(
+    width,
+    height,
+    sampleAspect,
+    [outG, outB, outR],
+    outA,
+    bgr24: frame.bgr24,
+  );
 }
 
 _VideoPlanes _scaleSubsampledRgb(
@@ -117,11 +120,14 @@ _VideoPlanes _scaleSubsampledRgb(
     outB[i] = ((yuv + 16525 * b) >> 22).clamp(0, 255);
     if (opacity != null) outA![i] = opacity[i].clamp(0, 255);
   }
-  return _packedRgbPlanes(width, height, sampleAspect, [
-    outG,
-    outB,
-    outR,
-  ], outA);
+  return _packedRgbPlanes(
+    width,
+    height,
+    sampleAspect,
+    [outG, outB, outR],
+    outA,
+    bgr24: frame.bgr24,
+  );
 }
 
 _VideoPlanes _packedRgbPlanes(
@@ -129,8 +135,9 @@ _VideoPlanes _packedRgbPlanes(
   int height,
   double sampleAspect,
   List<Uint8List> gbr,
-  Uint8List? alpha,
-) {
+  Uint8List? alpha, {
+  required bool bgr24,
+}) {
   _FilterPlane plane(Uint8List data) =>
       _FilterPlane(data, width, height, 8, rowStep: width);
   return _VideoPlanes(
@@ -140,17 +147,27 @@ _VideoPlanes _packedRgbPlanes(
     matrix: 0,
     fullRange: true,
     packedRgb: true,
+    bgr24: bgr24,
     sampleAspect: sampleAspect,
     alpha: alpha == null ? null : plane(alpha),
   );
 }
 
+const _bt601RgbToYuv = [
+  (8414, 16519, 3208),
+  (-4865, -9528, 14392),
+  (14392, -12061, -2332),
+];
+
 int _packedLuma(int r, int g, int b) =>
-    (8414 * r + 16519 * g + 3208 * b + 256) >> 9;
+    (_rgbProduct(_bt601RgbToYuv[0], r, g, b) + 256) >> 9;
 int _packedCb(int r, int g, int b) =>
-    (14392 * b - 4865 * r - 9528 * g + 512) >> 10;
+    (_rgbProduct(_bt601RgbToYuv[1], r, g, b) + 512) >> 10;
 int _packedCr(int r, int g, int b) =>
-    (14392 * r - 12061 * g - 2332 * b + 512) >> 10;
+    (_rgbProduct(_bt601RgbToYuv[2], r, g, b) + 512) >> 10;
+
+int _rgbProduct((int, int, int) coefficients, int r, int g, int b) =>
+    coefficients.$1 * r + coefficients.$2 * g + coefficients.$3 * b;
 
 // The packed alpha path replicates the high bits before rounding.
 int _packedPointAlpha(int value) => math.min(255, value + (value >> 7));

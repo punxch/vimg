@@ -1491,7 +1491,8 @@ final class Video {
           name,
           palette: run.aviPalettes?[0],
         );
-        render = ({scaler}) => _renderRgb(source, scaler);
+        final bgr24 = name == 'rawvideo' && _avi?.isBgr24 == true;
+        render = ({scaler}) => _renderRgb(source, scaler, bgr24: bgr24);
       }
       yield (packet: packet, render: render, scaler: scaler);
       return;
@@ -1764,14 +1765,18 @@ final class Video {
     return config;
   }
 
-  image.Image _renderRgb(image.Image source, YuvImageScaler? scaler) {
+  image.Image _renderRgb(
+    image.Image source,
+    YuvImageScaler? scaler, {
+    bool bgr24 = false,
+  }) {
     if (scaler == null) return source;
     final frame =
         source.hasAlpha && (scaler.width != null || scaler.height != null)
         ? _rgb(source)
         : source;
     return scaler.filters != null
-        ? scaler.filterRgb(frame)
+        ? scaler.filterRgb(frame, bgr24: bgr24)
         : resizeToFit(frame, width: scaler.width, height: scaler.height);
   }
 

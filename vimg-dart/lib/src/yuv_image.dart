@@ -10,6 +10,7 @@ import 'grid.dart';
 import 'metadata.dart' show VideoCrop, VideoOrientation;
 
 part 'video_filters.dart';
+part 'video_pixel_formats.dart';
 part 'video_filter_colors.dart';
 part 'video_filter_graph.dart';
 part 'video_filter_sync.dart';
@@ -40,6 +41,7 @@ image.Image yuvImage({
   int alphaDepth = 8,
   double sampleAspect = 1,
   bool packedRgb = false,
+  bool bgr24 = false,
   YuvImageScaler? scaler,
 }) {
   if (scaler != null && scaler.filters != null) {
@@ -74,6 +76,7 @@ image.Image yuvImage({
       matrix: matrix,
       fullRange: fullRange,
       packedRgb: packedRgb,
+      bgr24: bgr24,
       sampleAspect: scaler._sampleAspect ?? sampleAspect,
       alpha: alpha == null
           ? null

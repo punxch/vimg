@@ -68,6 +68,7 @@ final class _SetAspect implements _SpatialFilter {
       matrix: frame.matrix,
       fullRange: frame.fullRange,
       packedRgb: frame.packedRgb,
+      bgr24: frame.bgr24,
       sampleAspect: sar,
       alpha: frame.alpha,
     );
@@ -420,13 +421,7 @@ final class _PaintColor {
         _ => ((450 * red - 377 * green - 73 * blue + 511) >> 10) + 128,
       };
     }
-    final (kr, kb) = switch (box ? 6 : frame.matrix) {
-      1 => (0.2126, 0.0722),
-      4 => (0.30, 0.11),
-      7 => (0.212, 0.087),
-      9 || 10 => (0.2627, 0.0593),
-      _ => (0.299, 0.114),
-    };
+    final (kr, kb) = _filterLumaWeights(box ? 6 : frame.matrix);
     final y = kr * red + (1 - kr - kb) * green + kb * blue;
     final chroma = component != 0;
     final value = switch (component) {

@@ -432,6 +432,17 @@ void _checkGraph() {
     expected.getBytes(),
     '10-bit stacked 4:2:0 planes',
   );
+  // FFmpeg planar conversion before vimg's RGB rendering.
+  for (final (format, checksum) in [
+    ('yuv420p', 0xc5fb3242),
+    ('yuv444p', 0xe0ec8cbf),
+  ]) {
+    final converted = render(y, u, v, 6, 'format=$format');
+    check(
+      getCrc32(converted.getBytes()) == checksum,
+      '$format depth reduction matches FFmpeg ordered dithering',
+    );
+  }
 }
 
 void _checkCompositing() {
@@ -467,6 +478,34 @@ void _checkCompositing() {
     (overlay.width, overlay.height) == (8, 6) &&
         getCrc32(overlay.getBytes()) == 0x048e54b9,
     'FFmpeg RGBA blending with partial clipping',
+  );
+  for (final (graph, channels, checksum) in [
+    ('format=yuv420p', 3, 0x307b6ca8),
+    ('format=yuva420p10le', 4, 0x72a13b87),
+    ('crop=7:5:0:0,format=yuva420p10le', 4, 0xc6b327bf),
+    (
+      'split[a][b];[a]format=rgb24[m];[b]crop=4:4:2:0,format=yuva444p[c];'
+          '[m][c]overlay=2:2',
+      3,
+      0x99429347,
+    ),
+    (
+      'split[a][b];[b]crop=4:4:2:0,hflip[c];[a][c]overlay=x=4:y=2',
+      4,
+      0x85204890,
+    ),
+  ]) {
+    final converted = render(graph);
+    check(
+      converted.numChannels == channels &&
+          getCrc32(converted.getBytes()) == checksum,
+      '$graph matches FFmpeg conversion and compositing',
+    );
+  }
+  _sameBytes(
+    render('format=pix_fmts=yuv420p|rgba').getBytes(),
+    source.getBytes(),
+    'Format list keeps compatible RGBA input',
   );
   final premultiplied = render(
     'split[a][b];[b]crop=4:3:2:1,hflip[c];'
@@ -712,9 +751,25 @@ Future<void> _checkCli(String? executable) async {
       0xa59dc83c,
       0x3b9cc77c,
     ];
+    const delayedOverlay =
+        'split[main][inset];[main]fps=8[fast];'
+        '[inset]trim=start_frame=1,crop=12:8:2:2,hflip[late];'
+        '[fast][late]overlay=x=W-w:y=2';
+    // FFmpeg's scalar BGR24-to-YUV420 conversion followed by Dart RGB rendering.
+    const delayedReference = [
+      0xcd391635,
+      0xcd391635,
+      0xf296157d,
+      0xf296157d,
+      0xc9cf516b,
+      0xc9cf516b,
+      0xe08c8d50,
+      0xe08c8d50,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
+      ('delayed-overlay', delayedOverlay, 32, 24, delayedReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {

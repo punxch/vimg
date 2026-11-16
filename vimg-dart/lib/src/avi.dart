@@ -219,6 +219,7 @@ final class Avi {
   );
 
   bool get supportsBitmap => _header.tracks.firstOrNull?.bitmap != null;
+  bool get isBgr24 => _header.tracks.firstOrNull?.bitmap?.bits == 24;
   RawVideoFormat? get rawFormat => _header.tracks.firstOrNull?.raw;
   Uint8List? get cinepakDescription =>
       _header.tracks.firstOrNull?.cinepakDescription;

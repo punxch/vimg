@@ -1,7 +1,5 @@
 part of 'yuv_image.dart';
 
-typedef _OverlayFormat = ({bool rgb, int subX, int subY, int depth});
-
 final class _Overlay {
   factory _Overlay(String? source) {
     final options = _filterOptions(source, [
@@ -15,7 +13,6 @@ final class _Overlay {
       'alpha',
       'ts_sync_mode',
     ]);
-    // The two inputs arrive together, and have the same end event.
     final shortest = _filterFlag(options['shortest'], 'overlay shortest');
     final repeat = _filterFlag(
       options['repeatlast'] ?? '1',
@@ -56,13 +53,16 @@ final class _Overlay {
       _ => throw const FormatException('Invalid overlay alpha mode'),
     };
     final format = switch (options['format']) {
-      null || 'yuv420' || '0' => (rgb: false, subX: 1, subY: 1, depth: 8),
-      'yuv420p10' || '1' => (rgb: false, subX: 1, subY: 1, depth: 10),
-      'yuv422' || '2' => (rgb: false, subX: 1, subY: 0, depth: 8),
-      'yuv422p10' || '3' => (rgb: false, subX: 1, subY: 0, depth: 10),
-      'yuv444' || '4' => (rgb: false, subX: 0, subY: 0, depth: 8),
-      'yuv444p10' || '5' => (rgb: false, subX: 0, subY: 0, depth: 10),
-      'rgb' || 'gbrp' || '6' || '7' => (rgb: true, subX: 0, subY: 0, depth: 8),
+      null ||
+      'yuv420' ||
+      '0' => _pixelFormat(_PixelColor.yuv, 8, subX: 1, subY: 1),
+      'yuv420p10' || '1' => _pixelFormat(_PixelColor.yuv, 10, subX: 1, subY: 1),
+      'yuv422' || '2' => _pixelFormat(_PixelColor.yuv, 8, subX: 1),
+      'yuv422p10' || '3' => _pixelFormat(_PixelColor.yuv, 10, subX: 1),
+      'yuv444' || '4' => _pixelFormat(_PixelColor.yuv, 8),
+      'yuv444p10' || '5' => _pixelFormat(_PixelColor.yuv, 10),
+      'rgb' || '6' => _pixelFormat(_PixelColor.rgb, 8, packedRgb: true),
+      'gbrp' || '7' => _pixelFormat(_PixelColor.rgb, 8),
       'auto' || '8' => null,
       _ => throw const FormatException('Invalid overlay pixel format'),
     };
@@ -106,15 +106,10 @@ final class _Overlay {
       stop,
       pass,
       nearest,
-      options['format'] == 'rgb' || options['format'] == '6'
-          ? true
-          : options['format'] == 'gbrp' || options['format'] == '7'
-          ? false
-          : null,
     );
   }
 
-  const _Overlay._(
+  _Overlay._(
     this.x,
     this.y,
     this.format,
@@ -123,35 +118,41 @@ final class _Overlay {
     this.stopAtEof,
     this.dropSecondary,
     this.nearest,
-    this.packedRgb,
   );
 
   final FilterExpression x, y;
-  final _OverlayFormat? format;
+  final _VideoPixelFormat? format;
   final bool premultiplied, usesFramePosition;
   final bool stopAtEof, dropSecondary, nearest;
-  final bool? packedRgb;
+  final _converter = _PixelFormatConverter();
 
   _VideoPlanes apply(
-    _VideoPlanes main,
-    _VideoPlanes over,
+    _VideoPlanes input,
+    _VideoPlanes? secondary,
     FilterFramePosition position,
   ) {
-    final inputFormat = _overlayFormat(main);
-    if ((format != null && inputFormat != format) ||
-        inputFormat != _overlayFormat(over) ||
-        main.planes.length != over.planes.length ||
-        !main.planes.every((plane) => plane.depth == inputFormat.depth) ||
-        !over.planes.every((plane) => plane.depth == inputFormat.depth)) {
-      throw const FormatException(
-        'Overlay requires matching inputs in the requested pixel format',
-      );
-    }
+    final requested = format;
+    final target = requested == null || requested.packedRgb && input.bgr24
+        ? _frameFormat(input)
+        : requested;
+    final main = _converter.convert(
+      input,
+      target,
+      fullRange: format == null ? input.fullRange : null,
+      matrix: format == null ? input.matrix : null,
+    );
+    if (secondary == null) return main;
+    final over = identical(input, secondary)
+        ? main
+        : _converter.convert(
+            secondary,
+            target,
+            fullRange: main.fullRange,
+            matrix: main.matrix,
+          );
     if (premultiplied &&
         over.alpha != null &&
-        (!main.rgb ||
-            inputFormat.depth != 8 ||
-            !(packedRgb ?? main.packedRgb))) {
+        (!main.packedRgb || target.depth != 8)) {
       throw const FormatException(
         'Premultiplied overlay requires packed 8-bit RGB',
       );
@@ -257,27 +258,9 @@ final class _Overlay {
         return _FilterPlane(output, width, height, depth, rowStep: width);
       });
     }
-    return packedRgb == null || packedRgb == result.packedRgb
-        ? result
-        : _VideoPlanes(
-            result.planes,
-            result.subX,
-            result.subY,
-            matrix: result.matrix,
-            fullRange: result.fullRange,
-            packedRgb: packedRgb!,
-            sampleAspect: result.sampleAspect,
-            alpha: result.alpha,
-          );
+    return result;
   }
 }
-
-_OverlayFormat _overlayFormat(_VideoPlanes frame) => (
-  rgb: frame.rgb,
-  subX: frame.subX,
-  subY: frame.subY,
-  depth: frame.planes.first.depth,
-);
 
 int? _overlayOffset(double value, int shift) =>
     !value.isFinite || value.abs() > 2147483647

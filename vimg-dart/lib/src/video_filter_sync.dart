@@ -143,16 +143,14 @@ final class _SynchronizedFilterGraph {
         nextTime,
         duration: overlay == null ? stackDuration : first.duration,
       );
-      final FilterPicture picture;
-      if (overlay != null && inputs[1].frame == null) {
-        picture = _pictureOf(first);
-      } else {
-        picture = FilterOperationPicture(
-          step,
-          [for (final input in inputs) _pictureOf(input.frame!)],
-          (index: main.index, seconds: nextTime * clock.value),
-        );
-      }
+      final picture = FilterOperationPicture(
+        step,
+        [
+          for (final input in inputs)
+            if (input.frame case final frame?) _pictureOf(frame),
+        ],
+        (index: main.index, seconds: nextTime * clock.value),
+      );
       lastOutput = nextTime;
       yield primary.withPicture(picture);
     }

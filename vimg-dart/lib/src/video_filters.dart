@@ -407,6 +407,7 @@ final class _Transpose implements _SpatialFilter {
       matrix: frame.matrix,
       fullRange: frame.fullRange,
       packedRgb: frame.packedRgb,
+      bgr24: frame.bgr24,
       sampleAspect: 1 / frame.sampleAspect,
       alpha: frame.alpha?.orient(
         transpose: true,
@@ -762,6 +763,7 @@ final class _VideoPlanes {
     required this.matrix,
     required this.fullRange,
     this.packedRgb = false,
+    this.bgr24 = false,
     this.sampleAspect = 1,
     this.alpha,
   });
@@ -771,6 +773,7 @@ final class _VideoPlanes {
   final int matrix;
   final bool fullRange;
   final bool packedRgb;
+  final bool bgr24;
   final double sampleAspect;
 
   int get width => planes.first.width;
@@ -811,6 +814,7 @@ final class _VideoPlanes {
     matrix: matrix,
     fullRange: fullRange,
     packedRgb: packedRgb,
+    bgr24: bgr24,
     sampleAspect: sampleAspect ?? this.sampleAspect,
     alpha: alpha == null ? null : transform(alpha!, 0, 0, 3),
   );

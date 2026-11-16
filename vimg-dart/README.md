@@ -366,10 +366,15 @@ It selects a secondary picture at or before the main timestamp, or the
 closest picture with `ts_sync_mode=nearest`. Before the secondary begins it
 passes the main stream through. `eof_action`, `repeatlast` and `shortest`
 control how it handles input streams of different lengths.
-Both inputs must already match the requested pixel format. The default is
-8-bit YUV 4:2:0. Use `format=rgb` for 8-bit RGB or `format=auto` to
-retain the matching decoded planes. Packed 8-bit RGB also supports
-`alpha=premultiplied`.
+Overlay converts both inputs to the requested pixel format. The default is
+8-bit YUV 4:2:0. Use `format=rgb` for 8-bit packed RGB or `format=auto`
+to use the main input's decoded layout. Packed 8-bit RGB also supports
+`alpha=premultiplied`. The separate `format` filter accepts
+`pix_fmts` such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
+When given a `|`-separated list, it keeps a matching input format when
+available and otherwise converts to the first listed format.
+Native YUV depth reduction uses ordered dithering.
+Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered

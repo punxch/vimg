@@ -70,6 +70,7 @@ Object? _graphFilter(String specification) {
     'pad' => _Pad(args),
     'drawbox' => _DrawBox(args),
     'negate' => _Negate(args),
+    'format' => _FormatFilter(args),
     'setsar' || 'setdar' => _SetAspect(args, display: name == 'setdar'),
     'trim' => _Trim(args),
     'setpts' => _SetPts(args),
@@ -248,7 +249,11 @@ _VideoPlanes _applyFilterStep(
   FilterFramePosition position,
 ) => switch (filter) {
   final _Stack stack => stack.apply(inputs),
-  final _Overlay filter => filter.apply(inputs[0], inputs[1], position),
+  final _Overlay filter => filter.apply(
+    inputs[0],
+    inputs.elementAtOrNull(1),
+    position,
+  ),
   final _FrameSpatialFilter filter => filter.applyAt(inputs.single, position),
   final _SpatialFilter filter => filter.apply(inputs.single),
   _ => inputs.single,
