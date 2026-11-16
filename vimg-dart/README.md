@@ -213,7 +213,10 @@ tiles from short- and long-term references. Buffer capacity is measured in
 sub-picture units.
 Annex V decodes separate macroblock, motion and coefficient partitions,
 including reordered rectangular slices, Improved PB frames and scalability
-layers. Recovery by reading damaged partitions backward remains pending.
+layers. When the motion marker is intact, the decoder keeps the readable
+forward prefix and can recover primary vectors backward from the repeated
+last vector. Missing vectors fall back to zero motion. Recovery of damaged
+macroblock headers and coefficients remains pending.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
 and disposable Spark pictures.
 

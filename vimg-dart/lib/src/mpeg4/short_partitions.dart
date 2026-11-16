@@ -117,30 +117,6 @@ final class _H263PartitionBlock {
   _Vector? delta;
 }
 
-final class _H263PartitionVectors {
-  _H263PartitionVectors(this.bits);
-
-  final Rbsp bits;
-  var _pendingOne = false;
-  var count = 0;
-
-  _Vector read() {
-    count++;
-    return (x: _component(), y: _component());
-  }
-
-  int _component() {
-    final value = h263ReversibleComponent(bits);
-    if (value == 1 && _pendingOne) {
-      h263Marker(bits);
-      _pendingOne = false;
-    } else {
-      _pendingOne = value == 1;
-    }
-    return value;
-  }
-}
-
 extension _H263DataPartitions on _H263Macroblocks {
   List<_H263PartitionBlock> _readDataPartitions(int count, int end) {
     final (table, stuffing) = switch ((
@@ -190,51 +166,26 @@ extension _H263DataPartitions on _H263Macroblocks {
       );
     }
 
-    // Each slice starts one forward motion prediction chain. Backward
-    // B-prediction and MVDB keep their respective macroblock predictors.
-    final vectors = _H263PartitionVectors(_bits);
-    var lastMotion = _zeroVector;
-    var hasSecondary = false;
-    _Vector nextMotion(int _) {
-      final delta = vectors.read();
-      lastMotion = (x: lastMotion.x + delta.x, y: lastMotion.y + delta.y);
-      return lastMotion;
-    }
-
+    final motion = <_H263PartitionMotionSlot>[];
     for (final block in blocks) {
       final (primary, secondary) = _partitionMotionCounts(block);
       if (primary != 0) {
-        block.motion = List.generate(primary, nextMotion, growable: false);
+        block.motion = List.filled(primary, _zeroVector);
+        for (var i = 0; i < primary; i++) {
+          motion.add((block: block, index: i));
+        }
       }
-      if (secondary) {
-        block.delta = vectors.read();
-        hasSecondary = true;
-      }
-      if (_bits.position > end) {
-        throw const FormatException(
-          'H.263+ motion partition exceeds its slice',
-        );
-      }
+      if (secondary) motion.add((block: block, index: -1));
     }
-    if (vectors.count > 1) {
-      final repeated = vectors.read();
-      if (!hasSecondary && repeated != lastMotion) {
-        throw const FormatException(
-          'H.263+ motion partition has an inconsistent last vector',
-        );
-      }
-    }
-    if (vectors.count != 0 &&
-        (_bits.position + 10 > end || _bits.read(10) != 1)) {
-      throw const FormatException('Invalid H.263+ motion partition marker');
-    }
+    if (motion.isNotEmpty) _readPartitionMotion(_bits, end, motion);
     return blocks;
   }
 
   _Vector _readSecondaryVector(_Vector prediction) {
     final partition = _partition;
     if (partition == null) return _readVector(prediction);
-    final delta = partition.delta!;
+    final delta = partition.delta;
+    if (delta == null) return _zeroVector;
     if (header.format.unrestricted) {
       return (x: prediction.x + delta.x, y: prediction.y + delta.y);
     }

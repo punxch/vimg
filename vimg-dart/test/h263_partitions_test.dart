@@ -10,6 +10,7 @@ import 'fixtures.dart';
 
 const _input = 'test/fixtures/h263-dps-b.h263';
 const _inter = 'test/fixtures/h263-dps-p.h263';
+const _recoveredB = 'test/fixtures/h263-dps-recover-b.h263';
 
 Future<void> main(List<String> arguments) async {
   // An arbitrary-order rectangle can contain no MVs, one MV, or a
@@ -35,6 +36,26 @@ Future<void> main(List<String> arguments) async {
     (40, 52),
     [(0, 217700441), (4, 4138163183)],
   );
+  // Oversized and shortened MVD words break the forward parse. The
+  // intact LMVV permits recovery of the suffix and of an isolated lost
+  // delta. Multiple faults leave a gap, and a lone vector has no LMVV.
+  await _verify(
+    'test/fixtures/h263-dps-recover-p.h263',
+    (96, 80),
+    [(0, 1996152582), (4, 2140024951)],
+  );
+  // Skip secondary deltas encountered in the reverse pass, for standalone
+  // B prediction and for the B part of an Improved PB frame.
+  await _verify(
+    _recoveredB,
+    (64, 32),
+    [(0, 2479670088), (2, 3243469502), (4, 15202281)],
+  );
+  await _verify(
+    'test/fixtures/h263-dps-recover-pb.h263',
+    (48, 32),
+    [(0, 2068204920), (2, 1175256506), (4, 2620488000)],
+  );
   _verifyInvalidPartitions();
   if (arguments.firstOrNull case final cli?) {
     final directory = Directory.systemTemp.createTempSync('vimg-h263-dps-');
@@ -49,7 +70,7 @@ Future<void> main(List<String> arguments) async {
         '-t160ms',
         '-o',
         output.path,
-        _input,
+        _recoveredB,
       ]);
       check(
         result.exitCode == 0,
