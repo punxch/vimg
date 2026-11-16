@@ -1,6 +1,6 @@
 part of 'yuv_image.dart';
 
-/// A linear chain of spatial operations and frame-timing filters.
+/// A single-input, single-output graph of video filters.
 final class VideoFilterChain {
   VideoFilterChain._(this.source, this._filters, this._timing);
 
@@ -8,51 +8,7 @@ final class VideoFilterChain {
     if (source.length > 2048) {
       throw const FormatException('Video filter chain exceeds 2048 characters');
     }
-    final filters = <_SpatialFilter>[];
-    final timing = <_TimingFilter>[];
-    void addSpatial(_SpatialFilter filter) {
-      filters.add(filter);
-      if (filter is _FrameSpatialFilter && filter.usesFramePosition) {
-        timing.add(const _RecordFramePosition());
-      }
-    }
-
-    for (final entry in _splitFilters(source, ',')) {
-      final equal = entry.indexOf('=');
-      final name = (equal < 0 ? entry : entry.substring(0, equal)).trim();
-      final args = equal < 0 ? null : entry.substring(equal + 1);
-      switch (name) {
-        case 'null' || 'hflip' || 'vflip':
-          if (args != null) throw FormatException('$name takes no options');
-          if (name == 'hflip') filters.add(_Flip.horizontal);
-          if (name == 'vflip') filters.add(_Flip.vertical);
-        case 'crop':
-          addSpatial(_Crop(args));
-        case 'transpose':
-          filters.add(_Transpose(args));
-        case 'scale':
-          addSpatial(_Scale(args));
-        case 'pad':
-          filters.add(_Pad(args));
-        case 'drawbox':
-          filters.add(_DrawBox(args));
-        case 'negate':
-          filters.add(_Negate(args));
-        case 'setsar' || 'setdar':
-          filters.add(_SetAspect(args, display: name == 'setdar'));
-        case 'trim':
-          timing.add(_Trim(args));
-        case 'setpts':
-          timing.add(_SetPts(args));
-        case 'settb':
-          timing.add(_SetTimeBase(args));
-        case 'fps':
-          timing.add(_Fps(args));
-        default:
-          throw FormatException('Unsupported video filter: $name');
-      }
-    }
-    return VideoFilterChain._(source, filters, timing);
+    return _compileFilterGraph(source);
   }
 
   final String source;
@@ -113,9 +69,10 @@ final class VideoFilterChain {
   }
 }
 
-List<String> _splitFilters(String source, String delimiter) {
-  final parts = <String>[];
-  var quoted = false, escaped = false, depth = 0, start = 0;
+typedef _FilterToken = ({int start, int end, String kind});
+
+Iterable<_FilterToken> _filterSyntax(String source) sync* {
+  var quoted = false, escaped = false, depth = 0;
   for (var i = 0; i < source.length; i++) {
     final char = source[i];
     if (escaped) {
@@ -131,18 +88,36 @@ List<String> _splitFilters(String source, String delimiter) {
         case ')':
           if (--depth < 0)
             throw const FormatException('Unbalanced filter expression');
-        case ';' || '[' || ']':
-          throw const FormatException(
-            'Only linear video filter chains are supported',
-          );
-        case _ when char == delimiter && depth == 0:
-          parts.add(source.substring(start, i));
-          start = i + 1;
+        case '[' when depth == 0:
+          final close = source.indexOf(']', i + 1);
+          if (close < 0 || source.substring(i + 1, close).contains('[')) {
+            throw const FormatException('Unterminated video filter label');
+          }
+          yield (start: i, end: close + 1, kind: '[');
+          i = close;
+        case ']':
+          throw const FormatException('Unexpected video filter label end');
+        case ',' || ';' || ':' when depth == 0:
+          yield (start: i, end: i + 1, kind: char);
       }
     }
   }
   if (quoted || escaped || depth != 0) {
     throw const FormatException('Unterminated video filter argument');
+  }
+}
+
+List<String> _splitFilterOptions(String source) {
+  final parts = <String>[];
+  var start = 0;
+  for (final token in _filterSyntax(source)) {
+    switch (token.kind) {
+      case '[' || ';':
+        throw const FormatException('Unexpected video filter option delimiter');
+      case ':':
+        parts.add(source.substring(start, token.start));
+        start = token.end;
+    }
   }
   return [...parts, source.substring(start)];
 }
@@ -172,7 +147,7 @@ Map<String, String> _filterOptions(
   if (source == null) return options;
   var index = 0;
   // A colon escaped in both the graph and option layers remains literal.
-  for (final arg in _splitFilters(source.replaceAll(r'\\:', r'\:'), ':')) {
+  for (final arg in _splitFilterOptions(source.replaceAll(r'\\:', r'\:'))) {
     final equal = arg.indexOf('=');
     if (equal < 0 && index >= positional.length) {
       throw FormatException('Unexpected video filter argument: $arg');

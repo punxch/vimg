@@ -12,6 +12,7 @@ Future<void> main(List<String> arguments) async {
   _checkYuv();
   _checkLinearScale();
   _checkScaleAspect();
+  _checkGraph();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
 }
@@ -350,12 +351,97 @@ void _checkScaleAspect() {
   }
 }
 
+void _checkGraph() {
+  final source = image.Image(width: 8, height: 6, numChannels: 4);
+  for (final p in source) {
+    p.setRgba(p.x * 29, p.y * 41, p.x * 13 + p.y * 11, p.x * 19 + p.y * 23);
+  }
+  const graph =
+      '[middle]hflip@mirror[flipped]; '
+      '[in]split=outputs=3[top][middle][lower]; '
+      '[top][flipped]hstack[wide]; '
+      '[lower]vflip,crop=8:3:0:0,split,hstack[bottom]; '
+      '[wide][bottom]vstack=shortest=1[out]';
+  final result = YuvImageScaler(
+    filters: VideoFilterChain.parse(graph),
+  ).filterRgb(source);
+  check((result.width, result.height) == (16, 9), 'Nested stack dimensions');
+  for (final p in result) {
+    final expected = source.getPixel(
+      p.y < 6 && p.x >= 8 ? 15 - p.x : p.x % 8,
+      p.y < 6 ? p.y : 11 - p.y,
+    );
+    check(
+      (p.r, p.g, p.b, p.a) == (expected.r, expected.g, expected.b, expected.a),
+      'Nested stack RGBA pixel at ${p.x},${p.y}',
+    );
+  }
+  const implicit = '[source]split[left],hflip[right]; [left][right]hstack';
+  final top = YuvImageScaler(
+    filters: VideoFilterChain.parse(implicit),
+  ).filterRgb(source);
+  _sameBytes(
+    image.copyCrop(result, x: 0, y: 0, width: 16, height: 6).getBytes(),
+    top.getBytes(),
+    'Unlabelled split output connects to its next filter',
+  );
+
+  Uint16List samples(int width, int height, int bias) => Uint16List.fromList([
+    for (var y = 0; y < height; y++)
+      for (var x = 0; x < width; x++) bias + 23 * y + 37 * x,
+  ]);
+  final y = samples(8, 6, 120), u = samples(4, 3, 405), v = samples(4, 3, 480);
+  Uint16List mirrorRows(Uint16List plane, int stride) => Uint16List.fromList([
+    ...plane,
+    for (var i = plane.length - stride; i >= 0; i -= stride)
+      ...plane.sublist(i, i + stride),
+  ]);
+  image.Image render(
+    List<int> y,
+    List<int> u,
+    List<int> v,
+    int height, [
+    String filter = 'null',
+  ]) => yuvImage(
+    y: y,
+    cb: u,
+    cr: v,
+    stride: 8,
+    chromaStride: 4,
+    width: 8,
+    height: height,
+    cropLeft: 0,
+    cropTop: 0,
+    matrix: 6,
+    fullRange: false,
+    lumaDepth: 10,
+    chromaDepth: 10,
+    scaler: YuvImageScaler(filters: VideoFilterChain.parse(filter)),
+  );
+  final deep = render(y, u, v, 6, 'split[a][b];[b]vflip[c];[a][c]vstack');
+  final expected = render(
+    mirrorRows(y, 8),
+    mirrorRows(u, 4),
+    mirrorRows(v, 4),
+    12,
+  );
+  _sameBytes(
+    deep.getBytes(),
+    expected.getBytes(),
+    '10-bit stacked 4:2:0 planes',
+  );
+}
+
 void _checkErrors() {
   for (final chain in [
     '',
     'hflip=1',
     'hflip;vflip',
-    '[in]crop=4:2[out]',
+    'split[a][a];[a]hflip',
+    'split[a][b];[a]hflip',
+    'split[a][b];[a]hstack',
+    '[loop]split[loop][branch];split[a][b];[a][branch][b]hstack=3',
+    'split[a][b];[a]trim=end_frame=2[c];[c][b]hstack',
     "scale=w='min(4,2):h=2",
     'scale=4:2:flags=lanczos',
     'scale=4:2:force_original_aspect_ratio=fit',
@@ -371,7 +457,13 @@ void _checkErrors() {
     _fails(() => VideoFilterChain.parse(chain), chain);
   }
   final source = image.Image(width: 8, height: 6);
-  for (final chain in ['crop=9:5', 'scale=1/0:ih', 'scale=32768:32768']) {
+  for (final chain in [
+    'crop=9:5',
+    'scale=1/0:ih',
+    'scale=32768:32768',
+    'split[a][b];[a]crop=8:4[c];[c][b]hstack',
+    'split[a][b];[a]crop=6:6[c];[c][b]vstack',
+  ]) {
     _fails(
       () => YuvImageScaler(
         filters: VideoFilterChain.parse(chain),
@@ -490,6 +582,61 @@ Future<void> _checkCli(String? executable) async {
     List<File> ordered(String path) =>
         Directory(path).listSync().cast<File>()
           ..sort((a, b) => a.path.compareTo(b.path));
+
+    const graph =
+        'fps=8,split[left][right];'
+        '[left]crop=16:12:n*2:8*t[moving];'
+        '[right]crop=16:12:0:0,hflip[fixed];'
+        '[moving][fixed]hstack,trim=end_frame=8';
+    // FFmpeg BGR24 output with the same graph and source rate.
+    const graphReference = [
+      0x913ac000,
+      0x9317d5c0,
+      0x45f0098f,
+      0x47cd1f4f,
+      0xfa97530f,
+      0xfc7468cf,
+      0xaf4d9c8f,
+      0xb12ab24f,
+    ];
+    final graphSheet = File('${temp.path}/branch.avif');
+    for (final command in ['extract', 'vcs']) {
+      final folder = '${temp.path}/branch-$command';
+      await run([
+        command,
+        '-n1',
+        '-f8',
+        '-t1s',
+        '-T4',
+        if (command == 'vcs') ...[
+          '-c1',
+          '-H12',
+          '--keep',
+          '-o',
+          graphSheet.path,
+        ],
+        '--output-dir',
+        folder,
+        '--vfilter',
+        graph,
+        motion,
+      ]);
+      final outputs = ordered(folder);
+      check(outputs.length == graphReference.length, '$command branch frames');
+      for (final (index, file) in outputs.indexed) {
+        final frame = image.decodeBmp(file.readAsBytesSync())!;
+        check(
+          frame.width == 32 &&
+              frame.height == 12 &&
+              _bgrChecksum(frame) == graphReference[index],
+          '$command branch frame $index matches FFmpeg',
+        );
+      }
+    }
+    check(
+      ascii.decode(graphSheet.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
+      'Branched graph produces an animated contact sheet',
+    );
 
     final fitted = '${temp.path}/fitted';
     await run([

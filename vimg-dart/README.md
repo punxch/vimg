@@ -348,7 +348,14 @@ time base, and `fps` supports start padding, rounding and EOF modes. Spatial
 expressions use the timeline at their position in the chain. A crop after
 `fps` sees the duplicated frames, and a crop before `fps` sees the
 original frames. Wall-clock expressions, expressions that depend on earlier
-spatial evaluations, and branched graphs are pending.
+spatial evaluations, and independent timelines inside branches are pending.
+
+Single-input, single-output filter graphs can fan out with `split` and
+rejoin with `hstack` or `vstack`. For example,
+`--vfilter 'split[a][b];[b]hflip[c];[a][c]hstack'` puts each frame beside
+its mirror image. Each branch can apply spatial filters. Timing filters can
+run on the shared stream before a split or after branches rejoin.
+`hstack` requires equal input heights and `vstack` requires equal widths.
 
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered
