@@ -937,6 +937,10 @@ void _checkStandaloneAlpha() {
     ('premultiply=planes=8:inplace=1', 0x8fd11bb7),
     ('format=gbrap10le,premultiply=inplace=1', 0xe7e6bcab),
     ('format=gbrap16le,premultiply=inplace=1', 0x4147faf7),
+    // FFmpeg's native planes rendered by the Dart RGB converter.
+    ('format=gbrap10le,unpremultiply=inplace=1', 0xcd4771a2),
+    ('format=gbrap16le,unpremultiply=inplace=1', 0xdec5a2b6),
+    ('format=yuva444p10le,unpremultiply=inplace=1', 0x78324ce2),
     (
       'format=yuva444p10le,premultiply=inplace=1,unpremultiply=inplace=1',
       0xa1f06cdd,
@@ -1023,13 +1027,27 @@ void _checkFloatAlpha() {
   ).filterRgb(input ?? source);
   const format = 'format=gbrapf32le';
   const premultiply = 'premultiply=inplace=1';
+  const unpremultiply = 'unpremultiply=inplace=1';
   const masked = 'format=gbrpf32le,split[a][b];[b]hflip[m];[a][m]';
   for (final (graph, checksum) in [
     (format, 0x65e259ed),
     ('format=gbrapf32be', 0x65e259ed),
     ('$format,$premultiply', 0xa43ecb8a),
     ('$format,$premultiply,format=rgba', 0xa43ecb8a),
-    ('$format,$premultiply,unpremultiply=inplace=1', 0x65e259ed),
+    ('$format,$premultiply,$unpremultiply', 0x65e259ed),
+    ('$format,$unpremultiply', 0x7abccacc),
+    ('$format,hflip,$unpremultiply', 0xb0884373),
+    ('$format,$unpremultiply:planes=1', 0xa7a5b09e),
+    ('$format:alpha_modes=premultiplied,$unpremultiply', 0x65e259ed),
+    ('format=alpha_modes=premultiplied,$format,$unpremultiply', 0x65e259ed),
+    ('$format,format=alpha_modes=premultiplied,$unpremultiply', 0x7abccacc),
+    ('$format,scale=8:6:flags=neighbor,$unpremultiply', 0x7abccacc),
+    ('scale=8:6,$format,$unpremultiply', 0x65e259ed),
+    (
+      '$format,scale=8:6,$format:alpha_modes=straight,$unpremultiply',
+      0x65e259ed,
+    ),
+    ('$format,premultiply_dynamic=planes=1,$unpremultiply', 0xaa9f5ec8),
     (
       '$format,premultiply_dynamic,format=alpha_modes=premultiplied',
       0xa43ecb8a,
@@ -1045,6 +1063,12 @@ void _checkFloatAlpha() {
       '$graph matches the scalar floating-point filter conversion',
     );
   }
+  final dropped = render('$format,scale=8:6,format=gbrpf32le,$unpremultiply');
+  final opaque = render('$format,format=gbrpf32le,$format');
+  check(
+    getCrc32(dropped.getBytes()) == getCrc32(opaque.getBytes()),
+    'Implicit premultiplication respects a scale that drops alpha',
+  );
   final extracted = render('$format,alphaextract,format=grayf32be');
   for (final pixel in extracted) {
     final expected = source.getPixel(pixel.x, pixel.y).a;
@@ -1392,6 +1416,18 @@ Future<void> _checkCli(String? executable) async {
       0x7f8f10be,
       0x7f8f10be,
     ];
+    const implicitAlpha =
+        'format=gbrapf32le,hflip,unpremultiply=inplace=1:planes=1,fps=8';
+    const implicitAlphaReference = [
+      0x25d026a6,
+      0x25d026a6,
+      0x001a28e1,
+      0x001a28e1,
+      0xbd8d2a42,
+      0xbd8d2a42,
+      0xaf422c4c,
+      0xaf422c4c,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1410,6 +1446,7 @@ Future<void> _checkCli(String? executable) async {
         maskedReference,
       ),
       ('float-alpha', floatAlpha, 4, 4, floatAlphaReference),
+      ('implicit-alpha', implicitAlpha, 8, 6, implicitAlphaReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1433,7 +1470,8 @@ Future<void> _checkCli(String? executable) async {
           filter,
           name == 'associated-overlay' ||
                   name == 'masked-alpha' ||
-                  name == 'float-alpha'
+                  name == 'float-alpha' ||
+                  name == 'implicit-alpha'
               ? transparentMotion
               : motion,
         ]);

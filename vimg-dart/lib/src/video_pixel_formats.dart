@@ -141,12 +141,14 @@ final class _FormatFilter implements _SpatialFilter {
     this.ranges, [
     this.alphaModes = const [],
     this.restoreAlphaLayout = true,
+    this.layoutBeforeAlpha = false,
   ]);
   final List<_NamedPixelFormat> formats;
   final List<int> matrices;
   final List<bool> ranges;
   final List<bool> alphaModes;
   final bool restoreAlphaLayout;
+  final bool layoutBeforeAlpha;
   final _PixelFormatConverter _converter = _PixelFormatConverter();
 
   bool get unrestricted =>
@@ -183,10 +185,22 @@ final class _FormatFilter implements _SpatialFilter {
   _FormatFilter withoutAlphaModes() =>
       alphaModes.isEmpty ? this : _FormatFilter._(formats, matrices, ranges);
 
-  _FormatFilter atAlphaStage(bool restoreLayout) =>
-      alphaModes.isEmpty || restoreLayout == restoreAlphaLayout
+  _FormatFilter atAlphaStage(
+    bool restoreLayout, {
+    bool layoutBeforeAlpha = false,
+  }) =>
+      alphaModes.isEmpty ||
+          restoreLayout == restoreAlphaLayout &&
+              layoutBeforeAlpha == this.layoutBeforeAlpha
       ? this
-      : _FormatFilter._(formats, matrices, ranges, alphaModes, restoreLayout);
+      : _FormatFilter._(
+          formats,
+          matrices,
+          ranges,
+          alphaModes,
+          restoreLayout,
+          layoutBeforeAlpha,
+        );
 
   bool? alphaMode(_VideoPlanes frame) => alphaModes.isEmpty
       ? null
@@ -254,6 +268,14 @@ final class _FormatFilter implements _SpatialFilter {
       return frame;
     }
     var target = select(frame);
+    if (layoutBeforeAlpha &&
+        _VideoAlphaFilter.supportsInplaceFormat(target.format)) {
+      final converted = _convert(frame, target);
+      final mode = alphaMode(converted);
+      return mode == null
+          ? converted
+          : _converter.changeAlphaMode(converted, mode);
+    }
     final convertsLayout =
         target.format != _frameFormat(frame) ||
         (target.alpha != null && target.alpha != (frame.alpha != null)) ||
@@ -272,15 +294,21 @@ final class _FormatFilter implements _SpatialFilter {
       );
       if (formats.isEmpty) target = select(frame);
     }
-    return _converter.convert(
-      frame,
-      target.format,
-      alpha: target.alpha,
-      matrix: target.matrix,
-      fullRange: target.fullRange,
-      premultiplied: mode,
-    );
+    return _convert(frame, target, mode: mode);
   }
+
+  _VideoPlanes _convert(
+    _VideoPlanes frame,
+    _FormatSelection target, {
+    bool? mode,
+  }) => _converter.convert(
+    frame,
+    target.format,
+    alpha: target.alpha,
+    matrix: target.matrix,
+    fullRange: target.fullRange,
+    premultiplied: mode,
+  );
 }
 
 typedef _FormatSelection = ({

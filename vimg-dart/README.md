@@ -413,6 +413,10 @@ frame's own alpha. `premultiply_dynamic` follows the downstream alpha
 mode. The `planes` bitmask selects the color planes to process.
 GBR floating-point frames keep their 32-bit samples through alpha
 processing and spatial filters until conversion to an integer format.
+An implicit alpha conversion for `unpremultiply` can run at the input
+depth before an existing pixel format conversion. When `format` requests
+both an alpha mode and a layout that supports alpha processing, the
+association uses the requested layout.
 By default, `premultiply` and `unpremultiply` take two equal-sized inputs
 and read the first plane of the second input as the mask. `alphaextract`
 copies a frame's alpha into a full-range grayscale mask. The two-input

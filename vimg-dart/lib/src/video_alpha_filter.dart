@@ -79,6 +79,9 @@ final class _VideoAlphaFilter implements _SpatialFilter {
     _namedPixelFormat('gbrpf32le'),
   ];
 
+  static bool supportsInplaceFormat(_VideoPixelFormat format) =>
+      _alphaLayouts.any((layout) => layout.format == format);
+
   _VideoAlphaFilter withFormat(_FormatFilter format) =>
       _VideoAlphaFilter._(inplace, mode, planes, format);
 

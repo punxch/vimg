@@ -179,17 +179,20 @@ List<_FilterStep> _orderedFilterSteps(String source) {
 
 List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
   final regions = <int, _FormatRegion>{0: _FormatRegion(fixed: true)};
+  final scaleInputs = <_FormatRegion, _FormatRegion>{};
   for (final step in steps) {
     final filter = step.filter;
     final region = switch (filter) {
       final _FormatFilter format when !format.unrestricted => _FormatRegion(
         constraints: format,
         explicitFormat: true,
+        acceptsAlphaMode: true,
       ),
       final _Scale scale => _FormatRegion(constraints: scale.outputColors),
       final _VideoAlphaFilter alpha => _FormatRegion(
         constraints: alpha.format,
         explicitFormat: true,
+        acceptsAlphaMode: alpha.mode == null,
       ),
       final _Overlay overlay => _FormatRegion(
         constraints: overlay.mainFormat,
@@ -206,6 +209,7 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
       _FormatFilter() => regions[step.inputs.single]!,
       _ => _FormatRegion(fixed: true),
     };
+    if (filter is _Scale) scaleInputs[region] = regions[step.inputs.single]!;
     for (final output in step.outputs) {
       regions[output] = region;
     }
@@ -273,6 +277,36 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
     }
   }
 
+  for (final step in order) {
+    final filter = step.filter;
+    if (filter is! _VideoAlphaFilter || !filter.inplace) continue;
+    final mode = filter.mode;
+    if (mode == null) continue;
+    final inputMode = !mode;
+    var source = regions[step.inputs.single]!.root;
+    while (true) {
+      final input = scaleInputs[source];
+      if (input == null) break;
+      final format = source.constraints;
+      if (format != null &&
+          (format.formats.isNotEmpty && !format.formats.any((f) => f.alpha) ||
+              format.alphaModes.length == 1 &&
+                  format.alphaModes.single != inputMode)) {
+        break;
+      }
+      final upstream = input.root;
+      if (identical(source, upstream)) break;
+      source = upstream;
+    }
+    if (source.acceptsAlphaMode) {
+      // An implicit association can run on the source side of the existing
+      // pixel converter. A producer with an incompatible mode keeps its mode.
+      source.restrict(
+        _FormatFilter._(const [], const [], const [], [inputMode]),
+      );
+    }
+  }
+
   return [
     for (final step in steps)
       (
@@ -302,10 +336,13 @@ Object? _negotiatedFilter(
     final _VideoAlphaFilter alpha when format != null => alpha.withFormat(
       format,
     ),
-    final _FormatFilter original when original.onlyAlphaMode =>
+    final _FormatFilter original
+        when original.onlyAlphaMode && format?.formats.isNotEmpty != true =>
       original.atAlphaStage(false),
     final _FormatFilter original => format?.atAlphaStage(
       original.alphaModes.isEmpty,
+      layoutBeforeAlpha:
+          original.alphaModes.isNotEmpty && format.formats.isNotEmpty,
     ),
     _ => filter,
   };
@@ -318,12 +355,13 @@ final class _FormatRegion {
     this.fixed = false,
     this.explicitFormat = false,
     this.overlayOutput = false,
+    this.acceptsAlphaMode = false,
   });
 
   _FormatRegion? _parent;
   _FormatFilter? constraints;
   bool fixed, explicitFormat;
-  final bool overlayOutput;
+  final bool overlayOutput, acceptsAlphaMode;
 
   _FormatRegion get root {
     final parent = _parent;
