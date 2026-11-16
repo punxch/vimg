@@ -183,13 +183,16 @@ List<List<CaptureFrame>> _selectCaptures(
   VideoFilterChain? filters, {
   CaptureSelection? onSelect,
 }) {
-  final packets = video.packets();
   if (filters == null || !filters.usesTimeline) {
-    return plan.selectFrames(packets, onSelect: onSelect);
+    if (onSelect == null) {
+      final indexed = video.indexedCaptures(plan);
+      if (indexed != null) return indexed;
+    }
+    return plan.selectFrames(video.packets(), onSelect: onSelect);
   }
   final (:timeBase, :frameRate) = video.filterTiming;
   return plan.selectFilteredFrames(
-    packets,
+    video.packets(),
     filters.filterTiming,
     timeBase: timeBase,
     frameRate: frameRate,

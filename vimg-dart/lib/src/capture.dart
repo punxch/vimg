@@ -148,10 +148,28 @@ final class CapturePlan {
   List<List<CaptureFrame>> selectFrames(
     Iterable<FramePacket> packets, {
     CaptureSelection? onSelect,
+  }) =>
+      _selectFrames(packets, 0, starts.length, eof: true, onSelect: onSelect)!;
+
+  /// A bounded index may end while a window still needs more source packets.
+  /// Only a real end of file can fill slots by repeating the final packet.
+  List<List<CaptureFrame>>? selectIndexedWindows(
+    Iterable<FramePacket> packets,
+    int first,
+    int end, {
+    required bool eof,
+  }) => _selectFrames(packets, first, end, eof: eof);
+
+  List<List<CaptureFrame>>? _selectFrames(
+    Iterable<FramePacket> packets,
+    int first,
+    int end, {
+    required bool eof,
+    CaptureSelection? onSelect,
   }) {
     final schedules = [
-      for (final (index, start) in starts.indexed)
-        _CaptureSchedule(index, start, frames, _rate, onSelect),
+      for (var index = first; index < end; index++)
+        _CaptureSchedule(index, starts[index], frames, _rate, onSelect),
     ];
     final active = <_CaptureSchedule>[];
     var nextWindow = 0, inputIndex = -1;
@@ -185,8 +203,9 @@ final class CapturePlan {
       pending = packet;
       inputIndex++;
     }
-    if (pending == null) throw const FormatException('No video frames');
     if (nextWindow < schedules.length || active.isNotEmpty) {
+      if (!eof) return null;
+      if (pending == null) throw const FormatException('No video frames');
       submit(
         pending,
         _durationSeconds(pending) ?? lastDuration ?? _rate.period,

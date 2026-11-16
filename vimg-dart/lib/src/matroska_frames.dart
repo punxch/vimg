@@ -28,11 +28,15 @@ Iterable<FramePacket> matroskaFrames(
   MatroskaAlphaVisitor? onAlpha,
   void Function(Uint8List)? onCodecState,
   MatroskaCue? start,
+  int? end,
 }) sync* {
   var trackNumber = start?.trackNumber;
   var frameDuration = start?.defaultDuration;
   var timestampScale = start?.timestampScale ?? 1000000;
-  for (final element in media.segmentElements(start: start?.clusterOffset)) {
+  for (final element in media.segmentElements(
+    start: start?.clusterOffset,
+    end: end,
+  )) {
     switch (element.id) {
       case 0x1549a966:
         timestampScale =
@@ -75,14 +79,7 @@ Iterable<FramePacket> _clusterFrames(
   MatroskaAlphaVisitor? onAlpha,
   void Function(Uint8List)? onCodecState,
 }) sync* {
-  // Timestamp can occur anywhere in a Cluster.
-  final timestamp = media
-      .elements(cluster.data, cluster.end)
-      .where((child) => child.id == 0xe7)
-      .firstOrNull;
-  final clusterTime = media.number(timestamp);
-  if (clusterTime == null)
-    throw const FormatException('Missing Cluster timestamp');
+  final clusterTime = media.clusterTimestamp(cluster);
 
   var offset = cluster.data, blockNumber = 0;
   for (final child in media.elements(cluster.data, cluster.end)) {

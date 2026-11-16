@@ -245,6 +245,11 @@ frame selection with sparse indexes. AVC and HEVC can initialize from a
 random-access pictures. Missing or unusable indexes fall back to sequential
 selection. `preview --timings` includes the `cue_index` stage for indexed
 attempts.
+`extract` and `vcs` can read just the AVC or HEVC index ranges needed by the
+capture windows when the Matroska video track disables lacing. Cluster
+timestamp bounds protect frame selection across decode-order reordering.
+Overlapping windows share a local index and decode runs. Timing filters and
+authority manifests use the full presentation timeline.
 Matroska restores zlib, bzip2, LZO1X and header-stripped video frames and
 codec private data before decoding, including tracks with multiple compression
 layers.

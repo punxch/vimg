@@ -1,5 +1,17 @@
 # Performance Optimization Report
 
+## 2026-11-16 Dart Matroska 按取帧窗口读取索引
+
+基线为 Dart 提交 `8638c2f`。用 `sample/input.mkv` 和
+`vimg vcs -c3 -H160 -n9 sample/input.mkv --output output.avif` 做对照。
+调度基准在同一台 macOS 机器上预热后交替运行，每条路径记录六次，
+中位数由 648.0 ms 降至 157.4 ms。每次选中的 270 个位置的源 PTS、
+文件偏移和载荷长度完全一致。
+
+完整 CLI 启用 `--profile`，每版运行一次。端到端耗时由 54.69 s 降至 52.83 s，峰值 RSS
+由 328.2 MiB 降至 256.8 MiB。两份 937617 字节的 AVIF 逐字节一致。
+索引路径保留取帧窗口附近的解码索引，并合并重叠的读取区间。
+
 ## 2026-11-16 Dart 接触表流式合成
 
 以 `6702985` 编译的 Dart CLI 为基线，在同一台 macOS 机器上使用同一份

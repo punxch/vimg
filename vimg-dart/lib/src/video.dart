@@ -11,6 +11,7 @@ import 'av1/access_units.dart';
 import 'av1/frame_header.dart';
 import 'av1/picture_decoder.dart';
 import 'binary_file.dart';
+import 'capture.dart';
 import 'capture_timeline.dart';
 import 'cinepak.dart';
 import 'ffv1.dart';
@@ -51,6 +52,7 @@ import 'yuv_image.dart';
 
 part 'video_workers.dart';
 part 'video_matroska_alpha.dart';
+part 'video_matroska_capture.dart';
 part 'video_vp9.dart';
 part 'video_mpeg4.dart';
 
@@ -214,6 +216,7 @@ final class Video {
   }
 
   late final _nalTimeline = _indexNalVideo();
+  Map<FramePacket, _IndexedVideo>? _cueCaptureIndexes;
   late final _aviNal = _avi != null && (codec == 'h264' || codec == 'hevc')
       ? AviNal(_avi!, codec)
       : null;
@@ -697,6 +700,7 @@ final class Video {
     MatroskaAlphaVisitor? onAlpha,
     void Function(Uint8List)? onMatroskaConfiguration,
     MatroskaCue? matroskaStart,
+    int? matroskaEnd,
     void Function(MediaBox)? onDescription,
     _IsoSection? section,
   }) {
@@ -721,6 +725,7 @@ final class Video {
         onAlpha: onAlpha,
         onCodecState: onMatroskaConfiguration,
         start: matroskaStart,
+        end: matroskaEnd,
       );
     }
     final iso = _iso!;
@@ -844,6 +849,7 @@ final class Video {
     void Function(FramePacket, int?, bool, _NalConfiguration?, bool)? onSample,
     _IsoSection? section,
     MatroskaCue? matroskaStart,
+    int? matroskaEnd,
   }) sync* {
     if (_aviNal case final avi?) {
       for (final frame in avi.frames) {
@@ -909,6 +915,7 @@ final class Video {
       onDescription: configure,
       onMatroskaConfiguration: configureRecord,
       matroskaStart: matroskaStart,
+      matroskaEnd: matroskaEnd,
       onSample: (packet, sync) {
         if (_flv case final flv?) {
           final bytes = flv.avcConfiguration(packet);
@@ -956,8 +963,8 @@ final class Video {
         display = packet;
         fieldPair = false;
         final field = avcSample?.field;
-        if (matroskaStart != null &&
-            ((!hasPicture && !keyframe) || field != null)) {
+        if ((matroskaStart != null && !hasPicture && !keyframe) ||
+            ((matroskaStart != null || matroskaEnd != null) && field != null)) {
           throw const FormatException(
             'Matroska seek requires a complete random-access picture',
           );
@@ -1021,7 +1028,11 @@ final class Video {
     }
   }
 
-  _IndexedVideo _indexNalVideo({_IsoSection? section}) {
+  _IndexedVideo _indexNalVideo({
+    _IsoSection? section,
+    MatroskaCue? matroskaStart,
+    int? matroskaEnd,
+  }) {
     final isHevc = (section?.codec ?? codec) == 'hevc';
     final decodeOrder = <FramePacket>[];
     final index = <FramePacket, int>{};
@@ -1031,6 +1042,8 @@ final class Video {
     var start = -1, previous = -1, sectionStart = 0;
     final presentation = _nalPackets(
       section: section,
+      matroskaStart: matroskaStart,
+      matroskaEnd: matroskaEnd,
       onSample: (packet, type, randomAccess, configuration, newDescription) {
         final position = decodeOrder.length;
         if (randomAccess) {
@@ -1047,7 +1060,17 @@ final class Video {
       },
     ).toList();
     if (isHevc) {
-      presentation.removeWhere((packet) => gopStart[index[packet]!] < 0);
+      final cue = matroskaStart;
+      final anchorTime = cue == null
+          ? null
+          : cue.ticks * (cue.timestampScale / 1e9);
+      presentation.removeWhere((packet) {
+        final missing = gopStart[index[packet]!] < 0;
+        if (missing && anchorTime != null && packet.seconds >= anchorTime) {
+          throw const FormatException('Invalid HEVC leading picture time');
+        }
+        return missing;
+      });
     }
     presentation.sort((a, b) {
       final byTime = a.seconds.compareTo(b.seconds);
@@ -1191,6 +1214,24 @@ final class Video {
   /// Split exactly where the serial decoder would restart. In particular, an
   /// HEVC leading picture can require decoding across a random-access point.
   Iterable<_DecodeRun> _decodeRuns(Iterable<FramePacket> selected) sync* {
+    if (_cueCaptureIndexes case final indexes?) {
+      final groups = <_IndexedVideo, List<FramePacket>>{};
+      var covered = true;
+      for (final packet in selected) {
+        final index = indexes[packet];
+        if (index == null) {
+          covered = false;
+          break;
+        }
+        groups.putIfAbsent(index, () => []).add(packet);
+      }
+      if (covered) {
+        for (final group in groups.entries) {
+          yield* _runs(group.value, codec, group.key);
+        }
+        return;
+      }
+    }
     if (_mixedIsoCodecs) {
       final bySection = <_IsoSection, List<FramePacket>>{};
       for (final packet in selected) {

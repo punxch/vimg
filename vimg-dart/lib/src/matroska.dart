@@ -171,10 +171,10 @@ final class Matroska {
     throw const FormatException('Missing Matroska segment');
   }
 
-  Iterable<EbmlElement> segmentElements({int? start}) sync* {
+  Iterable<EbmlElement> segmentElements({int? start, int? end}) sync* {
     final root = _segmentRoot;
     var offset = start ?? root.data;
-    while (offset < root.end) {
+    while (offset < (end ?? root.end)) {
       var child = element(offset, root.end);
       if (child.id == matroskaCluster && child.unknownSize) {
         // A live muxer may omit the cluster size. The next Segment-level
@@ -198,6 +198,16 @@ final class Matroska {
       yield child;
       offset = child.end;
     }
+  }
+
+  int clusterTimestamp(EbmlElement cluster) {
+    // Timestamp can occur anywhere in a Cluster.
+    final timestamp = elements(
+      cluster.data,
+      cluster.end,
+    ).where((child) => child.id == 0xe7).firstOrNull;
+    return number(timestamp) ??
+        (throw const FormatException('Missing Cluster timestamp'));
   }
 
   static const _segmentIds = {
