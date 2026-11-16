@@ -130,7 +130,7 @@ high-precision weighted prediction offsets. The decoder supports up to
 16-bit samples, extended transform precision and CABAC bypass alignment.
 Separate colour planes and hardware capture backends remain pending.
 
-MPEG-TS supports H.264, HEVC, MPEG-1 Video and MPEG-2 Video in 188-byte TS,
+MPEG-TS supports H.264, HEVC, MPEG-1 Video, MPEG-2 Video and MPEG-4 Visual in 188-byte TS,
 192-byte M2TS and 204-byte transport packets. Capture uses the first
 supported video track found through the program tables. It groups video
 access units, preserves source PTS across 33-bit rollover and accounts for
@@ -160,12 +160,16 @@ MPEG-2 PES packets omit some picture timestamps, capture reconstructs
 presentation order from the GOP and picture headers. Elementary streams
 start at zero and use sequence timing, including signalled repeated fields.
 
-MP4/MOV, Matroska and AVI support progressive and interlaced MPEG-4 Visual (Part 2)
+MP4/MOV, Matroska, AVI, MPEG-TS, MPEG-PS and standalone `.m4v` streams
+support progressive and interlaced MPEG-4 Visual (Part 2)
 I/P/B pictures, including Xvid and DivX files. Capture handles half- and
 quarter-sample motion, MPEG and H.263 quantization, resynchronization
 packets and AVI chunks that pack multiple VOPs. The timeline orders B
 pictures by presentation time and restores earlier references across open
-GOPs. Interlaced capture reconstructs both fields in the same frame with
+GOPs. Standalone streams use the VOP clock and retain variable picture
+durations. Systems streams use PES timestamps where available and recover
+missing timestamps from the VOP clock. Interlaced capture reconstructs both
+fields in the same frame with
 field DCT, motion prediction, and direct B-VOP prediction in either field
 order. Progressive I/P pictures support data partitioning with ordinary
 and reversible VLCs, including reversible escape codes. S-VOPs support

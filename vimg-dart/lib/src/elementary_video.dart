@@ -11,15 +11,15 @@ final class _ElementaryVideo implements _PacketSource {
     if (first < 2 || prefix[first] != 1 || first + 1 == prefix.length) {
       return null;
     }
-    if (first == 2 && prefix[3] == 0xb3) {
-      return _isMpegSequence(prefix)
-          ? _ElementaryVideo(file, 'mpeg2video')
-          : null;
+    if (first == 2 && prefix[3] == 0xb3 && _isMpegSequence(prefix)) {
+      return _ElementaryVideo(file, 'mpeg2video');
     }
     final probe = file.length <= prefix.length
         ? prefix
         : file.read(0, math.min(1024 * 1024, file.length));
-    final codec = _annexBCodec(probe);
+    final codec = _isVisualPrefix(prefix[first + 1]) && _isMpeg4Visual(probe)
+        ? 'mpeg4'
+        : _annexBCodec(probe);
     return codec == null ? null : _ElementaryVideo(file, codec);
   }
 

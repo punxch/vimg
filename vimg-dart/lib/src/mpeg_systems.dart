@@ -13,11 +13,13 @@ import 'hevc/parameters.dart';
 import 'hevc/picture_order.dart';
 import 'metadata.dart';
 import 'mpeg12/syntax.dart';
+import 'mpeg4/syntax.dart';
 import 'nal_parameter_sets.dart';
 import 'rbsp.dart';
 
 part 'elementary_video.dart';
 part 'mpeg_nal_timing.dart';
+part 'mpeg_visual_systems.dart';
 part 'program_stream.dart';
 part 'transport_packets.dart';
 
@@ -57,6 +59,8 @@ final class MpegSystemsVideo {
       _index.mpegPictures[packet.offset]!;
   Uint8List? configurationAt(FramePacket packet) =>
       _index.configurations[packet.offset];
+  Mpeg4SystemPicture visualPicture(FramePacket packet) =>
+      _index.visualPictures[packet.offset]!;
 
   bool _randomAccess(int type) => switch (programCodec) {
     'h264' => type == 5,
@@ -66,7 +70,9 @@ final class MpegSystemsVideo {
 
   Uint8List read(FramePacket frame) {
     final data = _input.read(frame, _program.videoId);
-    return isMpegVideo(programCodec) ? data : annexBToLengthPrefixed(data);
+    return isMpegVideo(programCodec) || programCodec == 'mpeg4'
+        ? data
+        : annexBToLengthPrefixed(data);
   }
 
   _SystemsIndex _scan() {
@@ -98,6 +104,15 @@ final class MpegSystemsVideo {
       previousIndex = i;
     }
     final elementary = _input is _ElementaryVideo;
+    if (program.codec == 'mpeg4') {
+      return _scanVisual(
+        video,
+        audio,
+        stamps,
+        elementary: elementary,
+        programStream: _input is _ProgramInput,
+      );
+    }
     final missing = stamps.length != video.frames.length;
     final isNal = program.codec == 'h264' || program.codec == 'hevc';
     final rawNal = elementary && isNal;
@@ -232,6 +247,7 @@ final class MpegSystemsVideo {
       ],
       types: {for (final frame in video.frames) frame.offset: frame.type},
       mpegPictures: video.mpegPictures,
+      visualPictures: const {},
       configurations: video.configurations,
       hidden: {
         if (visible != null)
@@ -313,6 +329,7 @@ typedef _SystemsIndex = ({
   List<FramePacket> packets,
   Map<int, int> types,
   Map<int, MpegPictureInfo> mpegPictures,
+  Map<int, Mpeg4SystemPicture> visualPictures,
   Map<int, Uint8List> configurations,
   Set<int> hidden,
 });
@@ -395,6 +412,7 @@ final class _AudioClock {
 String? _videoCodec(int streamType) => switch (streamType) {
   0x01 => 'mpeg1video',
   0x02 => 'mpeg2video',
+  0x10 => 'mpeg4',
   0x1b => 'h264',
   0x24 => 'hevc',
   _ => null,
@@ -413,10 +431,13 @@ typedef _AccessUnit = ({
 final class _AccessUnits {
   _AccessUnits(String codec)
     : _hevc = codec == 'hevc',
-      _mpeg = isMpegVideo(codec) ? MpegHeaders() : null;
+      _mpeg = isMpegVideo(codec) ? MpegHeaders() : null,
+      _visual = codec == 'mpeg4' ? Mpeg4Headers() : null;
 
   final bool _hevc;
   final MpegHeaders? _mpeg;
+  final Mpeg4Headers? _visual;
+  bool get _mpegStartCodes => _mpeg != null || _visual != null;
   var _gopFlags = 0;
   var _mpegGroup = 0, _fields = 2;
   var _mpegStructure = 3;
@@ -426,6 +447,7 @@ final class _AccessUnits {
   final frames = <_AccessUnit>[];
   final configurations = <int, Uint8List>{};
   final mpegPictures = <int, MpegPictureInfo>{};
+  final visualPictures = <int, Mpeg4SystemPicture>{};
   final _parameters = NalParameterSets();
   final _avcSequences = <int, H264Sps>{};
   final _avcPpsSequences = <int, int>{};
@@ -438,6 +460,7 @@ final class _AccessUnits {
   (int, int)? timing;
   final _prefix = BytesBuilder(copy: false);
   bool _parameter = false;
+  int _visualCode = 0, _visualPrefixLimit = 0;
   int _length = 0, _zeros = 0, _zeroPosition = 0, _lastZero = 0;
   int _nalStart = -1, _nalPosition = 0;
   int _frameStart = -1, _framePosition = 0;
@@ -456,7 +479,7 @@ final class _AccessUnits {
       final byte = bytes[i];
       if (byte == 0) {
         final physical = position + i - start;
-        if (_mpeg != null) {
+        if (_mpegStartCodes) {
           _zeroPosition = _lastZero;
           _lastZero = physical;
         } else if (_zeros == 0) {
@@ -467,7 +490,7 @@ final class _AccessUnits {
         if (byte == 1 && _zeros >= 2) {
           // MPEG video uses exactly two zero bytes. A longer zero run can
           // include meaningful trailing bytes from its previous header.
-          final zeros = _mpeg == null ? _zeros : 2;
+          final zeros = _mpegStartCodes ? 2 : _zeros;
           final boundary = _length + i - start - zeros;
           _append(bytes, copyStart, math.max(copyStart, i - zeros));
           _nal();
@@ -484,6 +507,25 @@ final class _AccessUnits {
 
   void _append(Uint8List bytes, int start, int end) {
     if (_nalStart < 0 || start >= end) return;
+    if (_visual != null) {
+      if (_prefix.isEmpty) {
+        _visualCode = bytes[start];
+        _visualPrefixLimit = switch (_visualCode) {
+          // Keep the short timestamp prefix for the usual VOP header.
+          0xb6 when start + 1 < end && bytes[start + 1] & 0x3f != 0x3f => 8,
+          // A long gap can use up to 65535 unary clock bits.
+          0xb6 => 8200,
+          0xb2 || 0xb3 || 0xb5 => 32,
+          >= 0x20 && <= 0x2f => 512,
+          _ => 1,
+        };
+      }
+      final count = math.min(end - start, _visualPrefixLimit - _prefix.length);
+      if (count > 0) {
+        _prefix.add(Uint8List.sublistView(bytes, start, start + count));
+      }
+      return;
+    }
     if (_prefix.isEmpty) {
       final byte = bytes[start];
       final type = _hevc ? (byte >> 1) & 63 : byte & 31;
@@ -506,6 +548,10 @@ final class _AccessUnits {
   void _nal() {
     final bytes = _prefix.takeBytes();
     if (bytes.isEmpty) return;
+    if (_visual case final headers?) {
+      _visualUnit(headers, bytes);
+      return;
+    }
     final mpeg = _mpeg;
     if (mpeg != null) {
       _mpegUnit(mpeg, bytes);
@@ -747,6 +793,7 @@ final class _AccessUnits {
 
   void _discardPicture() {
     mpegPictures.remove(_framePosition);
+    visualPictures.remove(_framePosition);
     configurations.remove(_framePosition);
   }
 
@@ -765,6 +812,12 @@ final class _AccessUnits {
 
   /// Keep indexed frames when the final transport PES ends prematurely.
   void discardTail() {
+    if (_visual != null &&
+        _prefix.isNotEmpty &&
+        (_visualCode == 0xb6 || _isVisualPrefix(_visualCode))) {
+      // The last incomplete VOP's start code delimits the preceding one.
+      _frame(_nalStart);
+    }
     if (_frameType != null) _discardPicture();
     _clearPicture();
     _prefix.clear();

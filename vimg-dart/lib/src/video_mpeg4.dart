@@ -22,6 +22,35 @@ extension _Mpeg4Timeline on Video {
     var first = -1, forward = -1, sectionStart = 0, packedExtras = 0;
     double? aviOrigin, aviStart;
     final aviClock = _avi != null;
+    int record(
+      FramePacket frame,
+      Mpeg4PictureType type,
+      bool coded,
+      Uint8List? configuration,
+      Mpeg4Clock clock,
+    ) {
+      final position = decodeOrder.length;
+      if (coded && type == Mpeg4PictureType.intra) {
+        // An open GOP can still have a leading B picture after its I-VOP.
+        forward = first;
+        first = position;
+        configurations[first] = _RunConfiguration(
+          bytes: configuration,
+          mpeg4Clock: clock,
+        );
+        sections[first] = sectionStart;
+      } else if (coded &&
+          (type == Mpeg4PictureType.predictive ||
+              type == Mpeg4PictureType.sprite)) {
+        forward = first;
+      }
+      index[frame] = position;
+      decodeOrder.add(frame);
+      final anchor = type == Mpeg4PictureType.bidirectional ? forward : first;
+      gopStart.add(anchor);
+      return anchor;
+    }
+
     final presented = _containerPackets(
       false,
       section: section,
@@ -33,6 +62,18 @@ extension _Mpeg4Timeline on Video {
         sectionStart = decodeOrder.length;
       },
       onSample: (packet, _) {
+        if (_systems case final systems?) {
+          final picture = systems.visualPicture(packet);
+          final anchor = record(
+            packet,
+            picture.type,
+            picture.coded,
+            picture.configuration,
+            picture.clock,
+          );
+          if (anchor >= 0) displayedBySample[packet] = [packet];
+          return;
+        }
         final units = headers.read(_read(packet)).toList();
         if (units.isEmpty) {
           // Some AVI streams put a VOL or user data in its own chunk.
@@ -51,21 +92,6 @@ extension _Mpeg4Timeline on Video {
         final displays = <FramePacket>[];
         for (final unit in units) {
           final vop = unit.header, volume = vop.volume;
-          final position = decodeOrder.length;
-          if (vop.coded && vop.type == Mpeg4PictureType.intra) {
-            // An open GOP can still have a leading B picture after its I-VOP.
-            forward = first;
-            first = position;
-            configurations[first] = _RunConfiguration(
-              bytes: unit.configuration,
-              mpeg4Clock: unit.clock,
-            );
-            sections[first] = sectionStart;
-          } else if (vop.coded &&
-              (vop.type == Mpeg4PictureType.predictive ||
-                  vop.type == Mpeg4PictureType.sprite)) {
-            forward = first;
-          }
           final bitstreamTime = vop.pts / volume.resolution;
           final double seconds;
           if (aviClock) {
@@ -96,12 +122,13 @@ extension _Mpeg4Timeline on Video {
                   ),
                 )
               : packet;
-          index[frame] = position;
-          decodeOrder.add(frame);
-          final anchor = vop.type == Mpeg4PictureType.bidirectional
-              ? forward
-              : first;
-          gopStart.add(anchor);
+          final anchor = record(
+            frame,
+            vop.type,
+            vop.coded,
+            unit.configuration,
+            unit.clock,
+          );
           if (anchor >= 0 && !dummy) {
             displays.add(frame);
             if (section != null) _isoSectionByPacket[frame] = section;

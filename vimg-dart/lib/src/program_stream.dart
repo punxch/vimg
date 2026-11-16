@@ -33,12 +33,24 @@ final class _ProgramInput implements _PacketSource {
       final type = map[packet.id];
       // MPEG-1 and MPEG-2 video share the picture start codes. The sequence
       // extension identifies the actual generation once the index is built.
-      final codec = type == null ? 'mpeg2video' : _videoCodec(type);
+      final codec = type == null ? _unmappedVideo(packet) : _videoCodec(type);
       if (codec != null) {
         return (videoId: packet.id, codec: codec, audio: map);
       }
     }
     throw UnsupportedError('MPEG program stream has no supported video stream');
+  }
+
+  String _unmappedVideo(_ProgramPacket packet) {
+    final pes = _pes(packet);
+    final payload = file.read(pes.data, pes.end - pes.data);
+    final first = mpegStartCodes(payload).firstOrNull;
+    if (first != null &&
+        _isVisualPrefix(first.code) &&
+        _isMpeg4Visual(payload)) {
+      return 'mpeg4';
+    }
+    return 'mpeg2video';
   }
 
   @override

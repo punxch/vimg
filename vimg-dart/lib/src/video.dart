@@ -459,7 +459,7 @@ final class Video {
   Iterable<FramePacket> packets({bool preview = false}) {
     if (_mixedIsoCodecs) return _mixedIsoPackets(preview);
     final systems = _systems;
-    if (systems != null) {
+    if (systems != null && systems.programCodec != 'mpeg4') {
       return preview
           ? systems.packets(true)
           : (isMpegVideo(codec)

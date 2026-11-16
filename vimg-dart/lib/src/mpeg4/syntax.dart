@@ -243,6 +243,13 @@ final class Mpeg4Headers {
   int? _lastReference, _previousReference, _fieldInterval;
   bool _legacySprite = false;
 
+  Mpeg4Clock get clock => (
+    base: _base,
+    reference: _lastReference,
+    fieldInterval: _fieldInterval,
+    legacySprite: _legacySprite,
+  );
+
   void restoreClock(Mpeg4Clock clock) {
     _base = clock.base;
     _lastReference = clock.reference;
@@ -253,62 +260,68 @@ final class Mpeg4Headers {
   Iterable<Mpeg4CodedVop> read(Uint8List bytes) sync* {
     var start = 0;
     for (final unit in mpegStartCodes(bytes)) {
-      final bits = Rbsp(
+      final snapshot = clock;
+      final header = readUnit(
+        unit.code,
         Uint8List.sublistView(bytes, unit.data, unit.end),
-        codec: 'MPEG-4 Visual',
       );
-      if (unit.code == 0xb5) {
-        _signal = _readSignal(bits);
-        _visualObject = Uint8List.sublistView(bytes, unit.start, unit.end);
-      } else if (unit.code >= 0x20 && unit.code <= 0x2f) {
-        final current = Mpeg4Volume.read(bits, _signal);
-        if (volume != null && volume!.resolution != current.resolution) {
-          _base = _previousBase = 0;
-          _lastReference = _previousReference = null;
-        }
-        _fieldInterval = null;
-        volume = current;
-        configuration = Uint8List.fromList([
-          ...?_visualObject,
-          ...Uint8List.sublistView(bytes, unit.start, unit.end),
-        ]);
-      } else if (unit.code == 0xb2 && unit.end - unit.data >= 4) {
-        final name = String.fromCharCodes(
-          bytes,
-          unit.data,
-          math.min(unit.end, unit.data + 24),
-        );
-        if (name.startsWith('DivX')) {
-          _legacySprite = _divxSpriteMarker.hasMatch(name);
-        }
-      } else if (unit.code == 0xb3) {
-        final hours = bits.read(5), minutes = bits.read(6);
-        mpeg4Marker(bits);
-        _base = hours * 3600 + minutes * 60 + bits.read(6);
-      } else if (unit.code == 0xb6) {
-        final layer =
-            volume ??
-            (throw const FormatException('Missing MPEG-4 VOL header'));
-        final clock = (
-          base: _base,
-          reference: _lastReference,
-          fieldInterval: _fieldInterval,
-          legacySprite: _legacySprite,
-        );
-        final header = _readVop(bits, layer);
+      if (header != null) {
         yield (
           header: header,
           offset: start,
           length: unit.end - start,
           configuration: configuration,
-          clock: clock,
+          clock: snapshot,
         );
         start = unit.end;
       }
     }
   }
 
-  Mpeg4Vop _readVop(Rbsp bits, Mpeg4Volume layer) {
+  /// Advances the clock from the bytes after one start code.
+  Mpeg4Vop? readUnit(int code, Uint8List payload, {bool timingOnly = false}) {
+    final bits = Rbsp(payload, codec: 'MPEG-4 Visual');
+    if (code == 0xb5) {
+      _signal = _readSignal(bits);
+      _visualObject = Uint8List.fromList([0, 0, 1, code, ...payload]);
+    } else if (code >= 0x20 && code <= 0x2f) {
+      final current = Mpeg4Volume.read(bits, _signal);
+      if (volume != null && volume!.resolution != current.resolution) {
+        _base = _previousBase = 0;
+        _lastReference = _previousReference = null;
+      }
+      _fieldInterval = null;
+      volume = current;
+      configuration = Uint8List.fromList([
+        ...?_visualObject,
+        0,
+        0,
+        1,
+        code,
+        ...payload,
+      ]);
+    } else if (code == 0xb2 && payload.length >= 4) {
+      final name = String.fromCharCodes(
+        payload,
+        0,
+        math.min(payload.length, 24),
+      );
+      if (name.startsWith('DivX')) {
+        _legacySprite = _divxSpriteMarker.hasMatch(name);
+      }
+    } else if (code == 0xb3) {
+      final hours = bits.read(5), minutes = bits.read(6);
+      mpeg4Marker(bits);
+      _base = hours * 3600 + minutes * 60 + bits.read(6);
+    } else if (code == 0xb6) {
+      final layer =
+          volume ?? (throw const FormatException('Missing MPEG-4 VOL header'));
+      return _readVop(bits, layer, timingOnly);
+    }
+    return null;
+  }
+
+  Mpeg4Vop _readVop(Rbsp bits, Mpeg4Volume layer, bool timingOnly) {
     final type = Mpeg4PictureType.values[bits.read(2)];
     var seconds = 0;
     while (bits.flag()) {
@@ -344,6 +357,8 @@ final class Mpeg4Headers {
           _fieldInterval = pts - previous;
         }
       }
+    }
+    if (coded && !timingOnly) {
       final usesGmc = type == Mpeg4PictureType.sprite;
       noRound = (type == Mpeg4PictureType.predictive || usesGmc) && bits.flag();
       bits.skip(

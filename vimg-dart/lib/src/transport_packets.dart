@@ -104,7 +104,8 @@ final class _TransportInput implements _PacketSource {
         audio[packet.pid]?.add(packet);
       }
     }
-    if (pes.incomplete && isMpegVideo(program.codec)) {
+    if (pes.incomplete &&
+        (isMpegVideo(program.codec) || program.codec == 'mpeg4')) {
       video.discardTail();
     } else {
       pes.finish();
