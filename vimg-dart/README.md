@@ -325,7 +325,7 @@ output, `out_color_matrix` and `out_range` select the output matrix and coding
 range. Terminal scale filters that render directly to RGB use the input
 interpretation and output full-range RGB.
 
-For packed RGB, `neighbor`, `bilinear` and `bicublin` use FFmpeg's paired chroma
+For packed RGB, scaling uses FFmpeg's paired chroma
 sampling when reducing an even width by at least half. Add `+full_chroma_inp`
 to sample the RGB channels at full resolution.
 RGB conversion after spatial filters interpolates subsampled chroma at odd
@@ -379,14 +379,19 @@ to use the main input's decoded layout. Packed 8-bit RGB also supports
 `alpha=premultiplied`. The separate `format` filter accepts
 `pix_fmts` such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
 When given a `|`-separated list, it keeps a matching input format when
-available and otherwise converts to the first listed format.
+available. Otherwise it compares the color, alpha, bit-depth and chroma
+resolution losses of the candidates.
 YUV formats also accept `color_spaces` (`bt709`, `bt470bg`, `smpte170m`,
 `smpte240m`, `fcc`, `bt2020nc` or `unknown`) and `color_ranges`
-(`tv` for limited or `pc` for full). Each option accepts a list with
-the same selection rule. These options can be used on their own to keep
+(`tv` for limited or `pc` for full). Each option accepts a list and prefers
+the current value when allowed. These options can be used on their own to keep
 the input's pixel layout, for example
 `--vfilter 'format=color_spaces=bt709:color_ranges=pc'`.
-Format and color selections take effect at each filter in graph order.
+Compatible `format` constraints on the same branch can share a conversion.
+They propagate through crop, flips, aspect and timing filters to an upstream
+`scale`, allowing it to resize and produce the requested format in one
+operation. For example, `scale=640:-2:out_color_matrix=bt709,format=yuv420p`
+can convert an RGB frame directly to BT.709 YUV while scaling.
 Native YUV depth reduction uses ordered dithering.
 Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 

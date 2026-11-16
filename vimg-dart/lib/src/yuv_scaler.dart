@@ -236,18 +236,14 @@ final class YuvImageScaler {
       );
       if (w == frame.width &&
           h == frame.height &&
-          w.isEven &&
-          h.isEven &&
-          frame.subX == 1 &&
-          frame.subY <= 1 &&
-          !frame.rgb &&
-          frame.planes.length == 3 &&
-          frame.planes.every((plane) => plane.depth == 8) &&
+          frame.usesUnscaledRgbTable &&
           (frame.alpha?.depth ?? 8) == 8) {
         // The unscaled 8-bit RGB kernel reads chroma directly from its grid.
         return _rgbTable(frame.matrix, frame.fullRange).writeUnscaled(frame);
       }
-      if (frame.packedRgb && scale.algorithm != _ScaleAlgorithm.bicubic) {
+      if (frame.packedRgb &&
+          (scale.algorithm != _ScaleAlgorithm.bicubic ||
+              scale._subsamplesRgb(frame, w))) {
         frame = scale.resize(frame, w, h);
       } else {
         outputScale = _fixedOutput(w, h, scale.algorithm);
@@ -521,7 +517,7 @@ final class _PlaneScaler {
     int depth,
     int fractionalBits, {
     int? ditherOffset,
-    _ScaleSampleRange? range,
+    _VideoSampleRange? range,
   }) {
     final horizontalShift = depth + 14 - precision;
     final maximum = (1 << precision) - 1;
@@ -667,27 +663,40 @@ final class _RgbTable {
     }
   }
 
-  image.Image writeUnscaled(_VideoPlanes frame) {
+  image.Image writeUnscaled(_VideoPlanes frame, {bool preserveAlpha = true}) {
+    final alpha = preserveAlpha ? frame.alpha : null;
     final pixels = image.Image(
       width: frame.width,
       height: frame.height,
-      numChannels: frame.alpha == null ? 3 : 4,
+      numChannels: alpha == null ? 3 : 4,
     );
-    final y = frame.planes[0], cb = frame.planes[1], cr = frame.planes[2];
-    final alpha = frame.alpha;
     for (final pixel in pixels) {
-      final x = pixel.x >> frame.subX, row = pixel.y >> frame.subY;
-      _writePixel(pixel, y.at(pixel.x, pixel.y), cb.at(x, row), cr.at(x, row));
+      final (r, g, b) = unscaledSample(frame, pixel.x, pixel.y);
+      pixel.setRgb(r, g, b);
       if (alpha != null) pixel.a = alpha.at(pixel.x, pixel.y);
     }
     return pixels;
   }
 
   void _writePixel(image.Pixel pixel, int y, int u, int v) {
+    final (r, g, b) = _sample(y, u, v);
+    pixel.setRgb(r, g, b);
+  }
+
+  (int, int, int) unscaledSample(_VideoPlanes frame, int x, int y) {
+    final cx = x >> frame.subX, cy = y >> frame.subY;
+    return _sample(
+      frame.planes[0].at(x, y),
+      frame.planes[1].at(cx, cy),
+      frame.planes[2].at(cx, cy),
+    );
+  }
+
+  (int, int, int) _sample(int y, int u, int v) {
     u = u.clamp(0, 255);
     v = v.clamp(0, 255);
     final luma = y * scale + bias;
-    pixel.setRgb(
+    return (
       ((luma + red[v] * scale) >> 16).clamp(0, 255),
       ((luma + (greenU[u] + greenV[v]) * scale) >> 16).clamp(0, 255),
       ((luma + blue[u] * scale) >> 16).clamp(0, 255),

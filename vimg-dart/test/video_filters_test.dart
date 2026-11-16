@@ -15,6 +15,7 @@ Future<void> main(List<String> arguments) async {
   _checkScaleAspect();
   _checkGraph();
   _checkColorFormats();
+  _checkFormatNegotiation();
   _checkCompositing();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
@@ -563,6 +564,55 @@ void _checkColorFormats() {
       );
     }
   }
+  check(
+    getCrc32(
+          render(
+            8,
+            'scale=16:12:flags=bilinear:out_color_matrix=bt709:out_range=pc,'
+            'format=yuv444p10le',
+          ).getBytes(),
+        ) ==
+        0x7d2b2cda,
+    'Scale negotiates 10-bit 4:4:4 output and converts matrix while resizing',
+  );
+}
+
+void _checkFormatNegotiation() {
+  final source = image.Image(width: 32, height: 24);
+  for (final p in source) {
+    p.setRgb(7 * p.x, 9 * p.y, 2 * p.x + 2 * p.y);
+  }
+  image.Image render(String filter) => YuvImageScaler(
+    filters: VideoFilterChain.parse(filter),
+  ).filterRgb(source, bgr24: true);
+  const scale =
+      'scale=16:12:flags=bilinear:out_color_matrix=bt709:out_range=pc';
+  for (final (filter, checksum) in [
+    ('$scale,format=yuv420p', 0x9416f20d),
+    ('$scale,hflip,setsar=1,format=yuv420p', 0xbd2a725b),
+    ('$scale,format=yuv420p|rgb24', 0x9036c91b),
+    (
+      'scale=16:12:out_color_matrix=bt709:out_range=pc,'
+          'format=yuv420p:bt2020nc:tv',
+      0x9cd91dfa,
+    ),
+    ('format=yuv420p,format=color_spaces=bt709:color_ranges=pc', 0x755f97f8),
+    ('format=yuv420p,format=rgb24', 0x8e8f2f7f),
+    (
+      'scale=64:48:out_color_matrix=bt2020:out_range=tv,format=yuv420p10le',
+      0x86fa20bf,
+    ),
+  ]) {
+    check(
+      getCrc32(render(filter).getBytes()) == checksum,
+      '$filter matches FFmpeg negotiation',
+    );
+  }
+  _sameBytes(
+    render('format=yuv420p|rgb24,format=bgr24|rgb24').getBytes(),
+    source.getBytes(),
+    'Compatible format lists share one conversion',
+  );
 }
 
 void _checkCompositing() {
@@ -603,6 +653,12 @@ void _checkCompositing() {
     ('format=yuv420p', 3, 0x307b6ca8),
     ('format=yuva420p10le', 4, 0x72a13b87),
     ('crop=7:5:0:0,format=yuva420p10le', 4, 0xc6b327bf),
+    (
+      'scale=16:12:flags=bilinear:out_color_matrix=bt709:out_range=tv,'
+          'format=yuva420p10le',
+      4,
+      0xaae6c9d6,
+    ),
     (
       'split[a][b];[a]format=rgb24[m];[b]crop=4:4:2:0,format=yuva444p[c];'
           '[m][c]overlay=2:2',
@@ -914,12 +970,28 @@ Future<void> _checkCli(String? executable) async {
       0x521a9f8d,
       0x521a9f8d,
     ];
+    const negotiatedScale =
+        'scale=16:12:flags=bilinear:out_color_matrix=bt709:out_range=pc';
+    const negotiatedGraph =
+        'split[a][b];[a]$negotiatedScale,fps=8[l0];[l0]format=yuv420p[l];'
+        '[b]$negotiatedScale,fps=8,hflip,format=yuv420p[r];[l][r]hstack';
+    const negotiatedReference = [
+      0x44d18cc7,
+      0x44d18cc7,
+      0x5c75aaef,
+      0x5c75aaef,
+      0xd3ebc8d1,
+      0xd3ebc8d1,
+      0x01efe703,
+      0x01efe703,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
       ('delayed-overlay', delayedOverlay, 32, 24, delayedReference),
       ('color-format', color, 32, 24, colorReference),
       ('scale-color', scaleColor, 64, 24, scaleColorReference),
+      ('negotiated-scale', negotiatedGraph, 32, 12, negotiatedReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {

@@ -600,15 +600,40 @@ final class _Scale extends _FrameSpatialFilter {
   bool get nearest => algorithm == _ScaleAlgorithm.neighbor;
 
   @override
-  _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) {
+  _VideoPlanes applyAt(
+    _VideoPlanes frame,
+    FilterFramePosition position, {
+    _FormatFilter? outputFormat,
+  }) {
     final (w, h) = dimensions(frame, position);
-    if (frame.rgb) return resize(frame, w, h);
+    final selection = outputFormat?.select(
+      frame,
+      outputMatrix: outputMatrix,
+      outputRange: outputRange,
+    );
+    final target = selection?.format ?? _frameFormat(frame);
+    final alpha = selection?.alpha;
+    final preserveAlpha = alpha == null || alpha == (frame.alpha != null);
+    final sameLayout = target == _frameFormat(frame) && preserveAlpha;
+    if (frame.rgb && target.color == _PixelColor.rgb) {
+      final resized = resize(frame, w, h);
+      return sameLayout
+          ? resized
+          : _converter.convert(resized, target, alpha: alpha);
+    }
     final input = interpretInputColor(frame);
     // For planar output, default to the color properties of the source link.
-    final matrix = outputMatrix ?? frame.matrix;
-    final fullRange = outputRange ?? frame.fullRange;
-    if (input.planes.length == 1 ||
-        _rgbCoefficients(input.matrix) == _rgbCoefficients(matrix)) {
+    final matrix =
+        selection?.matrix ?? outputMatrix ?? (frame.rgb ? 6 : frame.matrix);
+    final fullRange =
+        selection?.fullRange ??
+        outputRange ??
+        (target.color == _PixelColor.yuv
+            ? !frame.rgb && frame.fullRange
+            : !sameLayout || frame.fullRange);
+    if (sameLayout &&
+        (input.planes.length == 1 ||
+            _rgbCoefficients(input.matrix) == _rgbCoefficients(matrix))) {
       return resize(
         input,
         w,
@@ -618,9 +643,10 @@ final class _Scale extends _FrameSpatialFilter {
     }
     return _converter.convert(
       input,
-      _frameFormat(input),
+      target,
+      alpha: alpha,
       matrix: matrix,
-      fullRange: fullRange,
+      fullRange: target.color == _PixelColor.rgb ? true : fullRange,
       scale: (
         width: w,
         height: h,
@@ -639,7 +665,6 @@ final class _Scale extends _FrameSpatialFilter {
         );
 
   bool _subsamplesRgb(_VideoPlanes frame, int width) =>
-      algorithm != _ScaleAlgorithm.bicubic &&
       !fullChromaInput &&
       frame.packedRgb &&
       frame.width.isEven &&
@@ -665,7 +690,7 @@ final class _Scale extends _FrameSpatialFilter {
       final chroma = !frame.rgb && (component == 1 || component == 2);
       final range =
           component != 3 && fullRange != null && fullRange != frame.fullRange
-          ? _ScaleSampleRange(plane.depth, frame.fullRange, fullRange, chroma)
+          ? _VideoSampleRange(plane.depth, frame.fullRange, fullRange, chroma)
           : null;
       return _resize(
         plane,
@@ -782,7 +807,7 @@ final class _Scale extends _FrameSpatialFilter {
     int height, {
     required bool packedAlpha,
     required _ScaleKernel kernel,
-    required _ScaleSampleRange? range,
+    required _VideoSampleRange? range,
   }) {
     final sameSize = source.width == width && source.height == height;
     if (sameSize && range == null) return source;
@@ -830,9 +855,23 @@ final class _Scale extends _FrameSpatialFilter {
   }
 }
 
+final class _ScaleFormat extends _FrameSpatialFilter {
+  _ScaleFormat(this.scale, this.format);
+
+  final _Scale scale;
+  final _FormatFilter format;
+
+  @override
+  bool get usesFramePosition => scale.usesFramePosition;
+
+  @override
+  _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) =>
+      scale.applyAt(frame, position, outputFormat: format);
+}
+
 /// Maps video range while samples still have horizontal filter precision.
-final class _ScaleSampleRange {
-  factory _ScaleSampleRange(int depth, bool inputFull, bool full, bool chroma) {
+final class _VideoSampleRange {
+  factory _VideoSampleRange(int depth, bool inputFull, bool full, bool chroma) {
     final precision = depth <= 14 ? 15 : 19;
     final shift = precision - depth;
     final multiplicationShift = precision - 1;
@@ -857,10 +896,10 @@ final class _ScaleSampleRange {
         (outputMax << (multiplicationShift + shift)) -
         (inputMax << shift) * factor +
         (1 << (multiplicationShift - 1));
-    return _ScaleSampleRange._(precision, factor, offset);
+    return _VideoSampleRange._(precision, factor, offset);
   }
 
-  const _ScaleSampleRange._(this.precision, this.factor, this.offset);
+  const _VideoSampleRange._(this.precision, this.factor, this.offset);
 
   final int precision, factor, offset;
 
@@ -915,6 +954,15 @@ final class _VideoPlanes {
   int get width => planes.first.width;
   int get height => planes.first.height;
   bool get rgb => matrix == 0 && planes.length == 3;
+
+  bool get usesUnscaledRgbTable =>
+      width.isEven &&
+      height.isEven &&
+      subX == 1 &&
+      subY <= 1 &&
+      !rgb &&
+      planes.length == 3 &&
+      planes.every((plane) => plane.depth == 8);
 
   _VideoPlanes withColor({required int matrix, required bool fullRange}) {
     if (matrix == this.matrix && fullRange == this.fullRange) return this;

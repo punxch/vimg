@@ -118,42 +118,140 @@ final class _FormatFilter implements _SpatialFilter {
   final List<bool> ranges;
   final _PixelFormatConverter _converter = _PixelFormatConverter();
 
-  @override
-  _VideoPlanes apply(_VideoPlanes frame) {
-    if (formats.isEmpty && matrices.isEmpty && ranges.isEmpty) return frame;
+  bool get unrestricted =>
+      formats.isEmpty && matrices.isEmpty && ranges.isEmpty;
+
+  _FormatFilter? intersect(_FormatFilter other) {
+    final commonFormats = _intersectFormats(formats, other.formats);
+    final commonMatrices = _intersectFormats(matrices, other.matrices);
+    final commonRanges = _intersectFormats(ranges, other.ranges);
+    if (commonFormats == null ||
+        commonMatrices == null ||
+        commonRanges == null) {
+      return null;
+    }
+    return _FormatFilter._(commonFormats, commonMatrices, commonRanges);
+  }
+
+  bool acceptsColor(int? matrix, bool? range) =>
+      (matrix == null || matrices.isEmpty || matrices.contains(matrix)) &&
+      (range == null || ranges.isEmpty || ranges.contains(range));
+
+  _FormatSelection select(
+    _VideoPlanes frame, {
+    int? outputMatrix,
+    bool? outputRange,
+  }) {
     final input = _frameFormat(frame);
     final hasAlpha = frame.alpha != null;
     final target = formats.isEmpty
         ? (format: input, alpha: hasAlpha, fullRange: null)
-        : formats.firstWhere(
-            (item) =>
-                item.format == input &&
-                item.alpha == hasAlpha &&
-                (item.fullRange == null || item.fullRange == frame.fullRange),
-            orElse: () => formats.first,
-          );
+        : _chooseFormat(formats, input, hasAlpha, frame.fullRange);
     final yuv = target.format.color == _PixelColor.yuv;
-    if (!yuv && formats.isEmpty) return frame;
-    final matrix = !yuv || matrices.isEmpty
+    final preferredMatrix = outputMatrix ?? frame.matrix;
+    final matrix = !yuv
         ? null
-        : matrices.contains(frame.matrix)
-        ? frame.matrix
+        : matrices.isEmpty
+        ? outputMatrix
+        : matrices.contains(preferredMatrix)
+        ? preferredMatrix
         : matrices.first;
+    final preferredRange = outputRange ?? (frame.rgb ? null : frame.fullRange);
     final fullRange =
         target.fullRange ??
-        (!yuv || ranges.isEmpty
-            ? null
-            : !frame.rgb && ranges.contains(frame.fullRange)
-            ? frame.fullRange
+        (!yuv
+            ? outputRange
+            : ranges.isEmpty
+            ? outputRange
+            : preferredRange != null && ranges.contains(preferredRange)
+            ? preferredRange
             : ranges.first);
-    return _converter.convert(
-      frame,
-      target.format,
+    return (
+      format: target.format,
       alpha: formats.isEmpty ? null : target.alpha,
       matrix: matrix,
       fullRange: fullRange,
     );
   }
+
+  @override
+  _VideoPlanes apply(_VideoPlanes frame) {
+    if (unrestricted ||
+        formats.isEmpty && _frameFormat(frame).color != _PixelColor.yuv) {
+      return frame;
+    }
+    final target = select(frame);
+    return _converter.convert(
+      frame,
+      target.format,
+      alpha: target.alpha,
+      matrix: target.matrix,
+      fullRange: target.fullRange,
+    );
+  }
+}
+
+typedef _FormatSelection = ({
+  _VideoPixelFormat format,
+  bool? alpha,
+  int? matrix,
+  bool? fullRange,
+});
+
+List<T>? _intersectFormats<T>(List<T> left, List<T> right) {
+  if (left.isEmpty) return right;
+  if (right.isEmpty) return left;
+  final common = left.where(right.contains).toList();
+  return common.isEmpty ? null : common;
+}
+
+_NamedPixelFormat _chooseFormat(
+  List<_NamedPixelFormat> candidates,
+  _VideoPixelFormat input,
+  bool hasAlpha,
+  bool fullRange,
+) {
+  var best = candidates.first;
+  var bestLoss = 1 << 30;
+  for (final candidate in candidates) {
+    final format = candidate.format;
+    if (format == input &&
+        candidate.alpha == hasAlpha &&
+        (candidate.fullRange == null || candidate.fullRange == fullRange)) {
+      return candidate;
+    }
+    // Use the comparable losses for the layouts vimg represents natively.
+    var loss = hasAlpha && !candidate.alpha ? 65536 : 0;
+    if (input.color != format.color) {
+      loss += format.color == _PixelColor.gray
+          ? 2 * 65536
+          : (3 * 65536) >> (math.min(input.depth, format.depth) - 1);
+    }
+    if (input.depth > format.depth) {
+      final channels =
+          input.color == _PixelColor.gray || format.color == _PixelColor.gray
+          ? 1
+          : 3;
+      loss += (channels * 65536) >> (format.depth - 1);
+    } else {
+      loss += format.depth - input.depth;
+    }
+    for (final (from, to) in [
+      (input.subX, format.subX),
+      (input.subY, format.subY),
+    ]) {
+      loss += to > from
+          ? 256 << to
+          : to < from
+          ? 1 << (from - to)
+          : 0;
+    }
+    if (loss < bestLoss) {
+      best = candidate;
+      bestLoss = loss;
+    }
+  }
+  return best;
 }
 
 int _namedColorMatrix(String name) => switch (name) {
@@ -232,7 +330,13 @@ final class _PixelFormatConverter {
       final w = reduce ? width : source.width;
       final h = reduce ? height : source.height;
       working = target.depth > 8
-          ? _toDeepRgb(source, w, h, algorithm)
+          ? _toDeepRgb(
+              source,
+              w,
+              h,
+              algorithm,
+              rgb48: source.alpha == null || !requestedAlpha,
+            )
           : _toRgb(
               source,
               w,
@@ -281,20 +385,31 @@ final class _PixelFormatConverter {
             : _constantPlane(w, h, target.depth, 1 << (target.depth - 1)),
       );
     }
-    final opacity = source.alpha;
+    var opacity = source.alpha;
+    final opacityDepth = scale != null && alpha == null && opacity != null
+        ? opacity.depth
+        : target.depth;
+    if (requestedAlpha &&
+        opacity != null &&
+        source.packedRgb &&
+        opacity.depth == 8 &&
+        target.color != _PixelColor.rgb) {
+      final sameSize = opacity.width == width && opacity.height == height;
+      opacity = _packedAlpha(
+        opacity,
+        sameSize ? opacityDepth : 14,
+        round: sameSize,
+      );
+    }
     final convertedAlpha = !requestedAlpha
         ? null
         : opacity == null
-        ? _constantPlane(width, height, target.depth, (1 << target.depth) - 1)
-        : source.packedRgb &&
-              opacity.depth == 8 &&
-              target.color != _PixelColor.rgb
-        ? _packedAlpha(opacity, target.depth)
+        ? _constantPlane(width, height, opacityDepth, (1 << opacityDepth) - 1)
         : _component(
             opacity,
             width,
             height,
-            scale == null ? target.depth : opacity.depth,
+            opacityDepth,
             inputFull: true,
             outputFull: true,
             channel: native ? 3 : null,
@@ -354,18 +469,17 @@ final class _PixelFormatConverter {
       }
       return _FilterPlane(out, width, height, depth, rowStep: width);
     }
+    final range = inputFull == outputFull
+        ? null
+        : _VideoSampleRange(depth, inputFull, outputFull, chroma);
     final preserveRange = !inputFull && !outputFull;
     var sampledDepth = srcDepth;
-    var sampledFull = inputFull;
     _FilterPlane sampled = source;
-    if (!sameSize) {
-      sampledDepth = scale != null || preserveRange || filterDither
+    if (!sameSize || range != null) {
+      sampledDepth =
+          scale != null || range != null || preserveRange || filterDither
           ? depth
           : srcDepth;
-      final range = scale == null || inputFull == outputFull
-          ? null
-          : _ScaleSampleRange(depth, inputFull, outputFull, chroma);
-      if (range != null) sampledFull = outputFull;
       sampled = _FilterPlane(
         _resample(
           source,
@@ -374,7 +488,7 @@ final class _PixelFormatConverter {
           sampledDepth - 8,
           ditherOffset: filterDither ? phase : null,
           kernel: scale?.kernel(chroma: chroma) ?? _ScaleKernel.cubic,
-          precision: scale != null && depth > 14 ? 19 : 15,
+          precision: (scale != null || range != null) && depth > 14 ? 19 : 15,
           range: range,
         ),
         width,
@@ -383,21 +497,8 @@ final class _PixelFormatConverter {
         rowStep: width,
       );
     }
-    // Range conversion maps the endpoints of the coded interval, including
-    // for chroma where the full-range midpoint falls between two codes.
-    final changingRange = sampledFull != outputFull;
-    final (lo, span) = _componentLevels(
-      sampledDepth,
-      sampledFull,
-      chroma,
-      fromMinimum: changingRange,
-    );
-    final (newLo, newSpan) = _componentLevels(
-      depth,
-      outputFull,
-      chroma,
-      fromMinimum: changingRange,
-    );
+    final (lo, span) = _componentLevels(sampledDepth, outputFull, chroma);
+    final (newLo, newSpan) = _componentLevels(depth, outputFull, chroma);
     var index = 0;
     for (var row = 0; row < height; row++) {
       for (var col = 0; col < width; col++) {
@@ -420,7 +521,7 @@ final class _PixelFormatConverter {
     int? ditherOffset,
     _ScaleKernel kernel = _ScaleKernel.cubic,
     int precision = 15,
-    _ScaleSampleRange? range,
+    _VideoSampleRange? range,
   }) {
     if (width * source.height > 100000000) {
       throw const FormatException(
@@ -467,9 +568,6 @@ final class _PixelFormatConverter {
     _ScaleAlgorithm algorithm, {
     bool bgr24 = false,
   }) {
-    final y = frame.planes.first.atOrigin;
-    final cb = frame.planes.length == 3 ? frame.planes[1].packed : null;
-    final cr = frame.planes.length == 3 ? frame.planes[2].packed : null;
     final geometry = (width, height, algorithm);
     if (_rgbScalers.length == 4 && !_rgbScalers.containsKey(geometry)) {
       _rgbScalers.clear();
@@ -479,6 +577,21 @@ final class _PixelFormatConverter {
       geometry,
       () => YuvImageScaler._fixed(width, height, algorithm),
     );
+    if (width == frame.width &&
+        height == frame.height &&
+        frame.usesUnscaledRgbTable) {
+      final pixels = scaler
+          ._rgbTable(frame.matrix, frame.fullRange)
+          .writeUnscaled(frame, preserveAlpha: false);
+      return YuvImageScaler._imagePlanes(
+        pixels,
+        frame.sampleAspect,
+        bgr24: bgr24,
+      );
+    }
+    final y = frame.planes.first.atOrigin;
+    final cb = frame.planes.length == 3 ? frame.planes[1].packed : null;
+    final cr = frame.planes.length == 3 ? frame.planes[2].packed : null;
     final result = scaler._resize(
       y: y.samples,
       cb: cb?.samples ?? const [],
@@ -511,14 +624,31 @@ final class _PixelFormatConverter {
     _VideoPlanes frame,
     int width,
     int height,
-    _ScaleAlgorithm algorithm,
-  ) {
+    _ScaleAlgorithm algorithm, {
+    required bool rgb48,
+  }) {
+    final resizing = width != frame.width || height != frame.height;
+    if (!resizing && rgb48 && frame.usesUnscaledRgbTable) {
+      // The unscaled packed RGB48 kernel repeats each table output byte.
+      final table = _RgbTable(frame.matrix, frame.fullRange);
+      final red = Uint16List(width * height);
+      final green = Uint16List(red.length), blue = Uint16List(red.length);
+      var i = 0;
+      for (var y = 0; y < height; y++) {
+        for (var x = 0; x < width; x++) {
+          final (r, g, b) = table.unscaledSample(frame, x, y);
+          red[i] = r * 257;
+          green[i] = g * 257;
+          blue[i++] = b * 257;
+        }
+      }
+      return _deepRgbPlanes(frame, width, height, green, blue, red);
+    }
     final paired = width.isEven && (frame.subX != 0 || frame.subY != 0);
     final chromaWidth = paired ? width >> 1 : width;
     final y = frame.planes.first;
     // Match the precision of the packed RGB48 conversion. The chroma
     // resampler returns Q9 values on an eight-bit sample scale.
-    final resizing = width != frame.width || height != frame.height;
     final lumaSamples = resizing
         ? _resample(
             y,
@@ -570,19 +700,28 @@ final class _PixelFormatConverter {
         green[i++] = sample(luma + ug * cb + vg * cr);
       }
     }
-    return _VideoPlanes(
-      [
-        for (final values in [green, blue, red])
-          _FilterPlane(values, width, height, 16, rowStep: width),
-      ],
-      0,
-      0,
-      matrix: 0,
-      fullRange: true,
-      packedRgb: true,
-      sampleAspect: frame.sampleAspect,
-    );
+    return _deepRgbPlanes(frame, width, height, green, blue, red);
   }
+
+  _VideoPlanes _deepRgbPlanes(
+    _VideoPlanes frame,
+    int width,
+    int height,
+    Uint16List green,
+    Uint16List blue,
+    Uint16List red,
+  ) => _VideoPlanes(
+    [
+      for (final values in [green, blue, red])
+        _FilterPlane(values, width, height, 16, rowStep: width),
+    ],
+    0,
+    0,
+    matrix: 0,
+    fullRange: true,
+    packedRgb: true,
+    sampleAspect: frame.sampleAspect,
+  );
 }
 
 int _depthDither(int sample, int bits) =>
@@ -600,11 +739,11 @@ const _conversionDither = [
   [56, 8, 52, 4, 59, 11, 55, 7],
 ];
 
-_FilterPlane _packedAlpha(_FilterPlane source, int depth) {
+_FilterPlane _packedAlpha(_FilterPlane source, int depth, {bool round = true}) {
   final width = source.width, height = source.height;
   final out = _paintSamples(depth, width * height);
   final shift = 16 - depth, limit = (1 << depth) - 1;
-  final rounding = (1 << shift) >> 1;
+  final rounding = round ? (1 << shift) >> 1 : 0;
   // The packed input expands alpha by repeating its eight bits.
   var index = 0;
   for (var y = 0; y < height; y++) {

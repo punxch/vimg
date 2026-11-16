@@ -168,7 +168,59 @@ List<_FilterStep> _orderedFilterSteps(String source) {
   if (sorted.length != entries.length) {
     throw const FormatException('Disconnected video filter graph');
   }
-  return sorted;
+  return _negotiateFilterFormats(sorted);
+}
+
+List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
+  final result = <_FilterStep>[];
+  // Track the nearest upstream format decision on each unbranched link.
+  final producers = <int, int>{};
+  for (final step in steps) {
+    final upstream = step.inputs.length == 1
+        ? producers[step.inputs.single]
+        : null;
+    var filter = step.filter;
+    if (filter is _FormatFilter) {
+      if (filter.unrestricted) {
+        filter = null;
+      } else if (upstream != null) {
+        final anchor = result[upstream];
+        final negotiated = _mergeOutputFormat(anchor.filter, filter);
+        if (negotiated != null) {
+          result[upstream] = (
+            filter: negotiated,
+            inputs: anchor.inputs,
+            outputs: anchor.outputs,
+          );
+          filter = null;
+        }
+      }
+    }
+    final anchor = switch (filter) {
+      _Scale() || _ScaleFormat() || _FormatFilter() => result.length,
+      null || _TimingFilter() || _SetAspect() || _Flip() || _Crop() => upstream,
+      _ => null,
+    };
+    if (anchor != null) producers[step.outputs.single] = anchor;
+    result.add((filter: filter, inputs: step.inputs, outputs: step.outputs));
+  }
+  return result;
+}
+
+_SpatialFilter? _mergeOutputFormat(Object? filter, _FormatFilter next) {
+  if (filter is _FormatFilter) return filter.intersect(next);
+  final scale = switch (filter) {
+    final _Scale scale => scale,
+    final _ScaleFormat bound => bound.scale,
+    _ => null,
+  };
+  final format = filter is _ScaleFormat ? filter.format.intersect(next) : next;
+  if (scale == null ||
+      format == null ||
+      !format.acceptsColor(scale.outputMatrix, scale.outputRange)) {
+    return null;
+  }
+  return _ScaleFormat(scale, format);
 }
 
 VideoFilterChain _compileFilterGraph(String source) {
