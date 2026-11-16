@@ -1,6 +1,50 @@
 part of 'video.dart';
 
 extension _Mpeg4Timeline on Video {
+  _IndexedVideo _indexShortVideo(String codec, {_IsoSection? section}) {
+    final headers = H263Headers(spark: codec == 'flv1');
+    final decodeOrder = <FramePacket>[], anchors = <int>[];
+    final positions = <FramePacket, int>{};
+    final configurations = <int, _RunConfiguration>{};
+    final sections = <int, int>{};
+    var anchor = -1;
+    final display =
+        _containerPackets(
+          false,
+          section: section,
+          onSample: (packet, _) {
+            final header = headers.read(_readPrefix(packet, 1024));
+            final position = decodeOrder.length;
+            if (header.intra) {
+              anchor = position;
+              configurations[anchor] = _RunConfiguration(
+                shortVideo: header.format,
+              );
+              sections[anchor] = 0;
+            }
+            positions[packet] = position;
+            decodeOrder.add(packet);
+            anchors.add(anchor);
+          },
+        ).where((packet) => anchors[positions[packet]!] >= 0).toList()..sort((
+          a,
+          b,
+        ) {
+          final byTime = a.seconds.compareTo(b.seconds);
+          return byTime == 0 ? positions[a]!.compareTo(positions[b]!) : byTime;
+        });
+    return (
+      timeline: (
+        presentation: display,
+        decodeOrder: decodeOrder,
+        index: positions,
+        gopStart: anchors,
+      ),
+      sections: sections,
+      configurations: configurations,
+    );
+  }
+
   _IndexedVideo _indexMpeg4({_IsoSection? section}) {
     final matroska = _matroska;
     var headers = Mpeg4Headers();

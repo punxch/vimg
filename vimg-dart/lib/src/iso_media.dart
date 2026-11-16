@@ -243,6 +243,7 @@ final class IsoMedia {
     'vp08' => 'vp8',
     'vp09' => 'vp9',
     'mp4v' => _visualDescriptor(entry)?.codec ?? 'mpeg4',
+    's263' || 'h263' => 'h263',
     'm1v ' || 'm1v1' || 'mpeg' || 'mp1v' => 'mpeg1video',
     'm2v1' || 'mp2v' || 'AVmp' => 'mpeg2video',
     _ when _mpeg2QuickTimeTags.hasMatch(entry.type) => 'mpeg2video',

@@ -17,7 +17,7 @@ On Windows, use `-o build/vimg.exe`.
 
 ## Available commands
 
-- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV, AVI, MPEG-TS,
+- `vimg probe video.mkv` reads Matroska/WebM, MP4/MOV, AVI, FLV, MPEG-TS,
   MPEG-PS and standalone MPEG video metadata and prints vimg-compatible JSON.
 - `vimg join -c3 -H160 image1.png image2.png -o grid.png` resizes images and
   composes a contact sheet. Pass a repeated `--label` to label successive tiles.
@@ -177,6 +177,13 @@ global motion compensation with zero to three warping points alongside
 locally predicted macroblocks, including in partitioned pictures. Static
 sprites, sprite brightness changes and recovery from damaged reversible
 VLC partitions remain pending.
+
+Standalone `.h263` files, 3GP, AVI and Matroska support H.263 and H.263+
+I/P pictures, including group-of-blocks resynchronization, custom sizes and
+clocks, unrestricted motion vectors and structured slices. FLV supports
+Sorenson Spark and H.264, with signed AVC composition offsets and disposable
+Spark pictures. H.263 arithmetic coding, overlapped motion, advanced intra
+coding, loop filtering and PB pictures remain pending.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS

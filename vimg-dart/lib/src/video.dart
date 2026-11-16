@@ -14,11 +14,13 @@ import 'binary_file.dart';
 import 'capture_timeline.dart';
 import 'cinepak.dart';
 import 'ffv1.dart';
+import 'flv.dart';
 import 'frame_packet.dart';
 import 'grid.dart' show resizeToFit;
 import 'huffyuv.dart' show isHuffYuvCodec;
 import 'h264/access_unit.dart';
 import 'h264/idr_picture.dart';
+import 'h263_elementary.dart';
 import 'hevc/access_unit.dart';
 import 'hevc/decode_picture.dart';
 import 'hevc/nal.dart';
@@ -30,6 +32,7 @@ import 'metadata.dart';
 import 'mpeg12/decode.dart';
 import 'mpeg12/syntax.dart';
 import 'mpeg4/decoder.dart';
+import 'mpeg4/short_header.dart';
 import 'mpeg4/syntax.dart';
 import 'mpeg_systems.dart';
 import 'msrle.dart';
@@ -69,9 +72,14 @@ final class Video {
         _avi = Avi(file);
       } else if (signature == 0x444b4946) {
         _ivf = Ivf(file);
+      } else if (signature >> 8 == 0x464c56) {
+        _flv = Flv(file);
       } else {
         _systems = MpegSystemsVideo.detect(file);
-        if (_systems == null) _iso = IsoMedia(file);
+        if (_systems == null) {
+          _shortElementary = H263Elementary.detect(file);
+          if (_shortElementary == null) _iso = IsoMedia(file);
+        }
       }
     } catch (_) {
       _input.closeSync();
@@ -86,12 +94,16 @@ final class Video {
   IsoMedia? _iso;
   Avi? _avi;
   Ivf? _ivf;
+  Flv? _flv;
+  H263Elementary? _shortElementary;
   MpegSystemsVideo? _systems;
 
   late final VideoMetadata metadata =
       _matroska?.metadata() ??
       _avi?.metadata() ??
       _ivf?.metadata() ??
+      _flv?.metadata() ??
+      _shortElementary?.metadata() ??
       _systems?.metadata() ??
       _iso!.metadata();
 
@@ -289,6 +301,9 @@ final class Video {
   _IndexedVideo _indexStatefulPictures(String name, {_IsoSection? section}) {
     if (name == 'vp9') return _indexVp9(section: section);
     if (name == 'mpeg4') return _indexMpeg4(section: section);
+    if (name == 'h263' || name == 'flv1') {
+      return _indexShortVideo(name, section: section);
+    }
     final alpha = _matroska != null && name == 'vp8'
         ? _MatroskaAlphaIndex(file, name)
         : null;
@@ -593,6 +608,10 @@ final class Video {
     if (systems != null) return systems.packets(keyframes, onSample: onSample);
     if (_avi case final avi?) return avi.packets(onSample: onSample);
     if (_ivf case final ivf?) return ivf.packets(keyframes, onSample: onSample);
+    if (_flv case final flv?) return flv.packets(keyframes, onSample: onSample);
+    if (_shortElementary case final elementary?) {
+      return elementary.packets(keyframes, onSample: onSample);
+    }
     final matroska = _matroska;
     if (matroska != null) {
       return matroskaFrames(
@@ -752,8 +771,8 @@ final class Video {
     var parameters = NalParameterSets();
     var newDescription = false, hasPicture = false;
     ({FramePacket packet, H264FieldKey field, bool keyframe})? pendingField;
-    void configure([MediaBox? description]) {
-      record = _configuration(name, description);
+    void configureRecord(Uint8List bytes) {
+      record = bytes;
       if (isHevc) {
         hevc = HevcConfiguration(record!);
       } else {
@@ -765,6 +784,9 @@ final class Video {
       newDescription = hasPicture || section?.restart == true;
       pendingField = null;
     }
+
+    void configure([MediaBox? description]) =>
+        configureRecord(_configuration(name, description));
 
     if (_matroska != null) configure();
     final encodedFrames = _matroska?.hasEncodedFrames ?? false;
@@ -779,6 +801,10 @@ final class Video {
       section: section,
       onDescription: configure,
       onSample: (packet, sync) {
+        if (_flv case final flv?) {
+          final bytes = flv.avcConfiguration(packet);
+          if (!identical(record, bytes)) configureRecord(bytes);
+        }
         final before = parameters.snapshot();
         final restored = encodedFrames ? _read(packet) : null;
         final offset = restored == null ? packet.offset : 0;
@@ -1296,6 +1322,16 @@ final class Video {
   ) {
     final configuration = run.configuration!;
     switch (run.codec) {
+      case 'h263':
+      case 'flv1':
+        final decoder = H263Decoder(
+          spark: run.codec == 'flv1',
+          previous: configuration.shortVideo,
+        );
+        return (packet, selected, _) {
+          final picture = decoder.decode(_read(packet));
+          return selected ? picture.rgb : null;
+        };
       case 'mpeg4':
         final reader = _SamplePayloadReader(this);
         final decoder = Mpeg4Decoder(
@@ -1521,7 +1557,12 @@ final class Video {
   }
 
   image.Image? cover() {
-    if (_avi != null || _systems != null) return null;
+    if (_avi != null ||
+        _systems != null ||
+        _flv != null ||
+        _shortElementary != null) {
+      return null;
+    }
     final matroska = _matroska;
     final covers = matroska == null
         ? isoCovers(_iso!)
@@ -1678,11 +1719,17 @@ typedef _RenderPicture = image.Image Function({YuvImageScaler? scaler});
 typedef _NalConfiguration = ({Uint8List? record, Uint8List? parameterSets});
 
 final class _RunConfiguration {
-  const _RunConfiguration({this.bytes, this.nal, this.mpeg4Clock});
+  const _RunConfiguration({
+    this.bytes,
+    this.nal,
+    this.mpeg4Clock,
+    this.shortVideo,
+  });
 
   final Uint8List? bytes;
   final _NalConfiguration? nal;
   final Mpeg4Clock? mpeg4Clock;
+  final H263Format? shortVideo;
 }
 
 typedef _IndexedVideo = ({
@@ -1745,6 +1792,8 @@ bool _hasStatefulFrames(String codec) =>
     codec == 'vp8' ||
     codec == 'vp9' ||
     codec == 'mpeg4' ||
+    codec == 'h263' ||
+    codec == 'flv1' ||
     codec == 'ffv1' ||
     codec == 'qtrle' ||
     codec == 'rpza' ||

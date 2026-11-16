@@ -74,7 +74,41 @@ _Vector _medianVector(_Vector a, _Vector b, _Vector c) {
   return (x: middle(a.x, b.x, c.x), y: middle(a.y, b.y, c.y));
 }
 
-_Vector _motionVector(Rbsp bits, _Vector prediction, int code) {
+_Vector _motionPrediction(
+  _PictureMotion motion,
+  int columns,
+  int start,
+  int x,
+  int y,
+  int block, {
+  bool h263 = false,
+}) {
+  final bx = x * 2 + (block & 1), by = y * 2 + (block >> 1);
+  final startX = start % columns;
+  final firstLine = y * columns + x < start + columns;
+  final a = motion.at(bx - 1, by);
+  final c = motion.at(bx + const [2, 1, 1, -1][block], by - 1);
+  if (firstLine && block < 2) {
+    if (block == 0 && x == startX) return _zeroVector;
+    if (!h263 && x + 1 == startX) {
+      return x == 0 && block == 0 ? c : _medianVector(a, _zeroVector, c);
+    }
+    return a;
+  }
+  final b = motion.at(bx, by - 1);
+  return _medianVector(
+    firstLine && block == 2 && x == startX ? _zeroVector : a,
+    b,
+    c,
+  );
+}
+
+_Vector _motionVector(
+  Rbsp bits,
+  _Vector prediction,
+  int code, {
+  bool long = false,
+}) {
   final extra = code - 1;
   final limit = 32 << extra;
   int component(int base) {
@@ -83,6 +117,11 @@ _Vector _motionVector(Rbsp bits, _Vector prediction, int code) {
     final negative = bits.flag();
     final delta = ((magnitude - 1) << extra) + bits.read(extra) + 1;
     final value = base + (negative ? -delta : delta);
+    if (long) {
+      if (base < -31 && value < -63) return value + 64;
+      if (base > 32 && value > 63) return value - 64;
+      return value;
+    }
     return ((value + limit) & (2 * limit - 1)) - limit;
   }
 
@@ -147,8 +186,8 @@ final class _Mpeg4MotionCompensation {
   }
 
   void predict(
-    Mpeg4Picture output,
-    Mpeg4Picture reference,
+    _DctPicture output,
+    _DctPicture reference,
     int x,
     int y,
     List<_Vector> vectors, {
@@ -157,7 +196,7 @@ final class _Mpeg4MotionCompensation {
   }) {
     final stride = output.stride, lines = output.rows * 16;
     final split = vectors.length == 4;
-    final quarter = output.volume.quarter;
+    final quarter = output.quarter;
     final luma = quarter ? _quarter : _half;
     var sumX = 0, sumY = 0;
     for (final (i, vector) in vectors.indexed) {

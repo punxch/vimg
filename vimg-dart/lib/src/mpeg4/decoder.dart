@@ -7,31 +7,42 @@ import '../mpeg12/syntax.dart' show mpegZigzag;
 import '../mpeg_idct.dart';
 import '../rbsp.dart';
 import '../yuv_image.dart';
+import 'short_header.dart';
 import 'syntax.dart';
 import 'tables.dart';
 
 part 'blocks.dart';
 part 'motion.dart';
 part 'partitions.dart';
+part 'short_video.dart';
 
-final class Mpeg4Picture {
-  Mpeg4Picture._(this.volume, this.pts)
-    : columns = (volume.width + 15) >> 4,
-      rows = (volume.height + 15) >> 4 {
+class _DctPicture {
+  _DctPicture(this.width, this.height, {this.quarter = false})
+    : columns = (width + 15) >> 4,
+      rows = (height + 15) >> 4 {
     final macroblocks = columns * rows;
     planes = [
       Uint8List(macroblocks * 256),
       Uint8List(macroblocks * 64),
       Uint8List(macroblocks * 64),
     ];
+  }
+
+  final int width, height, columns, rows;
+  final bool quarter;
+  int get stride => columns * 16;
+
+  late final List<Uint8List> planes;
+}
+
+final class Mpeg4Picture extends _DctPicture {
+  Mpeg4Picture._(this.volume, this.pts)
+    : super(volume.width, volume.height, quarter: volume.quarter) {
     motion = _PictureMotion(columns, rows, volume.interlaced);
   }
 
   final Mpeg4Volume volume;
-  final int pts, columns, rows;
-  int get stride => columns * 16;
-
-  late final List<Uint8List> planes;
+  final int pts;
   late final _PictureMotion motion;
 
   image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
@@ -540,24 +551,6 @@ final class _VopDecoder {
     }
   }
 
-  _Vector _predictVector(int x, int y, int block) {
-    final bx = x * 2 + (block & 1), by = y * 2 + (block >> 1);
-    final startX = _sliceStart % _columns;
-    final firstLine = y * _columns + x < _sliceStart + _columns;
-    final a = picture.motion.at(bx - 1, by);
-    final c = picture.motion.at(bx + const [2, 1, 1, -1][block], by - 1);
-    if (firstLine && block < 2) {
-      if (block == 0 && x == startX) return _zeroVector;
-      if (x + 1 == startX) {
-        return x == 0 && block == 0 ? c : _medianVector(a, _zeroVector, c);
-      }
-      return a;
-    }
-    final b = picture.motion.at(bx, by - 1);
-    return _medianVector(
-      firstLine && block == 2 && x == startX ? _zeroVector : a,
-      b,
-      c,
-    );
-  }
+  _Vector _predictVector(int x, int y, int block) =>
+      _motionPrediction(picture.motion, _columns, _sliceStart, x, y, block);
 }
