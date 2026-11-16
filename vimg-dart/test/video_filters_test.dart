@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/yuv_image.dart';
 
@@ -13,6 +14,7 @@ Future<void> main(List<String> arguments) async {
   _checkLinearScale();
   _checkScaleAspect();
   _checkGraph();
+  _checkCompositing();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
 }
@@ -432,6 +434,97 @@ void _checkGraph() {
   );
 }
 
+void _checkCompositing() {
+  final source = image.Image(width: 8, height: 6, numChannels: 4);
+  for (final p in source) {
+    p.setRgba(p.x * 29, p.y * 41, p.x * 13 + p.y * 11, p.x * 19 + p.y * 23);
+  }
+  image.Image render(String graph) =>
+      YuvImageScaler(filters: VideoFilterChain.parse(graph)).filterRgb(source);
+  final layout = render(
+    'split=3[a][b][c];[b]crop=6:4:2:2,hflip[l];[c]crop=3:2:0:0,vflip[t];'
+    '[a][l][t]xstack=inputs=3:layout=0_0|w0+1_2|w0+h1_0:fill=0x123456@0x80',
+  );
+  check(
+    (layout.width, layout.height) == (15, 6) &&
+        getCrc32(layout.getBytes()) == 0xadd2196e,
+    'FFmpeg xstack RGBA layout and gap color',
+  );
+  final grid = render(
+    'split=4[a][b][c][d];[a]crop=3:2:0:0[p];[b]crop=5:2:3:0[q];'
+    '[c]crop=5:4:0:2[r];[d]crop=3:4:5:2[s];[p][q][r][s]xstack=grid=2x2',
+  );
+  _sameBytes(
+    grid.getBytes(),
+    source.getBytes(),
+    'xstack grid with uneven row widths',
+  );
+  final overlay = render(
+    'split[a][b];[b]crop=4:3:2:1,hflip[c];'
+    '[a][c]overlay=x=-1:y=2:format=rgb:alpha=straight',
+  );
+  check(
+    (overlay.width, overlay.height) == (8, 6) &&
+        getCrc32(overlay.getBytes()) == 0x048e54b9,
+    'FFmpeg RGBA blending with partial clipping',
+  );
+  final premultiplied = render(
+    'split[a][b];[b]crop=4:3:2:1,hflip[c];'
+    '[a][c]overlay=x=-1:y=2:format=rgb:alpha=premultiplied',
+  );
+  check(
+    getCrc32(premultiplied.getBytes()) == 0x27bd4477,
+    'FFmpeg premultiplied blend with packed RGB',
+  );
+  final hidden = render('split[a][b];[a][b]overlay=x=t:eval=init:format=auto');
+  _sameBytes(
+    hidden.getBytes(),
+    source.getBytes(),
+    'Overlay hides a NaN position',
+  );
+
+  final input = [
+    for (var j = 0; j < 6; j++)
+      for (var i = 0; i < 8; i++) (i * 9 + j * 21) % 220 + 18,
+    for (var j = 0; j < 3; j++)
+      for (var i = 0; i < 4; i++) 50 + (i * 31 + j * 34) % 140,
+    for (var j = 0; j < 3; j++)
+      for (var i = 0; i < 4; i++) 79 + (i * 19 + j * 53) % 150,
+  ];
+  // FFmpeg's raw 4:2:0 output, before the common Dart conversion to RGB.
+  const hex =
+      '121b242d363f4851273039424b545d663c454e572d241b12'
+      '515a636c42393027666f7881574e453c7b848d966c635a51'
+      '3251708f54735132769573544f6275888497624fb9cc9784';
+  final expected = [
+    for (var i = 0; i < hex.length; i += 2)
+      int.parse(hex.substring(i, i + 2), radix: 16),
+  ];
+  image.Image planar(List<int> samples, String graph) => yuvImage(
+    y: samples.sublist(0, 48),
+    cb: samples.sublist(48, 60),
+    cr: samples.sublist(60),
+    stride: 8,
+    chromaStride: 4,
+    width: 8,
+    height: 6,
+    cropLeft: 0,
+    cropTop: 0,
+    matrix: 6,
+    fullRange: false,
+    scaler: YuvImageScaler(filters: VideoFilterChain.parse(graph)),
+  );
+  final chroma = planar(
+    input,
+    'split[a][b];[b]crop=4:4:0:0,hflip[c];[a][c]overlay=x=5:y=3',
+  );
+  _sameBytes(
+    chroma.getBytes(),
+    planar(expected, 'null').getBytes(),
+    'Overlay aligns odd offsets to the chroma grid',
+  );
+}
+
 void _checkErrors() {
   for (final chain in [
     '',
@@ -442,6 +535,11 @@ void _checkErrors() {
     'split[a][b];[a]hstack',
     '[loop]split[loop][branch];split[a][b];[a][branch][b]hstack=3',
     'split[a][b];[a]trim=end_frame=2[c];[c][b]hstack',
+    'split,xstack=layout=0_0|w0_0:grid=2x1',
+    'split,xstack=layout=0_0|w1_0',
+    'split,xstack=layout=0_0|h2_0',
+    'split,xstack=layout=0_0',
+    'split,overlay=format=invalid',
     "scale=w='min(4,2):h=2",
     'scale=4:2:flags=lanczos',
     'scale=4:2:force_original_aspect_ratio=fit',
@@ -599,44 +697,65 @@ Future<void> _checkCli(String? executable) async {
       0xaf4d9c8f,
       0xb12ab24f,
     ];
-    final graphSheet = File('${temp.path}/branch.avif');
-    for (final command in ['extract', 'vcs']) {
-      final folder = '${temp.path}/branch-$command';
-      await run([
-        command,
-        '-n1',
-        '-f8',
-        '-t1s',
-        '-T4',
-        if (command == 'vcs') ...[
-          '-c1',
-          '-H12',
-          '--keep',
-          '-o',
-          graphSheet.path,
-        ],
-        '--output-dir',
-        folder,
-        '--vfilter',
-        graph,
-        motion,
-      ]);
-      final outputs = ordered(folder);
-      check(outputs.length == graphReference.length, '$command branch frames');
-      for (final (index, file) in outputs.indexed) {
-        final frame = image.decodeBmp(file.readAsBytesSync())!;
-        check(
-          frame.width == 32 &&
-              frame.height == 12 &&
-              _bgrChecksum(frame) == graphReference[index],
-          '$command branch frame $index matches FFmpeg',
-        );
+    const composition =
+        'fps=8,split=3[base][inset][small];'
+        '[inset]crop=12:8:2:2,hflip[pip];'
+        '[base][pip]overlay=x=W-w-n:y=n/2:format=rgb[composed];'
+        '[small]crop=16:12:0:0,vflip[flip];'
+        '[composed][flip]xstack=layout=0_0|w0+2_4:fill=0x123456';
+    const compositionReference = [
+      0x45bddf4d,
+      0x1d89de8d,
+      0x048f2cfc,
+      0xc65d2c3c,
+      0xcf257a9c,
+      0x7b1379dc,
+      0xa59dc83c,
+      0x3b9cc77c,
+    ];
+    for (final (name, filter, width, height, checksums) in [
+      ('branch', graph, 32, 12, graphReference),
+      ('compose', composition, 50, 24, compositionReference),
+    ]) {
+      final graphSheet = File('${temp.path}/$name.avif');
+      for (final command in ['extract', 'vcs']) {
+        final folder = '${temp.path}/$name-$command';
+        await run([
+          command,
+          '-n1',
+          '-f8',
+          '-t1s',
+          '-T4',
+          if (command == 'vcs') ...[
+            '-c1',
+            '-H$height',
+            '--keep',
+            '-o',
+            graphSheet.path,
+          ],
+          '--output-dir',
+          folder,
+          '--vfilter',
+          filter,
+          motion,
+        ]);
+        final outputs = ordered(folder);
+        check(outputs.length == checksums.length, '$command $name frames');
+        for (final (index, file) in outputs.indexed) {
+          final frame = image.decodeBmp(file.readAsBytesSync())!;
+          check(
+            frame.width == width &&
+                frame.height == height &&
+                _bgrChecksum(frame) == checksums[index],
+            '$command $name frame $index matches FFmpeg',
+          );
+        }
       }
+      check(
+        ascii.decode(graphSheet.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
+        '$name produces an animated contact sheet',
+      );
     }
-    check(
-      ascii.decode(graphSheet.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
-      'Branched graph produces an animated contact sheet',
-    );
 
     final fitted = '${temp.path}/fitted';
     await run([

@@ -356,6 +356,14 @@ rejoin with `hstack` or `vstack`. For example,
 its mirror image. Each branch can apply spatial filters. Timing filters can
 run on the shared stream before a split or after branches rejoin.
 `hstack` requires equal input heights and `vstack` requires equal widths.
+`xstack` accepts a fixed `grid=2x2` or a custom `layout` with per-input
+offsets, including width and height references such as `w0+2_0`.
+Set `fill` to color any gaps. `overlay` places one branch on top of
+another, with clipping, alpha compositing and frame-dependent offsets.
+Both inputs must already match the requested pixel format. The default is
+8-bit YUV 4:2:0. Use `format=rgb` for 8-bit RGB or `format=auto` to
+retain the matching decoded planes. Packed 8-bit RGB also supports
+`alpha=premultiplied`.
 
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered

@@ -11,6 +11,7 @@ import 'metadata.dart' show VideoCrop, VideoOrientation;
 part 'video_filters.dart';
 part 'video_filter_colors.dart';
 part 'video_filter_graph.dart';
+part 'video_overlay_filter.dart';
 part 'video_paint_filters.dart';
 part 'video_timing_filters.dart';
 part 'rgb_scale.dart';

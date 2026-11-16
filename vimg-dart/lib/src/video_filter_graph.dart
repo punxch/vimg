@@ -76,7 +76,8 @@ Object? _graphFilter(String specification) {
     'settb' => _SetTimeBase(args),
     'fps' => _Fps(args),
     'split' => _Split(args),
-    'hstack' || 'vstack' => _Stack(args, vertical: name == 'vstack'),
+    'hstack' || 'vstack' || 'xstack' => _Stack(args, name),
+    'overlay' => _Overlay(args),
     _ => throw FormatException('Unsupported video filter: $name'),
   };
 }
@@ -91,7 +92,11 @@ List<_FilterStep> _orderedFilterSteps(String source) {
   var pending = const <int>[];
   for (final entry in _filterEntries(source)) {
     final filter = _graphFilter(entry.specification);
-    final inputCount = filter is _Stack ? filter.inputs : 1;
+    final inputCount = switch (filter) {
+      final _Stack stack => stack.inputs,
+      _Overlay() => 2,
+      _ => 1,
+    };
     final outputCount = filter is _Split ? filter.outputs : 1;
     if (entry.inputs.length > inputCount ||
         entry.outputs.length > outputCount) {
@@ -212,8 +217,11 @@ final class _FilterBranches extends _FrameSpatialFilter {
 
   @override
   late final bool usesFramePosition = steps.any((step) {
-    final filter = step.filter;
-    return filter is _FrameSpatialFilter && filter.usesFramePosition;
+    return switch (step.filter) {
+      final _Overlay filter => filter.usesFramePosition,
+      final _FrameSpatialFilter filter => filter.usesFramePosition,
+      _ => false,
+    };
   });
 
   @override
@@ -223,6 +231,7 @@ final class _FilterBranches extends _FrameSpatialFilter {
       final inputs = [for (final link in step.inputs) active.remove(link)!];
       final result = switch (step.filter) {
         final _Stack stack => stack.apply(inputs),
+        final _Overlay filter => filter.apply(inputs[0], inputs[1], position),
         final _FrameSpatialFilter filter => filter.applyAt(
           inputs.single,
           position,
@@ -255,31 +264,75 @@ final class _Split {
   final int outputs;
 }
 
+typedef _StackPosition = ({int left, int top});
+typedef _StackCoordinate = int Function(List<_VideoPlanes>);
+
 final class _Stack {
-  factory _Stack(String? args, {required bool vertical}) {
-    final options = _filterOptions(args, ['inputs', 'shortest']);
-    // Both branches have the same timeline, including the same end event.
+  factory _Stack(String? args, String name) {
+    final options = _filterOptions(args, [
+      'inputs',
+      if (name == 'xstack') ...['layout', 'grid'],
+      'shortest',
+      if (name == 'xstack') 'fill',
+    ]);
+    // All inputs share the same timeline and end event.
     _filterFlag(options['shortest'], 'shortest');
-    return _Stack._(_filterPadCount(options, 'inputs', 2), vertical);
+    var inputs = _filterPadCount(options, 'inputs', 2);
+    final fill = options['fill'];
+    final color = fill == null || fill == 'none'
+        ? null
+        : _PaintColor.parse(fill);
+    final grid = options['grid'], layout = options['layout'];
+    if (layout != null) {
+      if (grid != null)
+        throw const FormatException('xstack accepts either grid or layout');
+      final positions = layout.split('|');
+      if (positions.length != inputs) {
+        throw const FormatException('xstack layout must place every input');
+      }
+      final coordinates = [
+        for (final (i, position) in positions.indexed)
+          _stackCoordinates(position, i, inputs),
+      ];
+      return _Stack._(
+        inputs,
+        color,
+        (frames) => [
+          for (final (left, top) in coordinates)
+            (left: left(frames), top: top(frames)),
+        ],
+      );
+    }
+    var columns = name == 'vstack' ? 1 : inputs;
+    if (grid != null) {
+      final match = RegExp(r'^([1-9][0-9]*)x([1-9][0-9]*)$').firstMatch(grid);
+      final cols = int.tryParse(match?.group(1) ?? '');
+      final rows = int.tryParse(match?.group(2) ?? '');
+      if (cols == null ||
+          rows == null ||
+          cols > 2048 ||
+          rows > 2048 ||
+          cols * rows > 2048) {
+        throw const FormatException('Invalid xstack grid dimensions');
+      }
+      columns = cols;
+      inputs = cols * rows;
+    } else if (name == 'xstack' && inputs != 2) {
+      throw const FormatException(
+        'xstack requires a layout or grid for more than two inputs',
+      );
+    }
+    return _Stack._(inputs, color, (frames) => _stackGrid(frames, columns));
   }
 
-  const _Stack._(this.inputs, this.vertical);
+  const _Stack._(this.inputs, this.fill, this.positions);
   final int inputs;
-  final bool vertical;
+  final _PaintColor? fill;
+  final List<_StackPosition> Function(List<_VideoPlanes>) positions;
 
   _VideoPlanes apply(List<_VideoPlanes> frames) {
     final first = frames.first;
-    final offsets = <int>[];
-    var length = 0;
-    for (final frame in frames) {
-      if ((vertical && frame.width != first.width) ||
-          (!vertical && frame.height != first.height)) {
-        throw FormatException(
-          vertical
-              ? 'vstack inputs must have equal widths'
-              : 'hstack inputs must have equal heights',
-        );
-      }
+    for (final frame in frames.skip(1)) {
       if (frame.subX != first.subX ||
           frame.subY != first.subY ||
           frame.planes.length != first.planes.length ||
@@ -290,15 +343,24 @@ final class _Stack {
           'Stacked inputs must have the same pixel format',
         );
       }
-      offsets.add(length);
-      length += vertical ? frame.height : frame.width;
     }
-    final width = vertical ? first.width : length;
-    final height = vertical ? length : first.height;
+    final offsets = positions(frames);
+    var width = 0, height = 0;
+    for (final (i, frame) in frames.indexed) {
+      width = math.max(width, offsets[i].left + frame.width);
+      height = math.max(height, offsets[i].top + frame.height);
+    }
     _checkFilterSize(width, height);
     return first.mapComponents((plane, sx, sy, index) {
       final w = _subSize(width, sx), h = _subSize(height, sy);
-      final result = plane.depth <= 8 ? Uint8List(w * h) : Uint16List(w * h);
+      final result = _paintSamples(plane.depth, w * h);
+      if (fill case final color?) {
+        result.fillRange(
+          0,
+          result.length,
+          color.sample(first, index, plane.depth),
+        );
+      }
       for (final (i, frame) in frames.indexed) {
         final input = index == 3 ? frame.alpha! : frame.planes[index];
         if (input.depth != plane.depth) {
@@ -306,27 +368,106 @@ final class _Stack {
             'Stacked inputs must have the same pixel depth',
           );
         }
-        final left = vertical ? 0 : _subSize(offsets[i], sx);
-        final top = vertical ? _subSize(offsets[i], sy) : 0;
-        final copyWidth = math.min(input.width, w - left);
-        final copyHeight = math.min(input.height, h - top);
-        for (var row = 0; row < copyHeight; row++) {
-          final destination = (top + row) * w + left;
-          if (input.columnStep == 1) {
-            result.setRange(
-              destination,
-              destination + copyWidth,
-              input.samples,
-              input.offset + row * input.rowStep,
-            );
-          } else {
-            for (var x = 0; x < copyWidth; x++) {
-              result[destination + x] = input.at(x, row);
-            }
-          }
-        }
+        final left = _subSize(offsets[i].left, sx);
+        final top = _subSize(offsets[i].top, sy);
+        _pastePlane(input, result, w, h, left, top);
       }
       return _FilterPlane(result, w, h, plane.depth, rowStep: w);
     });
   }
+}
+
+void _pastePlane(
+  _FilterPlane source,
+  List<int> target,
+  int width,
+  int height,
+  int left,
+  int top,
+) {
+  final firstX = math.max(0, -left);
+  final endX = math.min(source.width, width - left);
+  if (firstX >= endX) return;
+  final endY = math.min(source.height, height - top);
+  for (var y = math.max(0, -top); y < endY; y++) {
+    final start = (top + y) * width + left;
+    if (source.columnStep == 1) {
+      target.setRange(
+        start + firstX,
+        start + endX,
+        source.samples,
+        source.offset + y * source.rowStep + firstX,
+      );
+    } else {
+      for (var x = firstX; x < endX; x++) {
+        target[start + x] = source.at(x, y);
+      }
+    }
+  }
+}
+
+List<_StackPosition> _stackGrid(List<_VideoPlanes> frames, int columns) {
+  final positions = <_StackPosition>[];
+  int? rowWidth;
+  var top = 0;
+  for (var start = 0; start < frames.length; start += columns) {
+    final height = frames[start].height;
+    var left = 0;
+    for (var i = start; i < start + columns; i++) {
+      final frame = frames[i];
+      if (frame.height != height) {
+        throw const FormatException(
+          'Stacked inputs in a row must have equal heights',
+        );
+      }
+      positions.add((left: left, top: top));
+      left += frame.width;
+    }
+    rowWidth ??= left;
+    if (left != rowWidth) {
+      throw const FormatException('Stacked rows must have equal widths');
+    }
+    top += height;
+  }
+  return positions;
+}
+
+(_StackCoordinate, _StackCoordinate) _stackCoordinates(
+  String position,
+  int input,
+  int count,
+) {
+  final axes = position.split('_');
+  if (axes.length != 2)
+    throw FormatException('Invalid xstack position: $position');
+  _StackCoordinate coordinate(String expression) {
+    var offset = 0;
+    final dimensions = <({int input, bool vertical})>[];
+    for (final term in expression.split('+')) {
+      final match = RegExp(r'^([wh]?)([0-9]+)$').firstMatch(term);
+      final value = int.tryParse(match?.group(2) ?? '');
+      if (value == null) throw FormatException('Invalid xstack offset: $term');
+      final dimension = match!.group(1)!;
+      if (dimension.isEmpty) {
+        if (value > 32768)
+          throw FormatException('xstack offset out of range: $term');
+        offset += value;
+      } else {
+        if (value >= count || value == input) {
+          throw FormatException('Invalid xstack input reference: $term');
+        }
+        dimensions.add((input: value, vertical: dimension == 'h'));
+      }
+    }
+    return (frames) {
+      var sum = offset;
+      for (final dimension in dimensions) {
+        final frame = frames[dimension.input];
+        sum += dimension.vertical ? frame.height : frame.width;
+      }
+      return sum;
+    };
+  }
+
+  return (coordinate(axes[0]), coordinate(axes[1]));
 }
