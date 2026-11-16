@@ -25,12 +25,8 @@ final class H263Elementary {
 
   VideoMetadata metadata() => _index.metadata;
 
-  FrameTimestamp? bidirectionalTimestamp(FramePacket packet) {
-    final pts = _index.pairedTimes[packet.offset];
-    return pts == null
-        ? null
-        : frameTimestamp(pts, 1, _clock, duration: packet.timestamp!.pts - pts);
-  }
+  FrameTimestamp? bidirectionalTimestamp(FramePacket packet) =>
+      _index.pairedTimes[packet.offset];
 
   Iterable<FramePacket> packets(bool preview, {FrameVisitor? onSample}) sync* {
     for (final (packet, key) in _index.frames) {
@@ -42,7 +38,7 @@ final class H263Elementary {
   ({
     VideoMetadata metadata,
     List<(FramePacket, bool)> frames,
-    Map<int, int> pairedTimes,
+    Map<int, FrameTimestamp> pairedTimes,
   })
   _scan() {
     final offsets = <int>[];
@@ -61,50 +57,61 @@ final class H263Elementary {
     }
     offsets.add(file.length);
     final headers = H263Headers();
-    final pictures = <(int, int, bool)>[];
-    final ticks = <int>[];
-    final displayTicks = <int>[], durations = <int>[];
-    final pairedTimes = <int, int>{};
+    final pictures = <(int, int, bool, int)>[];
+    final display = <(int, int, bool)>[];
     H263Format? format;
-    int? previous;
+    H263Header? previous;
+    int? older;
     // Accumulate at the common clock before rounding to output timestamps.
     const commonClock = 3 * _clock;
-    var elapsed = 0;
+    var elapsed = 0, olderElapsed = 0;
     for (var i = 1; i < offsets.length; i++) {
       final offset = offsets[i - 1];
       final size = offsets[i] - offset;
       final header = headers.read(file.read(offset, math.min(size, 1024)));
       if (format == null && !header.intra) continue;
-      final current = header.format;
-      format ??= current;
-      final temporal = header.temporalReference;
+      format ??= header.format;
+      if (header.temporalLayer != null) {
+        var time = (elapsed + 1) ~/ 3;
+        if (older != null && previous != null) {
+          final timing = h263BTiming(older, previous.temporalReference, header);
+          final between = (elapsed - olderElapsed) * timing.offset;
+          time = (olderElapsed + between ~/ timing.distance + 1) ~/ 3;
+          display.add((time, offset, false));
+        }
+        pictures.add((offset, size, false, time));
+        continue;
+      }
       if (previous != null) {
+        final prior = previous.format;
         final unit =
-            current.tickNumerator * (commonClock ~/ current.tickDenominator);
+            prior.tickNumerator * (commonClock ~/ prior.tickDenominator);
+        older = previous.temporalReference;
+        olderElapsed = elapsed;
         if (header.pb case final pb?) {
-          final delta = h263PbDistance(previous, header);
+          final delta = h263PbDistance(previous.temporalReference, header);
           final time = (elapsed + unit * pb.offset + 1) ~/ 3;
-          pairedTimes[offset] = time;
-          displayTicks.add(time);
+          display.add((time, offset, true));
           elapsed += delta * unit;
         } else {
-          elapsed += h263TemporalDistance(previous, header) * unit;
+          elapsed +=
+              h263TemporalDistance(previous.temporalReference, header) * unit;
         }
       }
-      previous = temporal;
-      ticks.add((elapsed + 1) ~/ 3);
-      displayTicks.add(ticks.last);
-      if (ticks.length > 1) {
-        final next = displayTicks.length - (header.pb == null ? 1 : 2);
-        durations.add(displayTicks[next] - ticks[ticks.length - 2]);
-      }
-      pictures.add((offset, size, header.intra));
+      previous = header;
+      final time = (elapsed + 1) ~/ 3;
+      display.add((time, offset, false));
+      pictures.add((offset, size, header.intra, time));
     }
     if (format == null)
       throw const FormatException('H.263 stream has no intra picture');
+    display.sort((a, b) {
+      final time = a.$1.compareTo(b.$1);
+      return time == 0 ? a.$2.compareTo(b.$2) : time;
+    });
     final cadence = <int, int>{};
-    for (var i = 1; i < displayTicks.length; i++) {
-      final delta = displayTicks[i] - displayTicks[i - 1];
+    for (var i = 1; i < display.length; i++) {
+      final delta = display[i].$1 - display[i - 1].$1;
       if (delta > 0)
         cadence.update(delta, (count) => count + 1, ifAbsent: () => 1);
     }
@@ -117,12 +124,22 @@ final class H263Elementary {
             )
             ?.key ??
         (_clock * format.tickNumerator / format.tickDenominator).round();
-    ticks.add(ticks.last + period);
-    durations.add(period);
+    final end = display.last.$1 + period;
+    final timestamps = <int, FrameTimestamp>{};
+    final pairedTimes = <int, FrameTimestamp>{};
+    for (final (i, (pts, offset, paired)) in display.indexed) {
+      final next = i + 1 < display.length ? display[i + 1].$1 : end;
+      (paired ? pairedTimes : timestamps)[offset] = frameTimestamp(
+        pts,
+        1,
+        _clock,
+        duration: next - pts,
+      );
+    }
     final fixed = cadence.keys.every((delta) => (delta - period).abs() <= 1);
     return (
       pairedTimes: pairedTimes,
-      metadata: VideoMetadata(ticks.last / _clock, [
+      metadata: VideoMetadata(end / _clock, [
         VideoStream(
           codec: 'h263',
           width: format.width,
@@ -132,18 +149,13 @@ final class H263Elementary {
         ),
       ]),
       frames: [
-        for (final (i, (offset, size, key)) in pictures.indexed)
+        for (final (offset, size, key, pts) in pictures)
           (
             (
               offset: offset,
               size: size,
-              seconds: ticks[i] / _clock,
-              timestamp: frameTimestamp(
-                ticks[i],
-                1,
-                _clock,
-                duration: durations[i],
-              ),
+              seconds: pts / _clock,
+              timestamp: timestamps[offset] ?? frameTimestamp(pts, 1, _clock),
               subframe: null,
             ),
             key,

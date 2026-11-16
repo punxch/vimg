@@ -25,30 +25,56 @@ final class H263Picture extends _DctPicture {
 /// H.263 pictures and Sorenson Spark use the same macroblock syntax with
 /// distinct picture headers and escape codes.
 final class H263Decoder {
-  H263Decoder({bool spark = false, H263Format? previous})
-    : _headers = H263Headers(spark: spark, previous: previous);
+  H263Decoder({
+    bool spark = false,
+    H263Format? previous,
+    Map<int, H263Format>? temporalLayers,
+  }) : _headers = H263Headers(
+         spark: spark,
+         previous: previous,
+         temporalLayers: temporalLayers,
+       );
 
   final H263Headers _headers;
   final _transform = MpegIdct();
   final _prediction = _Mpeg4MotionCompensation();
-  H263Picture? _reference;
-  int? _referenceTime;
+  _H263Reference? _reference, _olderReference;
 
   H263Picture decode(Uint8List bytes) =>
-      decodePair(bytes, includeBidirectional: false).picture;
+      decodePair(bytes, includeBidirectional: false).picture!;
 
-  ({H263Picture picture, H263Picture? bidirectional}) decodePair(
+  ({H263Picture? picture, H263Picture? bidirectional}) decodePair(
     Uint8List bytes, {
     required bool includeBidirectional,
+    bool includeStandaloneB = true,
   }) {
     final header = _headers.read(bytes);
     final format = header.format;
+    if (header.temporalLayer != null) {
+      if (!includeStandaloneB) return (picture: null, bidirectional: null);
+      final older = _olderReference, newest = _reference;
+      if (older == null ||
+          newest == null ||
+          !_h263Matches(older.picture, format) ||
+          !_h263Matches(newest.picture, format)) {
+        throw const FormatException('Missing H.263+ B-picture references');
+      }
+      final timing = h263BTiming(older.temporal, newest.temporal, header);
+      final picture = H263Picture._(format);
+      _H263Macroblocks(
+        header,
+        picture,
+        null,
+        _transform,
+        _prediction,
+        null,
+      ).decodeB(older.picture, newest, timing.offset, timing.distance);
+      return (picture: picture, bidirectional: null);
+    }
     final picture = H263Picture._(format);
-    final reference = header.intra ? null : _reference;
+    final reference = header.intra ? null : _reference?.picture;
     if (!header.intra &&
-        (reference == null ||
-            reference.width != picture.width ||
-            reference.height != picture.height)) {
+        (reference == null || !_h263Matches(reference, format))) {
       throw const FormatException('Missing H.263 reference picture');
     }
     final pb = header.pb == null
@@ -58,24 +84,33 @@ final class H263Decoder {
             reference!,
             picture,
             _prediction,
-            h263PbDistance(_referenceTime!, header),
+            h263PbDistance(_reference!.temporal, header),
             includeBidirectional ? H263Picture._(format) : null,
           );
-    _H263Macroblocks(
+    final macroblocks = _H263Macroblocks(
       header,
       picture,
       reference,
       _transform,
       _prediction,
       pb,
-    ).decode();
+    );
+    macroblocks.decode();
     if (!header.disposable) {
-      _reference = picture;
-      _referenceTime = header.temporalReference;
+      if (!_headers.spark) _olderReference = _reference;
+      _reference = (
+        picture: picture,
+        temporal: header.temporalReference,
+        motion: macroblocks._motion,
+        intraWithMotion: macroblocks._intraWithMotion,
+      );
     }
     return (picture: picture, bidirectional: pb?.output);
   }
 }
+
+bool _h263Matches(H263Picture picture, H263Format format) =>
+    picture.width == format.width && picture.height == format.height;
 
 final class _H263Macroblocks {
   _H263Macroblocks(
@@ -102,11 +137,14 @@ final class _H263Macroblocks {
       List<_H263IntraBlock?>.filled(picture.columns * picture.rows, null),
   ];
   late final _filterQuant = Uint8List(picture.columns * picture.rows);
-  late final _sac = header.format.arithmetic ? _H263Sac(_bits) : null;
+  late final _sac = header.format.arithmetic && header.temporalLayer == null
+      ? _H263Sac(_bits)
+      : null;
   late final _overlap = header.format.overlapping && reference != null
       ? _H263Overlap(picture, reference!, _motion, _prediction, header)
       : null;
   int _pendingPattern = -1;
+  Uint8List? _intraWithMotion;
   Rbsp get _bits => header.bits;
   int _quant, _sliceStart = 0;
 
@@ -146,6 +184,9 @@ final class _H263Macroblocks {
       }
       if (!intra || pbBlock?.mode == _PbMode.direct) {
         final vectors = _readMotion(x, y, mode & 16 != 0);
+        if (intra) {
+          (_intraWithMotion ??= Uint8List(count))[index] = 1;
+        }
         if (overlap != null) {
           overlap.markMotion(index, _sliceStart);
         } else if (!intra) {
@@ -328,9 +369,7 @@ final class _H263Macroblocks {
       if (++padding > 15)
         throw const FormatException('Invalid H.263 GOB start');
     }
-    if (header.format.arithmetic &&
-        _bits.remaining >= 5 &&
-        _bits.remaining <= 12) {
+    if (_sac != null && _bits.remaining >= 5 && _bits.remaining <= 12) {
       final afterStart = _bits.position;
       if (_bits.read(5) == 31 && _bits.read(_bits.remaining) == 0) {
         // Let the last buffered symbols finish before a terminal EOS.
@@ -360,7 +399,7 @@ final class _H263Macroblocks {
     }
     // A SAC interval can reach a future start code while the last
     // buffered macroblocks of the current segment are still being decoded.
-    if (header.format.arithmetic && address > index && address < macroblocks) {
+    if (_sac != null && address > index && address < macroblocks) {
       _bits.position = start;
       return;
     }
@@ -398,7 +437,7 @@ final class _H263Macroblocks {
 
   _Vector _readVector(_Vector prediction) {
     if (_sac case final sac?) return sac.motion(prediction, header.longVectors);
-    if (header.format.unrestricted) {
+    if (header.extended && header.format.unrestricted) {
       final dx = _readUmv(), dy = _readUmv();
       if (dx == 1 && dy == 1) h263Marker(_bits);
       return (x: prediction.x + dx, y: prediction.y + dy);

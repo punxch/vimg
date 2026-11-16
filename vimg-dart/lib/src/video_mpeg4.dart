@@ -1,5 +1,7 @@
 part of 'video.dart';
 
+typedef _H263TimedReference = ({FramePacket packet, int temporal, int anchor});
+
 extension _Mpeg4Timeline on Video {
   _IndexedVideo _indexShortVideo(String codec, {_IsoSection? section}) {
     final headers = H263Headers(spark: codec == 'flv1');
@@ -7,14 +9,19 @@ extension _Mpeg4Timeline on Video {
     final positions = <FramePacket, int>{};
     final configurations = <int, _RunConfiguration>{};
     final sections = <int, int>{};
-    final paired = <FramePacket, List<FramePacket>>{};
+    final displayBySample = <FramePacket, List<FramePacket>>{};
+    final bidirectional = <int>{};
     var anchor = -1;
-    FramePacket? previousPacket;
-    int? previousTime;
-    void record(FramePacket packet) {
+    _H263TimedReference? older, previous;
+    void record(FramePacket packet, int requiredAnchor) {
       positions[packet] = decodeOrder.length;
       decodeOrder.add(packet);
-      anchors.add(anchor);
+      anchors.add(requiredAnchor);
+    }
+
+    void inheritSampleProperties(FramePacket frame, FramePacket sample) {
+      if (section != null) _isoSectionByPacket[frame] = section;
+      if (_isoAspects[sample] case final aspect?) _isoAspects[frame] = aspect;
     }
 
     final display =
@@ -24,38 +31,68 @@ extension _Mpeg4Timeline on Video {
               onSample: (packet, _) {
                 final header = headers.read(_readPrefix(packet, 1024));
                 final position = decodeOrder.length;
+                if (header.temporalLayer != null) {
+                  var frame = packet;
+                  final before = older, after = previous;
+                  if (before != null && after != null) {
+                    final timing = h263BTiming(
+                      before.temporal,
+                      after.temporal,
+                      header,
+                    );
+                    frame = _h263StandalonePacket(
+                      before.packet,
+                      after.packet,
+                      packet,
+                      header,
+                      timing.offset,
+                      timing.distance,
+                    );
+                    if (frame != packet) {
+                      inheritSampleProperties(frame, packet);
+                      displayBySample[packet] = [frame];
+                    }
+                  }
+                  bidirectional.add(position);
+                  record(frame, before?.anchor ?? -1);
+                  return;
+                }
                 if (header.intra) {
                   anchor = position;
                   configurations[anchor] = _RunConfiguration(
                     shortVideo: header.format,
+                    h263TemporalLayers: headers.snapshotTemporalLayers(),
                   );
                   sections[anchor] = 0;
                 }
-                if (header.pb != null && previousPacket != null) {
-                  final distance = h263PbDistance(previousTime!, header);
+                if (header.pb != null && previous != null) {
+                  final distance = h263PbDistance(previous!.temporal, header);
                   final frames = _h263PairedPackets(
-                    previousPacket!,
+                    previous!.packet,
                     packet,
                     header,
                     distance,
                   );
+                  bidirectional.add(position);
                   for (final frame in frames) {
-                    if (section != null) _isoSectionByPacket[frame] = section;
-                    if (_isoAspects[packet] case final aspect?)
-                      _isoAspects[frame] = aspect;
-                    record(frame);
+                    inheritSampleProperties(frame, packet);
+                    record(frame, anchor);
                   }
-                  paired[packet] = frames;
+                  displayBySample[packet] = frames;
                 } else {
-                  record(packet);
+                  record(packet, anchor);
                 }
                 if (!header.disposable) {
-                  previousPacket = packet;
-                  previousTime = header.temporalReference;
+                  older = previous;
+                  previous = (
+                    packet: packet,
+                    temporal: header.temporalReference,
+                    anchor: anchor,
+                  );
                 }
               },
             )
-            .expand((packet) => paired[packet] ?? [packet])
+            .expand((packet) => displayBySample[packet] ?? [packet])
             .where((packet) => anchors[positions[packet]!] >= 0)
             .toList()
           ..sort((a, b) {
@@ -64,19 +101,19 @@ extension _Mpeg4Timeline on Video {
                 ? positions[a]!.compareTo(positions[b]!)
                 : byTime;
           });
-    if (paired.isNotEmpty && _shortElementary == null) {
+    if (bidirectional.isNotEmpty && _shortElementary == null) {
       for (var i = 0; i + 1 < display.length; i++) {
         final next = display[i + 1];
-        if (next.subframe?.displayIndex != 0) continue;
         final previous = display[i];
+        if (!bidirectional.contains(positions[next]) &&
+            !bidirectional.contains(positions[previous]))
+          continue;
         final shortened = _h263BeforeBidirectional(previous, next);
         if (shortened == previous) continue;
         final position = positions.remove(previous)!;
         positions[shortened] = position;
         decodeOrder[position] = display[i] = shortened;
-        if (section != null) _isoSectionByPacket[shortened] = section;
-        if (_isoAspects[previous] case final aspect?)
-          _isoAspects[shortened] = aspect;
+        inheritSampleProperties(shortened, previous);
       }
     }
     return (
@@ -121,19 +158,82 @@ extension _Mpeg4Timeline on Video {
     H263Header header,
     int distance,
   ) {
-    final offset = header.pb!.offset;
-    final before = previous.timestamp, after = packet.timestamp;
-    final gap = packet.seconds - previous.seconds;
-    var bTime = gap > 0
+    final stamp = _shortElementary?.bidirectionalTimestamp(packet);
+    final time = stamp == null
+        ? _h263Between(previous, packet, header, header.pb!.offset, distance)
+        : (
+            seconds: stamp.pts * stamp.numerator / stamp.denominator,
+            timestamp: stamp,
+          );
+    FramePacket subframe(
+      int index,
+      double seconds,
+      FrameTimestamp? timestamp,
+    ) => (
+      offset: packet.offset,
+      size: packet.size,
+      seconds: seconds,
+      timestamp: timestamp,
+      subframe: (
+        offset: 0,
+        length: packet.size,
+        displayIndex: index,
+        sampleTimestamp: packet.timestamp,
+      ),
+    );
+    return [
+      subframe(0, time.seconds, time.timestamp),
+      subframe(1, packet.seconds, packet.timestamp),
+    ];
+  }
+
+  FramePacket _h263StandalonePacket(
+    FramePacket before,
+    FramePacket after,
+    FramePacket packet,
+    H263Header header,
+    int offset,
+    int distance,
+  ) {
+    if (_shortElementary != null) return packet;
+    _displayRateVaries = true;
+    if (packet.seconds > before.seconds && packet.seconds < after.seconds) {
+      return packet;
+    }
+    // Some muxers timestamp chunks in coding order. Recover display
+    // placement from the interval between the two reference pictures.
+    final time = _h263Between(before, after, header, offset, distance);
+    return (
+      offset: packet.offset,
+      size: packet.size,
+      seconds: time.seconds,
+      timestamp: time.timestamp,
+      subframe: (
+        offset: 0,
+        length: packet.size,
+        displayIndex: null,
+        sampleTimestamp: packet.timestamp,
+      ),
+    );
+  }
+
+  ({double seconds, FrameTimestamp? timestamp}) _h263Between(
+    FramePacket previous,
+    FramePacket following,
+    H263Header header,
+    int offset,
+    int distance,
+  ) {
+    final before = previous.timestamp, after = following.timestamp;
+    final gap = following.seconds - previous.seconds;
+    final seconds = gap > 0
         ? previous.seconds + gap * offset / distance
-        : packet.seconds -
+        : following.seconds -
               (distance - offset) *
                   header.format.tickNumerator /
                   header.format.tickDenominator;
-    var stamp = _shortElementary?.bidirectionalTimestamp(packet);
-    if (stamp != null) {
-      bTime = stamp.pts * stamp.numerator / stamp.denominator;
-    } else if (before != null &&
+    FrameTimestamp? stamp;
+    if (before != null &&
         after != null &&
         before.numerator == after.numerator &&
         before.denominator == after.denominator &&
@@ -155,23 +255,7 @@ extension _Mpeg4Timeline on Video {
         _refinePresentationClock(stamp, _containerCaptureClock, 'H.263');
       }
     }
-    FramePacket subframe(
-      int index,
-      double seconds,
-      FrameTimestamp? timestamp,
-    ) => (
-      offset: packet.offset,
-      size: packet.size,
-      seconds: seconds,
-      timestamp: timestamp,
-      subframe: (
-        offset: 0,
-        length: packet.size,
-        displayIndex: index,
-        sampleTimestamp: packet.timestamp,
-      ),
-    );
-    return [subframe(0, bTime, stamp), subframe(1, packet.seconds, after)];
+    return (seconds: seconds, timestamp: stamp);
   }
 
   _IndexedVideo _indexMpeg4({_IsoSection? section}) {

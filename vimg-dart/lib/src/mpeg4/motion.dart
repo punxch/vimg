@@ -206,6 +206,7 @@ final class _Mpeg4MotionCompensation {
     List<_Vector> vectors, {
     bool noRound = false,
     bool average = false,
+    bool truncateAverage = false,
   }) {
     final stride = output.stride, lines = output.rows * 16;
     final split = vectors.length == 4;
@@ -227,6 +228,7 @@ final class _Mpeg4MotionCompensation {
         vector.y,
         noRound,
         average,
+        truncateAverage: truncateAverage,
       );
     }
     _predictChroma(
@@ -238,6 +240,7 @@ final class _Mpeg4MotionCompensation {
       split: split,
       noRound: noRound,
       average: average,
+      truncateAverage: truncateAverage,
     );
   }
 
@@ -250,6 +253,7 @@ final class _Mpeg4MotionCompensation {
     required bool split,
     required bool noRound,
     bool average = false,
+    bool truncateAverage = false,
   }) {
     final chroma = _chromaMotion(sum, split: split);
     for (var plane = 1; plane < 3; plane++) {
@@ -265,6 +269,7 @@ final class _Mpeg4MotionCompensation {
         chroma.y,
         noRound,
         average,
+        truncateAverage: truncateAverage,
       );
     }
   }
@@ -356,6 +361,7 @@ final class _Mpeg4MotionCompensation {
     bool noRound,
     bool average, {
     _FieldPair? field,
+    bool truncateAverage = false,
   }) {
     final dx = mx & 3, dy = my & 3;
     if (dx == 0 && dy == 0) {
@@ -372,6 +378,7 @@ final class _Mpeg4MotionCompensation {
         noRound,
         average,
         field: field,
+        truncateAverage: truncateAverage,
       );
       return;
     }
@@ -415,7 +422,7 @@ final class _Mpeg4MotionCompensation {
             ? _horizontal[row * size + column]
             : _quarterPhase(_horizontal, column, size, size, row, dy, round);
         output[target + column] = average
-            ? (output[target + column] + value + 1) >> 1
+            ? (output[target + column] + value + (truncateAverage ? 0 : 1)) >> 1
             : value;
       }
     }
@@ -469,6 +476,7 @@ final class _Mpeg4MotionCompensation {
     _FieldPair? field,
     int? rows,
     bool packed = false,
+    bool truncateAverage = false,
   }) {
     final dx = mx & 1, dy = my & 1;
     final sx = x + (mx >> 1), sy = y + (my >> 1);
@@ -501,7 +509,7 @@ final class _Mpeg4MotionCompensation {
                 2,
         };
         output[target + i] = average
-            ? (output[target + i] + value + 1) >> 1
+            ? (output[target + i] + value + (truncateAverage ? 0 : 1)) >> 1
             : value;
       }
     }

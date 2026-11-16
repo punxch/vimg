@@ -38,16 +38,25 @@ typedef H263Header = ({
   bool longVectors,
   bool sparkEscape,
   bool extended,
+  int? temporalLayer,
   ({int offset, int quantFactor})? pb,
   Rbsp bits,
 });
 
 final class H263Headers {
-  H263Headers({this.spark = false, H263Format? previous})
-    : _extended = previous;
+  H263Headers({
+    this.spark = false,
+    H263Format? previous,
+    Map<int, H263Format>? temporalLayers,
+  }) : _extended = previous,
+       _temporalLayers = {...?temporalLayers};
 
   final bool spark;
   H263Format? _extended;
+  final Map<int, H263Format> _temporalLayers;
+
+  Map<int, H263Format>? snapshotTemporalLayers() =>
+      _temporalLayers.isEmpty ? null : Map.of(_temporalLayers);
 
   H263Header read(Uint8List bytes) {
     final bits = Rbsp(bytes, codec: spark ? 'Sorenson Spark' : 'H.263');
@@ -61,6 +70,7 @@ final class H263Headers {
     final bool intra, longVectors, noRound, paired;
     final H263Format format;
     final int quant;
+    int? temporalLayer;
     if (source < 6) {
       intra = !bits.flag();
       longVectors = bits.flag();
@@ -74,16 +84,18 @@ final class H263Headers {
         width,
         height,
         12 / 11,
+        unrestricted: longVectors,
         overlapping: overlapping,
         arithmetic: arithmetic,
       );
+      _extended = format;
       noRound = false;
     } else {
       final update = bits.read(3);
       if (update > 1) throw const FormatException('Invalid H.263+ UFEP');
       final options = update == 1 ? _readOptions(bits) : null;
       final type = bits.read(3);
-      if (type > 2) throw UnsupportedError('H.263+ picture type $type');
+      if (type > 3) throw UnsupportedError('H.263+ picture type $type');
       intra = type == 0;
       paired = type == 2;
       if (bits.read(2) != 0)
@@ -91,8 +103,11 @@ final class H263Headers {
       noRound = bits.flag();
       bits.skip(3); // reserved MPPTYPE bits
       _checkMultipoint(bits);
+      final bidirectional = type == 3;
       format = options != null
-          ? _extended = _readFormat(bits, options)
+          ? _readFormat(bits, options)
+          : bidirectional
+          ? _inheritedBFormat(bits)
           : _extended ?? (throw const FormatException('Missing H.263+ format'));
       longVectors = false;
       if (format.customClock) temporal |= bits.read(2) << 8;
@@ -100,6 +115,24 @@ final class H263Headers {
         if (format.unrestricted && !bits.flag()) bits.skip(1);
         if (format.structured && bits.read(2) != 0)
           throw UnsupportedError('H.263+ rectangular or unordered slices');
+      }
+      if (bidirectional) {
+        temporalLayer = bits.read(4);
+        if (temporalLayer == 0) {
+          throw const FormatException('Invalid H.263+ enhancement layer');
+        }
+        if (options != null) {
+          final referenceLayer = bits.read(4);
+          if (referenceLayer != 1) {
+            throw UnsupportedError(
+              'H.263+ external B-picture reference layer $referenceLayer',
+            );
+          }
+          if (temporalLayer > 1) _temporalLayers[temporalLayer] = format;
+        }
+      }
+      if (options != null && (temporalLayer == null || temporalLayer == 1)) {
+        _extended = format;
       }
       quant = bits.read(5);
     }
@@ -126,15 +159,35 @@ final class H263Headers {
       format: format,
       temporalReference: temporal,
       intra: intra,
-      disposable: false,
+      disposable: temporalLayer != null,
       quant: quant,
       noRound: noRound,
       longVectors: longVectors,
       sparkEscape: false,
       extended: source >= 6,
+      temporalLayer: temporalLayer,
       pb: pb,
       bits: bits,
     );
+  }
+
+  H263Format _inheritedBFormat(Rbsp bits) {
+    final position = bits.position;
+    final base = _extended;
+    // ETR precedes ELNUM. A previously signalled layer supplies the
+    // width of ETR; prefer the base-layer clock if both alignments fit.
+    final preferred = base?.customClock ?? false;
+    for (final custom in [preferred, !preferred]) {
+      if (bits.remaining < (custom ? 6 : 4)) continue;
+      if (custom) bits.skip(2);
+      final layer = bits.read(4);
+      bits.position = position;
+      final candidate = layer == 1 ? base : _temporalLayers[layer];
+      if (candidate != null && candidate.customClock == custom) {
+        return candidate;
+      }
+    }
+    throw const FormatException('Missing H.263+ B-picture layer format');
   }
 
   H263Header _readSpark(Rbsp bits) {
@@ -171,6 +224,7 @@ final class H263Headers {
       longVectors: false,
       sparkEscape: version == 1,
       extended: false,
+      temporalLayer: null,
       pb: null,
       bits: bits,
     );
@@ -180,6 +234,20 @@ final class H263Headers {
 int h263TemporalDistance(int previous, H263Header header) =>
     (header.temporalReference - previous) %
     (header.format.customClock ? 1024 : 256);
+
+({int offset, int distance}) h263BTiming(
+  int previous,
+  int following,
+  H263Header header,
+) {
+  final wrap = header.format.customClock ? 1024 : 256;
+  final offset = (header.temporalReference - previous) % wrap;
+  final distance = (following - previous) % wrap;
+  if (offset == 0 || offset >= distance) {
+    throw const FormatException('H.263+ B-picture lies outside its references');
+  }
+  return (offset: offset, distance: distance);
+}
 
 int h263PbDistance(int previous, H263Header header) {
   final distance = h263TemporalDistance(previous, header);
@@ -193,6 +261,7 @@ H263Format _basicFormat(
   int width,
   int height,
   double aspect, {
+  bool unrestricted = false,
   bool overlapping = false,
   bool arithmetic = false,
 }) => (
@@ -202,7 +271,7 @@ H263Format _basicFormat(
   tickNumerator: 1001,
   tickDenominator: 30000,
   customClock: false,
-  unrestricted: false,
+  unrestricted: unrestricted,
   overlapping: overlapping,
   arithmetic: arithmetic,
   advancedIntra: false,

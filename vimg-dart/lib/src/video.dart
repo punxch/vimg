@@ -1358,6 +1358,7 @@ final class Video {
         final decoder = H263Decoder(
           spark: run.codec == 'flv1',
           previous: configuration.shortVideo,
+          temporalLayers: configuration.h263TemporalLayers,
         );
         H263Picture? pairedReference;
         return (packet, selected, _) {
@@ -1374,8 +1375,12 @@ final class Video {
               pairedReference = null;
               return selected ? picture?.rgb : null;
             default:
-              final picture = decoder.decode(_read(packet));
-              return selected ? picture.rgb : null;
+              final decoded = decoder.decodePair(
+                _read(packet),
+                includeBidirectional: false,
+                includeStandaloneB: selected,
+              );
+              return selected ? decoded.picture?.rgb : null;
           }
         };
       case 'mpeg4':
@@ -1770,12 +1775,14 @@ final class _RunConfiguration {
     this.nal,
     this.mpeg4Clock,
     this.shortVideo,
+    this.h263TemporalLayers,
   });
 
   final Uint8List? bytes;
   final _NalConfiguration? nal;
   final Mpeg4Clock? mpeg4Clock;
   final H263Format? shortVideo;
+  final Map<int, H263Format>? h263TemporalLayers;
 }
 
 typedef _IndexedVideo = ({
