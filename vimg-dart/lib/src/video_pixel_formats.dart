@@ -97,37 +97,82 @@ _NamedPixelFormat _namedPixelFormat(String name) {
 
 final class _FormatFilter implements _SpatialFilter {
   factory _FormatFilter(String? source) {
-    final options = _filterOptions(source, ['pix_fmts']);
-    final formats = options['pix_fmts'];
-    if (formats == null)
-      throw const FormatException('format requires pix_fmts');
-    return _FormatFilter._(formats.split('|').map(_namedPixelFormat).toList());
+    final options = _filterOptions(source, [
+      'pix_fmts',
+      'color_spaces',
+      'color_ranges',
+    ]);
+    return _FormatFilter._(
+      options['pix_fmts']?.split('|').map(_namedPixelFormat).toList() ??
+          const [],
+      options['color_spaces']?.split('|').map(_namedColorMatrix).toList() ??
+          const [],
+      options['color_ranges']?.split('|').map(_namedColorRange).toList() ??
+          const [],
+    );
   }
 
-  _FormatFilter._(this.formats);
+  _FormatFilter._(this.formats, this.matrices, this.ranges);
   final List<_NamedPixelFormat> formats;
+  final List<int> matrices;
+  final List<bool> ranges;
   final _PixelFormatConverter _converter = _PixelFormatConverter();
 
   @override
   _VideoPlanes apply(_VideoPlanes frame) {
+    if (formats.isEmpty && matrices.isEmpty && ranges.isEmpty) return frame;
     final input = _frameFormat(frame);
-    final target = formats.firstWhere(
-      (item) =>
-          item.format == input &&
-          item.alpha == (frame.alpha != null) &&
-          (item.fullRange == null || item.fullRange == frame.fullRange),
-      orElse: () => formats.first,
-    );
+    final hasAlpha = frame.alpha != null;
+    final target = formats.isEmpty
+        ? (format: input, alpha: hasAlpha, fullRange: null)
+        : formats.firstWhere(
+            (item) =>
+                item.format == input &&
+                item.alpha == hasAlpha &&
+                (item.fullRange == null || item.fullRange == frame.fullRange),
+            orElse: () => formats.first,
+          );
+    final yuv = target.format.color == _PixelColor.yuv;
+    if (!yuv && formats.isEmpty) return frame;
+    final matrix = !yuv || matrices.isEmpty
+        ? null
+        : matrices.contains(frame.matrix)
+        ? frame.matrix
+        : matrices.first;
+    final fullRange =
+        target.fullRange ??
+        (!yuv || ranges.isEmpty
+            ? null
+            : !frame.rgb && ranges.contains(frame.fullRange)
+            ? frame.fullRange
+            : ranges.first);
     return _converter.convert(
       frame,
       target.format,
-      alpha: target.alpha,
-      fullRange: target.fullRange,
+      alpha: formats.isEmpty ? null : target.alpha,
+      matrix: matrix,
+      fullRange: fullRange,
     );
   }
 }
 
-/// Converts decoded planes without a packed 8-bit intermediate on YUV paths.
+int _namedColorMatrix(String name) => switch (name) {
+  'bt709' => 1,
+  'unknown' => 2,
+  'fcc' => 4,
+  'bt470bg' => 5,
+  'smpte170m' => 6,
+  'smpte240m' => 7,
+  'bt2020nc' => 9,
+  _ => throw FormatException('Unsupported video color space: $name'),
+};
+
+bool _namedColorRange(String name) => switch (name) {
+  'tv' => false,
+  'pc' => true,
+  _ => throw FormatException('Unsupported video color range: $name'),
+};
+
 final class _PixelFormatConverter {
   final _scalers = <(int, int, int, int), _PlaneScaler>{};
   final _rgbScalers = <(int, int, int, int), YuvImageScaler>{};
@@ -162,12 +207,17 @@ final class _PixelFormatConverter {
     final width = source.width, height = source.height;
     _checkFilterSize(width, height);
     var working = source;
-    if (!source.rgb &&
-        (target.color == _PixelColor.rgb ||
-            target.color == _PixelColor.yuv &&
-                source.planes.length == 3 &&
-                source.matrix != colorMatrix)) {
+    if (!source.rgb && target.color == _PixelColor.rgb) {
       working = _toRgb(source);
+    } else if (!source.rgb &&
+        source.planes.length == 3 &&
+        target.color == _PixelColor.yuv &&
+        _rgbCoefficients(source.matrix) != _rgbCoefficients(colorMatrix)) {
+      // libswscale cascades both matrices through RGB, using 16-bit channels
+      // when the requested YUV output has more than eight bits per component.
+      working = target.depth > 8
+          ? _toDeepRgb(source)
+          : _toRgb(source, bgr24: source.alpha == null || !requestedAlpha);
     }
     if (working.rgb && target.color != _PixelColor.rgb) {
       working = _rgbToYuv(working, target, colorMatrix, full);
@@ -275,32 +325,12 @@ final class _PixelFormatConverter {
     var sampledDepth = srcDepth;
     _FilterPlane sampled = source;
     if (!sameSize) {
-      final geometry = (source.width, source.height, width, height);
-      if (width * source.height > 100000000) {
-        throw const FormatException(
-          'Pixel format conversion exceeds the sample limit',
-        );
-      }
-      if (_scalers.length == 6 && !_scalers.containsKey(geometry))
-        _scalers.clear();
-      final scaler = _scalers.putIfAbsent(
-        geometry,
-        () => _PlaneScaler(
-          source.width,
-          source.height,
+      sampledDepth = preserveRange || filterDither ? depth : srcDepth;
+      sampled = _FilterPlane(
+        _resample(
+          source,
           width,
           height,
-          kernel: _ScaleKernel.cubic,
-        ),
-      );
-      sampledDepth = preserveRange || filterDither ? depth : srcDepth;
-      final input = source.forward;
-      sampled = _FilterPlane(
-        scaler.resize(
-          input.samples,
-          input.rowStep,
-          input.offset,
-          srcDepth,
           sampledDepth - 8,
           ditherOffset: filterDither ? phase : null,
         ),
@@ -310,8 +340,21 @@ final class _PixelFormatConverter {
         rowStep: width,
       );
     }
-    final (lo, span) = _componentLevels(sampledDepth, inputFull, chroma);
-    final (newLo, newSpan) = _componentLevels(depth, outputFull, chroma);
+    // Range conversion maps the endpoints of the coded interval, including
+    // for chroma where the full-range midpoint falls between two codes.
+    final changingRange = inputFull != outputFull;
+    final (lo, span) = _componentLevels(
+      sampledDepth,
+      inputFull,
+      chroma,
+      fromMinimum: changingRange,
+    );
+    final (newLo, newSpan) = _componentLevels(
+      depth,
+      outputFull,
+      chroma,
+      fromMinimum: changingRange,
+    );
     var index = 0;
     for (var row = 0; row < height; row++) {
       for (var col = 0; col < width; col++) {
@@ -326,7 +369,43 @@ final class _PixelFormatConverter {
     return _FilterPlane(out, width, height, depth, rowStep: width);
   }
 
-  _VideoPlanes _toRgb(_VideoPlanes frame) {
+  Int32List _resample(
+    _FilterPlane source,
+    int width,
+    int height,
+    int fractionBits, {
+    int? ditherOffset,
+  }) {
+    if (width * source.height > 100000000) {
+      throw const FormatException(
+        'Pixel format conversion exceeds the sample limit',
+      );
+    }
+    final geometry = (source.width, source.height, width, height);
+    if (_scalers.length == 6 && !_scalers.containsKey(geometry))
+      _scalers.clear();
+    final scaler = _scalers.putIfAbsent(
+      geometry,
+      () => _PlaneScaler(
+        source.width,
+        source.height,
+        width,
+        height,
+        kernel: _ScaleKernel.cubic,
+      ),
+    );
+    final input = source.forward;
+    return scaler.resize(
+      input.samples,
+      input.rowStep,
+      input.offset,
+      input.depth,
+      fractionBits,
+      ditherOffset: ditherOffset,
+    );
+  }
+
+  _VideoPlanes _toRgb(_VideoPlanes frame, {bool bgr24 = false}) {
     final y = frame.planes.first.atOrigin;
     final cb = frame.planes.length == 3 ? frame.planes[1].packed : null;
     final cr = frame.planes.length == 3 ? frame.planes[2].packed : null;
@@ -361,7 +440,56 @@ final class _PixelFormatConverter {
       alpha: null,
       alphaDepth: 8,
     );
-    return YuvImageScaler._imagePlanes(result, frame.sampleAspect);
+    return YuvImageScaler._imagePlanes(
+      result,
+      frame.sampleAspect,
+      bgr24: bgr24,
+    );
+  }
+
+  _VideoPlanes _toDeepRgb(_VideoPlanes frame) {
+    final width = frame.width, height = frame.height;
+    final paired = width.isEven && (frame.subX != 0 || frame.subY != 0);
+    final chromaWidth = paired ? width >> 1 : width;
+    final y = frame.planes.first;
+    // Match the precision of the packed RGB48 conversion. The chroma
+    // resampler returns Q9 values on an eight-bit sample scale.
+    final u = _resample(frame.planes[1], chromaWidth, height, 9);
+    final v = _resample(frame.planes[2], chromaWidth, height, 9);
+    final (rv, bu, gu, gv) = _rgbCoefficients(frame.matrix);
+    int coefficient(int value) =>
+        ((frame.fullRange ? value * 224 ~/ 255 : value) + 4) >> 3;
+    final vr = coefficient(rv), ub = coefficient(bu);
+    final ug = coefficient(gu), vg = coefficient(gv);
+    final yc = frame.fullRange ? 8192 : 9539;
+    final black = frame.fullRange ? 0 : 16 << 9;
+    final green = Uint16List(width * height);
+    final blue = Uint16List(green.length);
+    final red = Uint16List(green.length);
+    int sample(int value) => ((value + 8192) >> 14).clamp(0, 65535);
+    var i = 0;
+    for (var row = 0; row < height; row++) {
+      for (var x = 0; x < width; x++) {
+        final c = row * chromaWidth + (paired ? x >> 1 : x);
+        final luma = ((y.at(x, row) << (17 - y.depth)) - black) * yc;
+        final cb = u[c] - (128 << 9), cr = v[c] - (128 << 9);
+        red[i] = sample(luma + vr * cr);
+        blue[i] = sample(luma + ub * cb);
+        green[i++] = sample(luma + ug * cb + vg * cr);
+      }
+    }
+    return _VideoPlanes(
+      [
+        for (final values in [green, blue, red])
+          _FilterPlane(values, width, height, 16, rowStep: width),
+      ],
+      0,
+      0,
+      matrix: 0,
+      fullRange: true,
+      packedRgb: true,
+      sampleAspect: frame.sampleAspect,
+    );
   }
 }
 
@@ -404,12 +532,19 @@ _FilterPlane _constantPlane(int width, int height, int depth, int sample) {
   return _FilterPlane(values, width, height, depth, rowStep: width);
 }
 
-(int, int) _componentLevels(int depth, bool full, bool chroma) => chroma
-    ? (1 << (depth - 1), full ? (1 << depth) - 1 : 224 << (depth - 8))
-    : (
-        full ? 0 : 16 << (depth - 8),
-        full ? (1 << depth) - 1 : 219 << (depth - 8),
-      );
+(int, int) _componentLevels(
+  int depth,
+  bool full,
+  bool chroma, {
+  bool fromMinimum = false,
+}) => (
+  chroma && !fromMinimum
+      ? 1 << (depth - 1)
+      : full
+      ? 0
+      : 16 << (depth - 8),
+  full ? (1 << depth) - 1 : (chroma ? 224 : 219) << (depth - 8),
+);
 
 int _roundComponent(int numerator, int denominator) {
   // Round the signed ratio to nearest, choosing the larger value on ties.
@@ -462,6 +597,8 @@ _VideoPlanes _rgbToYuv(
       cb = hasChroma ? Uint16List(cw * height) : null,
       cr = hasChroma ? Uint16List(cw * height) : null;
   final (black, levels) = _componentLevels(red.depth, frame.fullRange, false);
+  final deep = frame.packedRgb && red.depth == 16 && frame.fullRange;
+  final intermediateDepth = deep ? 16 : 14;
   int sample(int component, int r, int g, int b, int count) {
     final bias = count * black;
     final rgb = _rgbProduct(
@@ -471,6 +608,7 @@ _VideoPlanes _rgbToYuv(
       b - bias,
     );
     final offset = component == 0 ? 16 : 128;
+    if (deep) return ((rgb + (offset << 23) + 16384) >> 15).clamp(0, 65535);
     return ((offset << 6) + _roundComponent(rgb * 255, levels * count * 512))
         .clamp(0, 16383);
   }
@@ -494,6 +632,11 @@ _VideoPlanes _rgbToYuv(
         r += red.at(x + 1, row);
         g += green.at(x + 1, row);
         b += blue.at(x + 1, row);
+        if (deep) {
+          r = (r + 1) >> 1;
+          g = (g + 1) >> 1;
+          b = (b + 1) >> 1;
+        }
       }
       cb[chroma + col] = sample(1, r, g, b, 1 << sub);
       cr![chroma + col] = sample(2, r, g, b, 1 << sub);
@@ -501,10 +644,10 @@ _VideoPlanes _rgbToYuv(
   }
   return _VideoPlanes(
     [
-      _FilterPlane(y, width, height, 14, rowStep: width),
+      _FilterPlane(y, width, height, intermediateDepth, rowStep: width),
       if (cb != null)
         for (final plane in [cb, cr!])
-          _FilterPlane(plane, cw, height, 14, rowStep: cw),
+          _FilterPlane(plane, cw, height, intermediateDepth, rowStep: cw),
     ],
     sub,
     0,

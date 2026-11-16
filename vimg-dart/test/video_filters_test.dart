@@ -14,6 +14,7 @@ Future<void> main(List<String> arguments) async {
   _checkLinearScale();
   _checkScaleAspect();
   _checkGraph();
+  _checkColorFormats();
   _checkCompositing();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
@@ -445,6 +446,74 @@ void _checkGraph() {
   }
 }
 
+void _checkColorFormats() {
+  image.Image render(int depth, String filter) {
+    List<int> samples(int w, int h, int base, int dx, int dy, int wrap) => [
+      for (var y = 0; y < h; y++)
+        for (var x = 0; x < w; x++) base + (dx * x + dy * y) % wrap,
+    ];
+    final deep = depth == 10;
+    return yuvImage(
+      y: deep
+          ? samples(8, 6, 120, 37, 23, 1024)
+          : samples(8, 6, 18, 9, 21, 256),
+      cb: deep
+          ? samples(4, 3, 405, 37, 23, 1024)
+          : samples(4, 3, 50, 31, 34, 140),
+      cr: deep
+          ? samples(4, 3, 480, 37, 23, 1024)
+          : samples(4, 3, 79, 19, 53, 150),
+      stride: 8,
+      chromaStride: 4,
+      width: 8,
+      height: 6,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: 6,
+      fullRange: false,
+      lumaDepth: depth,
+      chromaDepth: depth,
+      scaler: YuvImageScaler(filters: VideoFilterChain.parse(filter)),
+    );
+  }
+
+  for (final depth in [8, 10]) {
+    final source = render(depth, 'null').getBytes();
+    _sameBytes(
+      render(
+        depth,
+        'format=color_spaces=bt709|smpte170m:color_ranges=pc|tv',
+      ).getBytes(),
+      source,
+      'Color lists keep an allowed matrix and range',
+    );
+    _sameBytes(
+      render(depth, 'format=color_spaces=bt470bg').getBytes(),
+      source,
+      'Equivalent BT.601 matrices keep the original samples',
+    );
+  }
+  // Scalar FFmpeg YUV output rendered with the requested matrix and range.
+  for (final (depth, matrix, range, checksum) in [
+    (8, 'bt709', 'tv', 0x64d19176),
+    (8, 'smpte170m', 'pc', 0x68b3f2c4),
+    (8, 'bt709', 'pc', 0xd98e582d),
+    (10, 'bt709', 'tv', 0xab7c4c64),
+    (10, 'bt2020nc', 'tv', 0xd4396ea9),
+    (10, 'smpte170m', 'pc', 0xb2ce6acc),
+    (10, 'bt709', 'pc', 0x7a627576),
+  ]) {
+    final converted = render(
+      depth,
+      'format=color_spaces=$matrix:color_ranges=$range',
+    );
+    check(
+      getCrc32(converted.getBytes()) == checksum,
+      '$depth-bit YUV color conversion to $matrix/$range',
+    );
+  }
+}
+
 void _checkCompositing() {
   final source = image.Image(width: 8, height: 6, numChannels: 4);
   for (final p in source) {
@@ -578,6 +647,8 @@ void _checkErrors() {
     'split,xstack=layout=0_0|h2_0',
     'split,xstack=layout=0_0',
     'split,overlay=format=invalid',
+    'format=color_spaces=invalid',
+    'format=color_ranges=invalid',
     "scale=w='min(4,2):h=2",
     'scale=4:2:flags=lanczos',
     'scale=4:2:force_original_aspect_ratio=fit',
@@ -766,10 +837,22 @@ Future<void> _checkCli(String? executable) async {
       0xe08c8d50,
       0xe08c8d50,
     ];
+    const color = 'format=pix_fmts=yuv420p:color_spaces=bt709:color_ranges=tv';
+    const colorReference = [
+      0x4db21575,
+      0x4db21575,
+      0x8adb51b3,
+      0x8adb51b3,
+      0x961a8d1d,
+      0x961a8d1d,
+      0x51c4c9a5,
+      0x51c4c9a5,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
       ('delayed-overlay', delayedOverlay, 32, 24, delayedReference),
+      ('color-format', color, 32, 24, colorReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {

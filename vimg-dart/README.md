@@ -373,6 +373,13 @@ to use the main input's decoded layout. Packed 8-bit RGB also supports
 `pix_fmts` such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
 When given a `|`-separated list, it keeps a matching input format when
 available and otherwise converts to the first listed format.
+YUV formats also accept `color_spaces` (`bt709`, `bt470bg`, `smpte170m`,
+`smpte240m`, `fcc`, `bt2020nc` or `unknown`) and `color_ranges`
+(`tv` for limited or `pc` for full). Each option accepts a list with
+the same selection rule. These options can be used on their own to keep
+the input's pixel layout, for example
+`--vfilter 'format=color_spaces=bt709:color_ranges=pc'`.
+Format and color selections take effect at each filter in graph order.
 Native YUV depth reduction uses ordered dithering.
 Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
 
