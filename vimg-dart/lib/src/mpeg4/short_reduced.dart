@@ -6,6 +6,14 @@ H263Picture _h263AlignReference(H263Picture source, {required bool reduced}) {
   final width = (format.width + alignment - 1) & -alignment;
   final height = (format.height + alignment - 1) & -alignment;
   if (source.stride == width && source.rows * 16 == height) return source;
+  if (source._referencePixels case final pixels?) {
+    return H263Picture._reference(
+      format,
+      pixels,
+      reduced: reduced,
+      subPictures: source._subPictures,
+    ).._segments = source._segments;
+  }
   final target = H263Picture._(format, reduced: reduced);
   target._segments = source._segments;
   for (var plane = 0; plane < 3; plane++) {

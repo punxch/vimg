@@ -1,3 +1,4 @@
+import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -27,6 +28,7 @@ part 'short_sac_models.dart';
 part 'short_segments.dart';
 part 'short_erps.dart';
 part 'short_slices.dart';
+part 'short_subpictures.dart';
 part 'short_video.dart';
 
 class _DctPicture {
@@ -35,14 +37,17 @@ class _DctPicture {
     this.height, {
     this.quarter = false,
     int alignment = 16,
+    bool allocate = true,
   }) : columns = ((width + alignment - 1) & -alignment) >> 4,
        rows = ((height + alignment - 1) & -alignment) >> 4 {
     final macroblocks = columns * rows;
-    planes = [
-      Uint8List(macroblocks * 256),
-      Uint8List(macroblocks * 64),
-      Uint8List(macroblocks * 64),
-    ];
+    planes = allocate
+        ? [
+            Uint8List(macroblocks * 256),
+            Uint8List(macroblocks * 64),
+            Uint8List(macroblocks * 64),
+          ]
+        : const [];
   }
 
   final int width, height, columns, rows;
@@ -50,6 +55,8 @@ class _DctPicture {
   int get stride => columns * 16;
 
   late final List<Uint8List> planes;
+
+  List<int> _referencePlane(int plane) => planes[plane];
 }
 
 final class Mpeg4Picture extends _DctPicture {

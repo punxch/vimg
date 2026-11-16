@@ -7,11 +7,24 @@ typedef H263ErpsBufferSize = ({
   bool reset,
 });
 
+({int columns, int rows}) h263ErpsGrid(
+  H263ErpsBufferSize size,
+  (int, int) dimensions,
+) {
+  final (width, height) = dimensions;
+  return (
+    columns: (width + 16 * size.width - 1) ~/ (16 * size.width),
+    rows: (height + 16 * size.height - 1) ~/ (16 * size.height),
+  );
+}
+
 typedef H263ErpsIndex = ({bool longTerm, int index});
 
 enum H263ErpsOperation {
   removeShort,
   removeLong,
+  removeShortRegions,
+  removeLongRegions,
   assignLong,
   limitLong,
   resize,
@@ -22,6 +35,7 @@ typedef H263ErpsCommand = ({
   int argument,
   int? destination,
   H263ErpsBufferSize? size,
+  String? removal,
 });
 
 final class H263Erps {
@@ -32,12 +46,16 @@ final class H263Erps {
     required this.sliding,
     required this.remapping,
     required this.commands,
-  });
+    required this.bufferSize,
+    required (int, int) dimensions,
+  }) : _dimensions = dimensions;
 
   final int number;
   final bool multiple, twoBackward, sliding;
   final List<H263ErpsIndex> remapping;
   final List<H263ErpsCommand> commands;
+  final H263ErpsBufferSize? bufferSize;
+  final (int, int) _dimensions;
 
   H263ErpsBufferSize? get size => commands.isEmpty ? null : commands.first.size;
 
@@ -46,6 +64,8 @@ final class H263Erps {
     int number, {
     required bool intra,
     required bool bidirectional,
+    required (int, int) dimensions,
+    required H263ErpsBufferSize? previousSize,
   }) {
     final multiple = !intra && bits.flag();
     final remapping = <H263ErpsIndex>[];
@@ -77,7 +97,7 @@ final class H263Erps {
     final twoBackward = bidirectional && multiple && bits.flag();
     final sliding = !bidirectional && bits.flag();
     final commands = !bidirectional && !sliding
-        ? _readCommands(bits, number)
+        ? _readCommands(bits, number, dimensions, previousSize)
         : const <H263ErpsCommand>[];
     return H263Erps._(
       number: number,
@@ -86,6 +106,9 @@ final class H263Erps {
       sliding: sliding,
       remapping: remapping,
       commands: commands,
+      bufferSize:
+          (commands.isEmpty ? null : commands.first.size) ?? previousSize,
+      dimensions: dimensions,
     );
   }
 
@@ -104,6 +127,8 @@ final class H263Erps {
       groupNumber,
       intra: intra,
       bidirectional: bidirectional,
+      dimensions: _dimensions,
+      previousSize: bufferSize,
     );
     if (group.sliding != sliding ||
         group.commands.any((command) => !commands.contains(command))) {
@@ -113,8 +138,14 @@ final class H263Erps {
   }
 }
 
-List<H263ErpsCommand> _readCommands(Rbsp bits, int number) {
+List<H263ErpsCommand> _readCommands(
+  Rbsp bits,
+  int number,
+  (int, int) dimensions,
+  H263ErpsBufferSize? previousSize,
+) {
   final commands = <H263ErpsCommand>[];
+  var bufferSize = previousSize;
   int readNumber() {
     final difference = h263ErpsVlc(bits);
     if (difference >= 1024) {
@@ -128,6 +159,7 @@ List<H263ErpsCommand> _readCommands(Rbsp bits, int number) {
     H263ErpsBufferSize? size;
     var argument = 0;
     int? destination;
+    String? removal;
     if (bits.flag()) {
       if (bits.flag()) {
         operation = H263ErpsOperation.removeShort;
@@ -145,9 +177,20 @@ List<H263ErpsCommand> _readCommands(Rbsp bits, int number) {
         throw const FormatException('Invalid H.263+ ERPS buffer command');
       }
       switch (bits.read(2)) {
-        case 0:
-        case 1:
-          throw UnsupportedError('H.263+ ERPS sub-picture removal');
+        case final code when code < 2:
+          final shortTerm = code == 0;
+          operation = shortTerm
+              ? H263ErpsOperation.removeShortRegions
+              : H263ErpsOperation.removeLongRegions;
+          argument = shortTerm ? readNumber() : h263ErpsVlc(bits);
+          final geometry = bufferSize;
+          if (geometry == null) {
+            throw const FormatException(
+              'Missing H.263+ ERPS sub-picture geometry',
+            );
+          }
+          final (:columns, :rows) = h263ErpsGrid(geometry, dimensions);
+          removal = _readRemovalMap(bits, columns * rows);
         case 2:
           operation = H263ErpsOperation.limitLong;
           argument = h263ErpsVlc(bits);
@@ -171,6 +214,7 @@ List<H263ErpsCommand> _readCommands(Rbsp bits, int number) {
             capacity: capacity,
             reset: bits.flag(),
           );
+          bufferSize = size;
         default:
           throw StateError('Invalid two-bit ERPS command');
       }
@@ -180,9 +224,31 @@ List<H263ErpsCommand> _readCommands(Rbsp bits, int number) {
       argument: argument,
       destination: destination,
       size: size,
+      removal: removal,
     ));
   }
   return commands;
+}
+
+String _readRemovalMap(Rbsp bits, int count) {
+  final map = <int>[];
+  var unused = 0, zeroes = 0;
+  for (var i = 0; i < count; i++) {
+    final bit = bits.bit();
+    map.add(48 + bit);
+    unused += bit;
+    zeroes = bit == 0 ? zeroes + 1 : 0;
+    if (zeroes == 8) {
+      if (!bits.flag()) {
+        throw const FormatException('Missing H.263+ ERPS bitmap marker');
+      }
+      zeroes = 0;
+    }
+  }
+  if (unused == 0 || unused == count) {
+    throw const FormatException('Invalid H.263+ ERPS sub-picture bitmap');
+  }
+  return String.fromCharCodes(map);
 }
 
 // Table U.1 interleaves the data bits with continuation bits.

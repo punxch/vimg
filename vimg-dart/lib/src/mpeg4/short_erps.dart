@@ -7,6 +7,18 @@ final class _H263ErpsBuffer {
   var _long = <int, _H263NumberedReference>{};
   var _longLimit = 0;
   H263ErpsBufferSize? _size;
+  (int, int)? _dimensions;
+  var _used = 0;
+
+  void checkResamplingCapacity(H263Format format) {
+    final size = _size!;
+    final (:columns, :rows) = h263ErpsGrid(size, (format.width, format.height));
+    if (_used + columns * rows > size.capacity) {
+      throw const FormatException(
+        'H.263+ ERPS buffer has no room for resampling',
+      );
+    }
+  }
 
   List<_H263Reference> ordered(H263Erps selection) {
     final front = <_H263NumberedReference>{};
@@ -36,16 +48,19 @@ final class _H263ErpsBuffer {
     if (size == null || _size == null && !reset) {
       throw const FormatException('Missing initial H.263+ ERPS buffer reset');
     }
-    if (16 * size.width < frame.picture.width ||
-        16 * size.height < frame.picture.height) {
-      throw UnsupportedError('H.263+ ERPS sub-picture buffering');
-    }
+    final dimensions = (frame.picture.width, frame.picture.height);
     if (!reset &&
-        (size.width != _size!.width || size.height != _size!.height)) {
+        (size.width != _size!.width ||
+            size.height != _size!.height ||
+            dimensions != _dimensions)) {
       throw const FormatException(
         'H.263+ ERPS buffer geometry changed without reset',
       );
     }
+    final (:columns, :rows) = h263ErpsGrid(size, dimensions);
+    final count = columns * rows;
+    int occupied(_H263NumberedReference entry) =>
+        entry.frame.picture._subPictures?.active ?? count;
 
     final short = reset ? <int, _H263NumberedReference>{} : {..._short};
     final long = reset ? <int, _H263NumberedReference>{} : {..._long};
@@ -57,13 +72,37 @@ final class _H263ErpsBuffer {
     }
     short[number] = (number: number, frame: frame);
     var longLimit = _longLimit;
-    for (final (:operation, :argument, :destination, size: _)
+    for (final (:operation, :argument, :destination, size: _, :removal)
         in selection.commands) {
       switch (operation) {
         case H263ErpsOperation.removeShort:
           short.remove(argument);
         case H263ErpsOperation.removeLong:
           long.remove(argument);
+        case H263ErpsOperation.removeShortRegions:
+        case H263ErpsOperation.removeLongRegions:
+          final references = operation == H263ErpsOperation.removeShortRegions
+              ? short
+              : long;
+          if (references[argument] case final entry?) {
+            final old = entry.frame;
+            final remaining = _H263SubPictures.remove(
+              old.picture,
+              size,
+              removal!,
+            );
+            references[argument] = (
+              number: entry.number,
+              frame: (
+                picture: remaining,
+                temporal: old.temporal,
+                resamplingRound: old.resamplingRound,
+                reduced: old.reduced,
+                motion: old.motion,
+                intraWithMotion: old.intraWithMotion,
+              ),
+            );
+          }
         case H263ErpsOperation.assignLong:
           if (destination! >= longLimit) {
             throw const FormatException(
@@ -88,18 +127,24 @@ final class _H263ErpsBuffer {
           break;
       }
     }
+    var used = [
+      ...short.values,
+      ...long.values,
+    ].fold(0, (total, entry) => total + occupied(entry));
     if (selection.sliding) {
-      while (short.length > 1 && short.length + long.length > size.capacity) {
-        short.remove(short.keys.first);
+      while (short.length > 1 && used > size.capacity) {
+        used -= occupied(short.remove(short.keys.first)!);
       }
     }
-    if (short.length + long.length > size.capacity) {
+    if (used > size.capacity) {
       throw const FormatException('H.263+ ERPS reference buffer full');
     }
     _short = short;
     _long = long;
     _longLimit = longLimit;
     _size = size;
+    _dimensions = dimensions;
+    _used = used;
   }
 }
 
@@ -164,6 +209,7 @@ final class _H263ErpsSelection {
           'H.263+ ERPS resampling requires one reference picture',
         );
       }
+      if (warp) buffer.checkResamplingCapacity(header.format);
       _resampled = warp;
       final round = header.bidirectional
           ? backward(picture, 0).resamplingRound

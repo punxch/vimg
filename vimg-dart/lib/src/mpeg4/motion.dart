@@ -231,7 +231,7 @@ final class _Mpeg4MotionCompensation {
       sumY += quarter ? vector.y ~/ 2 : vector.y;
       luma(
         output.planes[0],
-        (lumaReferences?[i] ?? reference).planes[0],
+        (lumaReferences?[i] ?? reference)._referencePlane(0),
         stride,
         lines,
         blockSize * (x * 2 + (i & 1)),
@@ -278,7 +278,7 @@ final class _Mpeg4MotionCompensation {
     for (var plane = 1; plane < 3; plane++) {
       _half(
         output.planes[plane],
-        reference.planes[plane],
+        reference._referencePlane(plane),
         output.stride >> 1,
         output.rows * 8,
         x * blockSize,
@@ -370,7 +370,7 @@ final class _Mpeg4MotionCompensation {
 
   void _quarter(
     Uint8List output,
-    Uint8List reference,
+    List<int> reference,
     int stride,
     int height,
     int x,
@@ -487,7 +487,7 @@ final class _Mpeg4MotionCompensation {
 
   void _half(
     Uint8List output,
-    Uint8List reference,
+    List<int> reference,
     int stride,
     int height,
     int x,
@@ -499,6 +499,8 @@ final class _Mpeg4MotionCompensation {
     bool average, {
     _FieldPair? field,
     int? rows,
+    int? columns,
+    int outputOffset = 0,
     bool packed = false,
     bool truncateAverage = false,
     _MotionBounds? bounds,
@@ -516,9 +518,9 @@ final class _Mpeg4MotionCompensation {
       final top = source.clamp(minY, maxY) * stride;
       final bottom = (source + dy * step).clamp(minY, maxY) * stride;
       final target = packed
-          ? j * size
+          ? outputOffset + j * size
           : ((y + j) * step + destinationField) * stride + x;
-      for (var i = 0; i < size; i++) {
+      for (var i = 0; i < (columns ?? size); i++) {
         final left = (sx + i).clamp(minX, maxX);
         final right = (sx + i + dx).clamp(minX, maxX);
         final a = reference[top + left];

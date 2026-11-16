@@ -2,9 +2,35 @@ part of 'decoder.dart';
 
 final class H263Picture extends _DctPicture {
   H263Picture._(this.format, {bool reduced = false})
-    : super(format.width, format.height, alignment: reduced ? 32 : 16);
+    : _referencePixels = null,
+      _subPictures = null,
+      super(format.width, format.height, alignment: reduced ? 32 : 16);
+
+  H263Picture._reference(
+    this.format,
+    _H263ReferencePixels referencePixels, {
+    required bool reduced,
+    _H263SubPictures? subPictures,
+  }) : _referencePixels = referencePixels,
+       _subPictures = subPictures,
+       super(
+         format.width,
+         format.height,
+         alignment: reduced ? 32 : 16,
+         allocate: false,
+       );
 
   final H263Format format;
+  final _H263ReferencePixels? _referencePixels;
+  final _H263SubPictures? _subPictures;
+  late final _views = [
+    for (var plane = 0; plane < 3; plane++)
+      _referencePixels!(plane, stride, rows * 16),
+  ];
+
+  @override
+  List<int> _referencePlane(int plane) =>
+      _referencePixels == null ? planes[plane] : _views[plane];
   Set<_MotionBounds>? _segments;
 
   image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
@@ -257,7 +283,9 @@ final class H263Decoder {
       _erpsBuffers.remove(header.layer);
     }
     final previous = _references[header.layer];
-    if (!_headers.spark && previous != null) {
+    if (erps != null) {
+      _olderReferences.remove(header.layer);
+    } else if (!_headers.spark && previous != null) {
       _olderReferences[header.layer] = previous;
     }
     _references[header.layer] = entry;

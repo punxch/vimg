@@ -107,6 +107,7 @@ final class H263Headers {
   final Map<int, H263LayerState> _layers;
   final _references = <int, ({H263Format format, H263Resampling? warp})>{};
   final _lastTemporal = <int, int>{};
+  final _erpsSizes = <int, H263ErpsBufferSize>{};
   (int, int, int)? _lastErps;
 
   Map<int, H263LayerState>? snapshotLayers() =>
@@ -260,6 +261,8 @@ final class H263Headers {
           number,
           intra: intra || enhancementIntra,
           bidirectional: bidirectional,
+          dimensions: (format.width, format.height),
+          previousSize: _erpsSizes[layer],
         );
       }
       quant = bits.read(5);
@@ -313,8 +316,14 @@ final class H263Headers {
       _lastTemporal[layer] = temporal;
       if (updateBase) _extended = format;
       if (layerState != null) _layers[layer] = layerState;
-      if (!bidirectional)
+      if (!bidirectional) {
         _references[layer] = (format: format, warp: resampling);
+        if (erps?.bufferSize case final size?) {
+          _erpsSizes[layer] = size;
+        } else if (erps == null) {
+          _erpsSizes.remove(layer);
+        }
+      }
     }
     return (
       format: format,

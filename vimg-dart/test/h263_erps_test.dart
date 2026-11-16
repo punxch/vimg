@@ -9,6 +9,8 @@ import 'fixtures.dart';
 
 const _input = 'test/fixtures/h263-erps-whole.h263';
 const _multiple = 'test/fixtures/h263-erps-multiple.h263';
+const _subPictures = 'test/fixtures/h263-erps-subpictures.h263';
+const _paddedWarp = 'test/fixtures/h263-erps-padded-warp.h263';
 
 Future<void> main(List<String> arguments) async {
   // Inter- and B-pictures choose older anchors across intra pictures,
@@ -75,7 +77,55 @@ Future<void> main(List<String> arguments) async {
       (16, 2535081388),
     ],
   );
-  _checkEviction();
+  // Short/long-term masks, zero-run bitmap markers, fractional motion
+  // across four retained tiles, and eviction by occupied tile count.
+  await _verify(
+    _subPictures,
+    (72, 28),
+    [
+      (0, 2153101045),
+      (4, 322539532),
+      (8, 3002023244),
+      (12, 1121029168),
+      (16, 3002023244),
+      (20, 3002023244),
+    ],
+  );
+  await _verify(
+    _paddedWarp,
+    (40, 52),
+    [
+      (0, 941703994),
+      (4, 1027202200),
+      (8, 3988724616),
+      (12, 1313674173),
+      (16, 2225769141),
+    ],
+  );
+  // Only the half affected by a remote OBMC vector may be sampled.
+  await _verify(
+    'test/fixtures/h263-erps-subpicture-obmc.h263',
+    (72, 28),
+    [(0, 2153101045), (4, 322539532), (8, 1397535920)],
+  );
+  _checkRejections(_input, [
+    (7, 'slid', 'Missing H.263+ ERPS reference index 1'),
+    (9, 'removed', 'Missing H.263+ ERPS reference index 1'),
+  ]);
+  _checkRejections(_subPictures, [
+    (2, 'removed-tap', 'H.263+ motion references an unused ERPS sub-picture'),
+    (2, 'restore', 'H.263+ ERPS bitmap restores an unused sub-picture'),
+    (2, 'bitmap-marker', 'Missing H.263+ ERPS bitmap marker'),
+    (2, 'too-full', 'H.263+ ERPS reference buffer full'),
+    (5, 'sliding-partial', 'Missing H.263+ ERPS reference index 3'),
+  ]);
+  _checkRejections(_paddedWarp, [
+    (
+      3,
+      'removed-warp-tap',
+      'H.263+ motion references an unused ERPS sub-picture',
+    ),
+  ]);
   if (arguments.firstOrNull case final cli?) {
     final directory = Directory.systemTemp.createTempSync('vimg-h263-erps-');
     try {
@@ -89,7 +139,7 @@ Future<void> main(List<String> arguments) async {
         '-t160ms',
         '-o',
         output.path,
-        _multiple,
+        _subPictures,
       ]);
       check(result.exitCode == 0, 'H.263 ERPS capture ${result.stderr}');
       check(
@@ -140,13 +190,13 @@ Future<void> _verify(
   }
 }
 
-void _checkEviction() {
-  final bytes = File(_input).readAsBytesSync();
+void _checkRejections(String path, List<(int, String, String)> cases) {
+  final bytes = File(path).readAsBytesSync();
   final offsets = [
     for (var i = 0; i + 2 < bytes.length; i++)
       if (bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] & 0xfc == 0x80) i,
   ];
-  for (final (stop, packet) in [(7, 'slid'), (9, 'removed')]) {
+  for (final (stop, packet, message) in cases) {
     final decoder = H263Decoder();
     for (var i = 0; i < stop; i++) {
       decoder.decodePair(
@@ -154,19 +204,14 @@ void _checkEviction() {
         includeBidirectional: true,
       );
     }
-    _expectMissing(decoder, packet, 1);
-  }
-}
-
-void _expectMissing(H263Decoder decoder, String packet, int index) {
-  final data = File('test/fixtures/h263-erps-$packet.packet').readAsBytesSync();
-  try {
-    decoder.decode(data);
-    throw StateError('Accepted an evicted ERPS reference');
-  } on FormatException catch (failure) {
-    check(
-      failure.message == 'Missing H.263+ ERPS reference index $index',
-      'ERPS eviction ${failure.message}',
-    );
+    final data = File(
+      'test/fixtures/h263-erps-$packet.packet',
+    ).readAsBytesSync();
+    try {
+      decoder.decode(data);
+      throw StateError('Accepted invalid ERPS packet $packet');
+    } on FormatException catch (failure) {
+      check(failure.message == message, '$packet: ${failure.message}');
+    }
   }
 }

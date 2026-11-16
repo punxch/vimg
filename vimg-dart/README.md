@@ -204,11 +204,13 @@ Annex N reference picture selection uses the temporal reference signalled in
 picture, GOB and slice headers. Random access preserves older references across
 intra pictures, and redundant copies share one display frame. Multiplexed
 back-channel messages require reverse-stream configuration and remain pending.
-Annex U supports whole-picture buffers with sliding-window and adaptive
+Annex U supports sliding-window and adaptive buffering with
 short- and long-term references. Picture, GOB and slice headers can remap
 the reference order. P, Improved PB, EP and B pictures can select references
 per macroblock, including four-reference luma prediction and two selectable
-backward references in B pictures. Sub-picture removal remains pending.
+backward references in B pictures. Sub-picture removal frees unused sample
+tiles from short- and long-term references. Buffer capacity is measured in
+sub-picture units.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
 and disposable Spark pictures.
 

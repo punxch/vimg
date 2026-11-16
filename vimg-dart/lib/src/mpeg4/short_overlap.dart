@@ -82,7 +82,7 @@ final class _H263Overlap {
     List<_Vector> vectors,
     _MotionBounds? bounds,
   ) {
-    final output = picture.planes[0], source = reference.planes[0];
+    final output = picture.planes[0], source = reference._referencePlane(0);
     final stride = picture.stride, height = picture.rows * 16;
     final size = 8 << _scale;
     final center = vectors.first;
@@ -105,19 +105,27 @@ final class _H263Overlap {
     }
     for (final (i, vector) in vectors.indexed) {
       if (i != 0 && vector == center) continue;
+      // A remote vector contributes only to the corresponding half.
+      final vertical = i == 1 || i == 2;
+      final horizontal = i == 3 || i == 4;
+      final startY = i == 2 ? size ~/ 2 : 0;
+      final startX = i == 4 ? size ~/ 2 : 0;
       sampler._half(
         _samples[i],
         source,
         stride,
         height,
-        x,
-        y,
+        x + startX,
+        y + startY,
         size,
         vector.x,
         vector.y,
         _noRound,
         false,
         packed: true,
+        rows: vertical ? size ~/ 2 : size,
+        columns: horizontal ? size ~/ 2 : size,
+        outputOffset: startY * size + startX,
         bounds: bounds,
       );
     }
