@@ -122,20 +122,24 @@ final class YuvImageScaler {
         ? terminal
         : null;
     final evaluated = <FilterPicture, _VideoPlanes>{};
-    _VideoPlanes evaluate(FilterPicture node) => evaluated.putIfAbsent(
-      node,
-      () {
-        return switch (node) {
-          FilterInputPicture(:final packet) => source(packet)._planes,
-          FilterOperationPicture(:final step, :final inputs, :final position) =>
-            _applyFilterStep(
-              graph.steps[step].filter,
-              inputs.map(evaluate).toList(),
-              position,
-            ),
-        };
-      },
-    );
+    _VideoPlanes evaluate(FilterPicture node) =>
+        evaluated.putIfAbsent(node, () {
+          return switch (node) {
+            FilterInputPicture(:final packet) => source(packet)._planes,
+            FilterOperationPicture(
+              :final step,
+              :final inputs,
+              :final position,
+              :final enablePosition,
+            ) =>
+              _applyFilterStep(
+                graph.steps[step],
+                inputs.map(evaluate).toList(),
+                position,
+                enablePosition: enablePosition,
+              ),
+          };
+        });
     return _convertFiltered(
       evaluate(scale == null ? picture : operation!.inputs.single),
       scale,

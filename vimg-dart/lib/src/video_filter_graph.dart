@@ -50,13 +50,49 @@ Iterable<_FilterEntry> _filterEntries(String source) sync* {
   }
 }
 
-Object? _graphFilter(String specification) {
+({Object? filter, _FilterEnable? enable}) _readGraphFilter(
+  String specification,
+) {
   final equal = specification.indexOf('=');
   final name = (equal < 0 ? specification : specification.substring(0, equal))
       .trim()
       .split('@')
       .first;
-  final args = equal < 0 ? null : specification.substring(equal + 1);
+  var args = equal < 0 ? null : specification.substring(equal + 1);
+  _FilterEnable? enable;
+  if (args != null && args.contains('enable')) {
+    final remaining = <String>[];
+    for (final option in _splitFilterOptions(args.replaceAll(r'\\:', r'\:'))) {
+      final separator = option.indexOf('=');
+      if (separator < 0 || option.substring(0, separator).trim() != 'enable') {
+        remaining.add(option);
+        continue;
+      }
+      if (!const {
+        'hflip',
+        'vflip',
+        'drawbox',
+        'negate',
+        'overlay',
+        'alphamerge',
+        'premultiply',
+        'unpremultiply',
+      }.contains(name)) {
+        throw FormatException('$name does not support enable');
+      }
+      if (enable != null) {
+        throw const FormatException('Duplicate video filter option: enable');
+      }
+      enable = _FilterEnable.parse(
+        _filterValue(option.substring(separator + 1)),
+      );
+    }
+    if (enable != null) args = remaining.isEmpty ? null : remaining.join(':');
+  }
+  return (filter: _graphFilter(name, args), enable: enable);
+}
+
+Object? _graphFilter(String name, String? args) {
   if (const {'null', 'hflip', 'vflip', 'alphaextract'}.contains(name) &&
       args != null) {
     throw FormatException('$name takes no options');
@@ -89,7 +125,12 @@ Object? _graphFilter(String specification) {
   };
 }
 
-typedef _FilterStep = ({Object? filter, List<int> inputs, List<int> outputs});
+typedef _FilterStep = ({
+  Object? filter,
+  _FilterEnable? enable,
+  List<int> inputs,
+  List<int> outputs,
+});
 
 List<_FilterStep> _orderedFilterSteps(
   String source, {
@@ -97,11 +138,18 @@ List<_FilterStep> _orderedFilterSteps(
 }) {
   final labels = <String, int>{};
   final entries =
-      <({Object? filter, List<Object> inputs, List<int> outputs})>[];
+      <
+        ({
+          Object? filter,
+          _FilterEnable? enable,
+          List<Object> inputs,
+          List<int> outputs,
+        })
+      >[];
   var nextLink = 1;
   var pending = const <int>[];
   for (final entry in _filterEntries(source)) {
-    final filter = _graphFilter(entry.specification);
+    final (:filter, :enable) = _readGraphFilter(entry.specification);
     final inputCount = switch (filter) {
       final _Stack stack => stack.inputs,
       _Overlay() || _MergeAlpha() => 2,
@@ -127,7 +175,12 @@ List<_FilterStep> _orderedFilterSteps(
       labels[label] = outputs[index];
     }
     pending = outputs.sublist(entry.outputs.length);
-    entries.add((filter: filter, inputs: inputs, outputs: outputs));
+    entries.add((
+      filter: filter,
+      enable: enable,
+      inputs: inputs,
+      outputs: outputs,
+    ));
   }
 
   final producers = <int, _FilterStep>{};
@@ -144,7 +197,12 @@ List<_FilterStep> _orderedFilterSteps(
       }
       inputs.add(link);
     }
-    final step = (filter: entry.filter, inputs: inputs, outputs: entry.outputs);
+    final step = (
+      filter: entry.filter,
+      enable: entry.enable,
+      inputs: inputs,
+      outputs: entry.outputs,
+    );
     for (final link in entry.outputs) {
       producers[link] = step;
     }
@@ -369,6 +427,7 @@ List<_FilterStep> _negotiateFilterFormats(
             regions[step.outputs.first]!.root,
           ),
         ),
+        enable: step.enable,
         inputs: step.inputs,
         outputs: step.outputs,
       ),
@@ -507,7 +566,8 @@ VideoFilterChain _compileFilterGraph(
         case final _TimingFilter filter:
           timing.add(filter);
         case final _SpatialFilter filter:
-          addSpatial(filter);
+          final enable = step.enable;
+          addSpatial(enable == null ? filter : _EnabledSpatial(filter, enable));
       }
     } else {
       if (filter is _TimingFilter) {
@@ -541,6 +601,7 @@ final class _FilterBranches extends _FrameSpatialFilter {
 
   @override
   late final bool usesFramePosition = steps.any((step) {
+    if (step.enable?.usesFramePosition == true) return true;
     return switch (step.filter) {
       final _Overlay filter => filter.usesFramePosition,
       final _FrameSpatialFilter filter => filter.usesFramePosition,
@@ -553,7 +614,7 @@ final class _FilterBranches extends _FrameSpatialFilter {
     final active = {steps.first.inputs.single: frame};
     for (final step in steps) {
       final inputs = [for (final link in step.inputs) active.remove(link)!];
-      final result = _applyFilterStep(step.filter, inputs, position);
+      final result = _applyFilterStep(step, inputs, position);
       for (final link in step.outputs) {
         active[link] = result;
       }
@@ -563,28 +624,40 @@ final class _FilterBranches extends _FrameSpatialFilter {
 }
 
 _VideoPlanes _applyFilterStep(
-  Object? filter,
+  _FilterStep step,
   List<_VideoPlanes> inputs,
-  FilterFramePosition position,
-) => switch (filter) {
-  final _Stack stack => stack.apply(inputs),
-  final _Overlay filter => filter.apply(
-    inputs[0],
-    inputs.elementAtOrNull(1),
-    position,
-  ),
-  final _MergeAlpha filter => filter.apply(
-    inputs[0],
-    inputs.elementAtOrNull(1),
-  ),
-  final _VideoAlphaFilter filter when !filter.inplace => filter.applyMask(
-    inputs[0],
-    inputs[1],
-  ),
-  final _FrameSpatialFilter filter => filter.applyAt(inputs.single, position),
-  final _SpatialFilter filter => filter.apply(inputs.single),
-  _ => inputs.single,
-};
+  FilterFramePosition position, {
+  FilterFramePosition? enablePosition,
+}) {
+  final enabled =
+      step.enable?.allows(inputs.first, enablePosition ?? position) ?? true;
+  return switch (step.filter) {
+    final _Stack stack => stack.apply(inputs),
+    final _Overlay filter => filter.apply(
+      inputs[0],
+      inputs.elementAtOrNull(1),
+      position,
+      enabled: enabled,
+    ),
+    final _MergeAlpha filter => filter.apply(
+      inputs[0],
+      inputs.elementAtOrNull(1),
+      enabled: enabled,
+    ),
+    final _VideoAlphaFilter filter when !filter.inplace => filter.applyMask(
+      inputs[0],
+      inputs[1],
+      enabled: enabled,
+    ),
+    final _SpatialFilter filter => _applySpatialFilter(
+      filter,
+      inputs.single,
+      position,
+      enabled,
+    ),
+    _ => inputs.single,
+  };
+}
 
 int _filterPadCount(Map<String, String> options, String key, int minimum) {
   final count = _filterInteger(options, key, minimum: minimum) ?? 2;

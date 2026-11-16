@@ -72,10 +72,16 @@ final class FilterInputPicture extends FilterPicture {
 }
 
 final class FilterOperationPicture extends FilterPicture {
-  const FilterOperationPicture(this.step, this.inputs, this.position);
+  const FilterOperationPicture(
+    this.step,
+    this.inputs,
+    this.position, {
+    this.enablePosition,
+  });
   final int step;
   final List<FilterPicture> inputs;
   final FilterFramePosition position;
+  final FilterFramePosition? enablePosition;
 }
 
 typedef CaptureSource = ({CaptureFrame frame, int index});

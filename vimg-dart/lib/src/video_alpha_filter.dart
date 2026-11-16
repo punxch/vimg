@@ -68,7 +68,11 @@ final class _MergeAlpha {
     bitmapTerminal ? format.packedAlphaFormat : null,
   );
 
-  _VideoPlanes apply(_VideoPlanes frame, _VideoPlanes? mask) {
+  _VideoPlanes apply(
+    _VideoPlanes frame,
+    _VideoPlanes? mask, {
+    required bool enabled,
+  }) {
     if (mask != null &&
         (frame.width != mask.width || frame.height != mask.height)) {
       throw const FormatException(
@@ -86,7 +90,7 @@ final class _MergeAlpha {
       matrix: target.matrix,
       fullRange: target.fullRange,
     );
-    final opacity = mask == null
+    final opacity = !enabled || mask == null
         ? base.alpha!
         : _frameFormat(mask) == _gray
         ? mask.planes.single
@@ -164,9 +168,10 @@ final class _VideoAlphaFilter implements _SpatialFilter {
       _VideoAlphaFilter._(inplace, mode, planes, format);
 
   @override
-  _VideoPlanes apply(_VideoPlanes frame) {
+  _VideoPlanes apply(_VideoPlanes frame, {bool enabled = true}) {
     final target = format.select(frame);
     final base = _prepare(frame, target);
+    if (!enabled) return base;
     final associated = mode ?? format.alphaMode(base);
     if (associated == null ||
         mode == null && base.premultiplied == associated) {
@@ -181,7 +186,11 @@ final class _VideoAlphaFilter implements _SpatialFilter {
     );
   }
 
-  _VideoPlanes applyMask(_VideoPlanes frame, _VideoPlanes mask) {
+  _VideoPlanes applyMask(
+    _VideoPlanes frame,
+    _VideoPlanes mask, {
+    required bool enabled,
+  }) {
     if (frame.width != mask.width || frame.height != mask.height) {
       throw const FormatException(
         'Alpha mask and video must have the same size',
@@ -189,6 +198,7 @@ final class _VideoAlphaFilter implements _SpatialFilter {
     }
     final target = format.select(frame);
     final base = _prepare(frame, target);
+    if (!enabled) return base;
     final opacity = _converter
         .convert(
           mask,

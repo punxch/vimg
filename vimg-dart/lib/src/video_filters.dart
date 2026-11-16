@@ -241,6 +241,63 @@ abstract class _FrameSpatialFilter implements _SpatialFilter {
 
 const _frameVariables = {'n', 't'};
 
+final class _FilterEnable {
+  factory _FilterEnable.parse(String source) {
+    var usesFramePosition = false;
+    final expression = parseFilterExpression(
+      source,
+      const {..._frameVariables, 'w', 'h'},
+      onVariable: (name) => usesFramePosition |= _frameVariables.contains(name),
+    );
+    return _FilterEnable._(expression, usesFramePosition);
+  }
+
+  const _FilterEnable._(this.expression, this.usesFramePosition);
+
+  final FilterExpression expression;
+  final bool usesFramePosition;
+
+  bool allows(_VideoPlanes frame, FilterFramePosition position) =>
+      expression({
+        'n': position.index.toDouble(),
+        't': position.seconds,
+        'w': frame.width.toDouble(),
+        'h': frame.height.toDouble(),
+      }).abs() >=
+      0.5;
+}
+
+final class _EnabledSpatial extends _FrameSpatialFilter {
+  _EnabledSpatial(this.filter, this.enable);
+
+  final _SpatialFilter filter;
+  final _FilterEnable enable;
+
+  @override
+  bool get usesFramePosition => enable.usesFramePosition;
+
+  @override
+  _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) =>
+      _applySpatialFilter(
+        filter,
+        frame,
+        position,
+        enable.allows(frame, position),
+      );
+}
+
+_VideoPlanes _applySpatialFilter(
+  _SpatialFilter filter,
+  _VideoPlanes frame,
+  FilterFramePosition position,
+  bool enabled,
+) => switch (filter) {
+  final _VideoAlphaFilter filter => filter.apply(frame, enabled: enabled),
+  _ when !enabled => frame,
+  final _FrameSpatialFilter filter => filter.applyAt(frame, position),
+  _ => filter.apply(frame),
+};
+
 final class _PresentationCrop implements _SpatialFilter {
   const _PresentationCrop(this.crop);
   final VideoCrop crop;

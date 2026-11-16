@@ -161,8 +161,9 @@ final class _Overlay {
   _VideoPlanes apply(
     _VideoPlanes input,
     _VideoPlanes? secondary,
-    FilterFramePosition position,
-  ) {
+    FilterFramePosition position, {
+    required bool enabled,
+  }) {
     final negotiated = outputFormat ?? mainFormat;
     final original = mainFormat.matchingFormat(input);
     final secondaryLayout = format == null && secondary != null
@@ -184,7 +185,7 @@ final class _Overlay {
             matrix: selection.matrix,
           )
         : input;
-    if (secondary == null) return main;
+    if (!enabled || secondary == null) return main;
     final over = _converter.convert(
       identical(input, secondary) ? main : secondary,
       target,

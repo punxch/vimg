@@ -132,6 +132,7 @@ final class _SynchronizedFilterGraph {
       for (final source in sources) _FilterSyncInput(source, clock),
     ];
     final main = inputs.first;
+    final trackEnable = steps[step].enable?.usesFramePosition == true;
     final stackDuration = outputRate == null
         ? 1
         : math.max(1, checkedCaptureTick(1 / (outputRate * clock.value)));
@@ -213,6 +214,7 @@ final class _SynchronizedFilterGraph {
             if (input.frame case final frame?) _pictureOf(frame),
         ],
         (index: main.index, seconds: pts * outputClock.value),
+        enablePosition: trackEnable ? main.consumedPosition : null,
       );
       lastOutput = pts;
       yield primary.withPicture(picture);
@@ -276,14 +278,26 @@ final class _FilterSyncInput {
   final Iterator<CaptureTimelineEvent> events;
   CaptureTimedFrame? frame, next;
   int? nextTime, end;
+  int? _lastInputPts;
   var ended = false;
   var index = -1;
+
+  // Framesync evaluates enable when taking a frame from the main link's FIFO.
+  // This can be a lookahead frame while a secondary event still uses the last main picture.
+  FilterFramePosition? get consumedPosition => switch (_lastInputPts) {
+    final pts? => (
+      index: next == null ? index : index + 1,
+      seconds: pts * source.timeBase.value,
+    ),
+    null => null,
+  };
 
   void prepare(bool stopExtending) {
     if (nextTime != null || ended) return;
     if (events.moveNext()) {
       final event = events.current;
       if (event is CaptureTimedFrame) {
+        _lastInputPts = event.pts;
         final time = rescaleCaptureTicks(event.pts, source.timeBase, clock);
         next = event.retime(time);
         nextTime = time;

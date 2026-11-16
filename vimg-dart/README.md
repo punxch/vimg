@@ -359,6 +359,14 @@ expressions use the timeline at their position in the chain. A crop after
 original frames. Wall-clock expressions, expressions that depend on earlier
 spatial evaluations, and arbitrary external graph inputs are pending.
 
+`hflip`, `vflip`, `drawbox`, `negate`, `overlay`, `alphamerge`,
+`premultiply` and `unpremultiply` accept `enable` expressions. For example,
+`--vfilter "fps=8,hflip=enable='between(n,8,15)'"` flips frames 8 through 15
+of each capture window. `n` starts at zero, `t` is the input time in seconds,
+and `w` and `h` are input dimensions. A result with absolute value below
+0.5 bypasses the effect. A two-input filter evaluates the expression when
+it reads a main-branch frame and continues to synchronize both branches.
+
 Single-input, single-output filter graphs can fan out with `split` and
 rejoin with `hstack` or `vstack`. For example,
 `--vfilter 'split[a][b];[b]hflip[c];[a][c]hstack'` puts each frame beside
@@ -503,6 +511,7 @@ dart test/video_test.dart
 dart test/video_filters_test.dart
 dart test/video_paint_filters_test.dart
 dart test/video_timing_test.dart
+dart test/video_enable_test.dart
 dart test/capture_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart
