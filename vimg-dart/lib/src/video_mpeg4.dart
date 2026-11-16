@@ -61,7 +61,9 @@ extension _Mpeg4Timeline on Video {
               mpeg4Clock: unit.clock,
             );
             sections[first] = sectionStart;
-          } else if (vop.coded && vop.type == Mpeg4PictureType.predictive) {
+          } else if (vop.coded &&
+              (vop.type == Mpeg4PictureType.predictive ||
+                  vop.type == Mpeg4PictureType.sprite)) {
             forward = first;
           }
           final bitstreamTime = vop.pts / volume.resolution;

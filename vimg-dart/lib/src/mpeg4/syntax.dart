@@ -5,6 +5,8 @@ import '../mpeg12/syntax.dart' show mpegStartCodes, mpegZigzag;
 import '../rbsp.dart';
 import 'tables.dart';
 
+part 'sprite.dart';
+
 enum Mpeg4PictureType { intra, predictive, bidirectional, sprite }
 
 typedef Mpeg4Signal = ({int matrix, bool fullRange});
@@ -38,7 +40,8 @@ class Mpeg4Volume {
   final double aspect;
   final Mpeg4Signal signal;
   final bool interlaced, quarter, resync, partitioned, reversibleVlc;
-  final int sprite, quantBits;
+  final Mpeg4Sprite? sprite;
+  final int quantBits;
   final List<int>? intraMatrix, interMatrix;
   final int complexityIntra, complexityPredictive, complexityBidirectional;
 
@@ -94,8 +97,11 @@ class Mpeg4Volume {
     final interlaced = bits.flag();
     if (!bits.flag())
       throw UnsupportedError('MPEG-4 overlapped motion compensation');
-    final sprite = bits.read(version == 1 ? 1 : 2);
-    if (sprite != 0) throw UnsupportedError('MPEG-4 sprite geometry');
+    final spriteUsage = bits.read(version == 1 ? 1 : 2);
+    if (spriteUsage == 1) throw UnsupportedError('MPEG-4 static sprites');
+    if (spriteUsage == 3)
+      throw const FormatException('Invalid MPEG-4 sprite usage');
+    final sprite = spriteUsage == 2 ? Mpeg4Sprite.read(bits) : null;
     var quantBits = 5;
     if (bits.flag()) {
       quantBits = bits.read(4);
@@ -201,6 +207,7 @@ typedef Mpeg4Vop = ({
   int pts,
   bool coded,
   bool noRound,
+  Mpeg4Gmc? globalMotion,
   bool topFieldFirst,
   int? fieldInterval,
   bool alternateScan,
@@ -211,7 +218,12 @@ typedef Mpeg4Vop = ({
   Rbsp bits,
 });
 
-typedef Mpeg4Clock = ({int base, int? reference, int? fieldInterval});
+typedef Mpeg4Clock = ({
+  int base,
+  int? reference,
+  int? fieldInterval,
+  bool legacySprite,
+});
 
 typedef Mpeg4CodedVop = ({
   Mpeg4Vop header,
@@ -229,11 +241,13 @@ final class Mpeg4Headers {
   Uint8List? _visualObject;
   var _base = 0, _previousBase = 0;
   int? _lastReference, _previousReference, _fieldInterval;
+  bool _legacySprite = false;
 
   void restoreClock(Mpeg4Clock clock) {
     _base = clock.base;
     _lastReference = clock.reference;
     _fieldInterval = clock.fieldInterval;
+    _legacySprite = clock.legacySprite;
   }
 
   Iterable<Mpeg4CodedVop> read(Uint8List bytes) sync* {
@@ -258,6 +272,15 @@ final class Mpeg4Headers {
           ...?_visualObject,
           ...Uint8List.sublistView(bytes, unit.start, unit.end),
         ]);
+      } else if (unit.code == 0xb2 && unit.end - unit.data >= 4) {
+        final name = String.fromCharCodes(
+          bytes,
+          unit.data,
+          math.min(unit.end, unit.data + 24),
+        );
+        if (name.startsWith('DivX')) {
+          _legacySprite = _divxSpriteMarker.hasMatch(name);
+        }
       } else if (unit.code == 0xb3) {
         final hours = bits.read(5), minutes = bits.read(6);
         mpeg4Marker(bits);
@@ -270,6 +293,7 @@ final class Mpeg4Headers {
           base: _base,
           reference: _lastReference,
           fieldInterval: _fieldInterval,
+          legacySprite: _legacySprite,
         );
         final header = _readVop(bits, layer);
         yield (
@@ -307,6 +331,7 @@ final class Mpeg4Headers {
     final pts = whole * layer.resolution + increment;
     var noRound = false, topFieldFirst = false, alternate = false;
     var threshold = 0, quant = 1, forward = 1, backward = 1;
+    Mpeg4Gmc? globalMotion;
     if (coded) {
       if (!bidirectional) {
         _previousReference = _lastReference;
@@ -319,7 +344,8 @@ final class Mpeg4Headers {
           _fieldInterval = pts - previous;
         }
       }
-      noRound = type == Mpeg4PictureType.predictive && bits.flag();
+      final usesGmc = type == Mpeg4PictureType.sprite;
+      noRound = (type == Mpeg4PictureType.predictive || usesGmc) && bits.flag();
       bits.skip(
         layer.complexityIntra +
             (type == Mpeg4PictureType.intra ? 0 : layer.complexityPredictive) +
@@ -329,6 +355,9 @@ final class Mpeg4Headers {
       if (layer.interlaced) {
         topFieldFirst = bits.flag();
         alternate = bits.flag();
+      }
+      if (usesGmc) {
+        globalMotion = Mpeg4Gmc.read(bits, layer, legacyDivx: _legacySprite);
       }
       quant = bits.read(layer.quantBits);
       if (type != Mpeg4PictureType.intra) forward = bits.read(3);
@@ -345,6 +374,7 @@ final class Mpeg4Headers {
       pts: pts,
       coded: coded,
       noRound: noRound,
+      globalMotion: globalMotion,
       topFieldFirst: topFieldFirst,
       fieldInterval: _fieldInterval,
       alternateScan: alternate,

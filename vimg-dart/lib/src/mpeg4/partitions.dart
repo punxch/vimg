@@ -7,6 +7,7 @@ final class _PartitionMacroblock {
   final bool intra;
   int quant = 0, pattern = 0;
   bool acPrediction = false;
+  bool global = false;
   List<int>? dc;
 }
 
@@ -45,19 +46,25 @@ extension _DataPartitions on _VopDecoder {
         throw const FormatException('Missing MPEG-4 data partition marker');
       }
       if (skipped) {
-        picture.motion.skipped[index] = 1;
+        if (_globalMotion != null) {
+          _saveGlobalVector(index % _columns, index ~/ _columns);
+        } else {
+          picture.motion.skipped[index] = 1;
+        }
         macroblocks.add(null);
       } else {
         final block = _PartitionMacroblock(mode, intra: intra || mode & 4 != 0);
         if (intra) {
           _readPartitionQuantAndDc(block, mode & 4 != 0, macroblocks.isEmpty);
         } else if (!block.intra) {
-          _readFrameVectors(
-            index % _columns,
-            index ~/ _columns,
-            index,
-            mode & 16 != 0,
-          );
+          final x = index % _columns, y = index ~/ _columns;
+          final split = mode & 16 != 0;
+          block.global = _globalMotion != null && !split && _bits.flag();
+          if (block.global) {
+            _saveGlobalVector(x, y);
+          } else {
+            _readFrameVectors(x, y, index, split);
+          }
         }
         macroblocks.add(block);
       }
@@ -125,14 +132,18 @@ extension _DataPartitions on _VopDecoder {
           acPrediction: block.acPrediction,
           dc: block.dc,
         );
+        continue;
+      }
+      if (block?.global ?? (_globalMotion != null)) {
+        _predictGlobal(x, y);
       } else {
         final split = motion.split[index] != 0;
         _prediction.predict(picture, past!, x, y, [
           for (var j = 0; j < (split ? 4 : 1); j++)
             motion.at(x * 2 + (j & 1), y * 2 + (j >> 1)),
         ], noRound: header.noRound);
-        if (block != null) _readResidual(x, y, block.pattern, false);
       }
+      if (block != null) _readResidual(x, y, block.pattern, false);
     }
   }
 }

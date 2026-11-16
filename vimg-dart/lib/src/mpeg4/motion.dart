@@ -93,6 +93,59 @@ final class _Mpeg4MotionCompensation {
   final _sourceRow = Uint8List(17);
   final _horizontal = Uint8List(17 * 16);
 
+  void predictGlobal(
+    Mpeg4Picture output,
+    Mpeg4Picture reference,
+    int x,
+    int y,
+    Mpeg4Gmc warp, {
+    required bool noRound,
+  }) {
+    final precision = warp.accuracy + 1;
+    final scale = warp.scale;
+    final fraction = scale - 1;
+    final bias = (scale * scale >> 1) - (noRound ? 1 : 0);
+    for (var plane = 0; plane < 3; plane++) {
+      final sub = plane == 0 ? 0 : 1;
+      final size = 16 >> sub;
+      final stride = output.stride >> sub;
+      final height = output.rows * size;
+      final pixels = reference.planes[plane];
+      final destination = output.planes[plane];
+      final offset = plane == 0 ? warp.luma : warp.chroma;
+      final dx = warp.stepX, dy = warp.stepY;
+      final left = x * size, top = y * size;
+      var rowX = offset.x + dx.x * left + dy.x * top;
+      var rowY = offset.y + dx.y * left + dy.y * top;
+      if (warp.translation) {
+        rowX = math.min(rowX, (reference.volume.width >> sub) << precision);
+        rowY = math.min(rowY, (reference.volume.height >> sub) << precision);
+      }
+      for (var row = 0; row < size; row++, rowX += dy.x, rowY += dy.y) {
+        final target = (top + row) * stride + left;
+        var valueX = rowX, valueY = rowY;
+        for (var column = 0; column < size; column++) {
+          final scaledX = valueX >> warp.shift, scaledY = valueY >> warp.shift;
+          valueX += dx.x;
+          valueY += dx.y;
+          final srcX = scaledX >> precision, srcY = scaledY >> precision;
+          final wx = scaledX & fraction, wy = scaledY & fraction;
+          final a = srcX.clamp(0, stride - 1);
+          final b = (srcX + 1).clamp(0, stride - 1);
+          final upper = srcY.clamp(0, height - 1) * stride;
+          final lower = (srcY + 1).clamp(0, height - 1) * stride;
+          final upperValue =
+              pixels[upper + a] * (scale - wx) + pixels[upper + b] * wx;
+          final lowerValue =
+              pixels[lower + a] * (scale - wx) + pixels[lower + b] * wx;
+          destination[target + column] =
+              (upperValue * (scale - wy) + lowerValue * wy + bias) >>
+              (2 * precision);
+        }
+      }
+    }
+  }
+
   void predict(
     Mpeg4Picture output,
     Mpeg4Picture reference,

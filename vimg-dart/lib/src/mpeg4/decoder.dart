@@ -74,8 +74,6 @@ final class Mpeg4Decoder {
         if (_future case final repeat?) yield repeat;
         continue;
       }
-      if (header.type == Mpeg4PictureType.sprite)
-        throw UnsupportedError('MPEG-4 sprite pictures');
       final old = header.type == Mpeg4PictureType.intra
           ? null
           : bidirectional
@@ -119,6 +117,7 @@ final class _VopDecoder {
       _threshold = header.dcThreshold,
       _forwardCode = header.forwardCode,
       _backwardCode = header.backwardCode,
+      _globalMotion = header.globalMotion,
       _intra = [
         List<_IntraBlock?>.filled(picture.columns * picture.rows * 4, null),
         List<_IntraBlock?>.filled(picture.columns * picture.rows, null),
@@ -137,6 +136,7 @@ final class _VopDecoder {
   final _rowVectors = List<_Vector>.filled(4, _zeroVector);
   int _quant, _threshold, _forwardCode, _backwardCode;
   int _sliceStart = 0;
+  Mpeg4Gmc? _globalMotion;
 
   void decode() {
     if (header.volume.partitioned &&
@@ -157,11 +157,10 @@ final class _VopDecoder {
             }
             _readIntra(x, y, mode, (mode & 4) != 0);
           case Mpeg4PictureType.predictive:
+          case Mpeg4PictureType.sprite:
             _readPredictive(x, y, index);
           case Mpeg4PictureType.bidirectional:
             _readBidirectional(x, y, index);
-          case Mpeg4PictureType.sprite:
-            throw StateError('Unexpected MPEG-4 sprite picture');
         }
       }
     }
@@ -205,6 +204,13 @@ final class _VopDecoder {
         throw const FormatException('MPEG-4 video packet changes picture type');
       }
       _threshold = mpeg4DcThreshold[_bits.read(3)];
+      if (_globalMotion case final global?) {
+        _globalMotion = Mpeg4Gmc.read(
+          _bits,
+          header.volume,
+          legacyDivx: global.legacyDivx,
+        );
+      }
       if (header.type != Mpeg4PictureType.intra) _forwardCode = _bits.read(3);
       if (header.type == Mpeg4PictureType.bidirectional)
         _backwardCode = _bits.read(3);
@@ -264,10 +270,15 @@ final class _VopDecoder {
     var mode = 20; // stuffing
     while (mode == 20) {
       if (_bits.flag()) {
-        picture.motion.skipped[index] = 1;
-        _prediction.predict(picture, reference, x, y, [
-          _zeroVector,
-        ], noRound: header.noRound);
+        if (_globalMotion != null) {
+          _saveGlobalVector(x, y);
+          _predictGlobal(x, y);
+        } else {
+          picture.motion.skipped[index] = 1;
+          _prediction.predict(picture, reference, x, y, [
+            _zeroVector,
+          ], noRound: header.noRound);
+        }
         return;
       }
       mode = _interMacroblock.read(_bits);
@@ -277,10 +288,17 @@ final class _VopDecoder {
       _readIntra(x, y, mode, changeQuant);
       return;
     }
+    final split = mode & 16 != 0;
+    final global = _globalMotion != null && !split && _bits.flag();
     final pattern = ((_lumaPattern.read(_bits) ^ 15) << 2) | (mode & 3);
     if (changeQuant) _adjustQuant(_quantChange[_bits.read(2)]);
     final fieldDct = header.volume.interlaced && pattern != 0 && _bits.flag();
-    final split = mode & 16 != 0;
+    if (global) {
+      _saveGlobalVector(x, y);
+      _predictGlobal(x, y);
+      _readResidual(x, y, pattern, fieldDct);
+      return;
+    }
     if (header.volume.interlaced && !split && _bits.flag()) {
       final selection = _readFieldSelection();
       final prediction = _predictVector(x, y, 0);
@@ -296,9 +314,7 @@ final class _VopDecoder {
         x: (sumX >> 1) | (sumX & 1),
         y: motion.top.y + motion.bottom.y,
       );
-      for (var block = 0; block < 4; block++) {
-        picture.motion.store(x, y, block, frameVector);
-      }
+      _storeFrameVector(x, y, frameVector);
       _prediction.predictFields(
         picture,
         reference,
@@ -336,11 +352,39 @@ final class _VopDecoder {
     if (split) {
       picture.motion.split[index] = 1;
     } else {
-      for (var block = 0; block < 4; block++) {
-        picture.motion.store(x, y, block, vectors.single);
-      }
+      _storeFrameVector(x, y, vectors.single);
     }
     return vectors;
+  }
+
+  void _storeFrameVector(int x, int y, _Vector vector) {
+    for (var block = 0; block < 4; block++) {
+      picture.motion.store(x, y, block, vector);
+    }
+  }
+
+  void _saveGlobalVector(int x, int y) {
+    _storeFrameVector(
+      x,
+      y,
+      _globalMotion!.averageVector(
+        x,
+        y,
+        _forwardCode,
+        quarter: header.volume.quarter,
+      ),
+    );
+  }
+
+  void _predictGlobal(int x, int y) {
+    _prediction.predictGlobal(
+      picture,
+      past!,
+      x,
+      y,
+      _globalMotion!,
+      noRound: header.noRound,
+    );
   }
 
   void _readBidirectional(int x, int y, int index) {
