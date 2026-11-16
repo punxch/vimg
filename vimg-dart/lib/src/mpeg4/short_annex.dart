@@ -88,10 +88,13 @@ void _deblockH263(
   H263Picture picture,
   Uint8List quantizers, {
   required bool modifiedQuant,
+  Uint16List? segments,
 }) {
   final columns = picture.columns, rows = picture.rows;
   final luma = picture.planes[0];
   final stride = picture.stride, chromaStride = stride >> 1;
+  bool sameSegment(int a, int b) =>
+      segments == null || segments[a] == segments[b];
   void lumaEdge(int x, int y, int quant, {required bool vertical}) {
     _filterH263Edge(
       luma,
@@ -131,7 +134,7 @@ void _deblockH263(
       if (y != 0) {
         final above = quantizers[index - columns];
         final topEdge = current != 0 ? current : above;
-        if (topEdge != 0) {
+        if (topEdge != 0 && sameSegment(index, index - columns)) {
           lumaEdge(lx, ly, topEdge, vertical: false);
           lumaEdge(lx + 8, ly, topEdge, vertical: false);
           chromaEdge(cx, cy, topEdge, vertical: false);
@@ -141,7 +144,8 @@ void _deblockH263(
           final upperLeft = above != 0
               ? above
               : quantizers[index - columns - 1];
-          if (upperLeft != 0) {
+          if (upperLeft != 0 &&
+              sameSegment(index - columns, index - columns - 1)) {
             lumaEdge(lx, ly - 8, upperLeft, vertical: true);
             chromaEdge(cx, cy - 8, upperLeft, vertical: true);
           }
@@ -153,7 +157,7 @@ void _deblockH263(
       }
       if (x != 0) {
         final leftEdge = current != 0 ? current : quantizers[index - 1];
-        if (leftEdge != 0) {
+        if (leftEdge != 0 && sameSegment(index, index - 1)) {
           lumaEdge(lx, ly, leftEdge, vertical: true);
           if (lastRow) {
             lumaEdge(lx, ly + 8, leftEdge, vertical: true);

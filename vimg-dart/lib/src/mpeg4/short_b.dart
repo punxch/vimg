@@ -68,8 +68,9 @@ extension _H263Bidirectional on _H263Macroblocks {
     final columns = _columns, rows = _rows;
     final backward = _PictureMotion(columns, rows, false);
     final newer = _h263AlignReference(latest.picture, reduced: header.reduced);
-    for (final index in _macroblockOrder()) {
+    for (final index in _macroblockOrder(backward: newer)) {
       final (picture: older, :offset, :distance) = _forward!;
+      final bounds = _boundsAt(index);
       final x = index % columns, y = index ~/ columns;
       var mode = _h263BMode.read(_bits);
       while (mode == _h263BModes.length) {
@@ -89,13 +90,19 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (changeQuant) _readQuantChange();
       switch (prediction) {
         case _H263BPrediction.direct:
-          _predictBDirect(older, newer, latest, x, y, offset, distance);
+          _predictBDirect(older, newer, latest, x, y, offset, distance, bounds);
         case _H263BPrediction.forward:
         case _H263BPrediction.both:
           final forward = _readBVector(_motion, x, y);
-          _prediction.predictH263(picture, older, x, y, [
-            forward,
-          ], reduced: header.reduced);
+          _prediction.predictH263(
+            picture,
+            older,
+            x,
+            y,
+            [forward],
+            reduced: header.reduced,
+            bounds: bounds,
+          );
           if (prediction == _H263BPrediction.both) {
             final vector = _readBVector(backward, x, y);
             _prediction.predictH263(
@@ -106,13 +113,20 @@ extension _H263Bidirectional on _H263Macroblocks {
               [vector],
               reduced: header.reduced,
               average: true,
+              bounds: bounds,
             );
           }
         case _H263BPrediction.backward:
           final vector = _readBVector(backward, x, y);
-          _prediction.predictH263(picture, newer, x, y, [
-            vector,
-          ], reduced: header.reduced);
+          _prediction.predictH263(
+            picture,
+            newer,
+            x,
+            y,
+            [vector],
+            reduced: header.reduced,
+            bounds: bounds,
+          );
         case _H263BPrediction.intra:
           break;
       }
@@ -152,6 +166,7 @@ extension _H263Bidirectional on _H263Macroblocks {
     int y,
     int offset,
     int period,
+    _MotionBounds? bounds,
   ) {
     final forward = <_Vector>[], backward = <_Vector>[];
     final size = header.macroblockSize >> 1;
@@ -196,6 +211,7 @@ extension _H263Bidirectional on _H263Macroblocks {
       y,
       forward,
       reduced: header.reduced,
+      bounds: bounds,
     );
     _prediction.predictH263(
       picture,
@@ -205,6 +221,7 @@ extension _H263Bidirectional on _H263Macroblocks {
       backward,
       reduced: header.reduced,
       average: true,
+      bounds: bounds,
     );
   }
 }

@@ -5,6 +5,7 @@ final class H263Picture extends _DctPicture {
     : super(format.width, format.height, alignment: reduced ? 32 : 16);
 
   final H263Format format;
+  Set<_MotionBounds>? _segments;
 
   image.Image rgb({YuvImageScaler? scaler}) => yuvImage(
     y: planes[0],
@@ -109,12 +110,7 @@ final class H263Decoder {
         null,
         selectForward: select,
       );
-      blocks.decodeEnhancement(
-        _h263AlignReference(
-          _h263Upsample(lower.picture, format),
-          reduced: header.reduced,
-        ),
-      );
+      blocks.decodeEnhancement(lower.picture);
       final decoded = _h263AlignReference(picture, reduced: false);
       _saveReference(header, decoded, blocks);
       return (picture: decoded, bidirectional: null);
@@ -282,10 +278,15 @@ final class _H263Macroblocks {
       List<_H263IntraBlock?>.filled(_count, null),
   ];
   late final _filterQuant = Uint8List(_count);
-  late final _filterSlices = header.reduced && header.format.structured
+  late final _filterSlices =
+      header.format.independentSegments ||
+          header.reduced && header.format.structured
       ? Uint16List(_count)
       : null;
   Uint16List? _sliceOwners;
+  final _segmentBounds = <int, _MotionBounds>{};
+  final _validatedReferences = <H263Picture>{};
+  late final _preparedSlices = _prepareSlices();
   late final _sac =
       header.format.arithmetic && !header.bidirectional && !header.enhancement
       ? _H263Sac(_bits)
@@ -323,6 +324,8 @@ final class _H263Macroblocks {
             [_zeroVector],
             reduced: header.reduced,
             noRound: header.noRound,
+            bounds: _boundsAt(index),
+            extend: header.canExtendMotion,
           );
         }
         _pb?.queue(_PbMode.direct, _zeroVector, 0, _forward!);
@@ -357,6 +360,8 @@ final class _H263Macroblocks {
             vectors,
             reduced: header.reduced,
             noRound: header.noRound,
+            bounds: _boundsAt(index),
+            extend: header.canExtendMotion,
           );
         }
       }
@@ -413,6 +418,7 @@ final class _H263Macroblocks {
         picture,
         _filterQuant,
         modifiedQuant: header.format.modifiedQuant,
+        segments: _filterSlices,
       );
     }
   }
@@ -462,7 +468,14 @@ final class _H263Macroblocks {
     final x = index % _columns, y = index ~/ _columns;
     _finishOverlap(x, y);
     if (_pb?.output != null) {
-      _pb!.reconstruct(x, y, _motion, _transform, _reducedSamples);
+      _pb!.reconstruct(
+        x,
+        y,
+        _motion,
+        _transform,
+        _reducedSamples,
+        _boundsAt(index),
+      );
     }
   }
 
@@ -470,7 +483,7 @@ final class _H263Macroblocks {
     final pattern = _pendingPattern;
     if (pattern < 0) return;
     final overlap = _overlap!;
-    overlap.predict(x, y, _pendingReference!);
+    overlap.predict(x, y, _pendingReference!, _boundsAt(y * _columns + x));
     for (var block = 0; block < 6; block++) {
       if (pattern & (32 >> block) != 0) {
         _writeBlock(x, y, block, overlap.residuals[block], intra: false);

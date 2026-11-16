@@ -26,6 +26,7 @@ typedef H263Format = ({
   bool structured,
   int sliceSubmode,
   bool referenceSelection,
+  bool independentSegments,
   bool alternateVlc,
   bool modifiedQuant,
 });
@@ -73,6 +74,12 @@ extension H263PictureLayer on H263Header {
   int get macroblockRows =>
       (format.height + macroblockSize - 1) ~/ macroblockSize;
   int get macroblockCount => macroblockColumns * macroblockRows;
+  bool get canExtendMotion =>
+      format.unrestricted ||
+      format.overlapping ||
+      format.loopFilter ||
+      bidirectional ||
+      enhancement;
 }
 
 extension H263SliceStructure on H263Format {
@@ -204,6 +211,11 @@ final class H263Headers {
         );
       }
       if (explicitResampling) {
+        if (format.independentSegments) {
+          throw const FormatException(
+            'H.263+ independent segments cannot use reference resampling',
+          );
+        }
         if (intra || enhancementIntra) {
           throw const FormatException(
             'Invalid H.263+ intra reference resampling',
@@ -231,6 +243,11 @@ final class H263Headers {
     while (bits.flag()) bits.skip(8);
     ({int address, int? width})? firstSlice;
     if (format.structured) {
+      if (format.independentSegments && !format.rectangularSlices) {
+        throw const FormatException(
+          'H.263+ independent slices must be rectangular',
+        );
+      }
       final (:address, :width, quant: _) = _readSliceHeader(
         bits,
         format,
@@ -467,6 +484,7 @@ H263Format _basicFormat(
   structured: false,
   sliceSubmode: 0,
   referenceSelection: false,
+  independentSegments: false,
   alternateVlc: false,
   modifiedQuant: false,
 );
@@ -481,6 +499,7 @@ typedef _Options = ({
   bool loopFilter,
   bool structured,
   bool referenceSelection,
+  bool independentSegments,
   bool alternateVlc,
   bool modifiedQuant,
 });
@@ -492,8 +511,7 @@ _Options _readOptions(Rbsp bits) {
   final overlapping = bits.flag(), aic = bits.flag(), loop = bits.flag();
   final structured = bits.flag();
   final referenceSelection = bits.flag();
-  if (bits.flag())
-    throw UnsupportedError('H.263+ independent segment decoding');
+  final independentSegments = bits.flag();
   final alternate = bits.flag(), modified = bits.flag();
   if (arithmetic && (unrestricted || alternate || modified)) {
     throw const FormatException('Incompatible H.263+ arithmetic coding modes');
@@ -509,6 +527,7 @@ _Options _readOptions(Rbsp bits) {
     loopFilter: loop,
     structured: structured,
     referenceSelection: referenceSelection,
+    independentSegments: independentSegments,
     alternateVlc: alternate,
     modifiedQuant: modified,
   );
@@ -565,6 +584,7 @@ _Options _readOptions(Rbsp bits) {
       structured: options.structured,
       sliceSubmode: sliceSubmode,
       referenceSelection: options.referenceSelection,
+      independentSegments: options.independentSegments,
       alternateVlc: options.alternateVlc,
       modifiedQuant: options.modifiedQuant,
     ),

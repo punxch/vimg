@@ -9,6 +9,11 @@ H263Picture _h263PredictionReference(
   if (header.resampling == null && _h263Matches(reference, format)) {
     return _h263AlignReference(reference, reduced: header.reduced);
   }
+  if (format.independentSegments) {
+    throw const FormatException(
+      'H.263+ independent reference picture size changed',
+    );
+  }
   if (!header.extended) {
     throw const FormatException('H.263 reference picture size changed');
   }

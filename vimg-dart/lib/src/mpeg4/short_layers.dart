@@ -83,8 +83,15 @@ const _h263EpModes = [
 ];
 
 extension _H263Enhancement on _H263Macroblocks {
-  void decodeEnhancement(H263Picture upward) {
+  void decodeEnhancement(H263Picture lower) {
     final columns = _columns;
+    final segments = header.format.independentSegments
+        ? _upwardSegments(lower)
+        : null;
+    final upward = _h263AlignReference(
+      _h263Upsample(lower, header.format, segments: segments),
+      reduced: header.reduced,
+    );
     final ei = header.enhancementIntra;
     final modes = ei ? _h263EiMode : _h263EpMode;
     final stuffing = ei ? 17 : _h263EpModes.length;
@@ -127,6 +134,7 @@ extension _H263Enhancement on _H263Macroblocks {
           vectors,
           reduced: header.reduced,
           noRound: header.noRound,
+          bounds: _boundsAt(index),
         );
       }
       if (prediction == _LayerPrediction.upward ||
@@ -139,6 +147,7 @@ extension _H263Enhancement on _H263Macroblocks {
           [_zeroVector],
           reduced: header.reduced,
           average: usesForward,
+          bounds: _boundsAt(index),
         );
       }
       for (var block = 0; block < 6; block++) {
@@ -163,7 +172,11 @@ extension _H263Enhancement on _H263Macroblocks {
   }
 }
 
-H263Picture _h263Upsample(H263Picture lower, H263Format target) {
+H263Picture _h263Upsample(
+  H263Picture lower,
+  H263Format target, {
+  Iterable<_MotionBounds>? segments,
+}) {
   if (_h263Matches(lower, target)) return lower;
   final doubleX = lower.width * 2 == target.width;
   final doubleY = lower.height * 2 == target.height;
@@ -172,6 +185,9 @@ H263Picture _h263Upsample(H263Picture lower, H263Format target) {
     throw UnsupportedError('Invalid H.263+ spatial scalability ratio');
   }
   final picture = H263Picture._(target);
+  final regions =
+      segments ??
+      [(left: 0, top: 0, right: picture.stride, bottom: picture.rows * 16)];
   for (var plane = 0; plane < 3; plane++) {
     final sub = plane == 0 ? 0 : 1;
     final source = lower.planes[plane], output = picture.planes[plane];
@@ -182,21 +198,30 @@ H263Picture _h263Upsample(H263Picture lower, H263Format target) {
     final bias = 1 << (shift - 1);
     // Annex O uses quarter-pixel phases between source samples. Multiply
     // the two axes' weights before rounding, including at replicated edges.
-    for (var y = 0; y < height; y++) {
-      final y0 = doubleY ? (y - 1) >> 1 : y;
-      final bottom = ((doubleY ? y0 + 1 : y0).clamp(0, lastY)) * stride;
-      final top = y0.clamp(0, lastY) * stride;
-      final wy = doubleY ? (y.isOdd ? 1 : 3) : 0;
-      final ty = doubleY ? 4 - wy : 1;
-      for (var x = 0; x < outStride; x++) {
-        final x0 = doubleX ? (x - 1) >> 1 : x;
-        final left = x0.clamp(0, lastX);
-        final right = (doubleX ? x0 + 1 : x0).clamp(0, lastX);
-        final wx = doubleX ? (x.isOdd ? 1 : 3) : 0;
-        final tx = doubleX ? 4 - wx : 1;
-        final a = source[top + left] * tx + source[top + right] * wx;
-        final b = source[bottom + left] * tx + source[bottom + right] * wx;
-        output[y * outStride + x] = (a * ty + b * wy + bias) >> shift;
+    for (final region in regions) {
+      final (:left, :top, :right, :bottom) = _scaleMotionBounds(region, sub);
+      final dx = doubleX ? 1 : 0, dy = doubleY ? 1 : 0;
+      final minX = math.min(left >> dx, lastX);
+      final minY = math.min(top >> dy, lastY);
+      final maxX = math.min((right >> dx) - 1, lastX);
+      final maxY = math.min((bottom >> dy) - 1, lastY);
+      final endX = math.min(right, outStride), endY = math.min(bottom, height);
+      for (var y = top; y < endY; y++) {
+        final y0 = doubleY ? (y - 1) >> 1 : y;
+        final lowerRow = (y0 + dy).clamp(minY, maxY) * stride;
+        final upperRow = y0.clamp(minY, maxY) * stride;
+        final wy = doubleY ? (y.isOdd ? 1 : 3) : 0;
+        final ty = doubleY ? 4 - wy : 1;
+        for (var x = left; x < endX; x++) {
+          final x0 = doubleX ? (x - 1) >> 1 : x;
+          final l = x0.clamp(minX, maxX);
+          final r = (x0 + dx).clamp(minX, maxX);
+          final wx = doubleX ? (x.isOdd ? 1 : 3) : 0;
+          final tx = doubleX ? 4 - wx : 1;
+          final a = source[upperRow + l] * tx + source[upperRow + r] * wx;
+          final b = source[lowerRow + l] * tx + source[lowerRow + r] * wx;
+          output[y * outStride + x] = (a * ty + b * wy + bias) >> shift;
+        }
       }
     }
   }

@@ -32,19 +32,33 @@ final class _H263Pb {
     _PictureMotion motion,
     MpegIdct transform,
     Int16List? reducedSamples,
+    _MotionBounds? bounds,
   ) {
     final picture = output!;
     switch (_mode) {
       case _PbMode.direct:
-        _predictDirect(picture, x, y, motion);
+        _predictDirect(picture, x, y, motion, bounds);
       case _PbMode.forward:
-        sampler.predictH263(picture, _forward.picture, x, y, [
-          _motion,
-        ], reduced: header.reduced);
+        sampler.predictH263(
+          picture,
+          _forward.picture,
+          x,
+          y,
+          [_motion],
+          reduced: header.reduced,
+          bounds: bounds,
+          extend: header.canExtendMotion,
+        );
       case _PbMode.backward:
-        sampler.predictH263(picture, current, x, y, [
-          _zeroVector,
-        ], reduced: header.reduced);
+        sampler.predictH263(
+          picture,
+          current,
+          x,
+          y,
+          [_zeroVector],
+          reduced: header.reduced,
+          bounds: bounds,
+        );
     }
     for (var block = 0; block < 6; block++) {
       if (_pattern & (32 >> block) != 0) {
@@ -67,6 +81,7 @@ final class _H263Pb {
     int x,
     int y,
     _PictureMotion motion,
+    _MotionBounds? bounds,
   ) {
     final forward = <_Vector>[], backward = <_Vector>[];
     final (picture: previous, :offset, :distance) = _forward;
@@ -103,6 +118,8 @@ final class _H263Pb {
       y,
       forward,
       reduced: header.reduced,
+      bounds: bounds,
+      extend: header.canExtendMotion,
     );
     final chroma = _chromaMotion((x: sumX, y: sumY), split: true);
     for (var block = 0; block < 4; block++) {
@@ -114,10 +131,20 @@ final class _H263Pb {
         _blockSize * (block & 1),
         _blockSize * (block >> 1),
         backward[block],
+        bounds,
       );
     }
     for (var plane = 1; plane < 3; plane++) {
-      _blendBlock(picture, plane, x * _blockSize, y * _blockSize, 0, 0, chroma);
+      _blendBlock(
+        picture,
+        plane,
+        x * _blockSize,
+        y * _blockSize,
+        0,
+        0,
+        chroma,
+        bounds,
+      );
     }
   }
 
@@ -129,6 +156,7 @@ final class _H263Pb {
     int bx,
     int by,
     _Vector motion,
+    _MotionBounds? bounds,
   ) {
     final subsample = plane == 0 ? 0 : 1;
     final stride = picture.stride >> subsample;
@@ -147,6 +175,7 @@ final class _H263Pb {
       false,
       false,
       packed: true,
+      bounds: bounds == null ? null : _scaleMotionBounds(bounds, subsample),
     );
     final destination = picture.planes[plane];
     // Annex G only uses backward prediction where both interpolation

@@ -141,6 +141,16 @@ _Vector _chromaMotion(_Vector sum, {required bool split}) {
   return (x: reduce(sum.x), y: reduce(sum.y));
 }
 
+// Half-open sample coordinates in the reference plane.
+typedef _MotionBounds = ({int left, int top, int right, int bottom});
+
+_MotionBounds _scaleMotionBounds(_MotionBounds bounds, int shift) => (
+  left: bounds.left >> shift,
+  top: bounds.top >> shift,
+  right: bounds.right >> shift,
+  bottom: bounds.bottom >> shift,
+);
+
 final class _Mpeg4MotionCompensation {
   final _sourceRow = Uint8List(17);
   final _horizontal = Uint8List(17 * 16);
@@ -208,6 +218,7 @@ final class _Mpeg4MotionCompensation {
     bool average = false,
     bool truncateAverage = false,
     int blockSize = 8,
+    _MotionBounds? bounds,
   }) {
     final stride = output.stride, lines = output.rows * 16;
     final split = vectors.length == 4;
@@ -230,6 +241,7 @@ final class _Mpeg4MotionCompensation {
         noRound,
         average,
         truncateAverage: truncateAverage,
+        bounds: bounds,
       );
     }
     _predictChroma(
@@ -243,6 +255,7 @@ final class _Mpeg4MotionCompensation {
       average: average,
       truncateAverage: truncateAverage,
       blockSize: blockSize,
+      bounds: bounds,
     );
   }
 
@@ -257,8 +270,10 @@ final class _Mpeg4MotionCompensation {
     bool average = false,
     bool truncateAverage = false,
     int blockSize = 8,
+    _MotionBounds? bounds,
   }) {
     final chroma = _chromaMotion(sum, split: split);
+    final region = bounds == null ? null : _scaleMotionBounds(bounds, 1);
     for (var plane = 1; plane < 3; plane++) {
       _half(
         output.planes[plane],
@@ -273,6 +288,7 @@ final class _Mpeg4MotionCompensation {
         noRound,
         average,
         truncateAverage: truncateAverage,
+        bounds: region,
       );
     }
   }
@@ -365,6 +381,7 @@ final class _Mpeg4MotionCompensation {
     bool average, {
     _FieldPair? field,
     bool truncateAverage = false,
+    _MotionBounds? bounds,
   }) {
     final dx = mx & 3, dy = my & 3;
     if (dx == 0 && dy == 0) {
@@ -382,6 +399,7 @@ final class _Mpeg4MotionCompensation {
         average,
         field: field,
         truncateAverage: truncateAverage,
+        bounds: bounds,
       );
       return;
     }
@@ -391,19 +409,21 @@ final class _Mpeg4MotionCompensation {
     final sourceField = field?.reference ?? 0;
     final destinationField = field?.destination ?? 0;
     final rows = dy == 0 ? size : size + 1;
+    final minX = bounds?.left ?? 0, maxX = (bounds?.right ?? stride) - 1;
+    final minY = bounds?.top ?? 0, maxY = (bounds?.bottom ?? height) - 1;
     for (var row = 0; row < rows; row++) {
       final referenceRow =
-          ((sy + row) * step + sourceField).clamp(0, height - 1) * stride;
+          ((sy + row) * step + sourceField).clamp(minY, maxY) * stride;
       final horizontalRow = row * size;
       if (dx == 0) {
         for (var column = 0; column < size; column++) {
           _horizontal[horizontalRow + column] =
-              reference[referenceRow + (sx + column).clamp(0, stride - 1)];
+              reference[referenceRow + (sx + column).clamp(minX, maxX)];
         }
       } else {
         for (var column = 0; column <= size; column++) {
           _sourceRow[column] =
-              reference[referenceRow + (sx + column).clamp(0, stride - 1)];
+              reference[referenceRow + (sx + column).clamp(minX, maxX)];
         }
         for (var column = 0; column < size; column++) {
           _horizontal[horizontalRow + column] = _quarterPhase(
@@ -480,6 +500,7 @@ final class _Mpeg4MotionCompensation {
     int? rows,
     bool packed = false,
     bool truncateAverage = false,
+    _MotionBounds? bounds,
   }) {
     final dx = mx & 1, dy = my & 1;
     final sx = x + (mx >> 1), sy = y + (my >> 1);
@@ -487,16 +508,18 @@ final class _Mpeg4MotionCompensation {
     final step = field == null ? 1 : 2;
     final sourceField = field?.reference ?? 0;
     final destinationField = field?.destination ?? 0;
+    final minX = bounds?.left ?? 0, maxX = (bounds?.right ?? stride) - 1;
+    final minY = bounds?.top ?? 0, maxY = (bounds?.bottom ?? height) - 1;
     for (var j = 0; j < (rows ?? size); j++) {
       final source = (sy + j) * step + sourceField;
-      final top = source.clamp(0, height - 1) * stride;
-      final bottom = (source + dy * step).clamp(0, height - 1) * stride;
+      final top = source.clamp(minY, maxY) * stride;
+      final bottom = (source + dy * step).clamp(minY, maxY) * stride;
       final target = packed
           ? j * size
           : ((y + j) * step + destinationField) * stride + x;
       for (var i = 0; i < size; i++) {
-        final left = (sx + i).clamp(0, stride - 1);
-        final right = (sx + i + dx).clamp(0, stride - 1);
+        final left = (sx + i).clamp(minX, maxX);
+        final right = (sx + i + dx).clamp(minX, maxX);
         final a = reference[top + left];
         final value = switch ((dx, dy)) {
           (0, 0) => a,

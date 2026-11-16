@@ -5,14 +5,15 @@ final class _H263Overlap {
     : _segments = Uint16List(header.macroblockColumns * header.macroblockRows),
       _columns = header.macroblockColumns,
       _scale = header.reduced ? 1 : 0,
-      _structured = header.format.structured,
+      _segmented =
+          header.format.structured || header.format.independentSegments,
       _noRound = header.noRound;
 
   final H263Picture picture;
   final _PictureMotion motion;
   final _Mpeg4MotionCompensation sampler;
   final int _columns, _scale;
-  final bool _structured, _noRound;
+  final bool _segmented, _noRound;
   // Zero denotes an intra macroblock with no transmitted motion vector.
   // Skipped inter blocks contribute a zero vector to their neighbors.
   final Uint16List _segments;
@@ -20,10 +21,10 @@ final class _H263Overlap {
   late final _samples = List.generate(5, (_) => Uint8List(64 << (2 * _scale)));
 
   void markMotion(int index, int start) {
-    _segments[index] = _structured ? start + 1 : 1;
+    _segments[index] = _segmented ? start + 1 : 1;
   }
 
-  void predict(int x, int y, H263Picture reference) {
+  void predict(int x, int y, H263Picture reference, _MotionBounds? bounds) {
     final columns = _columns, size = 8 << _scale;
     final segment = _segments[y * columns + x];
     _Vector motionAt(int x, int y) {
@@ -51,7 +52,7 @@ final class _H263Overlap {
         block < 2 ? remote(bx, by + 1) : center,
         remote(bx - 1, by),
         remote(bx + 1, by),
-      ]);
+      ], bounds);
       sumX += center.x;
       sumY += center.y;
     }
@@ -64,6 +65,7 @@ final class _H263Overlap {
       split: true,
       noRound: _noRound,
       blockSize: size,
+      bounds: bounds,
     );
   }
 
@@ -72,6 +74,7 @@ final class _H263Overlap {
     int x,
     int y,
     List<_Vector> vectors,
+    _MotionBounds? bounds,
   ) {
     final output = picture.planes[0], source = reference.planes[0];
     final stride = picture.stride, height = picture.rows * 16;
@@ -90,6 +93,7 @@ final class _H263Overlap {
         center.y,
         _noRound,
         false,
+        bounds: bounds,
       );
       return;
     }
@@ -108,6 +112,7 @@ final class _H263Overlap {
         _noRound,
         false,
         packed: true,
+        bounds: bounds,
       );
     }
     Uint8List samples(int i) => _samples[vectors[i] == center ? 0 : i];

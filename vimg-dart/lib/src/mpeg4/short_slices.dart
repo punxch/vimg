@@ -1,36 +1,20 @@
 part of 'decoder.dart';
 
+typedef _H263Slice = ({H263GroupHeader header, int data, int end});
+
 extension _H263Slices on _H263Macroblocks {
-  Iterable<int> _macroblockOrder() sync* {
-    if (!header.format.rectangularSlices && !header.format.arbitrarySlices) {
+  Iterable<int> _macroblockOrder({H263Picture? backward}) sync* {
+    if (!header.format.rectangularSlices &&
+        !header.format.arbitrarySlices &&
+        !header.format.independentSegments) {
       for (var index = 0; index < _count; index++) {
         _startMacroblock(index);
         yield index;
       }
       return;
     }
-    final layout = _sliceLayout();
-    final counts = _sliceMacroblockCounts(layout.map((slice) => slice.header));
-    final owners = _sliceOwners = Uint16List(_count);
-    int addressAt(H263GroupHeader slice, int offset) {
-      final width = slice.width;
-      return slice.address +
-          (width == null
-              ? offset
-              : offset ~/ width * _columns + offset % width);
-    }
-
-    for (final slice in layout) {
-      final group = slice.header;
-      for (var i = 0; i < counts[group.address]!; i++) {
-        final address = addressAt(group, i);
-        if (owners[address] != 0) {
-          throw const FormatException('Overlapping H.263+ slices');
-        }
-        owners[address] = group.address + 1;
-      }
-    }
-
+    final (:layout, :counts) = _preparedSlices;
+    _validateTemporalSegments(backward);
     final sac = _sac;
     for (final (i, slice) in layout.indexed) {
       final group = slice.header;
@@ -39,9 +23,10 @@ extension _H263Slices on _H263Macroblocks {
         _bits.position = slice.data;
         _beginGroup(group);
       }
+      _validateTemporalSegments(reference);
       final count = counts[group.address]!;
       for (var mb = 0; mb < count; mb++) {
-        final address = addressAt(group, mb);
+        final address = _sliceAddressAt(group, mb);
         _filterSlices?[address] = _sliceStart;
         yield address;
         if (_bits.position > slice.end) {
@@ -52,16 +37,40 @@ extension _H263Slices on _H263Macroblocks {
     }
   }
 
-  List<({H263GroupHeader header, int data, int end})> _sliceLayout() {
-    final first = header.firstSlice!;
+  ({List<_H263Slice> layout, Map<int, int> counts}) _prepareSlices() {
+    final layout = _sliceLayout();
+    final counts = _sliceMacroblockCounts(layout.map((slice) => slice.header));
+    final owners = _sliceOwners = Uint16List(_count);
+    for (final slice in layout) {
+      final group = slice.header;
+      for (var i = 0; i < counts[group.address]!; i++) {
+        final address = _sliceAddressAt(group, i);
+        if (owners[address] != 0) {
+          throw const FormatException('Overlapping H.263+ slices');
+        }
+        owners[address] = group.address + 1;
+      }
+    }
+    if (header.format.independentSegments) _setSegmentBounds(layout, counts);
+    return (layout: layout, counts: counts);
+  }
+
+  int _sliceAddressAt(H263GroupHeader slice, int offset) {
+    final width = slice.width;
+    return slice.address +
+        (width == null ? offset : offset ~/ width * _columns + offset % width);
+  }
+
+  List<_H263Slice> _sliceLayout() {
+    final first = header.firstSlice;
     var current = (
-      address: first.address,
-      width: first.width,
+      address: first?.address ?? 0,
+      width: first?.width,
       quant: header.quant,
       temporal: header.predictionTemporal,
     );
     var data = _bits.position;
-    final layout = <({H263GroupHeader header, int data, int end})>[];
+    final layout = <_H263Slice>[];
     for (final unit in h263GroupUnits(header, _bits.bytes)) {
       layout.add((header: current, data: data, end: unit.start));
       final group = unit.header;

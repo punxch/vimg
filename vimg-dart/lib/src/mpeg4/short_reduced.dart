@@ -7,6 +7,7 @@ H263Picture _h263AlignReference(H263Picture source, {required bool reduced}) {
   final height = (format.height + alignment - 1) & -alignment;
   if (source.stride == width && source.rows * 16 == height) return source;
   final target = H263Picture._(format, reduced: reduced);
+  target._segments = source._segments;
   for (var plane = 0; plane < 3; plane++) {
     final sub = plane == 0 ? 0 : 1;
     final input = source.planes[plane], output = target.planes[plane];
@@ -44,17 +45,39 @@ extension _H263Prediction on _Mpeg4MotionCompensation {
     required bool reduced,
     bool noRound = false,
     bool average = false,
+    _MotionBounds? bounds,
+    bool extend = true,
   }) {
+    final blockSize = reduced ? 16 : 8;
+    final physical = reduced
+        ? vectors.map(_h263ExpandVector).toList()
+        : vectors;
+    if (!extend && bounds != null) {
+      final size = physical.length == 4 ? blockSize : blockSize * 2;
+      for (final (i, vector) in physical.indexed) {
+        final left = 2 * blockSize * (2 * x + (i & 1)) + vector.x;
+        final top = 2 * blockSize * (2 * y + (i >> 1)) + vector.y;
+        if (left < 2 * bounds.left ||
+            top < 2 * bounds.top ||
+            left + 2 * size > 2 * bounds.right ||
+            top + 2 * size > 2 * bounds.bottom) {
+          throw const FormatException(
+            'H.263+ motion vector crosses an independent segment',
+          );
+        }
+      }
+    }
     predict(
       output,
       reference,
       x,
       y,
-      reduced ? vectors.map(_h263ExpandVector).toList() : vectors,
-      blockSize: reduced ? 16 : 8,
+      physical,
+      blockSize: blockSize,
       noRound: noRound,
       average: average,
       truncateAverage: average,
+      bounds: bounds,
     );
   }
 }
