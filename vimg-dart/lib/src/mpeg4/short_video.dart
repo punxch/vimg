@@ -1,7 +1,8 @@
 part of 'decoder.dart';
 
 final class H263Picture extends _DctPicture {
-  H263Picture._(this.format) : super(format.width, format.height);
+  H263Picture._(this.format, {bool reduced = false})
+    : super(format.width, format.height, alignment: reduced ? 32 : 16);
 
   final H263Format format;
 
@@ -65,7 +66,7 @@ final class H263Decoder {
         header,
         newest.resamplingRound ?? header.noRound,
       );
-      final picture = H263Picture._(format);
+      final picture = H263Picture._(format, reduced: header.reduced);
       _H263Macroblocks(
         header,
         picture,
@@ -74,9 +75,12 @@ final class H263Decoder {
         _prediction,
         null,
       ).decodeB(reference, newest, timing.offset, timing.distance);
-      return (picture: picture, bidirectional: null);
+      return (
+        picture: _h263AlignReference(picture, reduced: false),
+        bidirectional: null,
+      );
     }
-    final picture = H263Picture._(format);
+    final picture = H263Picture._(format, reduced: header.reduced);
     final previous = _references[header.layer];
     if (header.enhancement) {
       final lower = _references[header.referenceLayer];
@@ -103,9 +107,16 @@ final class H263Decoder {
         _prediction,
         null,
       );
-      blocks.decodeEnhancement(forward, _h263Upsample(lower.picture, format));
-      _saveReference(header, picture, blocks);
-      return (picture: picture, bidirectional: null);
+      blocks.decodeEnhancement(
+        forward,
+        _h263AlignReference(
+          _h263Upsample(lower.picture, format),
+          reduced: header.reduced,
+        ),
+      );
+      final decoded = _h263AlignReference(picture, reduced: false);
+      _saveReference(header, decoded, blocks);
+      return (picture: decoded, bidirectional: null);
     }
     if (!header.intra && previous == null) {
       throw const FormatException('Missing H.263 reference picture');
@@ -121,7 +132,9 @@ final class H263Decoder {
             picture,
             _prediction,
             h263PbDistance(previous!.temporal, header),
-            includeBidirectional ? H263Picture._(format) : null,
+            includeBidirectional
+                ? H263Picture._(format, reduced: header.reduced)
+                : null,
           );
     final macroblocks = _H263Macroblocks(
       header,
@@ -132,10 +145,17 @@ final class H263Decoder {
       pb,
     );
     macroblocks.decode();
+    final decoded = _h263AlignReference(picture, reduced: false);
     if (!header.disposable) {
-      _saveReference(header, picture, macroblocks);
+      _saveReference(header, decoded, macroblocks);
     }
-    return (picture: picture, bidirectional: pb?.output);
+    return (
+      picture: decoded,
+      bidirectional: switch (pb?.output) {
+        final output? => _h263AlignReference(output, reduced: false),
+        null => null,
+      },
+    );
   }
 
   void _saveReference(
@@ -153,6 +173,7 @@ final class H263Decoder {
       resamplingRound: header.layer == 1 && !header.intra
           ? header.noRound
           : null,
+      reduced: header.reduced,
       motion: blocks._motion,
       intraWithMotion: blocks._intraWithMotion,
     );
@@ -170,7 +191,11 @@ final class _H263Macroblocks {
     this._transform,
     this._prediction,
     this._pb,
-  ) : _motion = _PictureMotion(picture.columns, picture.rows, false),
+  ) : _motion = _PictureMotion(
+        header.macroblockColumns,
+        header.macroblockRows,
+        false,
+      ),
       _quant = header.quant;
 
   final H263Header header;
@@ -181,12 +206,19 @@ final class _H263Macroblocks {
   final _H263Pb? _pb;
   final _PictureMotion _motion;
   final _coefficients = Int16List(64);
+  late final _columns = header.macroblockColumns;
+  late final _rows = header.macroblockRows;
+  late final _count = _columns * _rows;
+  late final _reducedSamples = header.reduced ? Int16List(64) : null;
   late final _aic = [
-    List<_H263IntraBlock?>.filled(picture.columns * picture.rows * 4, null),
+    List<_H263IntraBlock?>.filled(_count * 4, null),
     for (var plane = 0; plane < 2; plane++)
-      List<_H263IntraBlock?>.filled(picture.columns * picture.rows, null),
+      List<_H263IntraBlock?>.filled(_count, null),
   ];
-  late final _filterQuant = Uint8List(picture.columns * picture.rows);
+  late final _filterQuant = Uint8List(_count);
+  late final _filterSlices = header.reduced && header.format.structured
+      ? Uint16List(_count)
+      : null;
   late final _sac =
       header.format.arithmetic && !header.bidirectional && !header.enhancement
       ? _H263Sac(_bits)
@@ -200,11 +232,10 @@ final class _H263Macroblocks {
   int _quant, _sliceStart = 0;
 
   void decode() {
-    final columns = picture.columns;
-    final count = columns * picture.rows;
+    final columns = _columns, count = _count;
     final overlap = _overlap;
     for (var index = 0; index < count; index++) {
-      if (index != 0) _readGroupHeader(index, count);
+      _startMacroblock(index);
       final x = index % columns, y = index ~/ columns;
       final mode = _readMacroblock();
       if (mode == -1) {
@@ -213,9 +244,15 @@ final class _H263Macroblocks {
         if (overlap != null) {
           _pendingPattern = 0;
         } else {
-          _prediction.predict(picture, reference!, x, y, [
-            _zeroVector,
-          ], noRound: header.noRound);
+          _prediction.predictH263(
+            picture,
+            reference!,
+            x,
+            y,
+            [_zeroVector],
+            reduced: header.reduced,
+            noRound: header.noRound,
+          );
         }
         _pb?.queue(_PbMode.direct, _zeroVector, 0);
         continue;
@@ -241,12 +278,13 @@ final class _H263Macroblocks {
         if (overlap != null) {
           overlap.markMotion(index, _sliceStart);
         } else if (!intra) {
-          _prediction.predict(
+          _prediction.predictH263(
             picture,
             reference!,
             x,
             y,
             vectors,
+            reduced: header.reduced,
             noRound: header.noRound,
           );
         }
@@ -276,10 +314,27 @@ final class _H263Macroblocks {
         }
       }
       if (pbBlock != null) _readPbBlocks(pbBlock.pattern);
-      if (header.format.loopFilter) _filterQuant[index] = _quant;
+      if (header.reduced || header.format.loopFilter)
+        _filterQuant[index] = _quant;
     }
     _finishPrevious(count - 1);
-    if (header.format.loopFilter) {
+    _finishFilter();
+  }
+
+  void _startMacroblock(int index) {
+    if (index != 0) _readGroupHeader(index, _count);
+    _filterSlices?[index] = _sliceStart;
+  }
+
+  void _finishFilter() {
+    if (header.reduced) {
+      _filterH263Reduced(
+        picture,
+        _filterQuant,
+        _filterSlices,
+        deblock: header.format.loopFilter && !header.bidirectional,
+      );
+    } else if (header.format.loopFilter && !header.bidirectional) {
       _deblockH263(
         picture,
         _filterQuant,
@@ -330,10 +385,10 @@ final class _H263Macroblocks {
   // then reconstruct the paired B macroblock before P-picture deblocking.
   void _finishPrevious(int index) {
     if (index < 0 || (_pendingPattern < 0 && _pb?.output == null)) return;
-    final x = index % picture.columns, y = index ~/ picture.columns;
+    final x = index % _columns, y = index ~/ _columns;
     _finishOverlap(x, y);
     if (_pb?.output != null) {
-      _pb!.reconstruct(x, y, _motion, _transform);
+      _pb!.reconstruct(x, y, _motion, _transform, _reducedSamples);
     }
   }
 
@@ -439,12 +494,12 @@ final class _H263Macroblocks {
       _bits.skip(2); // group frame identifier
     } else {
       final group = _bits.read(5);
-      final groupRows = picture.height <= 400
-          ? 1
-          : picture.height <= 800
-          ? 2
-          : 4;
-      address = group * picture.columns * groupRows;
+      final lines = picture.height > 800
+          ? 64
+          : picture.height > 400 || header.reduced
+          ? 32
+          : 16;
+      address = group * _columns * (lines ~/ header.macroblockSize);
       _bits.skip(2);
       quant = _bits.read(5);
     }
@@ -467,7 +522,7 @@ final class _H263Macroblocks {
     for (var i = 0; i < (split ? 4 : 1); i++) {
       final prediction = _motionPrediction(
         _motion,
-        picture.columns,
+        _columns,
         _sliceStart,
         x,
         y,
@@ -593,7 +648,16 @@ final class _H263Macroblocks {
     Int16List values, {
     required bool intra,
   }) {
-    _writeH263Block(_transform, picture, x, y, block, values, intra);
+    _writeH263Block(
+      _transform,
+      picture,
+      x,
+      y,
+      block,
+      values,
+      intra,
+      _reducedSamples,
+    );
   }
 
   bool _readCoefficients(
@@ -625,19 +689,26 @@ void _writeH263Block(
   int block,
   Int16List values,
   bool intra,
+  Int16List? reducedSamples,
 ) {
   final luma = block < 4;
   final plane = luma ? 0 : block - 3;
   final stride = luma ? picture.stride : picture.stride >> 1;
   final bx = luma ? x * 2 + (block & 1) : x;
   final by = luma ? y * 2 + (block >> 1) : y;
-  transform.write(
-    picture.planes[plane],
-    (by * stride + bx) * 8,
-    stride,
-    values,
-    intra,
-  );
+  final pixels = picture.planes[plane];
+  if (reducedSamples == null) {
+    transform.write(pixels, (by * stride + bx) * 8, stride, values, intra);
+  } else {
+    transform.samples(values, reducedSamples);
+    _writeH263ReducedBlock(
+      pixels,
+      (by * stride + bx) * 16,
+      stride,
+      reducedSamples,
+      intra,
+    );
+  }
 }
 
 _DctEvent _readShortEvent(Rbsp bits, _Events table, bool spark) {

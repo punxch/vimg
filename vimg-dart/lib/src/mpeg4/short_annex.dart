@@ -5,12 +5,10 @@ typedef _H263IntraBlock = ({int dc, Int16List edges});
 extension _H263AdvancedIntra on _H263Macroblocks {
   void _reconstructAic(int plane, int bx, int by, int quant, bool? fromLeft) {
     final sub = plane == 0 ? 1 : 0;
-    final columns = picture.columns << sub;
+    final columns = _columns << sub;
     final blocks = _aic[plane];
     _H263IntraBlock? neighbor(int x, int y) {
-      if (x < 0 ||
-          y < 0 ||
-          (y >> sub) * picture.columns + (x >> sub) < _sliceStart) {
+      if (x < 0 || y < 0 || (y >> sub) * _columns + (x >> sub) < _sliceStart) {
         return null;
       }
       return blocks[y * columns + x];
@@ -172,14 +170,17 @@ void _filterH263Edge(
   int offset,
   int across,
   int along,
-  int strength,
-) {
-  for (var i = 0; i < 8; i++, offset += along) {
+  int? strength, {
+  int length = 8,
+}) {
+  for (var i = 0; i < length; i++, offset += along) {
     final a = offset - 2 * across, b = offset - across, d = offset + across;
     final outer = plane[a] - plane[d];
     final difference = (outer + 4 * (plane[offset] - plane[b])) ~/ 8;
     final magnitude = difference.abs();
-    final inner = math.max(0, math.min(magnitude, 2 * strength - magnitude));
+    final inner = strength == null
+        ? magnitude
+        : math.max(0, math.min(magnitude, 2 * strength - magnitude));
     final adjustment = difference.sign * inner;
     plane[b] = (plane[b] + adjustment).clamp(0, 255);
     plane[offset] = (plane[offset] - adjustment).clamp(0, 255);

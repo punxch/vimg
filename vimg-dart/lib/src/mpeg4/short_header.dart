@@ -54,6 +54,7 @@ typedef H263Header = ({
   int referenceLayer,
   bool bidirectional,
   bool enhancementIntra,
+  bool reduced,
   H263Resampling? resampling,
   ({int offset, int quantFactor})? pb,
   Rbsp bits,
@@ -61,6 +62,11 @@ typedef H263Header = ({
 
 extension H263PictureLayer on H263Header {
   bool get enhancement => layer > 1 && !bidirectional;
+  int get macroblockSize => reduced ? 32 : 16;
+  int get macroblockColumns =>
+      (format.width + macroblockSize - 1) ~/ macroblockSize;
+  int get macroblockRows =>
+      (format.height + macroblockSize - 1) ~/ macroblockSize;
 }
 
 typedef H263LayerState = ({H263Format format, int? lowerLayer, int bReference});
@@ -94,7 +100,7 @@ final class H263Headers {
     final H263Format format;
     final int quant;
     var layer = 1, referenceLayer = 1;
-    var bidirectional = false, enhancementIntra = false;
+    var bidirectional = false, enhancementIntra = false, reduced = false;
     H263Resampling? resampling;
     if (source < 6) {
       intra = !bits.flag();
@@ -124,13 +130,17 @@ final class H263Headers {
       intra = type == 0;
       paired = type == 2;
       final explicitResampling = bits.flag();
-      if (bits.flag())
-        throw UnsupportedError('H.263+ reduced-resolution update');
+      reduced = bits.flag();
       noRound = bits.flag();
       bits.skip(3); // reserved MPPTYPE bits
       _checkMultipoint(bits);
       bidirectional = type == 3;
       enhancementIntra = type == 4;
+      if (reduced && (intra || enhancementIntra)) {
+        throw const FormatException(
+          'Invalid H.263+ intra reduced-resolution update',
+        );
+      }
       final layered = type >= 3;
       format = options != null
           ? _readFormat(bits, options)
@@ -199,7 +209,10 @@ final class H263Headers {
     while (bits.flag()) bits.skip(8);
     if (format.structured) {
       h263Marker(bits);
-      final count = ((format.width + 15) >> 4) * ((format.height + 15) >> 4);
+      final size = reduced ? 32 : 16;
+      final count =
+          ((format.width + size - 1) ~/ size) *
+          ((format.height + size - 1) ~/ size);
       if (bits.read(h263AddressBits(count)) != 0)
         throw const FormatException('H.263+ picture starts mid-slice');
       h263Marker(bits);
@@ -219,6 +232,7 @@ final class H263Headers {
       referenceLayer: referenceLayer,
       bidirectional: bidirectional,
       enhancementIntra: enhancementIntra,
+      reduced: reduced,
       resampling: resampling,
       pb: pb,
       bits: bits,
@@ -329,6 +343,7 @@ final class H263Headers {
       referenceLayer: 1,
       bidirectional: false,
       enhancementIntra: false,
+      reduced: false,
       resampling: null,
       pb: null,
       bits: bits,

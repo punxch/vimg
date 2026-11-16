@@ -207,6 +207,7 @@ final class _Mpeg4MotionCompensation {
     bool noRound = false,
     bool average = false,
     bool truncateAverage = false,
+    int blockSize = 8,
   }) {
     final stride = output.stride, lines = output.rows * 16;
     final split = vectors.length == 4;
@@ -221,9 +222,9 @@ final class _Mpeg4MotionCompensation {
         reference.planes[0],
         stride,
         lines,
-        x * 16 + 8 * (i & 1),
-        y * 16 + 8 * (i >> 1),
-        split ? 8 : 16,
+        blockSize * (x * 2 + (i & 1)),
+        blockSize * (y * 2 + (i >> 1)),
+        split ? blockSize : blockSize * 2,
         vector.x,
         vector.y,
         noRound,
@@ -241,6 +242,7 @@ final class _Mpeg4MotionCompensation {
       noRound: noRound,
       average: average,
       truncateAverage: truncateAverage,
+      blockSize: blockSize,
     );
   }
 
@@ -254,6 +256,7 @@ final class _Mpeg4MotionCompensation {
     required bool noRound,
     bool average = false,
     bool truncateAverage = false,
+    int blockSize = 8,
   }) {
     final chroma = _chromaMotion(sum, split: split);
     for (var plane = 1; plane < 3; plane++) {
@@ -262,9 +265,9 @@ final class _Mpeg4MotionCompensation {
         reference.planes[plane],
         output.stride >> 1,
         output.rows * 8,
-        x * 8,
-        y * 8,
-        8,
+        x * blockSize,
+        y * blockSize,
+        blockSize,
         chroma.x,
         chroma.y,
         noRound,

@@ -7,31 +7,39 @@ final class _H263Overlap {
     this.motion,
     this.sampler,
     H263Header header,
-  ) : _segments = Uint16List(picture.columns * picture.rows),
+  ) : _segments = Uint16List(header.macroblockColumns * header.macroblockRows),
+      _columns = header.macroblockColumns,
+      _scale = header.reduced ? 1 : 0,
       _structured = header.format.structured,
       _noRound = header.noRound;
 
   final H263Picture picture, reference;
   final _PictureMotion motion;
   final _Mpeg4MotionCompensation sampler;
+  final int _columns, _scale;
   final bool _structured, _noRound;
   // Zero denotes an intra macroblock with no transmitted motion vector.
   // Skipped inter blocks contribute a zero vector to their neighbors.
   final Uint16List _segments;
   final residuals = List.generate(6, (_) => Int16List(64));
-  final _samples = List.generate(5, (_) => Uint8List(64));
+  late final _samples = List.generate(5, (_) => Uint8List(64 << (2 * _scale)));
 
   void markMotion(int index, int start) {
     _segments[index] = _structured ? start + 1 : 1;
   }
 
   void predict(int x, int y) {
-    final columns = picture.columns;
+    final columns = _columns, size = 8 << _scale;
     final segment = _segments[y * columns + x];
+    _Vector motionAt(int x, int y) {
+      final vector = motion.at(x, y);
+      return _scale == 0 ? vector : _h263ExpandVector(vector);
+    }
+
     var sumX = 0, sumY = 0;
     for (var block = 0; block < 4; block++) {
       final bx = x * 2 + (block & 1), by = y * 2 + (block >> 1);
-      final center = motion.at(bx, by);
+      final center = motionAt(bx, by);
       _Vector remote(int rx, int ry) {
         if (rx < 0 ||
             rx >= columns * 2 ||
@@ -39,10 +47,10 @@ final class _H263Overlap {
             _segments[(ry >> 1) * columns + (rx >> 1)] != segment) {
           return center;
         }
-        return motion.at(rx, ry);
+        return motionAt(rx, ry);
       }
 
-      _predictBlock(bx * 8, by * 8, [
+      _predictBlock(bx * size, by * size, [
         center,
         remote(bx, by - 1),
         block < 2 ? remote(bx, by + 1) : center,
@@ -60,12 +68,14 @@ final class _H263Overlap {
       (x: sumX, y: sumY),
       split: true,
       noRound: _noRound,
+      blockSize: size,
     );
   }
 
   void _predictBlock(int x, int y, List<_Vector> vectors) {
     final output = picture.planes[0], source = reference.planes[0];
     final stride = picture.stride, height = picture.rows * 16;
+    final size = 8 << _scale;
     final center = vectors.first;
     if (vectors.every((vector) => vector == center)) {
       sampler._half(
@@ -75,7 +85,7 @@ final class _H263Overlap {
         height,
         x,
         y,
-        8,
+        size,
         center.x,
         center.y,
         _noRound,
@@ -92,7 +102,7 @@ final class _H263Overlap {
         height,
         x,
         y,
-        8,
+        size,
         vector.x,
         vector.y,
         _noRound,
@@ -102,17 +112,16 @@ final class _H263Overlap {
     }
     Uint8List samples(int i) => _samples[vectors[i] == center ? 0 : i];
     final middle = _samples[0], left = samples(3), right = samples(4);
-    // Annex F weights depend on distance to the nearest horizontal and
-    // vertical block edges. The three weights sum to eight at each pixel.
-    for (var j = 0; j < 8; j++) {
-      final vertical = samples(j < 4 ? 1 : 2);
-      final edgeY = math.min(j, 7 - j);
-      for (var i = 0; i < 8; i++) {
-        final horizontal = i < 4 ? left : right;
-        final edgeX = math.min(i, 7 - i);
+    // Annex Q doubles the Annex F weighting grid along both axes.
+    for (var j = 0; j < size; j++) {
+      final vertical = samples(j < size ~/ 2 ? 1 : 2);
+      final edgeY = math.min(j, size - 1 - j) >> _scale;
+      for (var i = 0; i < size; i++) {
+        final horizontal = i < size ~/ 2 ? left : right;
+        final edgeX = math.min(i, size - 1 - i) >> _scale;
         final wY = edgeY == 0 || (edgeY == 1 && edgeX >= 2) ? 2 : 1;
         final wX = edgeX == 0 || (edgeX == 1 && edgeY != 0) ? 2 : 1;
-        final k = j * 8 + i;
+        final k = j * size + i;
         output[(y + j) * stride + x + i] =
             ((8 - wX - wY) * middle[k] +
                 wX * horizontal[k] +

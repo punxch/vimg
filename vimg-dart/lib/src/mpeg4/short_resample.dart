@@ -7,7 +7,7 @@ H263Picture _h263PredictionReference(
 ) {
   final format = header.format;
   if (header.resampling == null && _h263Matches(reference, format)) {
-    return reference;
+    return _h263AlignReference(reference, reduced: header.reduced);
   }
   if (!header.extended) {
     throw const FormatException('H.263 reference picture size changed');
@@ -49,7 +49,7 @@ H263Picture _h263PredictionReference(
       roundingType: roundingType,
     );
   }
-  return output;
+  return _h263AlignReference(output, reduced: header.reduced);
 }
 
 typedef _H263WarpCorners = ({int lt, int rt, int lb, int rb});

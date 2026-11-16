@@ -192,8 +192,11 @@ inter VLCs, modified quantization and syntax-based arithmetic coding.
 Reference picture resampling handles implicit resolution changes and explicit
 warps in P, B, Improved PB and EP pictures. It includes half-pixel and
 sixteenth-pixel displacement precision and all four boundary fill modes.
+Reduced-resolution updates reconstruct 32×32 macroblocks at the full display
+size in P, B, Improved PB and EP pictures. The decoder expands signed texture
+updates and motion vectors and applies the Annex Q boundary filters.
 FLV supports Sorenson Spark and H.264, with signed AVC composition offsets
-and disposable Spark pictures. Reduced-resolution updates remain pending.
+and disposable Spark pictures.
 
 Program streams include MPEG-1 `.mpg`, MPEG-2 `.mpg` and unencrypted DVD
 `.vob` files. Program timing accounts for MPEG audio and DVD AC-3, DTS

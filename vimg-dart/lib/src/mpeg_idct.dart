@@ -16,7 +16,8 @@ int _idctWeight(int phase) {
 }
 
 final class MpegIdct {
-  final _rows = Int16List(64);
+  // Large coefficients can exceed 16 bits in the intermediate row pass.
+  final _rows = Int32List(64);
 
   void write(
     Uint8List plane,
@@ -25,6 +26,26 @@ final class MpegIdct {
     Int16List coefficients,
     bool intra,
   ) {
+    _prepare(coefficients);
+    for (var y = 0; y < 8; y++) {
+      final base = offset + y * stride;
+      for (var x = 0; x < 8; x++) {
+        final predicted = intra ? 0 : plane[base + x];
+        plane[base + x] = (predicted + _sample(x, y)).clamp(0, 255);
+      }
+    }
+  }
+
+  void samples(Int16List coefficients, Int16List output) {
+    _prepare(coefficients);
+    for (var y = 0; y < 8; y++) {
+      for (var x = 0; x < 8; x++) {
+        output[y * 8 + x] = _sample(x, y).clamp(-256, 255);
+      }
+    }
+  }
+
+  void _prepare(Int16List coefficients) {
     for (var row = 0; row < 64; row += 8) {
       var last = 7;
       while (last > 0 && coefficients[row + last] == 0) {
@@ -42,16 +63,13 @@ final class MpegIdct {
         }
       }
     }
-    for (var y = 0; y < 8; y++) {
-      final base = offset + y * stride;
-      for (var x = 0; x < 8; x++) {
-        var sum = 32 * _idctWeights[0];
-        for (var i = 0; i < 8; i++) {
-          sum += _rows[i * 8 + x] * _idctWeights[y * 8 + i];
-        }
-        final predicted = intra ? 0 : plane[base + x];
-        plane[base + x] = (predicted + (sum >> 20)).clamp(0, 255);
-      }
+  }
+
+  int _sample(int x, int y) {
+    var sum = 32 * _idctWeights[0];
+    for (var i = 0; i < 8; i++) {
+      sum += _rows[i * 8 + x] * _idctWeights[y * 8 + i];
     }
+    return sum >> 20;
   }
 }

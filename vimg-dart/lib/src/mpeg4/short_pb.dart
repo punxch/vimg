@@ -18,7 +18,8 @@ final class _H263Pb {
   final _Mpeg4MotionCompensation sampler;
   final int distance;
   late final residuals = List.generate(6, (_) => Int16List(64));
-  late final _backward = Uint8List(64);
+  late final _blockSize = header.macroblockSize >> 1;
+  late final _backward = Uint8List(_blockSize * _blockSize);
   _PbMode _mode = _PbMode.direct;
   _Vector _motion = _zeroVector;
   int _pattern = 0;
@@ -31,15 +32,25 @@ final class _H263Pb {
     _pattern = pattern;
   }
 
-  void reconstruct(int x, int y, _PictureMotion motion, MpegIdct transform) {
+  void reconstruct(
+    int x,
+    int y,
+    _PictureMotion motion,
+    MpegIdct transform,
+    Int16List? reducedSamples,
+  ) {
     final picture = output!;
     switch (_mode) {
       case _PbMode.direct:
         _predictDirect(picture, x, y, motion);
       case _PbMode.forward:
-        sampler.predict(picture, previous, x, y, [_motion]);
+        sampler.predictH263(picture, previous, x, y, [
+          _motion,
+        ], reduced: header.reduced);
       case _PbMode.backward:
-        sampler.predict(picture, current, x, y, [_zeroVector]);
+        sampler.predictH263(picture, current, x, y, [
+          _zeroVector,
+        ], reduced: header.reduced);
     }
     for (var block = 0; block < 6; block++) {
       if (_pattern & (32 >> block) != 0) {
@@ -51,6 +62,7 @@ final class _H263Pb {
           block,
           residuals[block],
           false,
+          reducedSamples,
         );
       }
     }
@@ -83,26 +95,35 @@ final class _H263Pb {
       final (fx, bx) = scale(p.x, _motion.x);
       final (fy, by) = scale(p.y, _motion.y);
       forward.add((x: fx, y: fy));
-      backward.add((x: bx, y: by));
-      sumX += bx;
-      sumY += by;
+      final vector = (x: bx, y: by);
+      final actual = header.reduced ? _h263ExpandVector(vector) : vector;
+      backward.add(actual);
+      sumX += actual.x;
+      sumY += actual.y;
     }
     // RTYPE does not apply to the B-part of Improved PB-pictures.
-    sampler.predict(picture, previous, x, y, forward);
+    sampler.predictH263(
+      picture,
+      previous,
+      x,
+      y,
+      forward,
+      reduced: header.reduced,
+    );
     final chroma = _chromaMotion((x: sumX, y: sumY), split: true);
     for (var block = 0; block < 4; block++) {
       _blendBlock(
         picture,
         0,
-        x * 16,
-        y * 16,
-        8 * (block & 1),
-        8 * (block >> 1),
+        x * 2 * _blockSize,
+        y * 2 * _blockSize,
+        _blockSize * (block & 1),
+        _blockSize * (block >> 1),
         backward[block],
       );
     }
     for (var plane = 1; plane < 3; plane++) {
-      _blendBlock(picture, plane, x * 8, y * 8, 0, 0, chroma);
+      _blendBlock(picture, plane, x * _blockSize, y * _blockSize, 0, 0, chroma);
     }
   }
 
@@ -118,7 +139,7 @@ final class _H263Pb {
     final subsample = plane == 0 ? 0 : 1;
     final stride = picture.stride >> subsample;
     final height = picture.rows * 16 >> subsample;
-    final last = ((16 >> subsample) - 1) * 2;
+    final last = ((header.macroblockSize >> subsample) - 1) * 2;
     sampler._half(
       _backward,
       current.planes[plane],
@@ -126,7 +147,7 @@ final class _H263Pb {
       height,
       mx + bx,
       my + by,
-      8,
+      _blockSize,
       motion.x,
       motion.y,
       false,
@@ -136,15 +157,15 @@ final class _H263Pb {
     final destination = picture.planes[plane];
     // Annex G only uses backward prediction where both interpolation
     // samples lie inside the colocated, reconstructed P macroblock.
-    for (var j = 0; j < 8; j++) {
+    for (var j = 0; j < _blockSize; j++) {
       final sy = 2 * (by + j) + motion.y;
       if (sy < 0 || sy > last) continue;
-      for (var i = 0; i < 8; i++) {
+      for (var i = 0; i < _blockSize; i++) {
         final sx = 2 * (bx + i) + motion.x;
         if (sx < 0 || sx > last) continue;
         final position = (my + by + j) * stride + mx + bx + i;
         destination[position] =
-            (destination[position] + _backward[j * 8 + i]) >> 1;
+            (destination[position] + _backward[j * _blockSize + i]) >> 1;
       }
     }
   }

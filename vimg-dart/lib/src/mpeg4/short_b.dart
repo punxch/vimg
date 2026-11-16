@@ -4,6 +4,7 @@ typedef _H263Reference = ({
   H263Picture picture,
   int temporal,
   bool? resamplingRound,
+  bool reduced,
   _PictureMotion motion,
   Uint8List? intraWithMotion,
 });
@@ -69,10 +70,11 @@ extension _H263Bidirectional on _H263Macroblocks {
     int offset,
     int period,
   ) {
-    final columns = picture.columns, rows = picture.rows;
+    final columns = _columns, rows = _rows;
     final backward = _PictureMotion(columns, rows, false);
+    final newer = _h263AlignReference(latest.picture, reduced: header.reduced);
     for (var index = 0; index < columns * rows; index++) {
-      if (index != 0) _readGroupHeader(index, columns * rows);
+      _startMacroblock(index);
       final x = index % columns, y = index ~/ columns;
       var mode = _h263BMode.read(_bits);
       while (mode == _h263BModes.length) {
@@ -92,26 +94,30 @@ extension _H263Bidirectional on _H263Macroblocks {
       if (changeQuant) _readQuantChange();
       switch (prediction) {
         case _H263BPrediction.direct:
-          _predictBDirect(older, latest, x, y, index, offset, period);
+          _predictBDirect(older, newer, latest, x, y, offset, period);
         case _H263BPrediction.forward:
         case _H263BPrediction.both:
           final forward = _readBVector(_motion, x, y);
-          _prediction.predict(picture, older, x, y, [forward]);
+          _prediction.predictH263(picture, older, x, y, [
+            forward,
+          ], reduced: header.reduced);
           if (prediction == _H263BPrediction.both) {
             final vector = _readBVector(backward, x, y);
-            _prediction.predict(
+            _prediction.predictH263(
               picture,
-              latest.picture,
+              newer,
               x,
               y,
               [vector],
+              reduced: header.reduced,
               average: true,
-              truncateAverage: true,
             );
           }
         case _H263BPrediction.backward:
           final vector = _readBVector(backward, x, y);
-          _prediction.predict(picture, latest.picture, x, y, [vector]);
+          _prediction.predictH263(picture, newer, x, y, [
+            vector,
+          ], reduced: header.reduced);
         case _H263BPrediction.intra:
           break;
       }
@@ -129,13 +135,15 @@ extension _H263Bidirectional on _H263Macroblocks {
           );
         }
       }
+      if (header.reduced && mode != 0) _filterQuant[index] = _quant;
     }
+    _finishFilter();
   }
 
   _Vector _readBVector(_PictureMotion motion, int x, int y) {
     final guess = _motionPrediction(
       motion,
-      picture.columns,
+      _columns,
       _sliceStart,
       x,
       y,
@@ -151,36 +159,65 @@ extension _H263Bidirectional on _H263Macroblocks {
 
   void _predictBDirect(
     H263Picture older,
+    H263Picture newer,
     _H263Reference latest,
     int x,
     int y,
-    int index,
     int offset,
     int period,
   ) {
     final forward = <_Vector>[], backward = <_Vector>[];
+    final size = header.macroblockSize >> 1;
+    final referenceSize = latest.reduced ? 16 : 8;
+    final referenceColumns =
+        (newer.width + 2 * referenceSize - 1) ~/ (2 * referenceSize);
+    final referenceRows =
+        (newer.height + 2 * referenceSize - 1) ~/ (2 * referenceSize);
+    int scale(int component, int elapsed) {
+      if (header.reduced && !latest.reduced) {
+        // Convert a full-resolution anchor to the pseudo-motion domain
+        // before temporal scaling, retaining any fractional pseudo-vector.
+        return component.sign * (component.abs() + 1) * elapsed ~/ (2 * period);
+      }
+      return component * elapsed ~/ period;
+    }
+
     for (var block = 0; block < 4; block++) {
-      final vector = latest.intraWithMotion?[index] == 1
+      final bx = math.min(
+        (x * 2 + (block & 1)) * size ~/ referenceSize,
+        2 * referenceColumns - 1,
+      );
+      final by = math.min(
+        (y * 2 + (block >> 1)) * size ~/ referenceSize,
+        2 * referenceRows - 1,
+      );
+      final referenceIndex = (by >> 1) * referenceColumns + (bx >> 1);
+      var vector = latest.intraWithMotion?[referenceIndex] == 1
           ? _zeroVector
-          : latest.motion.at(x * 2 + (block & 1), y * 2 + (block >> 1));
-      forward.add((
-        x: vector.x * offset ~/ period,
-        y: vector.y * offset ~/ period,
-      ));
+          : latest.motion.at(bx, by);
+      if (latest.reduced && !header.reduced) vector = _h263ExpandVector(vector);
+      forward.add((x: scale(vector.x, offset), y: scale(vector.y, offset)));
       backward.add((
-        x: vector.x * (offset - period) ~/ period,
-        y: vector.y * (offset - period) ~/ period,
+        x: scale(vector.x, offset - period),
+        y: scale(vector.y, offset - period),
       ));
     }
-    _prediction.predict(picture, older, x, y, forward);
-    _prediction.predict(
+    _prediction.predictH263(
       picture,
-      latest.picture,
+      older,
+      x,
+      y,
+      forward,
+      reduced: header.reduced,
+    );
+    _prediction.predictH263(
+      picture,
+      newer,
       x,
       y,
       backward,
+      reduced: header.reduced,
       average: true,
-      truncateAverage: true,
     );
   }
 }

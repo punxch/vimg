@@ -19,15 +19,20 @@ part 'short_b.dart';
 part 'short_layers.dart';
 part 'short_overlap.dart';
 part 'short_pb.dart';
+part 'short_reduced.dart';
 part 'short_resample.dart';
 part 'short_sac.dart';
 part 'short_sac_models.dart';
 part 'short_video.dart';
 
 class _DctPicture {
-  _DctPicture(this.width, this.height, {this.quarter = false})
-    : columns = (width + 15) >> 4,
-      rows = (height + 15) >> 4 {
+  _DctPicture(
+    this.width,
+    this.height, {
+    this.quarter = false,
+    int alignment = 16,
+  }) : columns = ((width + alignment - 1) & -alignment) >> 4,
+       rows = ((height + alignment - 1) & -alignment) >> 4 {
     final macroblocks = columns * rows;
     planes = [
       Uint8List(macroblocks * 256),

@@ -84,13 +84,12 @@ const _h263EpModes = [
 
 extension _H263Enhancement on _H263Macroblocks {
   void decodeEnhancement(H263Picture? previous, H263Picture upward) {
-    final columns = picture.columns;
-    final count = columns * picture.rows;
+    final columns = _columns, count = _count;
     final ei = header.enhancementIntra;
     final modes = ei ? _h263EiMode : _h263EpMode;
     final stuffing = ei ? 17 : _h263EpModes.length;
     for (var index = 0; index < count; index++) {
-      if (index != 0) _readGroupHeader(index, count);
+      _startMacroblock(index);
       var code = modes.read(_bits);
       while (code == stuffing) {
         code = modes.read(_bits);
@@ -121,25 +120,26 @@ extension _H263Enhancement on _H263Macroblocks {
           prediction == _LayerPrediction.blend;
       if (usesForward) {
         final vectors = texture ? _readMotion(x, y, false) : [_zeroVector];
-        _prediction.predict(
+        _prediction.predictH263(
           picture,
           previous!,
           x,
           y,
           vectors,
+          reduced: header.reduced,
           noRound: header.noRound,
         );
       }
       if (prediction == _LayerPrediction.upward ||
           prediction == _LayerPrediction.blend) {
-        _prediction.predict(
+        _prediction.predictH263(
           picture,
           upward,
           x,
           y,
           [_zeroVector],
+          reduced: header.reduced,
           average: usesForward,
-          truncateAverage: true,
         );
       }
       for (var block = 0; block < 6; block++) {
@@ -156,15 +156,11 @@ extension _H263Enhancement on _H263Macroblocks {
           );
         }
       }
-      if (header.format.loopFilter && code != 0) _filterQuant[index] = _quant;
+      if ((header.reduced || header.format.loopFilter) && code != 0) {
+        _filterQuant[index] = _quant;
+      }
     }
-    if (header.format.loopFilter) {
-      _deblockH263(
-        picture,
-        _filterQuant,
-        modifiedQuant: header.format.modifiedQuant,
-      );
-    }
+    _finishFilter();
   }
 }
 
