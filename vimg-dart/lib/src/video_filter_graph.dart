@@ -184,7 +184,8 @@ VideoFilterChain _compileFilterGraph(String source) {
   // one link remains, ordinary timing filters can still retime that stream.
   var live = 1;
   var region = <_FilterStep>[];
-  for (final step in _orderedFilterSteps(source)) {
+  final steps = _orderedFilterSteps(source);
+  for (final step in steps) {
     final filter = step.filter;
     final next = live + step.outputs.length - step.inputs.length;
     if (live == 1 && next == 1) {
@@ -196,8 +197,11 @@ VideoFilterChain _compileFilterGraph(String source) {
       }
     } else {
       if (filter is _TimingFilter) {
-        throw const FormatException(
-          'Timing filters require a shared video filter stream',
+        return VideoFilterChain._(
+          source,
+          const [],
+          const [],
+          _SynchronizedFilterGraph(steps),
         );
       }
       region.add(step);
@@ -229,16 +233,7 @@ final class _FilterBranches extends _FrameSpatialFilter {
     final active = {steps.first.inputs.single: frame};
     for (final step in steps) {
       final inputs = [for (final link in step.inputs) active.remove(link)!];
-      final result = switch (step.filter) {
-        final _Stack stack => stack.apply(inputs),
-        final _Overlay filter => filter.apply(inputs[0], inputs[1], position),
-        final _FrameSpatialFilter filter => filter.applyAt(
-          inputs.single,
-          position,
-        ),
-        final _SpatialFilter filter => filter.apply(inputs.single),
-        _ => inputs.single,
-      };
+      final result = _applyFilterStep(step.filter, inputs, position);
       for (final link in step.outputs) {
         active[link] = result;
       }
@@ -246,6 +241,18 @@ final class _FilterBranches extends _FrameSpatialFilter {
     return active.values.single;
   }
 }
+
+_VideoPlanes _applyFilterStep(
+  Object? filter,
+  List<_VideoPlanes> inputs,
+  FilterFramePosition position,
+) => switch (filter) {
+  final _Stack stack => stack.apply(inputs),
+  final _Overlay filter => filter.apply(inputs[0], inputs[1], position),
+  final _FrameSpatialFilter filter => filter.applyAt(inputs.single, position),
+  final _SpatialFilter filter => filter.apply(inputs.single),
+  _ => inputs.single,
+};
 
 int _filterPadCount(Map<String, String> options, String key, int minimum) {
   final count = _filterInteger(options, key, minimum: minimum) ?? 2;
@@ -275,8 +282,7 @@ final class _Stack {
       'shortest',
       if (name == 'xstack') 'fill',
     ]);
-    // All inputs share the same timeline and end event.
-    _filterFlag(options['shortest'], 'shortest');
+    final shortest = _filterFlag(options['shortest'], 'shortest');
     var inputs = _filterPadCount(options, 'inputs', 2);
     final fill = options['fill'];
     final color = fill == null || fill == 'none'
@@ -296,6 +302,7 @@ final class _Stack {
       ];
       return _Stack._(
         inputs,
+        shortest,
         color,
         (frames) => [
           for (final (left, top) in coordinates)
@@ -322,10 +329,16 @@ final class _Stack {
         'xstack requires a layout or grid for more than two inputs',
       );
     }
-    return _Stack._(inputs, color, (frames) => _stackGrid(frames, columns));
+    return _Stack._(
+      inputs,
+      shortest,
+      color,
+      (frames) => _stackGrid(frames, columns),
+    );
   }
 
-  const _Stack._(this.inputs, this.fill, this.positions);
+  const _Stack._(this.inputs, this.shortest, this.fill, this.positions);
+  final bool shortest;
   final int inputs;
   final _PaintColor? fill;
   final List<_StackPosition> Function(List<_VideoPlanes>) positions;

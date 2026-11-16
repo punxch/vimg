@@ -5,12 +5,14 @@ import 'package:image/image.dart' as image;
 
 import 'capture_timeline.dart';
 import 'filter_expression.dart';
+import 'frame_packet.dart';
 import 'grid.dart';
 import 'metadata.dart' show VideoCrop, VideoOrientation;
 
 part 'video_filters.dart';
 part 'video_filter_colors.dart';
 part 'video_filter_graph.dart';
+part 'video_filter_sync.dart';
 part 'video_overlay_filter.dart';
 part 'video_paint_filters.dart';
 part 'video_timing_filters.dart';

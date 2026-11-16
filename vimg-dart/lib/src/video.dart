@@ -63,6 +63,17 @@ typedef _SelectedFrame = ({
   image.Image? original,
 });
 
+typedef _CapturePicture = ({
+  FramePacket packet,
+  _RenderPicture render,
+  YuvImageScaler? scaler,
+});
+
+typedef _NativeCaptureFrame = ({
+  FramePacket packet,
+  VideoFilterPicture picture,
+});
+
 final class Video {
   Video(this.path) : _input = File(path).openSync() {
     try {
@@ -188,6 +199,9 @@ final class Video {
   late final _crop = _matroskaPresentation?.crop;
   bool get _hasPresentationTransform => _orientation != null || _crop != null;
   late final _previewScaler = _presentationScaler(null);
+  late final _planeCaptureScaler = YuvImageScaler(
+    filters: VideoFilterChain.parse('null'),
+  );
   late final _captureScalers = Expando<Map<double?, YuvImageScaler>>();
 
   YuvImageScaler? _presentationScaler(
@@ -1358,12 +1372,6 @@ final class Video {
     bool includeOriginal, {
     Map<FramePacket, Set<CaptureFrame>>? captures,
   }) sync* {
-    YuvImageScaler? scalerFor(FramePacket packet) => requestedScaler == null
-        ? _previewScaler
-        : _presentationScaler(
-            requestedScaler,
-            aspect: run.sampleAspects?[packet] ?? run.sampleAspect,
-          );
     Iterable<_SelectedFrame> renderCaptures(
       FramePacket packet,
       _RenderPicture render,
@@ -1392,6 +1400,39 @@ final class Video {
       }
     }
 
+    for (final (:packet, :render, :scaler) in _decodePictures(
+      run,
+      requestedScaler,
+      includeOriginal,
+    )) {
+      yield* renderCaptures(packet, render, scaler);
+    }
+  }
+
+  Iterable<_NativeCaptureFrame> _decodeNativeRun(_DecodeRun run) sync* {
+    for (final (:packet, :render, :scaler) in _decodePictures(
+      run,
+      _planeCaptureScaler,
+      true,
+    )) {
+      yield (
+        packet: packet,
+        picture: scaler!.captureFilterPicture(() => render(scaler: scaler)),
+      );
+    }
+  }
+
+  Iterable<_CapturePicture> _decodePictures(
+    _DecodeRun run,
+    YuvImageScaler? requestedScaler,
+    bool includeOriginal,
+  ) sync* {
+    YuvImageScaler? scalerFor(FramePacket packet) => requestedScaler == null
+        ? _previewScaler
+        : _presentationScaler(
+            requestedScaler,
+            aspect: run.sampleAspects?[packet] ?? run.sampleAspect,
+          );
     final name = run.codec;
     if (!_usesReferences(name)) {
       final packet = run.packets.single;
@@ -1452,7 +1493,7 @@ final class Video {
         );
         render = ({scaler}) => _renderRgb(source, scaler);
       }
-      yield* renderCaptures(packet, render, scaler);
+      yield (packet: packet, render: render, scaler: scaler);
       return;
     }
     final readPicture = _pictureReader(run);
@@ -1468,7 +1509,7 @@ final class Video {
               : 'Invalid $name video frame',
         );
       }
-      yield* renderCaptures(packet, render, scalerFor(packet));
+      yield (packet: packet, render: render, scaler: scalerFor(packet));
       target++;
     }
   }

@@ -18,6 +18,12 @@ bool _needsChromaResampling(
   int depth,
 ) => (horizontal != 0 || vertical != 0) && (width.isOdd || depth > 8);
 
+/// Owned decoded components for a graph with more than one source picture.
+final class VideoFilterPicture {
+  const VideoFilterPicture._(this._planes);
+  final _VideoPlanes _planes;
+}
+
 /// Resize video samples before RGB conversion. Reuse filter taps across frames.
 final class YuvImageScaler {
   YuvImageScaler({this.width, this.height, this.filters, this.enlarge = true})
@@ -78,6 +84,54 @@ final class YuvImageScaler {
   ({int matrix, bool fullRange})? _tableColor;
   late _RgbTable _table;
   List<FilterFramePosition> _positions = const [];
+  void Function(VideoFilterPicture)? _receivePicture;
+  static final _capturePlaceholder = image.Image(width: 1, height: 1);
+
+  VideoFilterPicture captureFilterPicture(image.Image Function() render) {
+    VideoFilterPicture? picture;
+    _receivePicture = (value) => picture = value;
+    try {
+      final rgb = render();
+      if (picture == null) filterRgb(rgb);
+      return picture!;
+    } finally {
+      _receivePicture = null;
+    }
+  }
+
+  image.Image renderFilterPicture(
+    FilterPicture picture,
+    VideoFilterPicture Function(FramePacket) source,
+  ) {
+    final graph = filters!._graph!;
+    final operation = picture is FilterOperationPicture ? picture : null;
+    final terminal = operation == null
+        ? null
+        : graph.steps[operation.step].filter;
+    final scale = width == null && height == null && terminal is _Scale
+        ? terminal
+        : null;
+    final evaluated = <FilterPicture, _VideoPlanes>{};
+    _VideoPlanes evaluate(FilterPicture node) => evaluated.putIfAbsent(
+      node,
+      () {
+        return switch (node) {
+          FilterInputPicture(:final packet) => source(packet)._planes,
+          FilterOperationPicture(:final step, :final inputs, :final position) =>
+            _applyFilterStep(
+              graph.steps[step].filter,
+              inputs.map(evaluate).toList(),
+              position,
+            ),
+        };
+      },
+    );
+    return _convertFiltered(
+      evaluate(scale == null ? picture : operation!.inputs.single),
+      scale,
+      operation?.position,
+    );
+  }
 
   image.Image renderCapture(
     List<FilterFramePosition> positions,
@@ -139,13 +193,30 @@ final class YuvImageScaler {
 
   image.Image _renderFiltered(_VideoPlanes source) {
     final scale = width == null && height == null ? filters!._finalScale : null;
-    var frame = filters!._apply(source, _positions, deferScale: scale != null);
+    final frame = filters!._apply(
+      source,
+      _positions,
+      deferScale: scale != null,
+    );
+    if (_receivePicture case final receive?) {
+      // Decoder buffers may be reused as soon as the next packet is read.
+      receive(VideoFilterPicture._(frame.map((plane, _, _) => plane._copy())));
+      return _capturePlaceholder;
+    }
+    return _convertFiltered(frame, scale, _positions.lastOrNull);
+  }
+
+  image.Image _convertFiltered(
+    _VideoPlanes frame,
+    _Scale? scale,
+    FilterFramePosition? position,
+  ) {
     YuvImageScaler? outputScale;
     if (scale != null) {
       // The terminal scale can upsample chroma while converting to RGB.
       final (w, h) = scale.dimensions(
         frame,
-        scale.usesFramePosition ? _positions.lastOrNull : null,
+        scale.usesFramePosition ? position : null,
       );
       if (frame.packedRgb && scale.algorithm != _ScaleAlgorithm.bicubic) {
         frame = scale.resize(frame, w, h);

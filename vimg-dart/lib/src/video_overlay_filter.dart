@@ -16,8 +16,11 @@ final class _Overlay {
       'ts_sync_mode',
     ]);
     // The two inputs arrive together, and have the same end event.
-    _filterFlag(options['shortest'], 'overlay shortest');
-    _filterFlag(options['repeatlast'], 'overlay repeatlast');
+    final shortest = _filterFlag(options['shortest'], 'overlay shortest');
+    final repeat = _filterFlag(
+      options['repeatlast'] ?? '1',
+      'overlay repeatlast',
+    );
     if (!const {
           null,
           'repeat',
@@ -36,6 +39,12 @@ final class _Overlay {
         }.contains(options['ts_sync_mode'])) {
       throw const FormatException('Invalid overlay synchronization option');
     }
+    final eofAction = options['eof_action'];
+    final pass = !repeat || eofAction == 'pass' || eofAction == '2';
+    final stop =
+        shortest || !pass && (eofAction == 'endall' || eofAction == '1');
+    final nearest =
+        options['ts_sync_mode'] == 'nearest' || options['ts_sync_mode'] == '1';
     final evaluateFrame = switch (options['eval']) {
       null || 'frame' || '1' => true,
       'init' || '0' => false,
@@ -94,6 +103,9 @@ final class _Overlay {
       format,
       premultiplied,
       evaluateFrame && dynamicPosition,
+      stop,
+      pass,
+      nearest,
       options['format'] == 'rgb' || options['format'] == '6'
           ? true
           : options['format'] == 'gbrp' || options['format'] == '7'
@@ -108,12 +120,16 @@ final class _Overlay {
     this.format,
     this.premultiplied,
     this.usesFramePosition,
+    this.stopAtEof,
+    this.dropSecondary,
+    this.nearest,
     this.packedRgb,
   );
 
   final FilterExpression x, y;
   final _OverlayFormat? format;
   final bool premultiplied, usesFramePosition;
+  final bool stopAtEof, dropSecondary, nearest;
   final bool? packedRgb;
 
   _VideoPlanes apply(

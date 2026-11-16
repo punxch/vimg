@@ -534,7 +534,6 @@ void _checkErrors() {
     'split[a][b];[a]hflip',
     'split[a][b];[a]hstack',
     '[loop]split[loop][branch];split[a][b];[a][branch][b]hstack=3',
-    'split[a][b];[a]trim=end_frame=2[c];[c][b]hstack',
     'split,xstack=layout=0_0|w0_0:grid=2x1',
     'split,xstack=layout=0_0|w1_0',
     'split,xstack=layout=0_0|h2_0',
@@ -754,6 +753,166 @@ Future<void> _checkCli(String? executable) async {
       check(
         ascii.decode(graphSheet.readAsBytesSync().sublist(4, 12)) == 'ftypavis',
         '$name produces an animated contact sheet',
+      );
+    }
+
+    const mixedRates =
+        'split[a][b];[a]fps=8[l];'
+        '[b]trim=start_frame=1,setpts=PTS-STARTPTS,fps=4,hflip[r];[l][r]hstack';
+    const overlayBranches =
+        'split[a][b];[a]fps=8[l];'
+        '[b]crop=16:12:0:0,setpts=PTS*2[r];[l][r]overlay=0:0:format=rgb';
+    const shortOverlay =
+        'split[a][b];[a]fps=8[l];'
+        '[b]trim=end_frame=2,crop=16:12:0:0,setpts=PTS*2[r];'
+        '[l][r]overlay=0:0:format=rgb';
+    // FFmpeg capture at 8 fps, with vimg's repeat-last padding for short windows.
+    const earlyStack = [0xeee3785a, 0xeee3785a, 0xe23af05a, 0xe23af05a];
+    const earlyOverlay = [0xa8641e2d, 0xa8641e2d, 0x4dbc4b2d, 0x4dbc4b2d];
+    for (final (name, filter, width, expected) in [
+      (
+        'mixed-rates',
+        mixedRates,
+        64,
+        [...earlyStack, 0xd5916869, 0xd5916869, 0x8fe9a469, 0x8fe9a469],
+      ),
+      (
+        'stack-shortest',
+        '$mixedRates=shortest=1',
+        64,
+        [...earlyStack, 0xd5916869],
+      ),
+      ('shortest-fps', '$mixedRates=shortest=1,fps=8', 64, earlyStack),
+      (
+        'overlay-before',
+        overlayBranches.replaceFirst('PTS*2', 'PTS+1'),
+        32,
+        [...earlyOverlay, 0xb78e872d, 0xb78e872d, 0x216fc32d, 0x216fc32d],
+      ),
+      (
+        'overlay-nearest',
+        '$overlayBranches:ts_sync_mode=nearest',
+        32,
+        [
+          ...earlyOverlay.take(3),
+          0x12455a2d,
+          0xb78e872d,
+          0xb78e872d,
+          0x5ce6b42d,
+          0x216fc32d,
+        ],
+      ),
+      (
+        'overlay-pass',
+        '$shortOverlay:eof_action=pass',
+        32,
+        [...earlyOverlay, 0xb78e872d, 0x7c17962d, 0xe5e9d22d, 0xe5e9d22d],
+      ),
+      (
+        'overlay-endall',
+        '$shortOverlay:eof_action=endall',
+        32,
+        [...earlyOverlay, 0xb78e872d],
+      ),
+    ]) {
+      final folder = '${temp.path}/$name';
+      await run([
+        'extract',
+        '-n1',
+        '-f8',
+        '-t1s',
+        '-T4',
+        '--output-dir',
+        folder,
+        '--vfilter',
+        filter,
+        motion,
+      ]);
+      final frames = ordered(folder);
+      check(frames.length == 8, '$name capture count');
+      for (final (index, file) in frames.indexed) {
+        final frame = image.decodeBmp(file.readAsBytesSync())!;
+        final reference = index < expected.length
+            ? expected[index]
+            : expected.last;
+        check(
+          (frame.width, frame.height) == (width, 24) &&
+              _bgrChecksum(frame) == reference,
+          '$name frame $index matches FFmpeg',
+        );
+      }
+    }
+
+    for (final command in ['extract', 'vcs']) {
+      await run([
+        command,
+        '-n2',
+        '-f2',
+        '-t500ms',
+        '-T4',
+        if (command == 'vcs') ...[
+          '-c2',
+          '-H24',
+          '--keep',
+          '-o',
+          '${temp.path}/timed-branches.avif',
+        ],
+        '--output-dir',
+        '${temp.path}/timed-$command',
+        '--vfilter',
+        mixedRates,
+        motion,
+      ]);
+    }
+    final synchronized = ordered('${temp.path}/timed-extract');
+    final synchronizedKept = ordered('${temp.path}/timed-vcs');
+    check(
+      synchronized.length == 4 && synchronizedKept.length == 4,
+      'Independent branch clocks reset across capture windows',
+    );
+    for (final (index, file) in synchronizedKept.indexed) {
+      _sameBytes(
+        file.readAsBytesSync(),
+        synchronized[index].readAsBytesSync(),
+        'Parallel contact sheet keeps synchronized capture $index',
+      );
+    }
+
+    // FFmpeg's simple MPEG-4 IDCT and YUV stack on the six source pictures
+    // in the seek window, using the ordinary vimg RGB conversion afterward.
+    const nativeReference = [
+      0x3de83187,
+      0xda0d0c2c,
+      0x774a923f,
+      0xd6e72ed7,
+      0x1a73b58b,
+      0x13cc313d,
+    ];
+    final native = '${temp.path}/native-branches';
+    await run([
+      'extract',
+      '-n1',
+      '-f6',
+      '-t1s',
+      '-T4',
+      '--output-dir',
+      native,
+      '--vfilter',
+      'split[a][b];[a]fps=6[l];[b]trim=start_frame=1,setpts=PTS-STARTPTS,fps=6[r];[l][r]hstack',
+      'test/fixtures/mpeg4-resync.m4v',
+    ]);
+    final nativeFrames = ordered(native);
+    check(
+      nativeFrames.length == nativeReference.length,
+      'Native YUV frame count',
+    );
+    for (final (index, file) in nativeFrames.indexed) {
+      final rgb = image.decodeBmp(file.readAsBytesSync())!;
+      check(
+        (rgb.width, rgb.height) == (192, 62) &&
+            getCrc32(rgb.getBytes(order: image.ChannelOrder.rgb)) ==
+                nativeReference[index],
+        'Native YUV branch result $index matches FFmpeg',
       );
     }
 

@@ -2,7 +2,7 @@ part of 'yuv_image.dart';
 
 /// A single-input, single-output graph of video filters.
 final class VideoFilterChain {
-  VideoFilterChain._(this.source, this._filters, this._timing);
+  VideoFilterChain._(this.source, this._filters, this._timing, [this._graph]);
 
   factory VideoFilterChain.parse(String source) {
     if (source.length > 2048) {
@@ -14,6 +14,7 @@ final class VideoFilterChain {
   final String source;
   final List<_SpatialFilter> _filters;
   final List<_TimingFilter> _timing;
+  final _SynchronizedFilterGraph? _graph;
 
   static VideoFilterChain _presentation(
     VideoCrop? crop,
@@ -22,22 +23,28 @@ final class VideoFilterChain {
   ) {
     final (:degrees, :horizontal, :vertical) =
         orientation ?? (degrees: 0, horizontal: false, vertical: false);
-    return VideoFilterChain._(next?.source ?? '', [
-      if (crop != null) _PresentationCrop(crop),
-      if (degrees == 90 || degrees == 270)
-        _Transpose._(degrees == 90 ? 1 : 2, 0)
-      else if (degrees != 0)
-        _Rotate(degrees),
-      if (horizontal) _Flip.horizontal,
-      if (vertical) _Flip.vertical,
-      ...?next?._filters,
-    ], next?._timing ?? const []);
+    return VideoFilterChain._(
+      next?.source ?? '',
+      [
+        if (crop != null) _PresentationCrop(crop),
+        if (degrees == 90 || degrees == 270)
+          _Transpose._(degrees == 90 ? 1 : 2, 0)
+        else if (degrees != 0)
+          _Rotate(degrees),
+        if (horizontal) _Flip.horizontal,
+        if (vertical) _Flip.vertical,
+        ...?next?._filters,
+      ],
+      next?._timing ?? const [],
+      next?._graph,
+    );
   }
 
-  bool get hasSpatialFilters => _filters.isNotEmpty;
-  bool get usesTimeline => _timing.isNotEmpty;
+  bool get hasSpatialFilters => _filters.isNotEmpty || _graph != null;
+  bool get usesTimeline => _timing.isNotEmpty || _graph != null;
 
   CaptureTimeline filterTiming(CaptureTimeline timeline) {
+    if (_graph case final graph?) return graph.schedule(timeline);
     for (final filter in _timing) {
       timeline = filter.apply(timeline);
     }
@@ -54,6 +61,11 @@ final class VideoFilterChain {
     List<FilterFramePosition> positions, {
     required bool deferScale,
   }) {
+    if (_graph != null) {
+      throw const FormatException(
+        'This video filter graph requires a capture timeline',
+      );
+    }
     final count = _filters.length - (deferScale ? 1 : 0);
     var next = 0;
     for (var i = 0; i < count; i++) {

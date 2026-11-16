@@ -36,10 +36,25 @@ final class VideoCaptureDecoder {
     Map<FramePacket, int>? firstUse,
   }) {
     final captures = <FramePacket, Set<CaptureFrame>>{};
-    var dynamicFilters = false;
+    var dynamicFilters = false, graph = false;
     for (final frame in selected) {
       captures.putIfAbsent(frame.packet, () => {}).add(frame);
       if (frame.positions.isNotEmpty) dynamicFilters = true;
+      if (frame.picture != null) graph = true;
+    }
+    if (graph) {
+      final composition = _FilterComposition(
+        captures.values.expand((frames) => frames),
+        _scaler!,
+        _includeOriginal,
+        firstUse,
+      );
+      return _decode(
+        composition.uses.keys,
+        null,
+        firstUse: firstUse == null ? null : composition.priorities,
+        composition: composition,
+      );
     }
     return _decode(
       captures.keys,
@@ -52,6 +67,7 @@ final class VideoCaptureDecoder {
     Iterable<FramePacket> selected,
     Map<FramePacket, Set<CaptureFrame>>? captures, {
     Map<FramePacket, int>? firstUse,
+    _FilterComposition? composition,
   }) async* {
     if (_closed || _busy) throw StateError('Capture decoder is unavailable');
     _busy = true;
@@ -80,6 +96,14 @@ final class VideoCaptureDecoder {
       }
       if (active <= 1) {
         for (final run in runs) {
+          if (composition != null) {
+            for (final picture in _video._decodeNativeRun(run)) {
+              for (final frame in composition.add(picture)) {
+                yield frame;
+              }
+            }
+            continue;
+          }
           for (final frame in _video._decodeRun(
             run,
             _scaler,
@@ -98,6 +122,7 @@ final class VideoCaptureDecoder {
         void send(int worker, _DecodeRun run) {
           _workers[worker].send((
             run: run,
+            native: composition != null,
             captures: captures == null
                 ? null
                 : {
@@ -114,6 +139,12 @@ final class VideoCaptureDecoder {
         var working = active;
         while (working > 0) {
           switch (await _receive()) {
+            case final _DecodedNativeFrame result:
+              if (firstUse != null) _workers[result.worker].send(true);
+              for (final frame in composition!.add(result.frame)) {
+                yield frame;
+              }
+              if (firstUse == null) _workers[result.worker].send(true);
             case final _DecodedFrame result:
               final frame = _unpackImage(result.frame);
               final original = result.original;
@@ -224,6 +255,76 @@ final class VideoCaptureDecoder {
   }
 }
 
+final class _FilterComposition {
+  _FilterComposition(
+    Iterable<CaptureFrame> captures,
+    this.scaler,
+    this.includeOriginal,
+    Map<FramePacket, int>? firstUse,
+  ) {
+    for (final frame in captures) {
+      final picture = frame.picture ?? FilterInputPicture(frame.packet);
+      final packets = picture.sourcePackets();
+      _pending[frame] = packets.length;
+      for (final packet in packets) {
+        uses.putIfAbsent(packet, () => []).add(frame);
+        if (firstUse != null) {
+          final rank = firstUse[frame.packet]!;
+          final prior = priorities[packet];
+          if (prior == null || rank < prior) priorities[packet] = rank;
+        }
+      }
+    }
+    for (final entry in uses.entries) {
+      _references[entry.key] = entry.value.length;
+    }
+  }
+
+  final YuvImageScaler scaler;
+  final bool includeOriginal;
+  final uses = <FramePacket, List<CaptureFrame>>{};
+  final priorities = <FramePacket, int>{};
+  final _pending = <CaptureFrame, int>{};
+  final _references = <FramePacket, int>{};
+  final _pictures = <FramePacket, VideoFilterPicture>{};
+
+  Iterable<_SelectedFrame> add(_NativeCaptureFrame source) sync* {
+    _pictures[source.packet] = source.picture;
+    for (final capture in uses.remove(source.packet)!) {
+      final remaining = _pending[capture]! - 1;
+      if (remaining != 0) {
+        _pending[capture] = remaining;
+        continue;
+      }
+      _pending.remove(capture);
+      final picture = capture.picture ?? FilterInputPicture(capture.packet);
+      VideoFilterPicture sourceFor(FramePacket packet) => _pictures[packet]!;
+      final render = scaler.renderFilterPicture(picture, sourceFor);
+      final unscaled = scaler.unscaled;
+      final original = !includeOriginal
+          ? null
+          : identical(unscaled, scaler)
+          ? render
+          : unscaled!.renderFilterPicture(picture, sourceFor);
+      for (final packet in picture.sourcePackets()) {
+        final count = _references[packet]! - 1;
+        if (count == 0) {
+          _references.remove(packet);
+          _pictures.remove(packet);
+        } else {
+          _references[packet] = count;
+        }
+      }
+      yield (
+        packet: capture.packet,
+        capture: capture,
+        frame: render,
+        original: original,
+      );
+    }
+  }
+}
+
 typedef _WorkerInput = ({
   String path,
   int? width,
@@ -246,8 +347,10 @@ typedef _DecodedFrame = ({
   _PackedImage frame,
   _PackedImage? original,
 });
+typedef _DecodedNativeFrame = ({int worker, _NativeCaptureFrame frame});
 typedef _DecodeJob = ({
   _DecodeRun run,
+  bool native,
   Map<FramePacket, Set<CaptureFrame>>? captures,
 });
 typedef _DecodeFailure = ({Object error, String stack});
@@ -268,21 +371,28 @@ Future<void> _decodeWorker(_WorkerInput input) async {
             filters: filters == null ? null : VideoFilterChain.parse(filters),
           );
     input.events.send(commands.sendPort);
-    Iterator<_SelectedFrame>? cursor;
+    Iterator<Object>? cursor;
     await for (final command in commands) {
       if (command == null) break;
       if (command is _DecodeJob) {
-        cursor = video
-            ._decodeRun(
-              command.run,
-              scaler,
-              input.original,
-              captures: command.captures,
-            )
-            .iterator;
+        cursor = command.native
+            ? video._decodeNativeRun(command.run).iterator
+            : video
+                  ._decodeRun(
+                    command.run,
+                    scaler,
+                    input.original,
+                    captures: command.captures,
+                  )
+                  .iterator;
       }
       if (cursor!.moveNext()) {
-        final result = cursor.current;
+        final item = cursor.current;
+        if (item is _NativeCaptureFrame) {
+          input.events.send((worker: input.index, frame: item));
+          continue;
+        }
+        final result = item as _SelectedFrame;
         final original = result.original;
         input.events.send((
           worker: input.index,

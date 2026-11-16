@@ -18,15 +18,17 @@ typedef FilterFramePosition = ({int index, double seconds});
 /// A single decoded picture can appear more than once after a timing filter.
 /// The values seen by spatial filters distinguish those renderings.
 final class CaptureFrame {
-  const CaptureFrame(this.packet, [this.positions = const []]);
+  const CaptureFrame(this.packet, [this.positions = const [], this.picture]);
 
   final FramePacket packet;
   final List<FilterFramePosition> positions;
+  final FilterPicture? picture;
 
   @override
   bool operator ==(Object other) {
     if (other is! CaptureFrame ||
         other.packet != packet ||
+        other.picture != picture ||
         other.positions.length != positions.length)
       return false;
     for (var i = 0; i < positions.length; i++) {
@@ -36,7 +38,44 @@ final class CaptureFrame {
   }
 
   @override
-  int get hashCode => Object.hash(packet, Object.hashAll(positions));
+  int get hashCode => Object.hash(packet, Object.hashAll(positions), picture);
+}
+
+// Timing builds a picture recipe without decoding any pixels. Multiple filter
+// inputs can refer to different source packets, or share a recipe at a split.
+sealed class FilterPicture {
+  const FilterPicture();
+
+  Set<FramePacket> sourcePackets() {
+    final packets = <FramePacket>{};
+    final seen = <FilterPicture>{};
+    void visit(FilterPicture picture) {
+      if (!seen.add(picture)) return;
+      switch (picture) {
+        case FilterInputPicture(:final packet):
+          packets.add(packet);
+        case FilterOperationPicture(:final inputs):
+          for (final input in inputs) {
+            visit(input);
+          }
+      }
+    }
+
+    visit(this);
+    return packets;
+  }
+}
+
+final class FilterInputPicture extends FilterPicture {
+  const FilterInputPicture(this.packet);
+  final FramePacket packet;
+}
+
+final class FilterOperationPicture extends FilterPicture {
+  const FilterOperationPicture(this.step, this.inputs, this.position);
+  final int step;
+  final List<FilterPicture> inputs;
+  final FilterFramePosition position;
 }
 
 typedef CaptureSource = ({CaptureFrame frame, int index});
@@ -60,13 +99,25 @@ final class CaptureTimedFrame extends CaptureTimelineEvent {
         frame: CaptureFrame(
           source.frame.packet,
           List.unmodifiable([...source.frame.positions, position]),
+          source.frame.picture,
+        ),
+        index: source.index,
+      ));
+
+  CaptureTimedFrame withPicture(FilterPicture picture) =>
+      CaptureTimedFrame(pts, duration, (
+        frame: CaptureFrame(
+          source.frame.packet,
+          source.frame.positions,
+          picture,
         ),
         index: source.index,
       ));
 }
 
 final class CaptureTimelineEnd extends CaptureTimelineEvent {
-  const CaptureTimelineEnd(super.pts);
+  const CaptureTimelineEnd(super.pts, {this.known = true});
+  final bool known;
 }
 
 final class CaptureTimeline {

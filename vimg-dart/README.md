@@ -348,18 +348,24 @@ time base, and `fps` supports start padding, rounding and EOF modes. Spatial
 expressions use the timeline at their position in the chain. A crop after
 `fps` sees the duplicated frames, and a crop before `fps` sees the
 original frames. Wall-clock expressions, expressions that depend on earlier
-spatial evaluations, and independent timelines inside branches are pending.
+spatial evaluations, and arbitrary external graph inputs are pending.
 
 Single-input, single-output filter graphs can fan out with `split` and
 rejoin with `hstack` or `vstack`. For example,
 `--vfilter 'split[a][b];[b]hflip[c];[a][c]hstack'` puts each frame beside
-its mirror image. Each branch can apply spatial filters. Timing filters can
-run on the shared stream before a split or after branches rejoin.
+its mirror image. Each branch can apply spatial and timing filters.
+Stacks emit frames on the union of their input timestamps after every input
+has started. They hold the last picture of an ended input by default.
+With `shortest=1` they stop at the first input to end.
 `hstack` requires equal input heights and `vstack` requires equal widths.
 `xstack` accepts a fixed `grid=2x2` or a custom `layout` with per-input
 offsets, including width and height references such as `w0+2_0`.
 Set `fill` to color any gaps. `overlay` places one branch on top of
 another, with clipping, alpha compositing and frame-dependent offsets.
+It selects a secondary picture at or before the main timestamp, or the
+closest picture with `ts_sync_mode=nearest`. Before the secondary begins it
+passes the main stream through. `eof_action`, `repeatlast` and `shortest`
+control how it handles input streams of different lengths.
 Both inputs must already match the requested pixel format. The default is
 8-bit YUV 4:2:0. Use `format=rgb` for 8-bit RGB or `format=auto` to
 retain the matching decoded planes. Packed 8-bit RGB also supports

@@ -158,7 +158,9 @@ final class _SetPts implements _TimingFilter {
     };
     var index = 0;
     for (final event in input.events) {
-      final pts = event.pts.toDouble();
+      final pts = event is CaptureTimelineEnd && !event.known
+          ? double.nan
+          : event.pts.toDouble();
       final seconds = pts * tb;
       variables['STARTPTS'] ??= pts;
       variables['STARTT'] ??= seconds;
@@ -166,7 +168,12 @@ final class _SetPts implements _TimingFilter {
       variables['PTS'] = pts;
       variables['T'] = seconds;
       variables['N'] = index.toDouble();
-      final output = checkedCaptureTick(expression(variables), truncate: true);
+      final value = expression(variables);
+      if (event is CaptureTimelineEnd && !event.known && value.isNaN) {
+        yield event;
+        return;
+      }
+      final output = checkedCaptureTick(value, truncate: true);
       if (event is! CaptureTimedFrame) {
         yield CaptureTimelineEnd(output);
         return;
@@ -288,6 +295,11 @@ final class _Fps implements _TimingFilter {
         next = tick;
         previous = event;
       } else {
+        if (!(event as CaptureTimelineEnd).known) {
+          // An untimestamped EOF drops the last buffered frame.
+          yield CaptureTimelineEnd(next ?? 0, known: next != null);
+          return;
+        }
         // EOF uses its own rounding and the absolute input clock.
         final end = rescaleCaptureTicks(
           event.pts,
@@ -343,7 +355,10 @@ final class _SetTimeBase implements _TimingFilter {
               timeBase,
             ),
           ),
-          CaptureTimelineEnd() => CaptureTimelineEnd(pts),
+          CaptureTimelineEnd(:final known) => CaptureTimelineEnd(
+            pts,
+            known: known,
+          ),
         };
       }),
       timeBase,
