@@ -1,5 +1,29 @@
 part of 'yuv_image.dart';
 
+final class _FrameSyncOptions {
+  factory _FrameSyncOptions.parse(Map<String, String> options) {
+    final shortest = _filterFlag(options['shortest'], 'shortest');
+    final repeat = _filterFlag(options['repeatlast'] ?? '1', 'repeatlast');
+    final eofAction = options['eof_action'];
+    final endAll = switch (eofAction) {
+      null || 'repeat' || 'pass' || '0' || '2' => false,
+      'endall' || '1' => true,
+      _ => throw const FormatException('Invalid eof_action'),
+    };
+    final nearest = switch (options['ts_sync_mode']) {
+      null || 'default' || '0' => false,
+      'nearest' || '1' => true,
+      _ => throw const FormatException('Invalid ts_sync_mode'),
+    };
+    final pass = !repeat || eofAction == 'pass' || eofAction == '2';
+    return _FrameSyncOptions._(shortest || !pass && endAll, pass, nearest);
+  }
+
+  const _FrameSyncOptions._(this.stopAtEof, this.dropSecondary, this.nearest);
+
+  final bool stopAtEof, dropSecondary, nearest;
+}
+
 final class _SynchronizedFilterGraph {
   _SynchronizedFilterGraph(this.steps);
   final List<_FilterStep> steps;
@@ -26,6 +50,7 @@ final class _SynchronizedFilterGraph {
         final _TimingFilter filter => filter.apply(inputs.single),
         _Stack() ||
         _Overlay() ||
+        _MergeAlpha() ||
         _VideoAlphaFilter(inplace: false) => _synchronize(index, inputs),
         _SpatialFilter() => _spatial(index, inputs.single),
         _ => inputs.single,
@@ -60,19 +85,23 @@ final class _SynchronizedFilterGraph {
 
   CaptureTimeline _synchronize(int step, List<CaptureTimeline> timelines) {
     final filter = steps[step].filter;
-    final overlay = filter is _Overlay ? filter : null;
+    final sync = switch (filter) {
+      final _Overlay filter => filter.sync,
+      final _MergeAlpha filter => filter.sync,
+      _ => null,
+    };
     final baseTimestamps = filter is _VideoAlphaFilter;
     final primary = timelines.first;
-    final clock = overlay != null
+    final clock = filter is _Overlay || sync?.dropSecondary == true
         ? primary.timeBase
         : timelines.map((input) => input.timeBase).reduce(_sharedFilterClock);
-    final outputClock = baseTimestamps ? primary.timeBase : clock;
+    final outputClock = baseTimestamps || filter is _MergeAlpha
+        ? primary.timeBase
+        : clock;
     final rate = primary.frameRate;
     final sameRate = timelines.every((input) => input.frameRate == rate);
-    final outputRate = overlay != null || baseTimestamps || sameRate
-        ? rate
-        : null;
-    final stop = overlay?.stopAtEof ?? (filter is _Stack && filter.shortest);
+    final outputRate = sync != null || baseTimestamps || sameRate ? rate : null;
+    final stop = sync?.stopAtEof ?? (filter is _Stack && filter.shortest);
     return CaptureTimeline(
       _joinEvents(
         step,
@@ -80,7 +109,7 @@ final class _SynchronizedFilterGraph {
         clock,
         outputClock,
         outputRate,
-        overlay,
+        sync,
         stop,
         baseTimestamps: baseTimestamps,
       ),
@@ -95,7 +124,7 @@ final class _SynchronizedFilterGraph {
     CaptureRational clock,
     CaptureRational outputClock,
     double? outputRate,
-    _Overlay? overlay,
+    _FrameSyncOptions? sync,
     bool stop, {
     required bool baseTimestamps,
   }) sync* {
@@ -113,12 +142,17 @@ final class _SynchronizedFilterGraph {
       var active = 0;
       for (final (i, input) in inputs.indexed) {
         final wasEnded = input.ended;
-        input.prepare(stop || overlay?.dropSecondary == true && i == 1);
+        input.prepare(stop || sync?.dropSecondary == true && i == 1);
         if (!wasEnded && input.ended) reportedEnd = input.end;
         if (!input.ended) active++;
         final next = input.nextTime;
         if (next != null && (nextTime == null || next < nextTime))
           nextTime = next;
+      }
+      if (sync?.dropSecondary == true && main.ended) {
+        // A secondary that cannot extend past EOF also cannot drive output.
+        nextTime = null;
+        reportedEnd = main.end;
       }
       if (nextTime == null || active == 0) {
         yield CaptureTimelineEnd(
@@ -136,7 +170,7 @@ final class _SynchronizedFilterGraph {
         final last = input.frame;
         final nearest =
             i == 1 &&
-            overlay?.nearest == true &&
+            sync?.nearest == true &&
             !main.ended &&
             input.next != null &&
             last != null &&
@@ -144,26 +178,31 @@ final class _SynchronizedFilterGraph {
         if (next != nextTime && !nearest) continue;
         if (input.next == null) {
           if (stop) {
-            yield CaptureTimelineEnd(nextTime, known: false);
+            yield CaptureTimelineEnd(
+              rescaleCaptureTicks(nextTime, clock, outputClock),
+              known: false,
+            );
             return;
           }
           input.clear();
           continue;
         }
         input.advance();
-        if (overlay == null || (main.ended ? i == 1 : i == 0)) ready = true;
+        if (sync == null || (main.ended ? i == 1 : i == 0)) ready = true;
       }
       if (!ready ||
           main.frame == null ||
-          overlay == null && inputs.any((input) => input.frame == null))
+          sync == null && inputs.any((input) => input.frame == null))
         continue;
       final first = main.frame!;
-      final pts = baseTimestamps
-          ? rescaleCaptureTicks(first.pts, clock, outputClock)
-          : nextTime;
+      final pts = rescaleCaptureTicks(
+        baseTimestamps ? first.pts : nextTime,
+        clock,
+        outputClock,
+      );
       final primary = first.retime(
         pts,
-        duration: overlay == null && !baseTimestamps
+        duration: sync == null && !baseTimestamps
             ? stackDuration
             : first.duration,
       );

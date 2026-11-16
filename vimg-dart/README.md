@@ -433,6 +433,12 @@ and read the first plane of the second input as the mask. `alphaextract`
 copies a frame's alpha into a full-range grayscale mask. The two-input
 implementation applies the documented mask operation when stock FFmpeg's
 equal-alpha-mode shortcut would leave the color samples as they were.
+`alphamerge` takes a main branch and an equally sized mask branch. It
+uses the mask's 8-bit luma as straight alpha on the main branch, which
+can be packed RGB, planar GBR or YUVA. For example,
+`split[a][b];[b]alphaextract,hflip[m];[a][m]alphamerge` mirrors the alpha
+channel. It accepts `eof_action`, `shortest`, `repeatlast` and
+`ts_sync_mode` for synchronizing the two branches.
 
 `vcs` applies the requested tile size after the filter chain and lays out the
 grid using the resulting tile dimensions. With `--keep`, it saves the filtered

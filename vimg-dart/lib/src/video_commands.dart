@@ -354,7 +354,12 @@ Future<void> writeContactSheet(
             ),
       scaler:
           scaleInDecoder && (spatial != null || width != null || height != null)
-          ? YuvImageScaler(width: width, height: height, filters: spatial)
+          ? YuvImageScaler(
+              width: width,
+              height: height,
+              filters: spatial,
+              packedOutput: true,
+            )
           : null,
       includeOriginal: paths != null && scaleInDecoder,
     );

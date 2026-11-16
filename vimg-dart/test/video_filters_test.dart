@@ -20,6 +20,7 @@ Future<void> main(List<String> arguments) async {
   _checkFormatNegotiation();
   _checkCompositing();
   _checkStandaloneAlpha();
+  _checkMergeAlpha();
   _checkFloatAlpha();
   _checkErrors();
   await _checkCli(arguments.firstOrNull);
@@ -747,6 +748,16 @@ void _checkColorFormats() {
       '$graph negotiates a native YUVA10 input and BMP output like FFmpeg',
     );
   }
+  final merged = render(
+    10,
+    'split[a][b];[b]alphaextract,hflip[m];[a][m]alphamerge',
+    alpha: alpha,
+    bitmap: true,
+  );
+  check(
+    getCrc32(merged.getBytes()) == 0x4fc19c87,
+    'alphamerge converts a high-depth mask to 8-bit luma like FFmpeg',
+  );
 }
 
 void _checkFormatNegotiation() {
@@ -1169,6 +1180,76 @@ void _checkStandaloneAlpha() {
   );
 }
 
+void _checkMergeAlpha() {
+  final source = image.Image(width: 8, height: 6, numChannels: 4);
+  for (final p in source) {
+    p.setRgba(29 * p.x, 41 * p.y, 13 * p.x + 11 * p.y, 19 * p.x + 23 * p.y);
+  }
+  YuvImageScaler bitmap(String filter) => YuvImageScaler(
+    filters: VideoFilterChain.parse(filter, bitmapOutput: true),
+  );
+  const alphaMask = 'split[a][b];[b]alphaextract,hflip[m];[a][m]alphamerge';
+  const lumaMask = 'split[a][b];[b]hflip[m];[a][m]alphamerge';
+  for (final (graph, checksum) in [
+    (alphaMask, 0x58342e75),
+    ('format=gbrap,$alphaMask', 0x58342e75),
+    (lumaMask, 0xf9ba5dab),
+    ('split[a][b];[b]hflip,scale=8:6[m];[a][m]alphamerge', 0xf9ba5dab),
+    ('$alphaMask,format=yuva444p', 0xa883f618),
+  ]) {
+    final frame = bitmap(graph).filterRgb(source);
+    check(
+      frame.hasAlpha && getCrc32(frame.getBytes()) == checksum,
+      '$graph matches FFmpeg BMP',
+    );
+  }
+  final opaque = bitmap(lumaMask).filterRgb(source.convert(numChannels: 3));
+  check(
+    opaque.hasAlpha && getCrc32(opaque.getBytes()) == 0xf9ba5dab,
+    'alphamerge adds alpha to an opaque source',
+  );
+  for (final (graph, hasAlpha, checksum) in [
+    (alphaMask, true, 0x201328f3),
+    (lumaMask, false, 0x4b592a34),
+    (
+      'split[a][b];[a]scale=8:6[s];[b]alphaextract,hflip[m];[s][m]alphamerge',
+      true,
+      0x201328f3,
+    ),
+  ]) {
+    final frame = yuvImage(
+      y: [for (final p in source) 30 + 14 * p.x + 7 * p.y],
+      cb: [
+        for (var y = 0; y < 3; y++)
+          for (var x = 0; x < 4; x++) 70 + 15 * x + 14 * y,
+      ],
+      cr: [
+        for (var y = 0; y < 3; y++)
+          for (var x = 0; x < 4; x++) 108 + 21 * x - 10 * y,
+      ],
+      stride: 8,
+      chromaStride: 4,
+      width: 8,
+      height: 6,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: 6,
+      fullRange: false,
+      alpha: hasAlpha ? [for (final p in source) p.a.toInt()] : null,
+      scaler: bitmap(graph),
+    );
+    check(
+      getCrc32(frame.getBytes()) == checksum,
+      '$graph preserves native YUV color',
+    );
+  }
+  _fails(
+    () =>
+        bitmap('split[a][b];[b]crop=4:4[m];[a][m]alphamerge').filterRgb(source),
+    'alphamerge requires equal input dimensions',
+  );
+}
+
 void _checkFloatAlpha() {
   final source = image.Image(width: 8, height: 6, numChannels: 4);
   for (final p in source) {
@@ -1522,16 +1603,91 @@ Future<void> _checkCli(String? executable) async {
         'crop=8:8:2:2,hflip[s];'
         '[m][s]overlay=2:2:format=auto:eof_action=pass,format=yuva420p';
     const autoOverlayReference = [
-      0xa755c65b,
-      0xa755c65b,
-      0x48e7d56c,
-      0x48e7d56c,
-      0x3a75e46d,
-      0xae26e46d,
-      0x939ff366,
-      0x939ff366,
+      0x0e0fc5d7,
+      0x0e0fc5d7,
+      0x8366d4c8,
+      0x8366d4c8,
+      0x8f84e3d9,
+      0x02e4e3d9,
+      0xe04cf2c6,
+      0xe04cf2c6,
     ];
     final transparentMotion = aviFixture(temp, rgba: true).path;
+    const mergeAlpha =
+        'split[a][b];[a]fps=8[m];[b]trim=start_frame=1:end_frame=3,'
+        'alphaextract,hflip,settb=1/16,setpts=PTS+1[mask];[m][mask]alphamerge';
+    const shortMain =
+        'split[a][b];[a]trim=end_frame=2,fps=8[m];'
+        '[b]alphaextract,hflip[mask];[m][mask]alphamerge';
+    // FFmpeg BMP capture at 8 fps, including the alpha channel.
+    const mergeStart = [0x8fd11bb7, 0x8fd11bb7, 0x0c2199ca, 0xcbcd922f];
+    const mergeMiddle = [0x507c60c1, 0x206679be];
+    const mergeLast = [0x49377881, 0x49377881];
+    const shortStart = [0x58342e75, 0x58342e75, 0xcbcd922f, 0xcbcd922f];
+    for (final (name, filter, expected) in [
+      (
+        'merge-repeat',
+        mergeAlpha,
+        [...mergeStart, ...mergeMiddle, ...mergeLast],
+      ),
+      (
+        'merge-nearest',
+        '$mergeAlpha=ts_sync_mode=nearest',
+        [...mergeStart, 0x206679be, 0x206679be, ...mergeLast],
+      ),
+      (
+        'merge-pass',
+        '$mergeAlpha=repeatlast=0',
+        [...mergeStart, ...mergeMiddle, 0xf5b7eb76, 0xf5b7eb76],
+      ),
+      (
+        'merge-shortest',
+        '$mergeAlpha=shortest=1',
+        [...mergeStart, ...List.filled(4, 0x507c60c1)],
+      ),
+      (
+        'merge-short-main',
+        shortMain,
+        [...shortStart, 0xbbd78b50, ...List.filled(3, 0xb0367c86)],
+      ),
+      (
+        'merge-short-main-pass',
+        '$shortMain=eof_action=pass',
+        [...shortStart, ...List.filled(4, 0xcbcd922f)],
+      ),
+    ]) {
+      for (final command in ['extract', if (name == 'merge-nearest') 'vcs']) {
+        final folder = '${temp.path}/$name-$command';
+        await run([
+          command,
+          '-n1',
+          '-f8',
+          '-t1s',
+          '-T4',
+          if (command == 'vcs') ...[
+            '-c1',
+            '-H6',
+            '--keep',
+            '-o',
+            '${temp.path}/merged.avif',
+          ],
+          '--output-dir',
+          folder,
+          '--vfilter',
+          filter,
+          transparentMotion,
+        ]);
+        final outputs = ordered(folder);
+        check(outputs.length == expected.length, '$command $name frame count');
+        for (final (i, file) in outputs.indexed) {
+          final bmp = image.decodeBmp(file.readAsBytesSync())!;
+          check(
+            bmp.hasAlpha && getCrc32(bmp.getBytes()) == expected[i],
+            '$command $name frame $i matches FFmpeg RGBA',
+          );
+        }
+      }
+    }
     const associatedOverlay =
         'format=gbrap,split[a][b];[a]fps=8[m];'
         '[b]trim=start_frame=1:end_frame=3,crop=4:4:2:2,hflip[x];'

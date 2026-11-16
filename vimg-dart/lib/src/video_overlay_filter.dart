@@ -13,35 +13,7 @@ final class _Overlay {
       'alpha',
       'ts_sync_mode',
     ]);
-    final shortest = _filterFlag(options['shortest'], 'overlay shortest');
-    final repeat = _filterFlag(
-      options['repeatlast'] ?? '1',
-      'overlay repeatlast',
-    );
-    if (!const {
-          null,
-          'repeat',
-          'endall',
-          'pass',
-          '0',
-          '1',
-          '2',
-        }.contains(options['eof_action']) ||
-        !const {
-          null,
-          'default',
-          'nearest',
-          '0',
-          '1',
-        }.contains(options['ts_sync_mode'])) {
-      throw const FormatException('Invalid overlay synchronization option');
-    }
-    final eofAction = options['eof_action'];
-    final pass = !repeat || eofAction == 'pass' || eofAction == '2';
-    final stop =
-        shortest || !pass && (eofAction == 'endall' || eofAction == '1');
-    final nearest =
-        options['ts_sync_mode'] == 'nearest' || options['ts_sync_mode'] == '1';
+    final sync = _FrameSyncOptions.parse(options);
     final evaluateFrame = switch (options['eval']) {
       null || 'frame' || '1' => true,
       'init' || '0' => false,
@@ -104,9 +76,7 @@ final class _Overlay {
       format,
       alphaMode,
       evaluateFrame && dynamicPosition,
-      stop,
-      pass,
-      nearest,
+      sync,
     );
   }
 
@@ -116,9 +86,7 @@ final class _Overlay {
     this.format,
     this.alphaMode,
     this.usesFramePosition,
-    this.stopAtEof,
-    this.dropSecondary,
-    this.nearest, [
+    this.sync, [
     this.outputFormat,
     this.bitmapFallback,
   ]);
@@ -127,7 +95,7 @@ final class _Overlay {
   final _VideoPixelFormat? format;
   final bool? alphaMode;
   final bool usesFramePosition;
-  final bool stopAtEof, dropSecondary, nearest;
+  final _FrameSyncOptions sync;
   final _FormatFilter? outputFormat;
   final _NamedPixelFormat? bitmapFallback;
   final _converter = _PixelFormatConverter();
@@ -141,9 +109,7 @@ final class _Overlay {
         this.format,
         alphaMode,
         usesFramePosition,
-        stopAtEof,
-        dropSecondary,
-        nearest,
+        sync,
         format,
         bitmapTerminal && this.format == null ? format.packedAlphaFormat : null,
       );

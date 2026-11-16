@@ -1,7 +1,9 @@
 part of 'yuv_image.dart';
 
 final class _ExtractAlpha implements _SpatialFilter {
-  const _ExtractAlpha();
+  const _ExtractAlpha([this.format]);
+
+  final _FormatFilter? format;
 
   @override
   _VideoPlanes apply(_VideoPlanes frame) {
@@ -9,13 +11,89 @@ final class _ExtractAlpha implements _SpatialFilter {
     if (alpha == null) {
       throw const FormatException('alphaextract requires an alpha plane');
     }
-    return _VideoPlanes(
+    final extracted = _VideoPlanes(
       [alpha],
       0,
       0,
       matrix: frame.matrix,
       fullRange: true,
       sampleAspect: frame.sampleAspect,
+    );
+    return format?.apply(extracted) ?? extracted;
+  }
+}
+
+final class _MergeAlpha {
+  factory _MergeAlpha(String? source) => _MergeAlpha._(
+    _FrameSyncOptions.parse(
+      _filterOptions(source, [
+        'eof_action',
+        'shortest',
+        'repeatlast',
+        'ts_sync_mode',
+      ]),
+    ),
+    mainFormat,
+  );
+
+  _MergeAlpha._(this.sync, this.format, [this.bitmapFallback]);
+
+  static final mainFormat = _FormatFilter._(
+    [
+      for (final name in ['yuva444p', 'yuva422p', 'yuva420p', 'gbrap', 'rgba'])
+        _namedPixelFormat(name),
+    ],
+    const [],
+    const [],
+    const [false],
+  );
+  static final _gray = _pixelFormat(_PixelColor.gray, 8);
+  static final maskFormat = _FormatFilter._(
+    [(format: _gray, alpha: false, fullRange: null)],
+    const [],
+    const [],
+  );
+
+  final _FrameSyncOptions sync;
+  final _FormatFilter format;
+  final _NamedPixelFormat? bitmapFallback;
+  final _converter = _PixelFormatConverter();
+
+  _MergeAlpha withFormat(
+    _FormatFilter format, {
+    required bool bitmapTerminal,
+  }) => _MergeAlpha._(
+    sync,
+    format,
+    bitmapTerminal ? format.packedAlphaFormat : null,
+  );
+
+  _VideoPlanes apply(_VideoPlanes frame, _VideoPlanes? mask) {
+    if (mask != null &&
+        (frame.width != mask.width || frame.height != mask.height)) {
+      throw const FormatException(
+        'Alpha mask and video must have the same size',
+      );
+    }
+    final target = format.select(
+      frame,
+      preferred: mainFormat.matchingFormat(frame) ?? bitmapFallback,
+    );
+    final base = _converter.convert(
+      frame,
+      target.format,
+      alpha: true,
+      matrix: target.matrix,
+      fullRange: target.fullRange,
+    );
+    final opacity = mask == null
+        ? base.alpha!
+        : _frameFormat(mask) == _gray
+        ? mask.planes.single
+        : _converter.convert(mask, _gray, alpha: false).planes.single;
+    return base.mapComponents(
+      (plane, _, _, i) => i == 3 ? opacity : plane,
+      premultiplied: false,
     );
   }
 }

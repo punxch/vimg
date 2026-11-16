@@ -27,14 +27,20 @@ final class VideoFilterPicture {
 
 /// Resize video samples before RGB conversion. Reuse filter taps across frames.
 final class YuvImageScaler {
-  YuvImageScaler({this.width, this.height, this.filters, this.enlarge = true})
-    : _exact = false,
-      _algorithm = _ScaleAlgorithm.bicubic,
-      _sampleAspect = null;
+  YuvImageScaler({
+    this.width,
+    this.height,
+    this.filters,
+    this.enlarge = true,
+    this.packedOutput = false,
+  }) : _exact = false,
+       _algorithm = _ScaleAlgorithm.bicubic,
+       _sampleAspect = null;
 
   YuvImageScaler._fixed(int this.width, int this.height, this._algorithm)
     : _exact = true,
       enlarge = true,
+      packedOutput = false,
       _sampleAspect = null,
       filters = null;
 
@@ -44,6 +50,7 @@ final class YuvImageScaler {
     this.filters,
     this._sampleAspect,
     this.enlarge,
+    this.packedOutput,
   ) : _exact = false,
       _algorithm = _ScaleAlgorithm.bicubic;
 
@@ -60,12 +67,13 @@ final class YuvImageScaler {
         : VideoFilterChain._presentation(crop, orientation, scaler?.filters),
     sampleAspect,
     scaler?.enlarge ?? true,
+    scaler?.packedOutput ?? false,
   );
 
   final int? width, height;
   final VideoFilterChain? filters;
   final double? _sampleAspect;
-  final bool enlarge, _exact;
+  final bool enlarge, packedOutput, _exact;
   final _ScaleAlgorithm _algorithm;
   YuvImageScaler? _outputScale;
   late final YuvImageScaler? unscaled = filters == null
@@ -78,6 +86,7 @@ final class YuvImageScaler {
           filters,
           _sampleAspect,
           enlarge,
+          packedOutput,
         );
   _YuvGeometry? _geometry;
   late _PlaneScaler _luma;
@@ -284,6 +293,38 @@ final class YuvImageScaler {
     FilterFramePosition? position,
   ) {
     YuvImageScaler? outputScale;
+    if ((packedOutput || filters?.bitmapOutput == true) &&
+        scale == null &&
+        frame.alpha?.depth == 8 &&
+        !frame.rgb &&
+        frame.planes.length == 3 &&
+        frame.planes.every((plane) => plane.depth == 8) &&
+        _dimensions(frame.width, frame.height) == (frame.width, frame.height)) {
+      // The unscaled filter sink converts YUVA directly to packed RGB.
+      if (frame.usesUnscaledRgbTable) {
+        return _rgbTable(frame.matrix, frame.fullRange).writeUnscaled(frame);
+      }
+      if (frame.subX == 0 && frame.subY == 0) {
+        final [y, cb, cr] = frame.planes;
+        final alpha = frame.alpha!;
+        final matrix = _PackedYuvMatrix(frame.matrix, frame.fullRange);
+        final pixels = image.Image(
+          width: frame.width,
+          height: frame.height,
+          numChannels: 4,
+        );
+        for (final pixel in pixels) {
+          final x = pixel.x, row = pixel.y;
+          final (r, g, b) = matrix.rgb(
+            y.at(x, row) << 9,
+            cb.at(x, row) << 9,
+            cr.at(x, row) << 9,
+          );
+          pixel.setRgba(r, g, b, alpha.at(x, row));
+        }
+        return pixels;
+      }
+    }
     if (scale != null) {
       // The terminal scale can upsample chroma while converting to RGB.
       // RGB output uses the input interpretation and has its own full range.

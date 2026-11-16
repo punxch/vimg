@@ -81,6 +81,7 @@ Object? _graphFilter(String specification) {
     'hstack' || 'vstack' || 'xstack' => _Stack(args, name),
     'overlay' => _Overlay(args),
     'alphaextract' => const _ExtractAlpha(),
+    'alphamerge' => _MergeAlpha(args),
     'premultiply' ||
     'unpremultiply' ||
     'premultiply_dynamic' => _VideoAlphaFilter(name, args),
@@ -103,7 +104,7 @@ List<_FilterStep> _orderedFilterSteps(
     final filter = _graphFilter(entry.specification);
     final inputCount = switch (filter) {
       final _Stack stack => stack.inputs,
-      _Overlay() => 2,
+      _Overlay() || _MergeAlpha() => 2,
       final _VideoAlphaFilter alpha => alpha.inputs,
       _ => 1,
     };
@@ -201,12 +202,17 @@ List<_FilterStep> _negotiateFilterFormats(
         explicitFormat: true,
         acceptsAlphaMode: alpha.mode == null,
       ),
+      _MergeAlpha() => _FormatRegion(
+        constraints: _MergeAlpha.mainFormat,
+        explicitFormat: true,
+        alphaLayoutOutput: true,
+      ),
       final _Overlay overlay => _FormatRegion(
         constraints: overlay.mainFormat,
         explicitFormat: true,
-        overlayOutput: true,
+        alphaLayoutOutput: true,
       ),
-      _Stack() => _FormatRegion(),
+      _Stack() || _ExtractAlpha() => _FormatRegion(),
       null ||
       _TimingFilter() ||
       _SetAspect() ||
@@ -239,7 +245,7 @@ List<_FilterStep> _negotiateFilterFormats(
           absorbed.add(step.outputs.first);
         } else if (input.merge(output)) {
           // A decoded alpha input can still determine the layout at runtime.
-          if (!input.overlayOutput && format.alphaModes.isEmpty) {
+          if (!input.alphaLayoutOutput && format.alphaModes.isEmpty) {
             absorbed.add(step.outputs.first);
           }
         } else {
@@ -255,6 +261,12 @@ List<_FilterStep> _negotiateFilterFormats(
             output.restrict(constraint.withoutAlphaModes());
           }
         }
+      case _MergeAlpha():
+        output.restrict(
+          regions[step.inputs.first]!.root.constraints?.withoutAlphaModes() ??
+              _MergeAlpha.mainFormat,
+        );
+        regions[step.inputs[1]]!.restrict(_MergeAlpha.maskFormat);
       case final _Overlay overlay:
         final main = regions[step.inputs.first]!;
         final secondary = regions[step.inputs[1]]!;
@@ -283,12 +295,20 @@ List<_FilterStep> _negotiateFilterFormats(
     }
   }
 
+  final mergeAlphaInputs = <_FormatRegion, _FormatRegion>{};
   for (final step in steps.reversed) {
-    if (step.filter is! _VideoAlphaFilter) continue;
-    final layout = regions[step.outputs.single]!.root.constraints!
-        .withoutAlphaModes();
-    for (final input in step.inputs) {
-      regions[input]!.restrict(layout);
+    final filter = step.filter;
+    if (filter is _VideoAlphaFilter || filter is _MergeAlpha) {
+      final output = regions[step.outputs.single]!.root;
+      final layout = output.constraints!.withoutAlphaModes();
+      if (filter is _MergeAlpha) {
+        final main = regions[step.inputs.first]!.root;
+        if (main.restrict(layout)) mergeAlphaInputs[output] = main;
+      } else {
+        for (final input in step.inputs) {
+          regions[input]!.restrict(layout);
+        }
+      }
     }
   }
 
@@ -322,15 +342,18 @@ List<_FilterStep> _negotiateFilterFormats(
     }
   }
 
-  // A bitmap encoder accepts packed alpha. Format-preserving operations
-  // expose this preference on the same link. A scale owns its output layout.
+  // A bitmap encoder accepts packed alpha. Transpose and alpha merge
+  // preserve their main input layout. A scale owns its output layout.
   var bitmapRegion = bitmapOutput
       ? regions[steps.last.outputs.single]!.root
       : null;
+  final bitmapRegions = <_FormatRegion>{};
+  final bitmapAlphaInputs = <_FormatRegion>{};
   while (true) {
-    final rotated = transposedInputs[bitmapRegion];
-    if (rotated == null) break;
-    bitmapRegion = rotated.root;
+    if (bitmapRegion == null || !bitmapRegions.add(bitmapRegion)) break;
+    final main = mergeAlphaInputs[bitmapRegion]?.root;
+    if (main != null) bitmapAlphaInputs.add(main);
+    bitmapRegion = main ?? transposedInputs[bitmapRegion]?.root;
   }
   return [
     for (final step in steps)
@@ -339,8 +362,10 @@ List<_FilterStep> _negotiateFilterFormats(
           step.filter,
           regions[step.outputs.first]!.root,
           absorbed: absorbed.contains(step.outputs.first),
-          bitmapTerminal: identical(
-            bitmapRegion,
+          bitmapTerminal: bitmapRegions.contains(
+            regions[step.outputs.first]!.root,
+          ),
+          bitmapAlphaInput: bitmapAlphaInputs.contains(
             regions[step.outputs.first]!.root,
           ),
         ),
@@ -355,6 +380,7 @@ Object? _negotiatedFilter(
   _FormatRegion region, {
   required bool absorbed,
   required bool bitmapTerminal,
+  required bool bitmapAlphaInput,
 }) {
   if (absorbed) return null;
   final format = region.constraints;
@@ -365,7 +391,7 @@ Object? _negotiatedFilter(
         format,
         preferred:
             bitmapTerminal &&
-                region.overlayOutput &&
+                (region.alphaLayoutOutput || bitmapAlphaInput) &&
                 format.formats.every((candidate) => candidate.alpha)
             ? format.packedAlphaFormat
             : null,
@@ -376,6 +402,11 @@ Object? _negotiatedFilter(
       format,
       bitmapTerminal: bitmapTerminal,
     ),
+    final _MergeAlpha merge when format != null => merge.withFormat(
+      format,
+      bitmapTerminal: bitmapTerminal,
+    ),
+    _ExtractAlpha() when format != null => _ExtractAlpha(format),
     final _VideoAlphaFilter alpha when format != null => alpha.withFormat(
       format,
     ),
@@ -397,7 +428,7 @@ final class _FormatRegion {
     this.constraints,
     this.fixed = false,
     this.explicitFormat = false,
-    this.overlayOutput = false,
+    this.alphaLayoutOutput = false,
     this.acceptsAlphaMode = false,
   });
 
@@ -405,7 +436,7 @@ final class _FormatRegion {
   _FormatFilter? constraints;
   bool fixed, explicitFormat;
   bool hasDecodedOverlayInput = false;
-  final bool overlayOutput, acceptsAlphaMode;
+  final bool alphaLayoutOutput, acceptsAlphaMode;
 
   _FormatRegion get root {
     final parent = _parent;
@@ -434,10 +465,9 @@ final class _FormatRegion {
     return true;
   }
 
-  void restrict(_FormatFilter format) {
-    if (format.unrestricted) return;
-    merge(_FormatRegion(constraints: format, explicitFormat: true));
-  }
+  bool restrict(_FormatFilter format) =>
+      format.unrestricted ||
+      merge(_FormatRegion(constraints: format, explicitFormat: true));
 
   void inheritColor(_FormatFilter? source) {
     final format = constraints;
@@ -542,6 +572,10 @@ _VideoPlanes _applyFilterStep(
     inputs[0],
     inputs.elementAtOrNull(1),
     position,
+  ),
+  final _MergeAlpha filter => filter.apply(
+    inputs[0],
+    inputs.elementAtOrNull(1),
   ),
   final _VideoAlphaFilter filter when !filter.inplace => filter.applyMask(
     inputs[0],
