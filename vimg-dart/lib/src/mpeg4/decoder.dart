@@ -16,6 +16,7 @@ import 'tables.dart';
 part 'blocks.dart';
 part 'motion.dart';
 part 'partitions.dart';
+part 'partition_texture.dart';
 part 'short_annex.dart';
 part 'short_b.dart';
 part 'short_layers.dart';
@@ -203,29 +204,31 @@ final class _VopDecoder {
     }
   }
 
+  int get _packetMarkerZeroes => switch (header.type) {
+    Mpeg4PictureType.intra => 16,
+    Mpeg4PictureType.bidirectional =>
+      15 + math.max<int>(2, math.max<int>(_forwardCode, _backwardCode)),
+    _ => 15 + _forwardCode,
+  };
+
   bool _readPacketHeader(int index) {
-    final zeroes = switch (header.type) {
-      Mpeg4PictureType.intra => 16,
-      Mpeg4PictureType.bidirectional =>
-        15 + math.max<int>(2, math.max<int>(_forwardCode, _backwardCode)),
-      _ => 15 + _forwardCode,
-    };
+    final zeroes = _packetMarkerZeroes;
     final saved = _bits.position;
     final pad = 8 - (saved & 7);
     final addressBits = (picture.columns * picture.rows - 1).bitLength;
     if (_bits.remaining <
         pad + zeroes + addressBits + header.volume.quantBits + 2)
       return false;
-    if (_bits.read(pad) != (1 << (pad - 1)) - 1 ||
-        _bits.read(zeroes + 1) != 1) {
+    if (_bits.read(pad) != (1 << (pad - 1)) - 1) {
       _bits.position = saved;
       return false;
     }
-    final address = _bits.read(addressBits);
+    final address = _readPacketAddress(_bits);
     if (address != index) {
       _bits.position = saved;
       // A skipped B macroblock consumes no bits before the next packet.
-      if (future?.motion.skipped[index] == 1 && address > index) return false;
+      if (address < 0 || future?.motion.skipped[index] == 1 && address > index)
+        return false;
       throw const FormatException('Invalid MPEG-4 video packet address');
     }
     _sliceStart = index;
@@ -258,6 +261,10 @@ final class _VopDecoder {
     return true;
   }
 
+  int _readPacketAddress(Rbsp bits) => bits.read(_packetMarkerZeroes + 1) == 1
+      ? bits.read((picture.columns * picture.rows - 1).bitLength)
+      : -1;
+
   void _adjustQuant(int delta) {
     _quant = (_quant + delta).clamp(1, (1 << header.volume.quantBits) - 1);
   }
@@ -285,7 +292,6 @@ final class _VopDecoder {
     required bool separateDc,
     required bool acPrediction,
     bool fieldDct = false,
-    List<int>? dc,
   }) {
     for (var block = 0; block < 6; block++) {
       _readBlock(
@@ -297,7 +303,6 @@ final class _VopDecoder {
         separateDc: separateDc,
         acPrediction: acPrediction,
         fieldDct: fieldDct,
-        dcDifference: dc?[block],
       );
     }
   }

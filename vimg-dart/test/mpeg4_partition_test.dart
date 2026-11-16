@@ -67,6 +67,7 @@ Future<void> main(List<String> arguments) async {
     1127191846,
   ]);
   _verifyDcInTexturePartition();
+  await _verifyDamagedReversibleTexture(arguments.firstOrNull);
   if (arguments.firstOrNull case final cli?) await _verifyContactSheet(cli);
 }
 
@@ -118,6 +119,148 @@ void _verifyDcInTexturePartition() {
     getCrc32(frame.planes.expand((plane) => plane).toList()) == 2655799332,
     'Partitioned DC in texture matches separately coded DC from FFmpeg',
   );
+}
+
+Future<void> _verifyDamagedReversibleTexture(String? cli) async {
+  final damaged = _reversibleStream(damaged: true);
+  final concealed = _reversibleStream();
+  final healthy = _reversibleStream(healthy: true);
+  final actual = Mpeg4Decoder().decode(damaged).toList();
+  final original = Mpeg4Decoder().decode(healthy).toList();
+  // FFmpeg's simple IDCT, decoding the intact concealment reference.
+  const expected = [3829798683, 2738999772, 3371650375];
+  check(actual.length == expected.length, 'RVLC recovery preserves all VOPs');
+  for (final (index, frame) in actual.indexed) {
+    check(frame.pts == index, 'Recovered VOP $index preserves its timestamp');
+    check(
+      getCrc32(frame.planes.expand((plane) => plane).toList()) ==
+          expected[index],
+      'Recovered VOP $index equals its concealment reference',
+    );
+  }
+  for (final index in [0, 2]) {
+    check(
+      getCrc32(actual[index].planes[0]) != getCrc32(original[index].planes[0]),
+      'Damaged block in VOP $index originally had texture',
+    );
+  }
+  if (cli == null) return;
+  final directory = Directory.systemTemp.createTempSync('vimg-rvlc-recovery-');
+  try {
+    final input = File('${directory.path}/damaged.m4v')
+      ..writeAsBytesSync(damaged);
+    final reference = File('${directory.path}/concealed.m4v')
+      ..writeAsBytesSync(concealed);
+    for (final (name, file) in [('actual', input), ('expected', reference)]) {
+      final result = await Process.run(cli, [
+        'extract',
+        '-n1',
+        '-f3',
+        '-t300ms',
+        '-T2',
+        '--output-dir',
+        '${directory.path}/$name',
+        file.path,
+      ]);
+      check(result.exitCode == 0, '${result.stderr}');
+    }
+    List<int> hashes(String name) {
+      final frames =
+          Directory(
+              '${directory.path}/$name',
+            ).listSync().whereType<File>().toList()
+            ..sort((left, right) => left.path.compareTo(right.path));
+      return [for (final file in frames) getCrc32(file.readAsBytesSync())];
+    }
+
+    final captures = hashes('actual'), references = hashes('expected');
+    check(
+      captures.length == 3 &&
+          references.length == 3 &&
+          captures.toSet().length == 3 &&
+          captures.indexed.every((entry) => entry.$2 == references[entry.$1]),
+      'CLI extract preserves the three recovered frames in presentation order',
+    );
+  } finally {
+    directory.deleteSync(recursive: true);
+  }
+}
+
+Uint8List _reversibleStream({bool damaged = false, bool healthy = false}) {
+  String word(int value, int length) =>
+      value.toRadixString(2).padLeft(length, '0');
+  String padded(String bits) =>
+      '$bits${'0'.padRight(8 - (bits.length & 7), '1')}';
+  List<int> unit(int startCode, String bits) {
+    final data = padded(bits);
+    return [
+      0,
+      0,
+      1,
+      startCode,
+      for (var i = 0; i < data.length; i += 8)
+        int.parse(data.substring(i, i + 8), radix: 2),
+    ];
+  }
+
+  const intraMarker = '1101011000000000001';
+  const motionMarker = '11111000000000001';
+  const dc = '1110110110111111';
+  const last = '10110'; // LAST=1, RUN=0, LEVEL=+1 in both tables.
+  const positiveEscape = '000011000001100000010100100000';
+  const negativeEscape = '000011000001100000010100100001';
+  // A missing escape marker before an intact LAST event leaves a block
+  // boundary the backward decoder can use to delimit the following block.
+  final brokenBlock = damaged ? '00000$last' : (healthy ? '10111' : '');
+  final codeAll = damaged || healthy;
+  final vol =
+      '0${word(1, 8)}0'
+      '0001'
+      '000'
+      '1${word(10, 16)}10'
+      '1${word(32, 13)}1${word(16, 13)}1'
+      '0100010110';
+  String header(int time, {bool intra = true}) =>
+      '${intra ? '00' : '01'}01${word(time, 4)}11${intra ? '' : '0'}00000110'
+      '${intra ? '' : '001'}';
+
+  // First I-VOP has two packets. Preserve DC in the damaged block and
+  // recover the signed escapes and ordinary VLCs on its far side.
+  final packet =
+      '011$dc$intraMarker'
+      '0${codeAll ? '11' : '1010'}'
+      '$last$brokenBlock'
+      '1100$positiveEscape$negativeEscape$last'
+      '100101';
+  final nextHeader = '${word(1, 17)}1${word(6, 5)}0';
+  final nextPacket =
+      '${padded('${header(0)}$packet')}$nextHeader'
+      '1$dc$intraMarker'
+      '01001$positiveEscape$last';
+  final cleanIntra =
+      '${header(1)}'
+      '1$dc'
+      '1$dc$intraMarker'
+      '01001'
+      '000100'
+      '$last$positiveEscape$negativeEscape';
+
+  // Final packet of a P-VOP. The reverse pass crosses from intra to inter
+  // VLCs and the lost inter block retains its motion-compensated pixels.
+  final predictive =
+      '${header(2, intra: false)}'
+      '000010111'
+      '00000011'
+      '$motionMarker${codeAll ? '0011' : '00011'}'
+      '011$dc'
+      '$last$brokenBlock$positiveEscape$last$negativeEscape$last'
+      '1100$positiveEscape$negativeEscape$last$last$last$last';
+  return Uint8List.fromList([
+    ...unit(0x20, vol),
+    ...unit(0xb6, nextPacket),
+    ...unit(0xb6, cleanIntra),
+    ...unit(0xb6, predictive),
+  ]);
 }
 
 Future<void> _verifyContactSheet(String cli) async {

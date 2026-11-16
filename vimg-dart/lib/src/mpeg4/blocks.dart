@@ -110,6 +110,40 @@ final class _Events {
       last: last,
     );
   }
+
+  _DctEvent readReverse(_ReverseTextureBits bits) {
+    final negative = bits.read(1) != 0;
+    var word = 0;
+    for (var length = 1; length <= 15; length++) {
+      word |= bits.read(1) << (length - 1);
+      if (length == 5 && word == 0x10) {
+        final level = bits.read(11);
+        if (level == 0 || bits.read(1) != 1) break;
+        final run = bits.read(6), last = bits.read(1) != 0;
+        if (bits.read(1) != 1 || bits.read(4) != 0) break;
+        return (run: run, value: negative ? -level : level, last: last);
+      }
+      final code = _vlc._values[(1 << length) | word];
+      // The escape opens with 0000 in the forward direction only.
+      if (code != null && code < _runs.length) {
+        final level = _levels[code];
+        return (
+          run: _runs[code],
+          value: negative ? -level : level,
+          last: code >= _firstLast,
+        );
+      }
+    }
+    throw const FormatException('Invalid MPEG-4 reverse VLC');
+  }
+}
+
+int _nextCoefficient(int position, _DctEvent event) {
+  position += event.run + 1;
+  if (position >= 64) {
+    throw const FormatException('MPEG-4 run exceeds the block');
+  }
+  return position;
 }
 
 typedef _IntraBlock = ({int dc, int quant, Int16List edges});
@@ -133,6 +167,7 @@ extension _DctBlocks on _VopDecoder {
     bool acPrediction = false,
     bool fieldDct = false,
     int? dcDifference,
+    List<_DctEvent>? texture,
   }) {
     final luma = block < 4;
     final plane = luma ? 0 : block - 3;
@@ -180,11 +215,10 @@ extension _DctBlocks on _VopDecoder {
           ? (intra ? _intraReversibleEvents : _interReversibleEvents)
           : (intra ? _intraEvents : _interEvents);
       var position = separateDc ? 0 : -1;
+      var index = 0;
       while (true) {
-        final event = events.read(_bits);
-        position += event.run + 1;
-        if (position >= 64)
-          throw const FormatException('MPEG-4 run exceeds the block');
+        final event = texture == null ? events.read(_bits) : texture[index++];
+        position = _nextCoefficient(position, event);
         values[scan[position]] = event.value;
         if (event.last) break;
       }

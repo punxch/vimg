@@ -178,11 +178,13 @@ missing timestamps from the VOP clock. Interlaced capture reconstructs both
 fields in the same frame with
 field DCT, motion prediction, and direct B-VOP prediction in either field
 order. Progressive I/P pictures support data partitioning with ordinary
-and reversible VLCs, including reversible escape codes. S-VOPs support
+and reversible VLCs, including reversible escape codes. If a texture
+partition fails to decode, recovery can read complete blocks backward from
+the next packet or picture boundary and reconstruct missing blocks from
+intact DC or motion information. S-VOPs support
 global motion compensation with zero to three warping points alongside
 locally predicted macroblocks, including in partitioned pictures. Static
-sprites, sprite brightness changes and recovery from damaged reversible
-VLC partitions remain pending.
+sprites and sprite brightness changes remain pending.
 
 Standalone `.h263` files, 3GP, AVI and Matroska support H.263 and H.263+
 I/P pictures, both parts of PB and Improved PB frames, and standalone H.263+

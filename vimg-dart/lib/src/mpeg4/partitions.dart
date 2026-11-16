@@ -22,7 +22,11 @@ extension _DataPartitions on _VopDecoder {
       }
       final macroblocks = _readFirstPartition(start, count, intra);
       _readSecondPartition(macroblocks, intra);
-      _readTexturePartition(start, macroblocks);
+      if (header.volume.reversibleVlc) {
+        _readReversibleTexture(start, macroblocks);
+      } else {
+        _reconstructPartition(start, macroblocks);
+      }
       start += macroblocks.length;
     }
   }
@@ -115,35 +119,46 @@ extension _DataPartitions on _VopDecoder {
     }
   }
 
-  void _readTexturePartition(
+  void _reconstructPartition(
     int start,
-    List<_PartitionMacroblock?> macroblocks,
-  ) {
+    List<_PartitionMacroblock?> macroblocks, [
+    List<List<_DctEvent>?>? texture,
+  ]) {
     final motion = picture.motion;
     for (final (i, block) in macroblocks.indexed) {
       final index = start + i, x = index % _columns, y = index ~/ _columns;
       if (block != null) _quant = block.quant;
-      if (block != null && block.intra) {
-        _readIntraBlocks(
-          x,
-          y,
-          block.pattern,
-          separateDc: block.dc != null,
-          acPrediction: block.acPrediction,
-          dc: block.dc,
-        );
-        continue;
+      if (block?.intra != true) {
+        if (block?.global ?? (_globalMotion != null)) {
+          _predictGlobal(x, y);
+        } else {
+          final split = motion.split[index] != 0;
+          _prediction.predict(picture, past!, x, y, [
+            for (var j = 0; j < (split ? 4 : 1); j++)
+              motion.at(x * 2 + (j & 1), y * 2 + (j >> 1)),
+          ], noRound: header.noRound);
+        }
       }
-      if (block?.global ?? (_globalMotion != null)) {
-        _predictGlobal(x, y);
-      } else {
-        final split = motion.split[index] != 0;
-        _prediction.predict(picture, past!, x, y, [
-          for (var j = 0; j < (split ? 4 : 1); j++)
-            motion.at(x * 2 + (j & 1), y * 2 + (j >> 1)),
-        ], noRound: header.noRound);
+      if (block == null) continue;
+      for (var j = 0; j < 6; j++) {
+        final events = texture?[i * 6 + j];
+        final coded = texture == null
+            ? block.pattern & (32 >> j) != 0
+            : events != null;
+        if (block.intra || coded) {
+          _readBlock(
+            x,
+            y,
+            j,
+            coded: coded,
+            intra: block.intra,
+            separateDc: block.dc != null,
+            acPrediction: block.acPrediction,
+            dcDifference: block.dc?[j],
+            texture: events,
+          );
+        }
       }
-      if (block != null) _readResidual(x, y, block.pattern, false);
     }
   }
 }
