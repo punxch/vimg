@@ -122,23 +122,58 @@ final class YuvImageScaler {
         ? terminal
         : null;
     final evaluated = <FilterPicture, _VideoPlanes>{};
+    bool commandEnabled(
+      FilterEnableCommand command,
+      _VideoPlanes frame,
+      FilterFramePosition position,
+      _VideoPlanes Function(FilterPicture) evaluate,
+    ) {
+      final variables = command.variables;
+      if (variables == null)
+        return _allowsFilter(command.expression, frame, position);
+      final sender = command.sender;
+      final value = command.expression({
+        ...variables,
+        if (sender != null) ...{
+          'W': evaluate(sender).width.toDouble(),
+          'H': evaluate(sender).height.toDouble(),
+        },
+      });
+      // FFmpeg passes an evaluated argument using printf's six-digit %g precision.
+      final rounded = value.isFinite
+          ? double.parse(value.toStringAsPrecision(6))
+          : value;
+      return rounded.abs() >= 0.5;
+    }
+
     _VideoPlanes evaluate(FilterPicture node) =>
         evaluated.putIfAbsent(node, () {
-          return switch (node) {
-            FilterInputPicture(:final packet) => source(packet)._planes,
-            FilterOperationPicture(
+          switch (node) {
+            case FilterInputPicture(:final packet):
+              return source(packet)._planes;
+            case FilterOperationPicture(
               :final step,
               :final inputs,
               :final position,
               :final enablePosition,
-            ) =>
-              _applyFilterStep(
+              :final enableCommand,
+            ):
+              final frames = inputs.map(evaluate).toList();
+              return _applyFilterStep(
                 graph.steps[step],
-                inputs.map(evaluate).toList(),
+                frames,
                 position,
                 enablePosition: enablePosition,
-              ),
-          };
+                commandEnabled: enableCommand == null
+                    ? null
+                    : commandEnabled(
+                        enableCommand,
+                        frames.first,
+                        enablePosition ?? position,
+                        evaluate,
+                      ),
+              );
+          }
         });
     return _convertFiltered(
       evaluate(scale == null ? picture : operation!.inputs.single),

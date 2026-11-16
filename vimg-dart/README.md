@@ -367,6 +367,14 @@ and `w` and `h` are input dimensions. A result with absolute value below
 0.5 bypasses the effect. A two-input filter evaluates the expression when
 it reads a main-branch frame and continues to synchronize both branches.
 
+Use `sendcmd` to update `enable` during a capture. For example,
+`--vfilter "sendcmd=c='0.25-0.75 [enter] hflip@flip enable 1,[leave] hflip@flip enable 0',hflip@flip=enable=0"`
+flips frames in the interval from 0.25 seconds up to 0.75 seconds. Commands
+can also come from a file through `sendcmd=f=commands.txt`. A target can be
+a filter name or a named instance. `[expr]` evaluates an argument at the
+sender using its frame count, timestamps, interval bounds and dimensions.
+Each capture window starts with the original filter settings.
+
 Single-input, single-output filter graphs can fan out with `split` and
 rejoin with `hstack` or `vstack`. For example,
 `--vfilter 'split[a][b];[b]hflip[c];[a][c]hstack'` puts each frame beside
@@ -512,6 +520,7 @@ dart test/video_filters_test.dart
 dart test/video_paint_filters_test.dart
 dart test/video_timing_test.dart
 dart test/video_enable_test.dart
+dart test/video_sendcmd_test.dart
 dart test/capture_test.dart
 dart test/avif_test.dart
 dart test/av1_header_test.dart

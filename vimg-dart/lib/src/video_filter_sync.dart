@@ -30,6 +30,9 @@ final class _SynchronizedFilterGraph {
 
   CaptureTimeline schedule(CaptureTimeline source) {
     final active = {0: source};
+    final commands = steps.any((step) => step.filter is _SendCmd)
+        ? _EnableCommandState(steps)
+        : null;
     for (final (index, step) in steps.indexed) {
       final inputs = [for (final link in step.inputs) active.remove(link)!];
       final filter = step.filter;
@@ -48,19 +51,26 @@ final class _SynchronizedFilterGraph {
       }
       active[step.outputs.single] = switch (filter) {
         final _TimingFilter filter => filter.apply(inputs.single),
+        final _SendCmd filter => filter.apply(inputs.single, commands!),
         _Stack() ||
         _Overlay() ||
         _MergeAlpha() ||
-        _VideoAlphaFilter(inplace: false) => _synchronize(index, inputs),
-        _SpatialFilter() => _spatial(index, inputs.single),
+        _VideoAlphaFilter(
+          inplace: false,
+        ) => _synchronize(index, inputs, commands),
+        _SpatialFilter() => _spatial(index, inputs.single, commands),
         _ => inputs.single,
       };
     }
     return active.values.single;
   }
 
-  CaptureTimeline _spatial(int step, CaptureTimeline source) => CaptureTimeline(
-    _spatialEvents(step, source),
+  CaptureTimeline _spatial(
+    int step,
+    CaptureTimeline source,
+    _EnableCommandState? commands,
+  ) => CaptureTimeline(
+    _spatialEvents(step, source, commands),
     source.timeBase,
     source.frameRate,
   );
@@ -68,6 +78,7 @@ final class _SynchronizedFilterGraph {
   Iterable<CaptureTimelineEvent> _spatialEvents(
     int step,
     CaptureTimeline source,
+    _EnableCommandState? commands,
   ) sync* {
     var index = 0;
     for (final event in source.events) {
@@ -77,13 +88,18 @@ final class _SynchronizedFilterGraph {
                 step,
                 [_pictureOf(event)],
                 (index: index++, seconds: event.pts * source.timeBase.value),
+                enableCommand: commands?.at(step),
               ),
             )
           : event;
     }
   }
 
-  CaptureTimeline _synchronize(int step, List<CaptureTimeline> timelines) {
+  CaptureTimeline _synchronize(
+    int step,
+    List<CaptureTimeline> timelines,
+    _EnableCommandState? commands,
+  ) {
     final filter = steps[step].filter;
     final sync = switch (filter) {
       final _Overlay filter => filter.sync,
@@ -112,6 +128,7 @@ final class _SynchronizedFilterGraph {
         sync,
         stop,
         baseTimestamps: baseTimestamps,
+        commands: commands,
       ),
       outputClock,
       outputRate,
@@ -127,23 +144,30 @@ final class _SynchronizedFilterGraph {
     _FrameSyncOptions? sync,
     bool stop, {
     required bool baseTimestamps,
+    required _EnableCommandState? commands,
   }) sync* {
     final inputs = [
       for (final source in sources) _FilterSyncInput(source, clock),
     ];
     final main = inputs.first;
-    final trackEnable = steps[step].enable?.usesFramePosition == true;
+    final commandTarget = commands != null && steps[step].commandTarget != null;
+    final trackEnable =
+        commandTarget || steps[step].enable?.usesFramePosition == true;
     final stackDuration = outputRate == null
         ? 1
         : math.max(1, checkedCaptureTick(1 / (outputRate * clock.value)));
     int? lastOutput;
     int? reportedEnd;
+    FilterEnableCommand? enableCommand;
     while (true) {
       int? nextTime;
       var active = 0;
       for (final (i, input) in inputs.indexed) {
         final wasEnded = input.ended;
+        final waitingForMain = commandTarget && i == 0 && input.next == null;
         input.prepare(stop || sync?.dropSecondary == true && i == 1);
+        if (waitingForMain && input.next != null)
+          enableCommand = commands.at(step);
         if (!wasEnded && input.ended) reportedEnd = input.end;
         if (!input.ended) active++;
         final next = input.nextTime;
@@ -215,6 +239,7 @@ final class _SynchronizedFilterGraph {
         ],
         (index: main.index, seconds: pts * outputClock.value),
         enablePosition: trackEnable ? main.consumedPosition : null,
+        enableCommand: enableCommand,
       );
       lastOutput = pts;
       yield primary.withPicture(picture);

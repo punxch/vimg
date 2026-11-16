@@ -193,6 +193,8 @@ final class VideoCaptureDecoder {
             enlarge: _scaler?.enlarge ?? true,
             filters: _scaler?.filters?.source,
             bitmapOutput: _scaler?.filters?.bitmapOutput ?? false,
+            commandFiles:
+                _scaler?.filters?.commandFiles ?? const <String, String>{},
             packedOutput: _scaler?.packedOutput ?? false,
             original: _includeOriginal,
             index: index,
@@ -334,6 +336,7 @@ typedef _WorkerInput = ({
   bool enlarge,
   String? filters,
   bool bitmapOutput,
+  Map<String, String> commandFiles,
   bool packedOutput,
   bool original,
   int index,
@@ -378,6 +381,7 @@ Future<void> _decodeWorker(_WorkerInput input) async {
                 : VideoFilterChain.parse(
                     filters,
                     bitmapOutput: input.bitmapOutput,
+                    commandFiles: input.commandFiles,
                   ),
           );
     input.events.send(commands.sendPort);

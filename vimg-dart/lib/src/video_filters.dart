@@ -7,18 +7,28 @@ final class VideoFilterChain {
     this._filters,
     this._timing, {
     this.bitmapOutput = false,
+    this.commandFiles = const {},
     _SynchronizedFilterGraph? graph,
   }) : _graph = graph;
 
-  factory VideoFilterChain.parse(String source, {bool bitmapOutput = false}) {
+  factory VideoFilterChain.parse(
+    String source, {
+    bool bitmapOutput = false,
+    Map<String, String> commandFiles = const {},
+  }) {
     if (source.length > 2048) {
       throw const FormatException('Video filter chain exceeds 2048 characters');
     }
-    return _compileFilterGraph(source, bitmapOutput: bitmapOutput);
+    return _compileFilterGraph(
+      source,
+      bitmapOutput: bitmapOutput,
+      commandFiles: {...commandFiles},
+    );
   }
 
   final String source;
   final bool bitmapOutput;
+  final Map<String, String> commandFiles;
   final List<_SpatialFilter> _filters;
   final List<_TimingFilter> _timing;
   final _SynchronizedFilterGraph? _graph;
@@ -44,12 +54,18 @@ final class VideoFilterChain {
       ],
       next?._timing ?? const [],
       bitmapOutput: next?.bitmapOutput ?? false,
+      commandFiles: next?.commandFiles ?? const {},
       graph: next?._graph,
     );
   }
 
-  VideoFilterChain forBitmap() =>
-      bitmapOutput ? this : VideoFilterChain.parse(source, bitmapOutput: true);
+  VideoFilterChain forBitmap() => bitmapOutput
+      ? this
+      : VideoFilterChain.parse(
+          source,
+          bitmapOutput: true,
+          commandFiles: commandFiles,
+        );
 
   bool get hasSpatialFilters => _filters.isNotEmpty || _graph != null;
   bool get usesTimeline => _timing.isNotEmpty || _graph != null;
@@ -152,7 +168,7 @@ String _filterValue(String source) {
     switch (source[i]) {
       case "'":
         quoted = !quoted;
-      case r'\' when !quoted:
+      case r'\' when !quoted && i + 1 < source.length:
         value.write(source[++i]);
       default:
         value.write(source[i]);
@@ -258,14 +274,21 @@ final class _FilterEnable {
   final bool usesFramePosition;
 
   bool allows(_VideoPlanes frame, FilterFramePosition position) =>
-      expression({
-        'n': position.index.toDouble(),
-        't': position.seconds,
-        'w': frame.width.toDouble(),
-        'h': frame.height.toDouble(),
-      }).abs() >=
-      0.5;
+      _allowsFilter(expression, frame, position);
 }
+
+bool _allowsFilter(
+  FilterExpression expression,
+  _VideoPlanes frame,
+  FilterFramePosition position,
+) =>
+    expression({
+      'n': position.index.toDouble(),
+      't': position.seconds,
+      'w': frame.width.toDouble(),
+      'h': frame.height.toDouble(),
+    }).abs() >=
+    0.5;
 
 final class _EnabledSpatial extends _FrameSpatialFilter {
   _EnabledSpatial(this.filter, this.enable);

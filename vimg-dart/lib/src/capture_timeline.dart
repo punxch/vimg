@@ -1,6 +1,7 @@
 import 'dart:math' as math;
 import 'dart:typed_data';
 
+import 'filter_expression.dart';
 import 'frame_packet.dart';
 
 typedef CaptureRational = ({int numerator, int denominator});
@@ -54,10 +55,11 @@ sealed class FilterPicture {
       switch (picture) {
         case FilterInputPicture(:final packet):
           packets.add(packet);
-        case FilterOperationPicture(:final inputs):
+        case FilterOperationPicture(:final inputs, :final enableCommand):
           for (final input in inputs) {
             visit(input);
           }
+          if (enableCommand?.sender case final sender?) visit(sender);
       }
     }
 
@@ -77,11 +79,22 @@ final class FilterOperationPicture extends FilterPicture {
     this.inputs,
     this.position, {
     this.enablePosition,
+    this.enableCommand,
   });
   final int step;
   final List<FilterPicture> inputs;
   final FilterFramePosition position;
   final FilterFramePosition? enablePosition;
+  final FilterEnableCommand? enableCommand;
+}
+
+/// An enable command as seen when a target reads its input frame.
+final class FilterEnableCommand {
+  const FilterEnableCommand(this.expression, {this.variables, this.sender});
+
+  final FilterExpression expression;
+  final Map<String, double>? variables;
+  final FilterPicture? sender;
 }
 
 typedef CaptureSource = ({CaptureFrame frame, int index});

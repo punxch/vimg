@@ -50,14 +50,30 @@ Iterable<_FilterEntry> _filterEntries(String source) sync* {
   }
 }
 
-({Object? filter, _FilterEnable? enable}) _readGraphFilter(
+typedef _FilterCommandTarget = ({String name, String instance});
+
+const _enableFilterNames = {
+  'hflip',
+  'vflip',
+  'drawbox',
+  'negate',
+  'overlay',
+  'alphamerge',
+  'premultiply',
+  'unpremultiply',
+};
+
+({Object? filter, _FilterEnable? enable, _FilterCommandTarget? commandTarget})
+_readGraphFilter(
   String specification,
+  int ordinal,
+  Map<String, String> commandFiles,
 ) {
   final equal = specification.indexOf('=');
-  final name = (equal < 0 ? specification : specification.substring(0, equal))
-      .trim()
-      .split('@')
-      .first;
+  final head = (equal < 0 ? specification : specification.substring(0, equal))
+      .trim();
+  final marker = head.indexOf('@');
+  final name = marker < 0 ? head : head.substring(0, marker);
   var args = equal < 0 ? null : specification.substring(equal + 1);
   _FilterEnable? enable;
   if (args != null && args.contains('enable')) {
@@ -68,16 +84,7 @@ Iterable<_FilterEntry> _filterEntries(String source) sync* {
         remaining.add(option);
         continue;
       }
-      if (!const {
-        'hflip',
-        'vflip',
-        'drawbox',
-        'negate',
-        'overlay',
-        'alphamerge',
-        'premultiply',
-        'unpremultiply',
-      }.contains(name)) {
+      if (!_enableFilterNames.contains(name)) {
         throw FormatException('$name does not support enable');
       }
       if (enable != null) {
@@ -89,7 +96,15 @@ Iterable<_FilterEntry> _filterEntries(String source) sync* {
     }
     if (enable != null) args = remaining.isEmpty ? null : remaining.join(':');
   }
-  return (filter: _graphFilter(name, args), enable: enable);
+  return (
+    filter: name == 'sendcmd'
+        ? _SendCmd(args, commandFiles)
+        : _graphFilter(name, args),
+    enable: enable,
+    commandTarget: !_enableFilterNames.contains(name)
+        ? null
+        : (name: name, instance: marker < 0 ? 'Parsed_${name}_$ordinal' : head),
+  );
 }
 
 Object? _graphFilter(String name, String? args) {
@@ -128,6 +143,7 @@ Object? _graphFilter(String name, String? args) {
 typedef _FilterStep = ({
   Object? filter,
   _FilterEnable? enable,
+  _FilterCommandTarget? commandTarget,
   List<int> inputs,
   List<int> outputs,
 });
@@ -135,6 +151,7 @@ typedef _FilterStep = ({
 List<_FilterStep> _orderedFilterSteps(
   String source, {
   required bool bitmapOutput,
+  required Map<String, String> commandFiles,
 }) {
   final labels = <String, int>{};
   final entries =
@@ -142,14 +159,19 @@ List<_FilterStep> _orderedFilterSteps(
         ({
           Object? filter,
           _FilterEnable? enable,
+          _FilterCommandTarget? commandTarget,
           List<Object> inputs,
           List<int> outputs,
         })
       >[];
   var nextLink = 1;
   var pending = const <int>[];
-  for (final entry in _filterEntries(source)) {
-    final (:filter, :enable) = _readGraphFilter(entry.specification);
+  for (final (i, entry) in _filterEntries(source).indexed) {
+    final (:filter, :enable, :commandTarget) = _readGraphFilter(
+      entry.specification,
+      i,
+      commandFiles,
+    );
     final inputCount = switch (filter) {
       final _Stack stack => stack.inputs,
       _Overlay() || _MergeAlpha() => 2,
@@ -178,6 +200,7 @@ List<_FilterStep> _orderedFilterSteps(
     entries.add((
       filter: filter,
       enable: enable,
+      commandTarget: commandTarget,
       inputs: inputs,
       outputs: outputs,
     ));
@@ -200,6 +223,7 @@ List<_FilterStep> _orderedFilterSteps(
     final step = (
       filter: entry.filter,
       enable: entry.enable,
+      commandTarget: entry.commandTarget,
       inputs: inputs,
       outputs: entry.outputs,
     );
@@ -273,6 +297,7 @@ List<_FilterStep> _negotiateFilterFormats(
       _Stack() || _ExtractAlpha() => _FormatRegion(),
       null ||
       _TimingFilter() ||
+      _SendCmd() ||
       _SetAspect() ||
       _Flip() ||
       _Crop() ||
@@ -428,6 +453,7 @@ List<_FilterStep> _negotiateFilterFormats(
           ),
         ),
         enable: step.enable,
+        commandTarget: step.commandTarget,
         inputs: step.inputs,
         outputs: step.outputs,
       ),
@@ -543,6 +569,7 @@ final class _FormatRegion {
 VideoFilterChain _compileFilterGraph(
   String source, {
   required bool bitmapOutput,
+  required Map<String, String> commandFiles,
 }) {
   final spatial = <_SpatialFilter>[];
   final timing = <_TimingFilter>[];
@@ -557,7 +584,21 @@ VideoFilterChain _compileFilterGraph(
   // one link remains, ordinary timing filters can still retime that stream.
   var live = 1;
   var region = <_FilterStep>[];
-  final steps = _orderedFilterSteps(source, bitmapOutput: bitmapOutput);
+  final steps = _orderedFilterSteps(
+    source,
+    bitmapOutput: bitmapOutput,
+    commandFiles: commandFiles,
+  );
+  final files = Map<String, String>.unmodifiable(commandFiles);
+  VideoFilterChain synchronized() => VideoFilterChain._(
+    source,
+    const [],
+    const [],
+    bitmapOutput: bitmapOutput,
+    commandFiles: files,
+    graph: _SynchronizedFilterGraph(steps),
+  );
+  if (steps.any((step) => step.filter is _SendCmd)) return synchronized();
   for (final step in steps) {
     final filter = step.filter;
     final next = live + step.outputs.length - step.inputs.length;
@@ -571,13 +612,7 @@ VideoFilterChain _compileFilterGraph(
       }
     } else {
       if (filter is _TimingFilter) {
-        return VideoFilterChain._(
-          source,
-          const [],
-          const [],
-          bitmapOutput: bitmapOutput,
-          graph: _SynchronizedFilterGraph(steps),
-        );
+        return synchronized();
       }
       region.add(step);
       if (next == 1) {
@@ -592,6 +627,7 @@ VideoFilterChain _compileFilterGraph(
     spatial,
     timing,
     bitmapOutput: bitmapOutput,
+    commandFiles: files,
   );
 }
 
@@ -628,9 +664,12 @@ _VideoPlanes _applyFilterStep(
   List<_VideoPlanes> inputs,
   FilterFramePosition position, {
   FilterFramePosition? enablePosition,
+  bool? commandEnabled,
 }) {
   final enabled =
-      step.enable?.allows(inputs.first, enablePosition ?? position) ?? true;
+      commandEnabled ??
+      step.enable?.allows(inputs.first, enablePosition ?? position) ??
+      true;
   return switch (step.filter) {
     final _Stack stack => stack.apply(inputs),
     final _Overlay filter => filter.apply(

@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -13,6 +14,7 @@ part 'video_filters.dart';
 part 'video_pixel_formats.dart';
 part 'video_filter_colors.dart';
 part 'video_filter_graph.dart';
+part 'video_filter_commands.dart';
 part 'video_filter_sync.dart';
 part 'video_overlay_filter.dart';
 part 'video_alpha_filter.dart';
