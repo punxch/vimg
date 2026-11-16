@@ -137,12 +137,15 @@ final class _FormatFilter implements _SpatialFilter {
     _VideoPlanes frame, {
     int? outputMatrix,
     bool? outputRange,
+    _NamedPixelFormat? preferred,
   }) {
     final input = _frameFormat(frame);
     final hasAlpha = frame.alpha != null;
-    final target = formats.isEmpty
-        ? (format: input, alpha: hasAlpha, fullRange: null)
-        : _chooseFormat(formats, input, hasAlpha, frame.fullRange);
+    final target =
+        preferred ??
+        (formats.isEmpty
+            ? (format: input, alpha: hasAlpha, fullRange: null)
+            : _chooseFormat(formats, input, hasAlpha, frame.fullRange));
     final yuv = target.format.color == _PixelColor.yuv;
     final preferredMatrix = outputMatrix ?? frame.matrix;
     final matrix = !yuv
@@ -168,6 +171,17 @@ final class _FormatFilter implements _SpatialFilter {
       matrix: matrix,
       fullRange: fullRange,
     );
+  }
+
+  _NamedPixelFormat? matchingFormat(_VideoPlanes frame) {
+    final layout = _frameFormat(frame);
+    final alpha = frame.alpha != null;
+    return formats
+        .where(
+          (candidate) =>
+              _matchesFormat(candidate, layout, alpha, frame.fullRange),
+        )
+        .firstOrNull;
   }
 
   @override
@@ -211,23 +225,23 @@ _NamedPixelFormat _chooseFormat(
   var bestLoss = 1 << 30;
   for (final candidate in candidates) {
     final format = candidate.format;
-    if (format == input &&
-        candidate.alpha == hasAlpha &&
-        (candidate.fullRange == null || candidate.fullRange == fullRange)) {
+    if (_matchesFormat(candidate, input, hasAlpha, fullRange)) {
       return candidate;
     }
     // Use the comparable losses for the layouts vimg represents natively.
     var loss = hasAlpha && !candidate.alpha ? 65536 : 0;
-    if (input.color != format.color) {
+    final grayToRgb =
+        input.color == _PixelColor.gray && format.color == _PixelColor.rgb;
+    final channels =
+        input.color == _PixelColor.gray || format.color == _PixelColor.gray
+        ? 1
+        : 3;
+    if (input.color != format.color && !grayToRgb) {
       loss += format.color == _PixelColor.gray
           ? 2 * 65536
-          : (3 * 65536) >> (math.min(input.depth, format.depth) - 1);
+          : (channels * 65536) >> (math.min(input.depth, format.depth) - 1);
     }
     if (input.depth > format.depth) {
-      final channels =
-          input.color == _PixelColor.gray || format.color == _PixelColor.gray
-          ? 1
-          : 3;
       loss += (channels * 65536) >> (format.depth - 1);
     } else {
       loss += format.depth - input.depth;
@@ -249,6 +263,16 @@ _NamedPixelFormat _chooseFormat(
   }
   return best;
 }
+
+bool _matchesFormat(
+  _NamedPixelFormat candidate,
+  _VideoPixelFormat format,
+  bool alpha,
+  bool fullRange,
+) =>
+    candidate.format == format &&
+    candidate.alpha == alpha &&
+    (candidate.fullRange == null || candidate.fullRange == fullRange);
 
 int _namedColorMatrix(String name) => switch (name) {
   'bt709' => 1,
@@ -297,7 +321,7 @@ final class _PixelFormatConverter {
     final full =
         fullRange ??
         (target.color == _PixelColor.yuv
-            ? !source.rgb && source.fullRange
+            ? !source.rgb && source.planes.length == 3 && source.fullRange
             : true);
     final colorMatrix = target.color == _PixelColor.rgb
         ? 0

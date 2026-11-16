@@ -575,6 +575,42 @@ void _checkColorFormats() {
         0x7d2b2cda,
     'Scale negotiates 10-bit 4:4:4 output and converts matrix while resizing',
   );
+  final auto = render(
+    10,
+    'split[a][b];[b]crop=4:4:2:2,hflip[x];[a][x]overlay=2:2:format=auto',
+  );
+  check(
+    auto.numChannels == 4 && getCrc32(auto.getBytes()) == 0xfffd05a0,
+    'Automatic overlay keeps 10-bit 4:2:0 and adds opaque alpha',
+  );
+  for (final (depth, checksum) in [(8, 0xb1c3b03e), (10, 0x031721d3)]) {
+    final gray = yuvImage(
+      y: [
+        for (var y = 0; y < 6; y++)
+          for (var x = 0; x < 8; x++) (16 + 13 * x + 20 * y) << (depth - 8),
+      ],
+      cb: const [],
+      cr: const [],
+      stride: 8,
+      chromaStride: 0,
+      width: 8,
+      height: 6,
+      cropLeft: 0,
+      cropTop: 0,
+      matrix: 6,
+      fullRange: true,
+      lumaDepth: depth,
+      scaler: YuvImageScaler(
+        filters: VideoFilterChain.parse(
+          'split[a][b];[b]crop=4:4:2:2,hflip[r];[a][r]overlay=2:2:format=auto',
+        ),
+      ),
+    );
+    check(
+      gray.numChannels == 4 && getCrc32(gray.getBytes()) == checksum,
+      '$depth-bit grayscale automatic overlay matches FFmpeg',
+    );
+  }
 }
 
 void _checkFormatNegotiation() {
@@ -665,6 +701,30 @@ void _checkFormatNegotiation() {
       '$graph matches FFmpeg across split branches',
     );
   }
+  const autoOverlay =
+      'split[a][b];[b]crop=16:12:2:2,hflip[x];[a][x]overlay=4:2:format=auto';
+  const resizeOverlay =
+      'scale=16:12:out_color_matrix=bt709:out_range=pc,split[a][b];'
+      '[b]crop=8:8:2:2,hflip[x];[a][x]overlay=2:2:format=auto';
+  for (final (graph, channels, checksum) in [
+    (autoOverlay, 4, 0xfc06a9c6),
+    ('$autoOverlay,format=rgb24', 3, 0x3ae8ffec),
+    (resizeOverlay, 4, 0x853cbf41),
+    ('$resizeOverlay,format=yuva420p', 4, 0x82e448ab),
+    (
+      'split[a][b];[a]format=yuva420p10le[m];'
+          '[b]crop=16:12:2:2,hflip,format=yuva444p10le[x];'
+          '[m][x]overlay=4:2:format=auto',
+      4,
+      0xf76854b8,
+    ),
+  ]) {
+    final result = render(graph);
+    check(
+      result.numChannels == channels && getCrc32(result.getBytes()) == checksum,
+      '$graph matches FFmpeg automatic overlay',
+    );
+  }
 }
 
 void _checkCompositing() {
@@ -749,6 +809,33 @@ void _checkCompositing() {
     source.getBytes(),
     'Overlay hides a NaN position',
   );
+  const prepare = 'split[a][b];[b]crop=4:4:2:2,hflip';
+  for (final (filter, checksum) in [
+    ('$prepare,format=yuva420p[x];[a][x]overlay=2:2:format=auto', 0x20f64769),
+    ('$prepare[x];[a][x]overlay=2:2:format=auto,format=yuva420p', 0xeda11a4c),
+  ]) {
+    check(
+      getCrc32(render(filter).getBytes()) == checksum,
+      'Automatic overlay honors an already compatible decoded main layout',
+    );
+  }
+  // Compare partially transparent input using the selected planar format.
+  for (final (format, offset, checksum) in [
+    ('yuva420p', '2:0', 0x9af53551),
+    ('yuva422p', '-1:1', 0x8ecae76b),
+    ('yuva444p', '-1:1', 0xedf5b33a),
+    ('yuva420p10le', '2:0', 0xf3840e13),
+    ('yuva444p10le', '-1:1', 0xb3783697),
+    ('gbrap', '-1:1', 0xf3fc397c),
+  ]) {
+    final actual = render(
+      'format=$format,$prepare[x];[a][x]overlay=$offset:format=auto',
+    );
+    check(
+      getCrc32(actual.getBytes()) == checksum,
+      'Automatic overlay matches FFmpeg $format partial alpha blend',
+    );
+  }
 
   final input = [
     for (var j = 0; j < 6; j++)
@@ -1050,6 +1137,21 @@ Future<void> _checkCli(String? executable) async {
       0xff59c8f9,
       0xff59c8f9,
     ];
+    const automaticOverlay =
+        'scale=16:12:out_color_matrix=bt709:out_range=pc,'
+        'split[a][b];[a]fps=8[m];[b]trim=start_frame=1:end_frame=3,'
+        'crop=8:8:2:2,hflip[s];'
+        '[m][s]overlay=2:2:format=auto:eof_action=pass,format=yuva420p';
+    const autoOverlayReference = [
+      0xa755c65b,
+      0xa755c65b,
+      0x48e7d56c,
+      0x48e7d56c,
+      0x3a75e46d,
+      0xae26e46d,
+      0x939ff366,
+      0x939ff366,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1058,6 +1160,7 @@ Future<void> _checkCli(String? executable) async {
       ('scale-color', scaleColor, 64, 24, scaleColorReference),
       ('negotiated-scale', negotiatedGraph, 32, 12, negotiatedReference),
       ('split-formats', splitFormatGraph, 32, 12, splitFormatReference),
+      ('auto-overlay', automaticOverlay, 16, 12, autoOverlayReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {

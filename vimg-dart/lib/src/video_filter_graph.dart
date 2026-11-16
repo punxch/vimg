@@ -181,6 +181,11 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
         explicitFormat: true,
       ),
       final _Scale scale => _FormatRegion(constraints: scale.outputColors),
+      final _Overlay overlay => _FormatRegion(
+        constraints: overlay.mainFormat,
+        explicitFormat: true,
+        overlayOutput: true,
+      ),
       _Stack() => _FormatRegion(),
       null ||
       _TimingFilter() ||
@@ -206,8 +211,11 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
     switch (step.filter) {
       case final _FormatFilter format:
         final input = regions[step.inputs.single]!;
-        if (format.unrestricted || input.merge(output)) {
+        if (format.unrestricted) {
           absorbed.add(step.outputs.first);
+        } else if (input.merge(output)) {
+          // A decoded alpha input can still determine the layout at runtime.
+          if (!input.overlayOutput) absorbed.add(step.outputs.first);
         } else {
           output.root.inheritColor(input.root.constraints);
         }
@@ -216,12 +224,17 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
           output.merge(regions[input]!);
         }
       case final _Overlay overlay:
-        for (final (index, input) in step.inputs.indexed) {
-          if (overlay.inputFormat(secondary: index != 0) case final format?) {
-            regions[input]!.merge(
-              _FormatRegion(constraints: format, explicitFormat: true),
-            );
-          }
+        output.merge(regions[step.inputs.first]!);
+        final secondary = regions[step.inputs[1]]!;
+        if (overlay.format == null) {
+          output.merge(secondary);
+        } else {
+          secondary.merge(
+            _FormatRegion(
+              constraints: overlay.secondaryFormat,
+              explicitFormat: true,
+            ),
+          );
         }
     }
   }
@@ -251,6 +264,7 @@ Object? _negotiatedFilter(
     final _Scale scale when region.explicitFormat && format != null =>
       _ScaleFormat(scale, format),
     final _Stack stack when format != null => stack.withFormat(format),
+    final _Overlay overlay when format != null => overlay.withFormat(format),
     _FormatFilter() => format,
     _ => filter,
   };
@@ -262,11 +276,13 @@ final class _FormatRegion {
     this.constraints,
     this.fixed = false,
     this.explicitFormat = false,
+    this.overlayOutput = false,
   });
 
   _FormatRegion? _parent;
   _FormatFilter? constraints;
   bool fixed, explicitFormat;
+  final bool overlayOutput;
 
   _FormatRegion get root {
     final parent = _parent;

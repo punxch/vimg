@@ -117,18 +117,50 @@ final class _Overlay {
     this.usesFramePosition,
     this.stopAtEof,
     this.dropSecondary,
-    this.nearest,
-  );
+    this.nearest, [
+    this.outputFormat,
+  ]);
 
   final FilterExpression x, y;
   final _VideoPixelFormat? format;
   final bool premultiplied, usesFramePosition;
   final bool stopAtEof, dropSecondary, nearest;
+  final _FormatFilter? outputFormat;
   final _converter = _PixelFormatConverter();
+  late final mainFormat = _inputFormat(secondary: false);
+  late final secondaryFormat = _inputFormat(secondary: true);
 
-  _FormatFilter? inputFormat({required bool secondary}) {
+  _Overlay withFormat(_FormatFilter format) => _Overlay._(
+    x,
+    y,
+    this.format,
+    premultiplied,
+    usesFramePosition,
+    stopAtEof,
+    dropSecondary,
+    nearest,
+    format,
+  );
+
+  static final _autoFormats = _FormatFilter._(
+    [
+      for (final depth in [8, 10])
+        for (final (sx, sy) in [(1, 1), (1, 0), (0, 0)])
+          (
+            format: _pixelFormat(_PixelColor.yuv, depth, subX: sx, subY: sy),
+            alpha: true,
+            fullRange: null,
+          ),
+      _namedPixelFormat('rgba'),
+      _namedPixelFormat('gbrap'),
+    ],
+    const [],
+    const [],
+  );
+
+  _FormatFilter _inputFormat({required bool secondary}) {
     final requested = format;
-    if (requested == null) return null;
+    if (requested == null) return _autoFormats;
     final rgb = requested.color == _PixelColor.rgb;
     final opaque = (
       format: requested,
@@ -153,22 +185,34 @@ final class _Overlay {
     _VideoPlanes? secondary,
     FilterFramePosition position,
   ) {
-    final requested = format;
-    final target = requested == null || requested.packedRgb && input.bgr24
-        ? _frameFormat(input)
-        : requested;
-    final main = _converter.convert(
+    final negotiated = outputFormat ?? mainFormat;
+    final original = mainFormat.matchingFormat(input);
+    final secondaryLayout = format == null && secondary != null
+        ? negotiated.matchingFormat(secondary)
+        : null;
+    // A compatible decoded main link fixes the working layout. Otherwise an
+    // alpha-capable side or the negotiated output can supply the target.
+    final selection = negotiated.select(
       input,
-      target,
-      fullRange: format == null ? input.fullRange : null,
-      matrix: format == null ? input.matrix : null,
+      preferred: original ?? secondaryLayout,
     );
+    final target = selection.format;
+    final main = original == null
+        ? _converter.convert(
+            input,
+            target,
+            alpha: selection.alpha,
+            fullRange: selection.fullRange,
+            matrix: selection.matrix,
+          )
+        : input;
     if (secondary == null) return main;
     final over = identical(input, secondary)
         ? main
         : _converter.convert(
             secondary,
             target,
+            alpha: format == null ? true : null,
             fullRange: main.fullRange,
             matrix: main.matrix,
           );
@@ -260,9 +304,9 @@ final class _Overlay {
                 math.min(height, py + sourceHeight),
                 max,
               );
-              // For straight output divide source coverage by the composite coverage.
-              final weight =
-                  alpha * max * max ~/ ((alpha + under) * max - alpha * under);
+              final weight = main.alpha == null
+                  ? alpha
+                  : _straightOverlayWeight(alpha, under);
               if (!premultiplied) {
                 output[dest] = _overlayDivide(
                   color * (max - weight) + sample * weight,
@@ -291,6 +335,13 @@ int? _overlayOffset(double value, int shift) =>
 
 int _overlayDivide(int value, int max) =>
     max == 255 ? ((value + 128) * 257) >> 16 : value ~/ max;
+
+int _straightOverlayWeight(int alpha, int under) {
+  // The scalar overlay kernel stores the averaged destination alpha in a byte,
+  // including in its 10-bit specialization.
+  under &= 255;
+  return (alpha * 255 * 255) ~/ ((alpha + under) * 255 - alpha * under);
+}
 
 int _overlayAlpha(
   _FilterPlane? plane,

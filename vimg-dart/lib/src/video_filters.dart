@@ -637,7 +637,7 @@ final class _Scale extends _FrameSpatialFilter {
         selection?.fullRange ??
         outputRange ??
         (target.color == _PixelColor.yuv
-            ? !frame.rgb && frame.fullRange
+            ? !frame.rgb && frame.planes.length == 3 && frame.fullRange
             : !sameLayout || frame.fullRange);
     if (sameLayout &&
         (input.planes.length == 1 ||

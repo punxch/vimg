@@ -373,9 +373,13 @@ It selects a secondary picture at or before the main timestamp, or the
 closest picture with `ts_sync_mode=nearest`. Before the secondary begins it
 passes the main stream through. `eof_action`, `repeatlast` and `shortest`
 control how it handles input streams of different lengths.
-Overlay converts both inputs to the requested pixel format. The default is
-8-bit YUV 4:2:0. Use `format=rgb` for 8-bit packed RGB or `format=auto`
-to use the main input's decoded layout. Packed 8-bit RGB also supports
+Overlay converts its inputs to the requested pixel format. The default is
+8-bit YUV 4:2:0. Use `format=rgb` for 8-bit packed RGB. With `format=auto`,
+both inputs and the output share an alpha-capable layout. The supported
+layouts are 8- and 10-bit YUVA 4:2:0, 4:2:2 and 4:4:4, packed 8-bit RGBA
+and planar 8-bit GBR with alpha. Auto keeps a compatible main input layout.
+An upstream scale can produce the working layout directly, including when
+a downstream format filter selects it. Packed 8-bit RGB also supports
 `alpha=premultiplied`. The separate `format` filter accepts
 `pix_fmts` such as `rgb24`, `gray`, `yuv444p` or `yuva420p10le`.
 When given a `|`-separated list, it keeps a matching input format when
