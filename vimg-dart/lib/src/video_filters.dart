@@ -2,16 +2,23 @@ part of 'yuv_image.dart';
 
 /// A single-input, single-output graph of video filters.
 final class VideoFilterChain {
-  VideoFilterChain._(this.source, this._filters, this._timing, [this._graph]);
+  VideoFilterChain._(
+    this.source,
+    this._filters,
+    this._timing, {
+    this.bitmapOutput = false,
+    _SynchronizedFilterGraph? graph,
+  }) : _graph = graph;
 
-  factory VideoFilterChain.parse(String source) {
+  factory VideoFilterChain.parse(String source, {bool bitmapOutput = false}) {
     if (source.length > 2048) {
       throw const FormatException('Video filter chain exceeds 2048 characters');
     }
-    return _compileFilterGraph(source);
+    return _compileFilterGraph(source, bitmapOutput: bitmapOutput);
   }
 
   final String source;
+  final bool bitmapOutput;
   final List<_SpatialFilter> _filters;
   final List<_TimingFilter> _timing;
   final _SynchronizedFilterGraph? _graph;
@@ -36,9 +43,13 @@ final class VideoFilterChain {
         ...?next?._filters,
       ],
       next?._timing ?? const [],
-      next?._graph,
+      bitmapOutput: next?.bitmapOutput ?? false,
+      graph: next?._graph,
     );
   }
+
+  VideoFilterChain forBitmap() =>
+      bitmapOutput ? this : VideoFilterChain.parse(source, bitmapOutput: true);
 
   bool get hasSpatialFilters => _filters.isNotEmpty || _graph != null;
   bool get usesTimeline => _timing.isNotEmpty || _graph != null;
@@ -615,12 +626,14 @@ final class _Scale extends _FrameSpatialFilter {
     _VideoPlanes frame,
     FilterFramePosition position, {
     _FormatFilter? outputFormat,
+    _NamedPixelFormat? preferredOutput,
   }) {
     final (w, h) = dimensions(frame, position);
     final selection = outputFormat?.select(
       frame,
       outputMatrix: outputMatrix,
       outputRange: outputRange,
+      preferred: preferredOutput,
     );
     final target = selection?.format ?? _frameFormat(frame);
     final alpha = selection?.alpha;
@@ -896,17 +909,31 @@ final class _Scale extends _FrameSpatialFilter {
 }
 
 final class _ScaleFormat extends _FrameSpatialFilter {
-  _ScaleFormat(this.scale, this.format);
+  _ScaleFormat(
+    this.scale,
+    this.format, {
+    this.preferred,
+    this.keepCompatibleInput = false,
+  });
 
   final _Scale scale;
   final _FormatFilter format;
+  final _NamedPixelFormat? preferred;
+  final bool keepCompatibleInput;
 
   @override
   bool get usesFramePosition => scale.usesFramePosition;
 
   @override
   _VideoPlanes applyAt(_VideoPlanes frame, FilterFramePosition position) =>
-      scale.applyAt(frame, position, outputFormat: format);
+      scale.applyAt(
+        frame,
+        position,
+        outputFormat: format,
+        preferredOutput: keepCompatibleInput && preferred != null
+            ? format.matchingFormat(frame) ?? preferred
+            : preferred,
+      );
 }
 
 /// Maps video range while samples still have horizontal filter precision.

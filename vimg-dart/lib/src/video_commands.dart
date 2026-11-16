@@ -211,14 +211,15 @@ Future<void> extractFrames(
   VideoCaptureDecoder? decoder;
   try {
     final plan = CapturePlan(video.metadata.duration, options);
-    final selected = _selectCaptures(video, plan, filters);
+    final bitmapFilters = filters?.forBitmap();
+    final selected = _selectCaptures(video, plan, bitmapFilters);
     Directory(directory).createSync(recursive: true);
     final paths = _capturePaths(input, directory, plan, selected);
     decoder = VideoCaptureDecoder(
       video,
       threads: threads,
-      scaler: filters?.hasSpatialFilters == true
-          ? YuvImageScaler(filters: filters)
+      scaler: bitmapFilters?.hasSpatialFilters == true
+          ? YuvImageScaler(filters: bitmapFilters)
           : null,
     );
     await for (final decoded in decoder.decodeCaptures(paths.keys)) {

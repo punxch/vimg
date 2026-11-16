@@ -171,7 +171,7 @@ void _checkYuv() {
   );
   check(deep.width == 4 && deep.height == 3, 'Scaled 10-bit dimensions');
   for (final p in deep) {
-    check(p.r == 191 && p.g == 191 && p.b == 191, 'Scaled 10-bit intensity');
+    check(p.r == 192 && p.g == 192 && p.b == 192, 'Scaled 10-bit intensity');
   }
 }
 
@@ -530,7 +530,12 @@ void _checkDeepYuvPacking() {
 }
 
 void _checkColorFormats() {
-  image.Image render(int depth, String filter) {
+  image.Image render(
+    int depth,
+    String filter, {
+    List<int>? alpha,
+    bool bitmap = false,
+  }) {
     List<int> samples(int w, int h, int base, int dx, int dy, int wrap) => [
       for (var y = 0; y < h; y++)
         for (var x = 0; x < w; x++)
@@ -557,7 +562,11 @@ void _checkColorFormats() {
       fullRange: false,
       lumaDepth: depth,
       chromaDepth: depth,
-      scaler: YuvImageScaler(filters: VideoFilterChain.parse(filter)),
+      alpha: alpha,
+      alphaDepth: depth,
+      scaler: YuvImageScaler(
+        filters: VideoFilterChain.parse(filter, bitmapOutput: bitmap),
+      ),
     );
   }
 
@@ -665,34 +674,77 @@ void _checkColorFormats() {
     auto.numChannels == 4 && getCrc32(auto.getBytes()) == 0xfffd05a0,
     'Automatic overlay keeps 10-bit 4:2:0 and adds opaque alpha',
   );
-  for (final (depth, checksum) in [(8, 0xb1c3b03e), (10, 0x06ec2c1d)]) {
-    final layout = depth == 10 ? ',format=yuva444p10le' : '';
-    final gray = yuvImage(
-      y: [
-        for (var y = 0; y < 6; y++)
-          for (var x = 0; x < 8; x++) (16 + 13 * x + 20 * y) << (depth - 8),
-      ],
-      cb: const [],
-      cr: const [],
-      stride: 8,
-      chromaStride: 0,
-      width: 8,
-      height: 6,
-      cropLeft: 0,
-      cropTop: 0,
-      matrix: 6,
-      fullRange: true,
-      lumaDepth: depth,
-      scaler: YuvImageScaler(
-        filters: VideoFilterChain.parse(
-          'split[a][b];[b]crop=4:4:2:2,hflip[r];'
-          '[a][r]overlay=2:2:format=auto$layout',
+  const grayOverlay =
+      'split[a][b];[b]crop=4:4:2:2,hflip[r];[a][r]overlay=2:2:format=auto';
+  image.Image renderGray(int depth, String graph, {bool bitmap = false}) =>
+      yuvImage(
+        y: [
+          for (var y = 0; y < 6; y++)
+            for (var x = 0; x < 8; x++) (16 + 13 * x + 20 * y) << (depth - 8),
+        ],
+        cb: const [],
+        cr: const [],
+        stride: 8,
+        chromaStride: 0,
+        width: 8,
+        height: 6,
+        cropLeft: 0,
+        cropTop: 0,
+        matrix: 6,
+        fullRange: true,
+        lumaDepth: depth,
+        scaler: YuvImageScaler(
+          filters: VideoFilterChain.parse(graph, bitmapOutput: bitmap),
         ),
-      ),
-    );
+      );
+  for (final (depth, checksum) in [(8, 0xb1c3b03e), (10, 0x06ec2c1d)]) {
+    final gray = renderGray(depth, grayOverlay);
     check(
       gray.numChannels == 4 && getCrc32(gray.getBytes()) == checksum,
-      '$depth-bit grayscale automatic overlay matches FFmpeg',
+      '$depth-bit grayscale automatic overlay with RGB24 capture',
+    );
+  }
+  for (final (graph, checksum) in [
+    (grayOverlay, 0xb1c3b03e),
+    ('scale=8:6,$grayOverlay', 0xb1c3b03e),
+    ('$grayOverlay,scale=8:6', 0x06ec2c1d),
+    ('$grayOverlay,hflip', 0xcc2df34a),
+    ('$grayOverlay,transpose=clock', 0x0a82337a),
+    ('$grayOverlay,format=yuva444p10le', 0x06ec2c1d),
+  ]) {
+    final gray = renderGray(10, graph, bitmap: true);
+    check(
+      gray.hasAlpha && getCrc32(gray.getBytes()) == checksum,
+      '$graph matches FFmpeg BMP format negotiation',
+    );
+  }
+  final alpha = [
+    for (var y = 0; y < 6; y++)
+      for (var x = 0; x < 8; x++) 17 + 19 * x + 57 * y + 3 * y * x,
+  ];
+  for (final (graph, checksum) in [
+    (grayOverlay, 0x72f995b6),
+    ('scale=8:6,$grayOverlay', 0x1416f64a),
+    (
+      'split[a][b];[a]scale=8:6[m];[b]crop=4:4:2:2,hflip[r];'
+          '[m][r]overlay=2:2:format=auto',
+      0x72f995b6,
+    ),
+    (
+      'split[a][b];[b]crop=4:4:2:2,hflip,scale=4:4[r];'
+          '[a][r]overlay=2:2:format=auto',
+      0x72f995b6,
+    ),
+    (
+      'split[a][b];[a]scale=8:6[m];[b]crop=4:4:2:2,hflip,scale=4:4[r];'
+          '[m][r]overlay=2:2:format=auto',
+      0x1416f64a,
+    ),
+  ]) {
+    final yuv = render(10, graph, alpha: alpha, bitmap: true);
+    check(
+      getCrc32(yuv.getBytes()) == checksum,
+      '$graph negotiates a native YUVA10 input and BMP output like FFmpeg',
     );
   }
 }

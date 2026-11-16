@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/avif_image.dart';
 import 'package:vimg_dart/src/raw_video.dart';
@@ -162,11 +163,14 @@ File _matroska(
   String tag,
   List<int> Function(int) frame, {
   bool vfw = false,
+  int width = 4,
+  int height = 2,
+  String? name,
 }) {
   List<int> item(int id, int size, List<int> bytes) =>
       ebml(uint(id, size), bytes);
   final duration = ByteData(8)..setFloat64(0, 8000);
-  return File('${directory.path}/$tag.mkv')..writeAsBytesSync([
+  return File('${directory.path}/${name ?? tag}.mkv')..writeAsBytesSync([
     ...item(0x1a45dfa3, 4, item(0x4282, 2, ascii.encode('matroska'))),
     ...item(0x18538067, 4, [
       ...item(0x1549a966, 4, item(0x4489, 2, duration.buffer.asUint8List())),
@@ -184,8 +188,8 @@ File _matroska(
           if (vfw)
             ...item(0x63a2, 2, [
               ...uint(40, 4).reversed,
-              ...uint(4, 4).reversed,
-              ...uint(2, 4).reversed,
+              ...uint(width, 4).reversed,
+              ...uint(height, 4).reversed,
               1,
               0,
               16,
@@ -194,8 +198,8 @@ File _matroska(
               ...List.filled(20, 0),
             ]),
           ...item(0xe0, 1, [
-            ...item(0xb0, 1, [4]),
-            ...item(0xba, 1, [2]),
+            ...item(0xb0, 1, [width]),
+            ...item(0xba, 1, [height]),
             if (!vfw) ...item(0x2eb524, 3, tag.codeUnits),
             ...item(0x55b0, 2, [
               ...item(0x55b1, 2, [1]),
@@ -315,5 +319,83 @@ Future<void> _checkCli(
           pixel.a <= 120,
       'Retained BGRA BMP preserves source geometry and alpha',
     );
+  }
+
+  final gray = _matroska(
+    directory,
+    String.fromCharCodes([89, 49, 0, 10]),
+    (frame) => [
+      for (var y = 0; y < 6; y++)
+        for (var x = 0; x < 8; x++)
+          ...uint(
+            (((16 + 13 * x + 20 * y + 7 * frame) << 2) +
+                    (x + 2 * y + frame) % 4) &
+                1023,
+            2,
+          ).reversed,
+    ],
+    width: 8,
+    height: 6,
+    name: 'gray10',
+  );
+  const graph =
+      'split[a][b];[a]fps=1[m];[b]crop=4:4:2:2,hflip[r];'
+      '[m][r]overlay=2:2:format=auto';
+  const bitmap = [
+    0xcd84d3ce,
+    0xceea0a9f,
+    0x1aa6de34,
+    0x7eeea423,
+    0xe7fc8148,
+    0x3986cb8a,
+    0xdbe84c09,
+    0x509215c0,
+  ];
+  const rgb = [
+    0xc3662814,
+    0x92311ea4,
+    0x2de9af5f,
+    0x0b64ef1b,
+    0xd1474a5f,
+    0x371ea81a,
+    0xed274921,
+    0xc6532920,
+  ];
+  for (final (command, threads, checksums) in [
+    ('extract', '1', bitmap),
+    ('extract', '2', bitmap),
+    ('vcs', '2', rgb),
+  ]) {
+    final captures = '${directory.path}/gray-$command-$threads';
+    await run([
+      command,
+      '-n1',
+      '-f8',
+      '-t8s',
+      '-T$threads',
+      '--vfilter',
+      graph,
+      '--output-dir',
+      captures,
+      if (command == 'vcs') ...[
+        '-c1',
+        '-H6',
+        '--keep',
+        '--output',
+        '${directory.path}/gray.avif',
+      ],
+      gray.path,
+    ]);
+    final files = Directory(captures).listSync().whereType<File>().toList()
+      ..sort((a, b) => a.path.compareTo(b.path));
+    check(files.length == checksums.length, 'Grayscale overlay capture count');
+    for (final (i, file) in files.indexed) {
+      final frame = image.decodeBmp(file.readAsBytesSync())!;
+      final output = command == 'vcs' ? frame.convert(numChannels: 3) : frame;
+      check(
+        getCrc32(output.getBytes()) == checksums[i],
+        'Timed grayscale overlay matches FFmpeg for $command, T$threads, frame $i',
+      );
+    }
   }
 }

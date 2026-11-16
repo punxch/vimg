@@ -3,6 +3,8 @@ part of 'yuv_image.dart';
 bool _hasDeepYuvDepth(int matrix, int lumaDepth, int chromaDepth) =>
     matrix != 0 && lumaDepth > 8 && lumaDepth == chromaDepth;
 
+bool _hasDeepGrayPacking(int depth, bool fullRange) => depth > 8 && fullRange;
+
 // The horizontal identity stage produces Q7, which the matrix reads as Q9.
 int _unscaledSampleQ9(int value, int depth) =>
     depth == 16 ? (value >> 1) << 2 : value << (17 - depth);

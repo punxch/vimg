@@ -259,6 +259,10 @@ final class _FormatFilter implements _SpatialFilter {
         .firstOrNull;
   }
 
+  _NamedPixelFormat? get packedAlphaFormat => formats
+      .where((candidate) => candidate.alpha && candidate.format.packedRgb)
+      .firstOrNull;
+
   @override
   _VideoPlanes apply(_VideoPlanes frame) {
     if (unrestricted ||
@@ -605,12 +609,19 @@ final class _PixelFormatConverter {
       );
     }
     if (source.floating) source = _quantizeFloatFrame(source);
-    final packsDeepYuv =
-        source.usesDeepYuvPacking && target.packedRgb && target.depth == 8;
+    final packsDeepLuma =
+        target.packedRgb &&
+        target.depth == 8 &&
+        (source.usesDeepYuvPacking ||
+            source.planes.length == 1 &&
+                _hasDeepGrayPacking(
+                  source.planes.first.depth,
+                  source.fullRange,
+                ));
     final packsDeep =
         target.packedRgb &&
         target.depth == 8 &&
-        (packsDeepYuv || source.usesDeepRgbPacking);
+        (packsDeepLuma || source.usesDeepRgbPacking);
     final expandsRgb8 =
         source.rgb &&
         source.subX == 0 &&
@@ -621,11 +632,11 @@ final class _PixelFormatConverter {
         target.depth > 8 &&
         target.depth < 16;
     if ((packsDeep || expandsRgb8) &&
-        (source.fullRange || packsDeepYuv) &&
+        (source.fullRange || packsDeepLuma) &&
         full &&
         opacityDepth == target.depth &&
         (packsDeep || scale == null)) {
-      if (packsDeepYuv ||
+      if (packsDeepLuma ||
           scale != null && (width != source.width || height != source.height)) {
         return _toRgb(
           source,

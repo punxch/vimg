@@ -90,7 +90,10 @@ Object? _graphFilter(String specification) {
 
 typedef _FilterStep = ({Object? filter, List<int> inputs, List<int> outputs});
 
-List<_FilterStep> _orderedFilterSteps(String source) {
+List<_FilterStep> _orderedFilterSteps(
+  String source, {
+  required bool bitmapOutput,
+}) {
   final labels = <String, int>{};
   final entries =
       <({Object? filter, List<Object> inputs, List<int> outputs})>[];
@@ -174,12 +177,16 @@ List<_FilterStep> _orderedFilterSteps(String source) {
   if (sorted.length != entries.length) {
     throw const FormatException('Disconnected video filter graph');
   }
-  return _negotiateFilterFormats(sorted);
+  return _negotiateFilterFormats(sorted, bitmapOutput: bitmapOutput);
 }
 
-List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
+List<_FilterStep> _negotiateFilterFormats(
+  List<_FilterStep> steps, {
+  required bool bitmapOutput,
+}) {
   final regions = <int, _FormatRegion>{0: _FormatRegion(fixed: true)};
   final scaleInputs = <_FormatRegion, _FormatRegion>{};
+  final transposedInputs = <_FormatRegion, _FormatRegion>{};
   for (final step in steps) {
     final filter = step.filter;
     final region = switch (filter) {
@@ -210,6 +217,9 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
       _ => _FormatRegion(fixed: true),
     };
     if (filter is _Scale) scaleInputs[region] = regions[step.inputs.single]!;
+    if (filter is _Transpose) {
+      transposedInputs[region] = regions[step.inputs.single]!;
+    }
     for (final output in step.outputs) {
       regions[output] = region;
     }
@@ -251,6 +261,11 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
         final sharedInput = identical(main.root, secondary.root);
         output.merge(main);
         if (overlay.format == null) {
+          final decoded = regions[0]!.root;
+          if (identical(main.root, decoded) ||
+              identical(secondary.root, decoded)) {
+            output.root.hasDecodedOverlayInput = true;
+          }
           final secondaryConstraints = secondary.root.constraints;
           final separateAlpha =
               !sharedInput &&
@@ -307,6 +322,16 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
     }
   }
 
+  // A bitmap encoder accepts packed alpha. Format-preserving operations
+  // expose this preference on the same link. A scale owns its output layout.
+  var bitmapRegion = bitmapOutput
+      ? regions[steps.last.outputs.single]!.root
+      : null;
+  while (true) {
+    final rotated = transposedInputs[bitmapRegion];
+    if (rotated == null) break;
+    bitmapRegion = rotated.root;
+  }
   return [
     for (final step in steps)
       (
@@ -314,6 +339,10 @@ List<_FilterStep> _negotiateFilterFormats(List<_FilterStep> steps) {
           step.filter,
           regions[step.outputs.first]!.root,
           absorbed: absorbed.contains(step.outputs.first),
+          bitmapTerminal: identical(
+            bitmapRegion,
+            regions[step.outputs.first]!.root,
+          ),
         ),
         inputs: step.inputs,
         outputs: step.outputs,
@@ -325,14 +354,28 @@ Object? _negotiatedFilter(
   Object? filter,
   _FormatRegion region, {
   required bool absorbed,
+  required bool bitmapTerminal,
 }) {
   if (absorbed) return null;
   final format = region.constraints;
   return switch (filter) {
     final _Scale scale when region.explicitFormat && format != null =>
-      _ScaleFormat(scale, format),
+      _ScaleFormat(
+        scale,
+        format,
+        preferred:
+            bitmapTerminal &&
+                region.overlayOutput &&
+                format.formats.every((candidate) => candidate.alpha)
+            ? format.packedAlphaFormat
+            : null,
+        keepCompatibleInput: region.hasDecodedOverlayInput,
+      ),
     final _Stack stack when format != null => stack.withFormat(format),
-    final _Overlay overlay when format != null => overlay.withFormat(format),
+    final _Overlay overlay when format != null => overlay.withFormat(
+      format,
+      bitmapTerminal: bitmapTerminal,
+    ),
     final _VideoAlphaFilter alpha when format != null => alpha.withFormat(
       format,
     ),
@@ -361,6 +404,7 @@ final class _FormatRegion {
   _FormatRegion? _parent;
   _FormatFilter? constraints;
   bool fixed, explicitFormat;
+  bool hasDecodedOverlayInput = false;
   final bool overlayOutput, acceptsAlphaMode;
 
   _FormatRegion get root {
@@ -386,6 +430,7 @@ final class _FormatRegion {
     first.constraints = common;
     first.fixed |= second.fixed;
     first.explicitFormat |= second.explicitFormat;
+    first.hasDecodedOverlayInput |= second.hasDecodedOverlayInput;
     return true;
   }
 
@@ -406,7 +451,10 @@ final class _FormatRegion {
   }
 }
 
-VideoFilterChain _compileFilterGraph(String source) {
+VideoFilterChain _compileFilterGraph(
+  String source, {
+  required bool bitmapOutput,
+}) {
   final spatial = <_SpatialFilter>[];
   final timing = <_TimingFilter>[];
   void addSpatial(_SpatialFilter filter) {
@@ -420,7 +468,7 @@ VideoFilterChain _compileFilterGraph(String source) {
   // one link remains, ordinary timing filters can still retime that stream.
   var live = 1;
   var region = <_FilterStep>[];
-  final steps = _orderedFilterSteps(source);
+  final steps = _orderedFilterSteps(source, bitmapOutput: bitmapOutput);
   for (final step in steps) {
     final filter = step.filter;
     final next = live + step.outputs.length - step.inputs.length;
@@ -437,7 +485,8 @@ VideoFilterChain _compileFilterGraph(String source) {
           source,
           const [],
           const [],
-          _SynchronizedFilterGraph(steps),
+          bitmapOutput: bitmapOutput,
+          graph: _SynchronizedFilterGraph(steps),
         );
       }
       region.add(step);
@@ -448,7 +497,12 @@ VideoFilterChain _compileFilterGraph(String source) {
     }
     live = next;
   }
-  return VideoFilterChain._(source, spatial, timing);
+  return VideoFilterChain._(
+    source,
+    spatial,
+    timing,
+    bitmapOutput: bitmapOutput,
+  );
 }
 
 final class _FilterBranches extends _FrameSpatialFilter {

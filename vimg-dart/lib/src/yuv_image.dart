@@ -161,15 +161,15 @@ image.Image yuvImage({
     }
     return pixels;
   }
-  if (deepYuv) {
+  if (deepYuv || cb.isEmpty && _hasDeepGrayPacking(lumaDepth, fullRange)) {
     final packed = _PackedYuvMatrix(matrix, fullRange);
     for (final pixel in pixels) {
       final x = cropLeft + pixel.x, row = cropTop + pixel.y;
       final luma = row * stride + x, chroma = row * chromaStride + x;
       final (r, g, b) = packed.rgb(
         _unscaledSampleQ9(y[luma], lumaDepth),
-        _unscaledSampleQ9(cb[chroma], chromaDepth),
-        _unscaledSampleQ9(cr[chroma], chromaDepth),
+        deepYuv ? _unscaledSampleQ9(cb[chroma], chromaDepth) : 128 << 9,
+        deepYuv ? _unscaledSampleQ9(cr[chroma], chromaDepth) : 128 << 9,
       );
       pixel.setRgb(r, g, b);
       if (alpha != null) pixel.a = _packedAlphaSample8(alpha[luma], alphaDepth);

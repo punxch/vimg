@@ -380,6 +380,9 @@ Overlay converts its inputs to the requested pixel format. The default is
 both inputs and the output share an alpha-capable layout. The supported
 layouts are 8- and 10-bit YUVA 4:2:0, 4:2:2 and 4:4:4, packed 8-bit RGBA
 and planar 8-bit GBR with alpha. Auto keeps a compatible main input layout.
+BMP extraction prefers packed alpha for a terminal automatic overlay when
+the graph leaves its layout open. An explicit format or a compatible input
+can fix the working layout. A following scale negotiates its output separately.
 An upstream scale can produce the working layout directly, including when
 a downstream format filter selects it. Overlay accepts `alpha=straight`
 and `alpha=premultiplied` for packed RGB, planar GBR and planar YUV.

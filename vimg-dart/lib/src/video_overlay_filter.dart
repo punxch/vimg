@@ -120,6 +120,7 @@ final class _Overlay {
     this.dropSecondary,
     this.nearest, [
     this.outputFormat,
+    this.bitmapFallback,
   ]);
 
   final FilterExpression x, y;
@@ -128,21 +129,24 @@ final class _Overlay {
   final bool usesFramePosition;
   final bool stopAtEof, dropSecondary, nearest;
   final _FormatFilter? outputFormat;
+  final _NamedPixelFormat? bitmapFallback;
   final _converter = _PixelFormatConverter();
   late final mainFormat = _inputFormat(secondary: false);
   late final secondaryFormat = _inputFormat(secondary: true);
 
-  _Overlay withFormat(_FormatFilter format) => _Overlay._(
-    x,
-    y,
-    this.format,
-    alphaMode,
-    usesFramePosition,
-    stopAtEof,
-    dropSecondary,
-    nearest,
-    format,
-  );
+  _Overlay withFormat(_FormatFilter format, {required bool bitmapTerminal}) =>
+      _Overlay._(
+        x,
+        y,
+        this.format,
+        alphaMode,
+        usesFramePosition,
+        stopAtEof,
+        dropSecondary,
+        nearest,
+        format,
+        bitmapTerminal && this.format == null ? format.packedAlphaFormat : null,
+      );
 
   static final _autoFormats = _FormatFilter._(
     [
@@ -202,7 +206,7 @@ final class _Overlay {
     // alpha-capable side or the negotiated output can supply the target.
     final selection = negotiated.select(
       input,
-      preferred: original ?? secondaryLayout,
+      preferred: original ?? secondaryLayout ?? bitmapFallback,
     );
     final target = selection.format;
     final main = original == null

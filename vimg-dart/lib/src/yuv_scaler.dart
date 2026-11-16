@@ -451,6 +451,7 @@ final class YuvImageScaler {
     final gbr = matrix == 0 && cb.isNotEmpty;
     final deepYuv =
         cb.isNotEmpty && _hasDeepYuvDepth(matrix, lumaDepth, chromaDepth);
+    final deepGray = cb.isEmpty && _hasDeepGrayPacking(lumaDepth, fullRange);
     final studio =
         gbr &&
             !packedRgb &&
@@ -477,7 +478,7 @@ final class YuvImageScaler {
       chromaHeight: (sourceHeight + (1 << subsamplingY) - 1) >> subsamplingY,
       outputChromaWidth: cb.isEmpty ? 0 : (halfChroma ? width >> 1 : width),
       chromaKernel: _algorithm.kernel(chroma: !gbr || studio != null),
-      scalarTaps: studio != null || deepYuv,
+      scalarTaps: studio != null || deepYuv || deepGray,
     );
     if (geometry != _geometry) {
       final lumaKernel = _algorithm.kernel(chroma: false);
@@ -536,7 +537,7 @@ final class YuvImageScaler {
       studioPlanes = (y16, u16, v16);
     }
     bool truncateMatrix(int row) =>
-        _luma.hasPackedPair(row) && _chroma!.hasPackedPair(row);
+        _luma.hasPackedPair(row) && (_chroma?.hasPackedPair(row) ?? true);
     final truncateRows = geometry.scalarTaps ? truncateMatrix : null;
     final luma = _luma.resize(
       studioPlanes?.$1 ?? y,
@@ -580,11 +581,15 @@ final class YuvImageScaler {
       }
     } else if (useTable) {
       _rgbTable(matrix, fullRange).write(pixels, luma, blueChroma!, redChroma!);
-    } else if (deepYuv) {
+    } else if (deepYuv || deepGray) {
       final packed = _PackedYuvMatrix(matrix, fullRange);
       var i = 0;
       for (final pixel in pixels) {
-        final (r, g, b) = packed.rgb(luma[i], blueChroma![i], redChroma![i]);
+        final (r, g, b) = packed.rgb(
+          luma[i],
+          blueChroma?[i] ?? 128 << 9,
+          redChroma?[i] ?? 128 << 9,
+        );
         pixel.setRgb(r, g, b);
         i++;
       }
