@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:archive/archive.dart';
 import 'package:image/image.dart' as image;
 import 'package:vimg_dart/src/avi.dart';
 import 'package:vimg_dart/src/ffv1.dart';
@@ -19,6 +20,13 @@ const _v0 = 'test/fixtures/ffv1-v0.avi';
 const _v1 = 'test/fixtures/ffv1-v1.mp4';
 const _crc2 = 'test/fixtures/ffv1-crc2.mkv';
 const _v4Rgb10 = 'test/fixtures/ffv1-v4-rgb10.mkv';
+const _v4Rgb10Display = [
+  0x9fb35598,
+  0x9b4273cd,
+  0xb624bace,
+  0xe1a1a798,
+  0x2bfdbfba,
+];
 // Raw slices over the same source planes as the seeded-CRC fixture.
 const _v4Pcm = 'test/fixtures/ffv1-v4-pcm.mkv';
 
@@ -102,7 +110,14 @@ Future<void> _checkVideo(String path) async {
           );
         }
       }
-      expectedRgb.add(picture.rgb().getBytes());
+      final rgb = picture.rgb().getBytes();
+      if (path == _v4Rgb10) {
+        check(
+          getCrc32(rgb) == _v4Rgb10Display[frame],
+          'High-depth FFV1 display matches scalar FFmpeg RGB24',
+        );
+      }
+      expectedRgb.add(rgb);
     }
 
     check(

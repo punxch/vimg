@@ -299,6 +299,7 @@ final class YuvImageScaler {
         return _rgbTable(frame.matrix, frame.fullRange).writeUnscaled(frame);
       }
       if (frame.floating ||
+          frame.usesDeepRgbPacking && scale.nearest ||
           frame.packedRgb &&
               (scale.algorithm != _ScaleAlgorithm.bicubic ||
                   scale._subsamplesRgb(frame, w))) {
@@ -328,13 +329,6 @@ final class YuvImageScaler {
         outputScale = null;
       }
       frame = _quantizeFloatFrame(frame);
-      if (frame.rgb && frame.fullRange) {
-        frame = _packFloatRgb(
-          frame,
-          _pixelFormat(_PixelColor.rgb, 8, packedRgb: true),
-          alpha: frame.alpha != null,
-        );
-      }
     }
     if (outputScale == null &&
         frame.planes.length == 3 &&
@@ -378,6 +372,7 @@ final class YuvImageScaler {
       cropTop: 0,
       matrix: frame.matrix,
       fullRange: frame.fullRange,
+      packedRgb: frame.packedRgb,
       lumaDepth: y.depth,
       chromaDepth: cb?.depth ?? y.depth,
       subsamplingX: frame.subX,

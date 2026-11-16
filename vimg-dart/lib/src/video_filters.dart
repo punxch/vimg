@@ -984,6 +984,15 @@ final class _VideoPlanes {
   bool get rgb => matrix == 0 && planes.length == 3;
   bool get floating => planes.first.floating;
 
+  bool get usesDeepRgbPacking =>
+      rgb &&
+      !packedRgb &&
+      fullRange &&
+      subX == 0 &&
+      subY == 0 &&
+      planes.first.depth > 8 &&
+      planes.every((plane) => plane.depth == planes.first.depth);
+
   bool get usesUnscaledRgbTable =>
       width.isEven &&
       height.isEven &&

@@ -448,58 +448,102 @@ _VideoPlanes _quantizeFloatFrame(_VideoPlanes source) {
   });
 }
 
-_VideoPlanes _packFloatRgb(
+/// Scalar RGB depth conversion via the studio-range matrix.
+final class _RgbStudioConverter {
+  _RgbStudioConverter(int depth, {int outputDepth = 8})
+    : _shift = depth == 16 ? 16 : depth + 1,
+      _q7Shift = depth == 16 ? 0 : 1,
+      _outputShift = 30 - outputDepth,
+      _rounding = 1 << (29 - outputDepth),
+      _maximum = (1 << outputDepth) - 1,
+      _lumaBias = (16 << (depth + 7)) + (1 << (depth == 16 ? 14 : depth)),
+      _chromaBias = (128 << (depth + 7)) + (1 << (depth == 16 ? 14 : depth));
+
+  final int _shift, _q7Shift, _lumaBias, _chromaBias;
+  final int _outputShift, _rounding, _maximum;
+  static final _inverse = (() {
+    final (rv, bu, gu, gv) = _rgbCoefficients(6);
+    return ((rv + 4) >> 3, (bu + 4) >> 3, (gu + 4) >> 3, (gv + 4) >> 3);
+  })();
+
+  (int, int, int) rgb(int r, int g, int b) {
+    // The horizontal identity filter expands Q6 and truncates Q8 to Q7.
+    final luma =
+        ((_rgbProduct(_bt601RgbToYuv[0], r, g, b) + _lumaBias) >> _shift) <<
+        _q7Shift;
+    final cb =
+        ((_rgbProduct(_bt601RgbToYuv[1], r, g, b) + _chromaBias) >> _shift) <<
+        _q7Shift;
+    final cr =
+        ((_rgbProduct(_bt601RgbToYuv[2], r, g, b) + _chromaBias) >> _shift) <<
+        _q7Shift;
+    final lum = (luma - (16 << 7)) * 4 * 9539;
+    final u = (cb - (128 << 7)) * 4, v = (cr - (128 << 7)) * 4;
+    final (vr, ub, ug, vg) = _inverse;
+    return (
+      _sample(lum + vr * v),
+      _sample(lum + ug * u + vg * v),
+      _sample(lum + ub * u),
+    );
+  }
+
+  int _sample(int value) =>
+      ((value + _rounding) >> _outputShift).clamp(0, _maximum);
+
+  static int alpha8(int sample, int depth) =>
+      math.min(255, ((sample << (16 - depth)) + 128) >> 8);
+}
+
+_VideoPlanes _convertRgbViaStudio(
   _VideoPlanes source,
   _VideoPixelFormat target, {
   required bool alpha,
+  required bool premultiplied,
 }) {
   final width = source.width, height = source.height;
-  final green = Uint8List(width * height);
-  final blue = Uint8List(green.length), red = Uint8List(green.length);
-  final opacity = alpha ? Uint8List(green.length) : null;
+  final depth = target.depth;
+  final green = _paintSamples(depth, width * height);
+  final blue = _paintSamples(depth, green.length);
+  final red = _paintSamples(depth, green.length);
+  final opacity = alpha && depth == 8 ? Uint8List(green.length) : null;
   final [g, b, r] = source.planes;
   final inputAlpha = source.alpha;
-  final (rv, bu, gu, gv) = _rgbCoefficients(6);
-  final vr = (rv + 4) >> 3, ub = (bu + 4) >> 3;
-  final ug = (gu + 4) >> 3, vg = (gv + 4) >> 3;
-  // The packed output rounds after a studio-range Q7 matrix round trip.
-  int pack(int sample) => ((sample + (1 << 21)) >> 22).clamp(0, 255);
+  final converter = _RgbStudioConverter(g.depth, outputDepth: depth);
   var i = 0;
   for (var y = 0; y < height; y++) {
     for (var x = 0; x < width; x++) {
-      final rr = r.at(x, y), gg = g.at(x, y), bb = b.at(x, y);
-      final luma =
-          (_rgbProduct(_bt601RgbToYuv[0], rr, gg, bb) + (0x2001 << 14)) >> 16;
-      final cb =
-          (_rgbProduct(_bt601RgbToYuv[1], rr, gg, bb) + (0x10001 << 14)) >> 16;
-      final cr =
-          (_rgbProduct(_bt601RgbToYuv[2], rr, gg, bb) + (0x10001 << 14)) >> 16;
-      final lum = (luma - (16 << 7)) * 4 * 9539;
-      final u = (cb - (128 << 7)) * 4, v = (cr - (128 << 7)) * 4;
-      green[i] = pack(lum + ug * u + vg * v);
-      blue[i] = pack(lum + ub * u);
-      red[i] = pack(lum + vr * v);
+      final (rr, gg, bb) = converter.rgb(r.at(x, y), g.at(x, y), b.at(x, y));
+      green[i] = gg;
+      blue[i] = bb;
+      red[i] = rr;
       if (opacity != null) {
         opacity[i] = inputAlpha == null
             ? 255
-            : math.min(255, (inputAlpha.at(x, y) + 128) >> 8);
+            : _RgbStudioConverter.alpha8(inputAlpha.at(x, y), inputAlpha.depth);
       }
       i++;
     }
   }
-  _FilterPlane plane(Uint8List data) =>
-      _FilterPlane(data, width, height, 8, rowStep: width);
+  _FilterPlane plane(List<int> data) =>
+      _FilterPlane(data, width, height, depth, rowStep: width);
+  final outputAlpha = !alpha
+      ? null
+      : opacity != null
+      ? plane(opacity)
+      : inputAlpha == null
+      ? _constantPlane(width, height, depth, (1 << depth) - 1)
+      : _expandRgbAlpha(inputAlpha, depth, packed: source.packedRgb);
   return _VideoPlanes(
     [plane(green), plane(blue), plane(red)],
     0,
     0,
     matrix: 0,
     fullRange: true,
-    packedRgb: true,
+    packedRgb: target.packedRgb,
     bgr24: target.bgr24,
     sampleAspect: source.sampleAspect,
-    alpha: opacity == null ? null : plane(opacity),
-    premultiplied: opacity != null && source.premultiplied,
+    alpha: outputAlpha,
+    premultiplied: outputAlpha != null && premultiplied,
   );
 }
 
@@ -579,22 +623,29 @@ final class _PixelFormatConverter {
             requestedAlpha && (premultiplied ?? resized.premultiplied),
       );
     }
-    if (source.floating) {
-      if (source.rgb &&
-          source.fullRange &&
-          full &&
-          target.packedRgb &&
-          opacityDepth == 8 &&
-          width == source.width &&
-          height == source.height &&
-          scale == null) {
-        return _packFloatRgb(
-          _quantizeFloatFrame(source),
-          target,
-          alpha: requestedAlpha,
-        );
-      }
-      source = _quantizeFloatFrame(source);
+    if (source.floating) source = _quantizeFloatFrame(source);
+    final packsDeepRgb =
+        source.usesDeepRgbPacking && target.packedRgb && target.depth == 8;
+    final expandsRgb8 =
+        source.rgb &&
+        source.subX == 0 &&
+        source.subY == 0 &&
+        source.planes.every((plane) => plane.depth == 8) &&
+        (source.alpha?.depth ?? 8) == 8 &&
+        target.color == _PixelColor.rgb &&
+        target.depth > 8 &&
+        target.depth < 16;
+    if ((packsDeepRgb || expandsRgb8) &&
+        source.fullRange &&
+        full &&
+        opacityDepth == target.depth &&
+        scale == null) {
+      return _convertRgbViaStudio(
+        source,
+        target,
+        alpha: requestedAlpha,
+        premultiplied: premultiplied ?? source.premultiplied,
+      );
     }
     if (target.depth == _floatSampleDepth) {
       final deep = convert(

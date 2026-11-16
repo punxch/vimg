@@ -133,6 +133,25 @@ image.Image yuvImage({
     height: height,
     numChannels: alpha == null ? 3 : 4,
   );
+  final gbr = matrix == 0 && cb.isNotEmpty;
+  if (gbr &&
+      fullRange &&
+      !packedRgb &&
+      lumaDepth == chromaDepth &&
+      lumaDepth > 8 &&
+      subsamplingX == 0 &&
+      subsamplingY == 0) {
+    final packing = _RgbStudioConverter(lumaDepth);
+    for (final pixel in pixels) {
+      final x = cropLeft + pixel.x, row = cropTop + pixel.y;
+      final luma = row * stride + x, chroma = row * chromaStride + x;
+      final (r, g, b) = packing.rgb(cr[chroma], y[luma], cb[chroma]);
+      pixel.setRgb(r, g, b);
+      if (alpha != null)
+        pixel.a = _RgbStudioConverter.alpha8(alpha[luma], alphaDepth);
+    }
+    return pixels;
+  }
   final (rv, gu, gv, bu) = switch (matrix) {
     1 => (1.5748, 0.187324, 0.468124, 1.8556), // BT.709
     4 => (1.4, 0.331864, 0.711864, 1.78), // FCC
@@ -154,7 +173,6 @@ image.Image yuvImage({
           .round();
   final bias = fullRange ? 0 : 16 << (lumaDepth - 8);
   final midpoint = 1 << (chromaDepth - 1);
-  final gbr = matrix == 0 && cb.isNotEmpty;
   final rgbBias = fullRange ? 0 : 16 << (chromaDepth - 8);
   final rgbScale = !gbr || chromaDepth == lumaDepth
       ? yScale

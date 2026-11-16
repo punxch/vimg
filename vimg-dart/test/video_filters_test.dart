@@ -935,11 +935,18 @@ void _checkStandaloneAlpha() {
     ('unpremultiply=inplace=1', 0x127f7c0c),
     ('format=yuva420p,premultiply=inplace=1', 0x8a97ecff),
     ('premultiply=planes=8:inplace=1', 0x8fd11bb7),
-    ('format=gbrap10le,premultiply=inplace=1', 0xe7e6bcab),
-    ('format=gbrap16le,premultiply=inplace=1', 0x4147faf7),
-    // FFmpeg's native planes rendered by the Dart RGB converter.
-    ('format=gbrap10le,unpremultiply=inplace=1', 0xcd4771a2),
-    ('format=gbrap16le,unpremultiply=inplace=1', 0xdec5a2b6),
+    ('format=gbrap10le,premultiply=inplace=1', 0xcc00156b),
+    ('format=gbrap12le,premultiply=inplace=1', 0xee0225f2),
+    ('format=gbrap16le,premultiply=inplace=1', 0xa43ecb8a),
+    ('format=gbrap10le,unpremultiply=inplace=1', 0xf4b9d374),
+    ('format=gbrap12le,unpremultiply=inplace=1', 0x744c67fc),
+    ('format=gbrap16le,unpremultiply=inplace=1', 0x7abccacc),
+    ('format=gbrap12le,premultiply=inplace=1,format=rgba', 0xee0225f2),
+    (
+      'format=gbrap16le,unpremultiply=inplace=1,scale=4:3:flags=neighbor',
+      0xfcede330,
+    ),
+    // FFmpeg's native YUVA planes rendered by the Dart RGB converter.
     ('format=yuva444p10le,unpremultiply=inplace=1', 0x78324ce2),
     (
       'format=yuva444p10le,premultiply=inplace=1,unpremultiply=inplace=1',
@@ -1428,6 +1435,18 @@ Future<void> _checkCli(String? executable) async {
       0xaf422c4c,
       0xaf422c4c,
     ];
+    const packedAlpha =
+        'format=gbrap12le,premultiply=inplace=1,format=rgba,fps=8';
+    const packedAlphaReference = [
+      0xb5fb1f00,
+      0xb5fb1f00,
+      0xd43621ca,
+      0xd43621ca,
+      0xd07c22e9,
+      0xd07c22e9,
+      0xddf22480,
+      0xddf22480,
+    ];
     for (final (name, filter, width, height, checksums) in [
       ('branch', graph, 32, 12, graphReference),
       ('compose', composition, 50, 24, compositionReference),
@@ -1447,6 +1466,7 @@ Future<void> _checkCli(String? executable) async {
       ),
       ('float-alpha', floatAlpha, 4, 4, floatAlphaReference),
       ('implicit-alpha', implicitAlpha, 8, 6, implicitAlphaReference),
+      ('packed-alpha', packedAlpha, 8, 6, packedAlphaReference),
     ]) {
       final graphSheet = File('${temp.path}/$name.avif');
       for (final command in ['extract', 'vcs']) {
@@ -1471,7 +1491,8 @@ Future<void> _checkCli(String? executable) async {
           name == 'associated-overlay' ||
                   name == 'masked-alpha' ||
                   name == 'float-alpha' ||
-                  name == 'implicit-alpha'
+                  name == 'implicit-alpha' ||
+                  name == 'packed-alpha'
               ? transparentMotion
               : motion,
         ]);

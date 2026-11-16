@@ -407,6 +407,8 @@ matrix and range for all inputs, converting branches that require it.
 Explicit overlay formats also pass their input layout requirements upstream.
 Native YUV depth reduction uses ordered dithering.
 Even-width BGR24 to 8-bit YUV 4:2:0 follows FFmpeg's scalar rounding.
+Unscaled full-range planar GBR uses the scalar matrix and alpha rounding
+when converting between 8-bit RGB and higher component depths.
 
 Use `premultiply=inplace=1` or `unpremultiply=inplace=1` to process the
 frame's own alpha. `premultiply_dynamic` follows the downstream alpha
