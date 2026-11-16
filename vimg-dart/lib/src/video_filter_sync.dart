@@ -31,7 +31,7 @@ final class _SynchronizedFilterGraph {
   CaptureTimeline schedule(CaptureTimeline source) {
     final active = {0: source};
     final commands = steps.any((step) => step.filter is _SendCmd)
-        ? _EnableCommandState(steps)
+        ? _FilterCommandState(steps)
         : null;
     for (final (index, step) in steps.indexed) {
       final inputs = [for (final link in step.inputs) active.remove(link)!];
@@ -68,7 +68,7 @@ final class _SynchronizedFilterGraph {
   CaptureTimeline _spatial(
     int step,
     CaptureTimeline source,
-    _EnableCommandState? commands,
+    _FilterCommandState? commands,
   ) => CaptureTimeline(
     _spatialEvents(step, source, commands),
     source.timeBase,
@@ -78,7 +78,7 @@ final class _SynchronizedFilterGraph {
   Iterable<CaptureTimelineEvent> _spatialEvents(
     int step,
     CaptureTimeline source,
-    _EnableCommandState? commands,
+    _FilterCommandState? commands,
   ) sync* {
     var index = 0;
     for (final event in source.events) {
@@ -88,7 +88,7 @@ final class _SynchronizedFilterGraph {
                 step,
                 [_pictureOf(event)],
                 (index: index++, seconds: event.pts * source.timeBase.value),
-                enableCommand: commands?.at(step),
+                enableCommand: commands?.enableAt(step),
               ),
             )
           : event;
@@ -98,7 +98,7 @@ final class _SynchronizedFilterGraph {
   CaptureTimeline _synchronize(
     int step,
     List<CaptureTimeline> timelines,
-    _EnableCommandState? commands,
+    _FilterCommandState? commands,
   ) {
     final filter = steps[step].filter;
     final sync = switch (filter) {
@@ -144,7 +144,7 @@ final class _SynchronizedFilterGraph {
     _FrameSyncOptions? sync,
     bool stop, {
     required bool baseTimestamps,
-    required _EnableCommandState? commands,
+    required _FilterCommandState? commands,
   }) sync* {
     final inputs = [
       for (final source in sources) _FilterSyncInput(source, clock),
@@ -153,12 +153,16 @@ final class _SynchronizedFilterGraph {
     final commandTarget = commands != null && steps[step].commandTarget != null;
     final trackEnable =
         commandTarget || steps[step].enable?.usesFramePosition == true;
+    final overlay = commands?.tracksOverlayFrames(step) == true
+        ? steps[step].filter as _Overlay
+        : null;
     final stackDuration = outputRate == null
         ? 1
         : math.max(1, checkedCaptureTick(1 / (outputRate * clock.value)));
     int? lastOutput;
     int? reportedEnd;
-    FilterEnableCommand? enableCommand;
+    FilterCommandArgument? enableCommand;
+    FilterOperationPicture? lastOverlay;
     while (true) {
       int? nextTime;
       var active = 0;
@@ -167,7 +171,7 @@ final class _SynchronizedFilterGraph {
         final waitingForMain = commandTarget && i == 0 && input.next == null;
         input.prepare(stop || sync?.dropSecondary == true && i == 1);
         if (waitingForMain && input.next != null)
-          enableCommand = commands.at(step);
+          enableCommand = commands.enableAt(step);
         if (!wasEnded && input.ended) reportedEnd = input.end;
         if (!input.ended) active++;
         final next = input.nextTime;
@@ -231,6 +235,15 @@ final class _SynchronizedFilterGraph {
             ? stackDuration
             : first.duration,
       );
+      final overlayCommands = commands?.overlayAt(step);
+      final hasSecondary = overlay != null && inputs[1].frame != null;
+      final needsPrevious =
+          hasSecondary &&
+          (overlay.usesPreviousPosition ||
+              overlayCommands?.x?.usesPreviousPosition == true ||
+              overlayCommands?.y?.usesPreviousPosition == true ||
+              enableCommand != null ||
+              steps[step].enable != null);
       final picture = FilterOperationPicture(
         step,
         [
@@ -240,7 +253,10 @@ final class _SynchronizedFilterGraph {
         (index: main.index, seconds: pts * outputClock.value),
         enablePosition: trackEnable ? main.consumedPosition : null,
         enableCommand: enableCommand,
+        overlayCommands: overlayCommands,
+        previousOverlay: needsPrevious ? lastOverlay : null,
       );
+      if (hasSecondary) lastOverlay = picture;
       lastOutput = pts;
       yield primary.withPicture(picture);
     }

@@ -61,12 +61,12 @@ final class _SendCmd {
 
   final List<_CommandInterval> intervals;
 
-  CaptureTimeline apply(CaptureTimeline input, _EnableCommandState state) =>
+  CaptureTimeline apply(CaptureTimeline input, _FilterCommandState state) =>
       CaptureTimeline(_events(input, state), input.timeBase, input.frameRate);
 
   Iterable<CaptureTimelineEvent> _events(
     CaptureTimeline input,
-    _EnableCommandState state,
+    _FilterCommandState state,
   ) sync* {
     final previous = List.filled(intervals.length, false);
     var frameCount = 0;
@@ -113,8 +113,12 @@ final class _ScriptCommand {
     final name = reader.word();
     final argument = reader.word();
     if (target.isEmpty || name.isEmpty) reader.fail();
-    if (name != 'enable')
-      throw FormatException('Unsupported sendcmd command: $name');
+    final option = switch (name) {
+      'enable' => _FilterCommandOption.enable,
+      'x' => _FilterCommandOption.x,
+      'y' => _FilterCommandOption.y,
+      _ => throw FormatException('Unsupported sendcmd command: $name'),
+    };
 
     if ((flags & _commandExpr) != 0) {
       var usesSize = false;
@@ -123,50 +127,114 @@ final class _ScriptCommand {
         _commandVariables,
         onVariable: (name) => usesSize |= name == 'W' || name == 'H',
       );
-      return _ScriptCommand._(target, flags, expression, usesSize: usesSize);
+      return _ScriptCommand._(
+        target,
+        option,
+        flags,
+        expression,
+        usesSize: usesSize,
+      );
     }
     FilterExpression? expression;
+    var usesPreviousPosition = false;
     try {
-      expression = _FilterEnable.parse(argument).expression;
+      expression = option == _FilterCommandOption.enable
+          ? _FilterEnable.parse(argument).expression
+          : _parseOverlayCoordinate(
+              argument,
+              onVariable: (name) =>
+                  usesPreviousPosition |= name == 'x' || name == 'y',
+            );
     } on FormatException {
-      // A rejected runtime enable expression leaves the previous one active.
+      // A rejected runtime expression leaves the previous one active.
     }
-    return _ScriptCommand._(target, flags, expression);
+    return _ScriptCommand._(
+      target,
+      option,
+      flags,
+      expression,
+      usesPreviousPosition: usesPreviousPosition,
+    );
   }
 
   const _ScriptCommand._(
     this.target,
+    this.option,
     this.flags,
     this.expression, {
     this.usesSize = false,
+    this.usesPreviousPosition = false,
   });
 
   final String target;
+  final _FilterCommandOption option;
   final int flags;
   final FilterExpression? expression;
   final bool usesSize;
+  final bool usesPreviousPosition;
 }
 
-final class _EnableCommandState {
-  _EnableCommandState(List<_FilterStep> steps) {
+enum _FilterCommandOption { enable, x, y }
+
+final class _FilterCommandState {
+  _FilterCommandState(this.steps) {
     // FFmpeg dispatches to the first matching filter in declaration order.
     final order = List.generate(
       steps.length,
       (i) => i,
     )..sort((a, b) => steps[a].outputs.first.compareTo(steps[b].outputs.first));
-    if (steps[order.first].commandTarget != null) _targets['all'] = order.first;
+    if (steps[order.first].commandTarget != null)
+      _enableTargets['all'] = order.first;
+    final firstPositionTarget = order
+        .where(
+          (i) => switch (steps[i].filter) {
+            _Overlay() || _Crop() || _DrawBox() => true,
+            _ => false,
+          },
+        )
+        .firstOrNull;
+    if (firstPositionTarget != null &&
+        steps[firstPositionTarget].filter is _Overlay) {
+      _overlayTargets['all'] = firstPositionTarget;
+    }
     for (final i in order) {
       final target = steps[i].commandTarget;
       if (target == null) continue;
-      _targets.putIfAbsent(target.name, () => i);
-      _targets.putIfAbsent(target.instance, () => i);
+      _enableTargets.putIfAbsent(target.name, () => i);
+      _enableTargets.putIfAbsent(target.instance, () => i);
+      if (steps[i].filter is _Overlay) {
+        _overlayTargets.putIfAbsent(target.name, () => i);
+        _overlayTargets.putIfAbsent(target.instance, () => i);
+      }
+    }
+    for (final (index, step) in steps.indexed) {
+      switch (step.filter) {
+        case _Overlay(usesPreviousPosition: true):
+          _positionReferences.add(index);
+        case final _SendCmd sender:
+          for (final interval in sender.intervals) {
+            for (final command in interval.commands) {
+              if (!command.usesPreviousPosition) continue;
+              final target = _overlayTargets[command.target];
+              if (target != null) _positionReferences.add(target);
+            }
+          }
+      }
     }
   }
 
-  final _targets = <String, int>{};
-  final _active = <int, FilterEnableCommand>{};
+  final List<_FilterStep> steps;
+  final _enableTargets = <String, int>{};
+  final _overlayTargets = <String, int>{};
+  final _enable = <int, FilterCommandArgument>{};
+  final _coordinates = <int, OverlayPositionCommands>{};
+  final _positionReferences = <int>{};
 
-  FilterEnableCommand? at(int step) => _active[step];
+  FilterCommandArgument? enableAt(int step) => _enable[step];
+  OverlayPositionCommands? overlayAt(int step) => _coordinates[step];
+  bool tracksOverlayFrames(int step) =>
+      _positionReferences.contains(step) &&
+      (steps[step].filter as _Overlay).evaluateFrame;
 
   void send(
     _ScriptCommand command,
@@ -176,26 +244,48 @@ final class _EnableCommandState {
     int pts,
     CaptureRational timeBase,
   ) {
-    final step = _targets[command.target], expression = command.expression;
+    final enable = command.option == _FilterCommandOption.enable;
+    final step = (enable ? _enableTargets : _overlayTargets)[command.target];
+    final expression = command.expression;
     if (step == null || expression == null) return;
-    if ((command.flags & _commandExpr) == 0) {
-      _active[step] = FilterEnableCommand(expression);
-      return;
-    }
+    final senderExpression = (command.flags & _commandExpr) != 0;
     final t = pts * timeBase.value;
     final start = interval.start / 1000000, end = interval.end / 1000000;
-    _active[step] = FilterEnableCommand(
+    final argument = FilterCommandArgument(
       expression,
-      variables: {
-        'N': frameCount.toDouble(),
-        'T': t,
-        'PTS': pts.toDouble(),
-        'TS': start,
-        'TE': end,
-        'TI': (t - start) / (end - start),
-      },
+      variables: senderExpression
+          ? {
+              'N': frameCount.toDouble(),
+              'T': t,
+              'PTS': pts.toDouble(),
+              'TS': start,
+              'TE': end,
+              'TI': (t - start) / (end - start),
+            }
+          : null,
       sender: command.usesSize ? picture : null,
+      usesPreviousPosition: command.usesPreviousPosition,
     );
+    if (enable) {
+      _enable[step] = argument;
+      return;
+    }
+    final horizontal = command.option == _FilterCommandOption.x;
+    final previous = _coordinates[step];
+    final overlay = steps[step].filter as _Overlay;
+    _coordinates[step] =
+        overlay.evaluateFrame || !_positionReferences.contains(step)
+        ? OverlayPositionCommands(
+            x: horizontal ? argument : previous?.x,
+            y: horizontal ? previous?.y : argument,
+          )
+        : OverlayPositionCommands(
+            history: OverlayPositionChange(
+              horizontal,
+              argument,
+              previous?.history,
+            ),
+          );
   }
 }
 

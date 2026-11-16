@@ -45,6 +45,8 @@ Future<void> main(List<String> args) async {
     final fromFile =
         "sendcmd=f='${script.path}',fps=8,crop=16:12:0:0,vflip@v=enable=0";
     const window = "sendcmd='0.25 hflip enable 1',hflip=enable=0";
+    const overlay =
+        'split[a][b];[b]crop=4:4:2:2,hflip[s];[a][s]overlay@o=0:0:format=rgb';
     // FFmpeg BMP checksums in source presentation order at 8 fps.
     for (final (name, filter, dimensions, expected, input) in [
       (
@@ -114,10 +116,115 @@ Future<void> main(List<String> args) async {
         _twice([0x8fd11bb7, 0xa108f493, 0x718fb8b8, 0xaef8fc4e]),
         alpha,
       ),
+      (
+        'overlay-axes',
+        "fps=8,sendcmd='0.25 overlay@o x W-w,overlay@o y H-h;0.625 overlay@o x -1',$overlay",
+        (8, 6),
+        [
+          0x2ae8724e,
+          0x2ae8724e,
+          0xce50a998,
+          0xce50a998,
+          0xeda80f09,
+          0x6d1fe945,
+          0xb4f8920a,
+          0xb4f8920a,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-frame',
+        "fps=8,sendcmd='0.25 overlay@o x n-2;0.375 overlay@o y 4*t;0.75 overlay@o x nonsense',$overlay",
+        (8, 6),
+        [
+          0x2ae8724e,
+          0x2ae8724e,
+          0x363b938a,
+          0x85ab110d,
+          0x79879518,
+          0xeda80f09,
+          0xa56690af,
+          0x4a7662a1,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-init',
+        "fps=8,sendcmd='0.25 overlay@o x x+1,overlay@o x x+1,overlay@o y H-h+n;"
+            "0.5 overlay@o y t;0.75 overlay@o y 0',$overlay:eval=init",
+        (8, 6),
+        [
+          0x2ae8724e,
+          0x2ae8724e,
+          0x4bfc57ae,
+          0x4bfc57ae,
+          0xd63147c5,
+          0xd63147c5,
+          0xf5b7eb76,
+          0xf5b7eb76,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-relative',
+        "fps=8,sendcmd='0.25 overlay@o x x+1;0.375 overlay@o enable 0;"
+            "0.625 overlay@o enable 1;0.75 overlay@o y x/2',$overlay",
+        (8, 6),
+        [
+          0x2ae8724e,
+          0x2ae8724e,
+          0x296b659d,
+          0x0c2199ca,
+          0xd63147c5,
+          0xbe4ebffa,
+          0x7200b8f1,
+          0xf5b7eb76,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-expr',
+        "fps=8,sendcmd='0-0.75 [expr] overlay@o x (W-H)*TI,[expr] overlay@o y PTS*0.5;"
+            "0.75 overlay@o x -1',$overlay",
+        (8, 6),
+        [
+          0x2ae8724e,
+          0x2ae8724e,
+          0x1e21e21a,
+          0xd8b0035d,
+          0x639ab9ed,
+          0x639ab9ed,
+          0xb4f8920a,
+          0xb4f8920a,
+        ],
+        alpha,
+      ),
+      (
+        'overlay-yuv420',
+        "fps=8,sendcmd='0.25 overlay@o x 3,overlay@o y 3;0.75 overlay@o x -1',"
+            "${overlay.replaceFirst('format=rgb', 'format=yuv420')}",
+        (8, 6),
+        _twice([0xbe567793, 0x95b30c29, 0x37aaefb9, 0x019685bb]),
+        alpha,
+      ),
+      (
+        'overlay-secondary',
+        "split[a][b];[b]sendcmd='0.25 overlay@o x 2;0.5 overlay@o y 2',"
+            'crop=4:4:2:2,hflip[s];[a][s]overlay@o=0:0:format=rgb',
+        (8, 6),
+        _twice([0x2ae8724e, 0x296b659d, 0xbf0a814a, 0x7108b370]),
+        alpha,
+      ),
     ]) {
       for (final command in [
         'extract',
-        if (name == 'file' || name == 'secondary') 'vcs',
+        if (const {
+          'file',
+          'secondary',
+          'overlay-relative',
+          'overlay-expr',
+        }.contains(name))
+          'vcs',
       ]) {
         final directory = Directory('${temp.path}/$name-$command');
         final result = await Process.run(cli, [

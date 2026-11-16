@@ -50,20 +50,30 @@ sealed class FilterPicture {
   Set<FramePacket> sourcePackets() {
     final packets = <FramePacket>{};
     final seen = <FilterPicture>{};
-    void visit(FilterPicture picture) {
-      if (!seen.add(picture)) return;
+    final pending = <FilterPicture>[this];
+    while (pending.isNotEmpty) {
+      final picture = pending.removeLast();
+      if (!seen.add(picture)) continue;
       switch (picture) {
         case FilterInputPicture(:final packet):
           packets.add(packet);
-        case FilterOperationPicture(:final inputs, :final enableCommand):
-          for (final input in inputs) {
-            visit(input);
+        case FilterOperationPicture(
+          :final inputs,
+          :final enableCommand,
+          :final overlayCommands,
+          :final previousOverlay,
+        ):
+          if (previousOverlay != null) pending.add(previousOverlay);
+          if (enableCommand?.sender case final sender?) pending.add(sender);
+          if (overlayCommands != null) {
+            for (final argument in overlayCommands.arguments) {
+              if (argument.sender case final sender?) pending.add(sender);
+            }
           }
-          if (enableCommand?.sender case final sender?) visit(sender);
+          pending.addAll(inputs.reversed);
       }
     }
 
-    visit(this);
     return packets;
   }
 }
@@ -80,21 +90,54 @@ final class FilterOperationPicture extends FilterPicture {
     this.position, {
     this.enablePosition,
     this.enableCommand,
+    this.overlayCommands,
+    this.previousOverlay,
   });
   final int step;
   final List<FilterPicture> inputs;
   final FilterFramePosition position;
   final FilterFramePosition? enablePosition;
-  final FilterEnableCommand? enableCommand;
+  final FilterCommandArgument? enableCommand;
+  final OverlayPositionCommands? overlayCommands;
+  final FilterOperationPicture? previousOverlay;
 }
 
-/// An enable command as seen when a target reads its input frame.
-final class FilterEnableCommand {
-  const FilterEnableCommand(this.expression, {this.variables, this.sender});
+/// A direct filter expression or a numeric argument evaluated at the sender.
+final class FilterCommandArgument {
+  const FilterCommandArgument(
+    this.expression, {
+    this.variables,
+    this.sender,
+    this.usesPreviousPosition = false,
+  });
 
   final FilterExpression expression;
   final Map<String, double>? variables;
   final FilterPicture? sender;
+  final bool usesPreviousPosition;
+}
+
+final class OverlayPositionCommands {
+  const OverlayPositionCommands({this.x, this.y, this.history});
+
+  final FilterCommandArgument? x, y;
+  final OverlayPositionChange? history;
+
+  Iterable<FilterCommandArgument> get arguments sync* {
+    if (x case final argument?) yield argument;
+    if (y case final argument?) yield argument;
+    for (var change = history; change != null; change = change.previous) {
+      yield change.argument;
+    }
+  }
+}
+
+final class OverlayPositionChange {
+  const OverlayPositionChange(this.horizontal, this.argument, this.previous);
+
+  final bool horizontal;
+  final FilterCommandArgument argument;
+  final OverlayPositionChange? previous;
 }
 
 typedef CaptureSource = ({CaptureFrame frame, int index});

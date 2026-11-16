@@ -374,6 +374,11 @@ can also come from a file through `sendcmd=f=commands.txt`. A target can be
 a filter name or a named instance. `[expr]` evaluates an argument at the
 sender using its frame count, timestamps, interval bounds and dimensions.
 Each capture window starts with the original filter settings.
+An `overlay` target also accepts `x` and `y` commands. These replace the
+corresponding coordinate expression. For example, the command `0.5 overlay@logo x W-w`
+moves `overlay@logo` to the right edge. With `eval=init`, each accepted
+command recomputes the position. With `eval=frame`, coordinate expressions
+can use `n`, `t` and values calculated for the preceding overlay frame.
 
 Single-input, single-output filter graphs can fan out with `split` and
 rejoin with `hstack` or `vstack`. For example,

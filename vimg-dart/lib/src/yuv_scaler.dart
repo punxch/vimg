@@ -122,15 +122,11 @@ final class YuvImageScaler {
         ? terminal
         : null;
     final evaluated = <FilterPicture, _VideoPlanes>{};
-    bool commandEnabled(
-      FilterEnableCommand command,
-      _VideoPlanes frame,
-      FilterFramePosition position,
-      _VideoPlanes Function(FilterPicture) evaluate,
-    ) {
+    final overlayPositions = <FilterOperationPicture, _OverlayPosition?>{};
+    late _VideoPlanes Function(FilterPicture) evaluate;
+    FilterExpression resolveCommand(FilterCommandArgument command) {
       final variables = command.variables;
-      if (variables == null)
-        return _allowsFilter(command.expression, frame, position);
+      if (variables == null) return command.expression;
       final sender = command.sender;
       final value = command.expression({
         ...variables,
@@ -143,38 +139,84 @@ final class YuvImageScaler {
       final rounded = value.isFinite
           ? double.parse(value.toStringAsPrecision(6))
           : value;
-      return rounded.abs() >= 0.5;
+      return (_) => rounded;
     }
 
-    _VideoPlanes evaluate(FilterPicture node) =>
-        evaluated.putIfAbsent(node, () {
-          switch (node) {
-            case FilterInputPicture(:final packet):
-              return source(packet)._planes;
-            case FilterOperationPicture(
-              :final step,
-              :final inputs,
-              :final position,
-              :final enablePosition,
-              :final enableCommand,
-            ):
-              final frames = inputs.map(evaluate).toList();
-              return _applyFilterStep(
-                graph.steps[step],
-                frames,
-                position,
-                enablePosition: enablePosition,
-                commandEnabled: enableCommand == null
-                    ? null
-                    : commandEnabled(
-                        enableCommand,
-                        frames.first,
-                        enablePosition ?? position,
-                        evaluate,
-                      ),
-              );
-          }
-        });
+    bool? enabledByCommand(FilterOperationPicture node, _VideoPlanes frame) {
+      final command = node.enableCommand;
+      return command == null
+          ? null
+          : _allowsFilter(
+              resolveCommand(command),
+              frame,
+              node.enablePosition ?? node.position,
+            );
+    }
+
+    _OverlayCommandExpressions? coordinates(
+      OverlayPositionCommands? commands,
+    ) => commands == null
+        ? null
+        : (positions: commands, resolve: resolveCommand);
+
+    _OverlayPosition? previousPosition(FilterOperationPicture? previous) {
+      if (previous == null) return null;
+      final pending = <FilterOperationPicture>[];
+      FilterOperationPicture? cursor = previous;
+      while (cursor != null && !overlayPositions.containsKey(cursor)) {
+        pending.add(cursor);
+        cursor = cursor.previousOverlay;
+      }
+      var offset = cursor == null ? null : overlayPositions[cursor];
+      for (final node in pending.reversed) {
+        final step = graph.steps[node.step];
+        final overlay = step.filter as _Overlay;
+        final main = evaluate(node.inputs.first);
+        final enabled =
+            enabledByCommand(node, main) ??
+            step.enable?.allows(main, node.enablePosition ?? node.position) ??
+            true;
+        if (enabled) {
+          final secondary = evaluate(node.inputs[1]);
+          final layout = overlay._select(main, secondary).selection.format;
+          offset = overlay.coordinates(
+            main,
+            secondary,
+            layout,
+            node.position,
+            commands: coordinates(node.overlayCommands),
+            previous: offset,
+          );
+        }
+        overlayPositions[node] = offset;
+      }
+      return offset;
+    }
+
+    evaluate = (FilterPicture node) => evaluated.putIfAbsent(node, () {
+      switch (node) {
+        case FilterInputPicture(:final packet):
+          return source(packet)._planes;
+        case FilterOperationPicture(
+          :final step,
+          :final inputs,
+          :final position,
+          :final enablePosition,
+          :final overlayCommands,
+          :final previousOverlay,
+        ):
+          final frames = inputs.map(evaluate).toList();
+          return _applyFilterStep(
+            graph.steps[step],
+            frames,
+            position,
+            enablePosition: enablePosition,
+            commandEnabled: enabledByCommand(node, frames.first),
+            overlayCommands: coordinates(overlayCommands),
+            previousOverlayPosition: previousPosition(previousOverlay),
+          );
+      }
+    });
     return _convertFiltered(
       evaluate(scale == null ? picture : operation!.inputs.single),
       scale,

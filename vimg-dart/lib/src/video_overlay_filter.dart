@@ -1,5 +1,32 @@
 part of 'yuv_image.dart';
 
+typedef _OverlayPosition = ({double x, double y});
+
+typedef _OverlayCommandExpressions = ({
+  OverlayPositionCommands positions,
+  FilterExpression Function(FilterCommandArgument) resolve,
+});
+
+FilterExpression _parseOverlayCoordinate(
+  String source, {
+  void Function(String)? onVariable,
+}) => parseFilterExpression(source, const {
+  'main_w',
+  'main_h',
+  'W',
+  'H',
+  'overlay_w',
+  'overlay_h',
+  'w',
+  'h',
+  'hsub',
+  'vsub',
+  'x',
+  'y',
+  'n',
+  't',
+}, onVariable: onVariable);
+
 final class _Overlay {
   factory _Overlay(String? source) {
     final options = _filterOptions(source, [
@@ -39,35 +66,18 @@ final class _Overlay {
       'auto' || '8' => null,
       _ => throw const FormatException('Invalid overlay pixel format'),
     };
-    const variables = {
-      'main_w',
-      'main_h',
-      'W',
-      'H',
-      'overlay_w',
-      'overlay_h',
-      'w',
-      'h',
-      'hsub',
-      'vsub',
-      'x',
-      'y',
-      'n',
-      't',
-    };
-    var dynamicPosition = false;
+    var dynamicPosition = false, usesPreviousPosition = false;
     void reference(String name) {
       if (_frameVariables.contains(name)) dynamicPosition = true;
+      usesPreviousPosition |= name == 'x' || name == 'y';
     }
 
-    final x = parseFilterExpression(
+    final x = _parseOverlayCoordinate(
       options['x'] ?? '0',
-      variables,
       onVariable: reference,
     );
-    final y = parseFilterExpression(
+    final y = _parseOverlayCoordinate(
       options['y'] ?? '0',
-      variables,
       onVariable: reference,
     );
     return _Overlay._(
@@ -75,7 +85,9 @@ final class _Overlay {
       y,
       format,
       alphaMode,
+      evaluateFrame,
       evaluateFrame && dynamicPosition,
+      usesPreviousPosition,
       sync,
     );
   }
@@ -85,7 +97,9 @@ final class _Overlay {
     this.y,
     this.format,
     this.alphaMode,
+    this.evaluateFrame,
     this.usesFramePosition,
+    this.usesPreviousPosition,
     this.sync, [
     this.outputFormat,
     this.bitmapFallback,
@@ -94,7 +108,9 @@ final class _Overlay {
   final FilterExpression x, y;
   final _VideoPixelFormat? format;
   final bool? alphaMode;
+  final bool evaluateFrame;
   final bool usesFramePosition;
+  final bool usesPreviousPosition;
   final _FrameSyncOptions sync;
   final _FormatFilter? outputFormat;
   final _NamedPixelFormat? bitmapFallback;
@@ -108,7 +124,9 @@ final class _Overlay {
         y,
         this.format,
         alphaMode,
+        evaluateFrame,
         usesFramePosition,
+        usesPreviousPosition,
         sync,
         format,
         bitmapTerminal && this.format == null ? format.packedAlphaFormat : null,
@@ -158,12 +176,10 @@ final class _Overlay {
     );
   }
 
-  _VideoPlanes apply(
+  ({_FormatSelection selection, bool convert}) _select(
     _VideoPlanes input,
     _VideoPlanes? secondary,
-    FilterFramePosition position, {
-    required bool enabled,
-  }) {
+  ) {
     final negotiated = outputFormat ?? mainFormat;
     final original = mainFormat.matchingFormat(input);
     final secondaryLayout = format == null && secondary != null
@@ -175,8 +191,84 @@ final class _Overlay {
       input,
       preferred: original ?? secondaryLayout ?? bitmapFallback,
     );
+    return (selection: selection, convert: original == null);
+  }
+
+  _OverlayPosition coordinates(
+    _VideoPlanes main,
+    _VideoPlanes over,
+    _VideoPixelFormat layout,
+    FilterFramePosition position, {
+    _OverlayCommandExpressions? commands,
+    _OverlayPosition? previous,
+  }) {
+    final variables = {
+      'main_w': main.width.toDouble(),
+      'W': main.width.toDouble(),
+      'main_h': main.height.toDouble(),
+      'H': main.height.toDouble(),
+      'overlay_w': over.width.toDouble(),
+      'w': over.width.toDouble(),
+      'overlay_h': over.height.toDouble(),
+      'h': over.height.toDouble(),
+      'hsub': (1 << layout.subX).toDouble(),
+      'vsub': (1 << layout.subY).toDouble(),
+      'x': previous?.x ?? double.nan,
+      'y': previous?.y ?? double.nan,
+      // Overlay reads the main link's frame count after the current frame arrives.
+      'n': evaluateFrame ? position.index + 1.0 : 0.0,
+      't': evaluateFrame ? position.seconds : double.nan,
+    };
+    var xExpression = x, yExpression = y;
+    void evaluateCoordinates() {
+      variables['x'] = xExpression(variables);
+      variables['y'] = yExpression(variables);
+      variables['x'] = xExpression(variables);
+    }
+
+    if (commands == null) {
+      evaluateCoordinates();
+    } else if (commands.positions.history == null) {
+      if (commands.positions.x case final arg?)
+        xExpression = commands.resolve(arg);
+      if (commands.positions.y case final arg?)
+        yExpression = commands.resolve(arg);
+      evaluateCoordinates();
+    } else {
+      // Init mode evaluates once at startup and again after each accepted update.
+      evaluateCoordinates();
+      final history = <OverlayPositionChange>[];
+      for (
+        var change = commands.positions.history;
+        change != null;
+        change = change.previous
+      ) {
+        history.add(change);
+      }
+      for (final change in history.reversed) {
+        final expression = commands.resolve(change.argument);
+        if (change.horizontal) {
+          xExpression = expression;
+        } else {
+          yExpression = expression;
+        }
+        evaluateCoordinates();
+      }
+    }
+    return (x: variables['x']!, y: variables['y']!);
+  }
+
+  _VideoPlanes apply(
+    _VideoPlanes input,
+    _VideoPlanes? secondary,
+    FilterFramePosition position, {
+    required bool enabled,
+    _OverlayCommandExpressions? commands,
+    _OverlayPosition? previousPosition,
+  }) {
+    final (:selection, :convert) = _select(input, secondary);
     final target = selection.format;
-    final main = original == null
+    final main = convert
         ? _converter.convert(
             input,
             target,
@@ -194,26 +286,16 @@ final class _Overlay {
       matrix: main.matrix,
       premultiplied: alphaMode ?? main.premultiplied,
     );
-    final variables = {
-      'main_w': main.width.toDouble(),
-      'W': main.width.toDouble(),
-      'main_h': main.height.toDouble(),
-      'H': main.height.toDouble(),
-      'overlay_w': over.width.toDouble(),
-      'w': over.width.toDouble(),
-      'overlay_h': over.height.toDouble(),
-      'h': over.height.toDouble(),
-      'hsub': (1 << main.subX).toDouble(),
-      'vsub': (1 << main.subY).toDouble(),
-      'x': double.nan,
-      'y': double.nan,
-      // Overlay reads the main link's frame count after the current frame arrives.
-      'n': usesFramePosition ? position.index + 1.0 : 0.0,
-      't': usesFramePosition ? position.seconds : double.nan,
-    };
-    variables['x'] = x(variables);
-    final top = _overlayOffset(variables['y'] = y(variables), main.subY);
-    final left = _overlayOffset(x(variables), main.subX);
+    final offset = coordinates(
+      main,
+      over,
+      target,
+      position,
+      commands: commands,
+      previous: previousPosition,
+    );
+    final top = _overlayOffset(offset.y, main.subY);
+    final left = _overlayOffset(offset.x, main.subX);
     var result = main;
     if (left != null &&
         top != null &&

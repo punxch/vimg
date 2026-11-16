@@ -665,6 +665,8 @@ _VideoPlanes _applyFilterStep(
   FilterFramePosition position, {
   FilterFramePosition? enablePosition,
   bool? commandEnabled,
+  _OverlayCommandExpressions? overlayCommands,
+  _OverlayPosition? previousOverlayPosition,
 }) {
   final enabled =
       commandEnabled ??
@@ -677,6 +679,8 @@ _VideoPlanes _applyFilterStep(
       inputs.elementAtOrNull(1),
       position,
       enabled: enabled,
+      commands: overlayCommands,
+      previousPosition: previousOverlayPosition,
     ),
     final _MergeAlpha filter => filter.apply(
       inputs[0],
